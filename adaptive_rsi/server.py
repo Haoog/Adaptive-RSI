@@ -1,4 +1,5 @@
 import hmac
+import html
 import json
 import mimetypes
 import os
@@ -304,6 +305,21 @@ class Server(ThreadingHTTPServer):
             return {"url": url, "csrf": csrf}
 
 
+def _start_response(handler, code, headers=None, content_type=None, length=None):
+    """Send status, shared security headers and one response's fixed headers."""
+    handler.send_response(code)
+    handler.headers_common()
+    for key, value in (headers or {}).items():
+        handler.send_header(key, value)
+    if getattr(handler, "_request_id", None):
+        handler.send_header("X-RSI-Request-ID", handler._request_id)
+    if content_type:
+        handler.send_header("Content-Type", content_type)
+    if length is not None:
+        handler.send_header("Content-Length", str(length))
+    handler.end_headers()
+
+
 class Handler(BaseHTTPRequestHandler):
     # 慢速或悬挂的连接最多占用线程 30 秒；超时由 handle_one_request 关闭连接。
     timeout = 30
@@ -326,16 +342,11 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(payload, str):
             payload = payload.encode()
         try:
-            self.send_response(code)
-            self.headers_common()
-            for key, value in (headers or {}).items():
-                self.send_header(key, value)
-            if getattr(self, "_request_id", None):
-                self.send_header("X-RSI-Request-ID", self._request_id)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+            _start_response(self, code, headers=headers, content_type=content_type, length=len(payload))
+            # HEAD shares GET's status and headers, including Content-Length,
+            # but never transfers a representation body (RFC 9110 9.3.2).
+            if getattr(self, "command", "") != "HEAD":
+                self.wfile.write(payload)
         except OSError:
             # Aborted browser fetches are normal during navigation; socket write
             # timeouts on slow clients are OSError subclasses as well. Do not
@@ -344,6 +355,58 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._response_status = 500
             self._response_error_code = "response_interrupted"
+
+    def redirect(self, location, headers=None):
+        """A 303 is a real response: it must carry the shared headers and request id."""
+        self._response_status, self._response_error_code = 303, ""
+        try:
+            _start_response(self, 303, headers={**(headers or {}), "Location": location}, length=0)
+        except OSError:
+            self.close_connection = True
+            self._response_status = 500
+            self._response_error_code = "response_interrupted"
+
+    def method_not_allowed(self):
+        # An unimplemented method on our own listener is not RFC 9110 501
+        # ("method not recognized"); the method is known but not offered here.
+        # The request body was never read, so the connection must not be reused.
+        path = getattr(self, "path", "") or ""
+        allowed = "GET, HEAD, POST, OPTIONS" if path.startswith("/api/") else "GET, HEAD, OPTIONS"
+        self.close_connection = True
+        self.respond({"error": "Method not allowed", "error_code": "http_405"}, 405,
+                     headers={"Allow": allowed, "Connection": "close"})
+
+    def send_error(self, code, message=None, explain=None):
+        """Protocol errors bypass route dispatch; keep the same header contract.
+
+        BaseHTTPRequestHandler answers unimplemented methods with 501 and other
+        parse failures with an HTML page, none of which pass through respond().
+        API callers get JSON, static callers keep the HTML page, and both get
+        no-store/CSP/nosniff plus a request id.
+        """
+        if not getattr(self, "_request_id", None):
+            self._request_id = secrets.token_hex(8)
+        if int(code) == 501:
+            return self.method_not_allowed()
+        short, long = self.responses.get(code, ("???", "???"))
+        detail = str(message or short)
+        if str(getattr(self, "path", "")).startswith("/api/"):
+            self.close_connection = True
+            self.respond({"error": detail, "error_code": "http_" + str(int(code))}, int(code),
+                         headers={"Connection": "close"})
+            return
+        payload = (self.error_message_format % {
+            "code": int(code), "message": html.escape(detail, quote=False),
+            "explain": html.escape(str(explain or long), quote=False)}).encode("utf-8", "replace")
+        self._response_status, self._response_error_code = int(code), "http_" + str(int(code))
+        self.close_connection = True
+        try:
+            _start_response(self, code, headers={"Connection": "close"},
+                            content_type="text/html; charset=utf-8", length=len(payload))
+            if getattr(self, "command", "") != "HEAD":
+                self.wfile.write(payload)
+        except OSError:
+            self.close_connection = True
 
     def api_error(self, exc):
         if isinstance(exc, RequestError):
@@ -437,6 +500,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/vnd.sqlite3")
                 self.send_header("Content-Length", str(size))
                 self.end_headers()
+                if getattr(self, "command", "") == "HEAD":
+                    # HEAD 只发送与 GET 相同的头，不传输整库内容。
+                    self._response_status, self._response_error_code = 200, ""
+                    self.close_connection = True
+                    return
                 remaining = size
                 deadline = time.monotonic() + 120
                 try:
@@ -466,7 +534,8 @@ class Handler(BaseHTTPRequestHandler):
         if retry:
             self.respond({"error": "Too many authentication failures", "error_code": "session_required"},
                          429, headers={"Retry-After": str(retry)})
-        elif self.command == "GET" and urlparse(self.path).path in ["/", "/index.html"]:
+        elif self.command in ("GET", "HEAD") and urlparse(self.path).path in ["/", "/index.html"]:
+            # HEAD 与 GET 共享登录页的 401 表示与头；respond() 负责不发送 body。
             self.respond(self.server.assets["login.html"], 401, "text/html; charset=utf-8")
         else:
             self.respond({"error": "Open the authenticated URL printed by adaptive-rsi serve/open", "error_code": "session_required"}, 401)
@@ -495,7 +564,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.authentication_failure()
         return True
 
-    def do_GET(self):
+    def _dispatch_GET(self):
         self._request_id = secrets.token_hex(8)
         # The shutdown probe must stay readable while the runtime closes its
         # store; it only reads in-memory phase and counters.
@@ -503,6 +572,34 @@ class Handler(BaseHTTPRequestHandler):
             return self._do_GET()
         with self.server.runtime.store.query_scope(request=self._request_id):
             return self._do_GET()
+
+    def do_GET(self):
+        return self._dispatch_GET()
+
+    def do_HEAD(self):
+        # Same status, headers and Content-Length as GET, without the body.
+        return self._dispatch_GET()
+
+    def do_OPTIONS(self):
+        self._request_id = secrets.token_hex(8)
+        path = urlparse(self.path).path
+        allowed = "GET, HEAD, POST, OPTIONS" if path.startswith("/api/") else "GET, HEAD, OPTIONS"
+        self._response_status, self._response_error_code = 204, ""
+        try:
+            _start_response(self, 204, headers={"Allow": allowed})
+        except OSError:
+            self.close_connection = True
+            self._response_status, self._response_error_code = 500, "response_interrupted"
+
+    def _record_get(self, request_id, started, error_code=""):
+        """Record only the route shape, never query values, bodies or headers."""
+        try:
+            self.server.runtime.store.record_request(
+                request_id, getattr(self, "command", "GET") or "GET", urlparse(self.path).path[:300],
+                getattr(self, "_response_status", 500), started, time.time(),
+                getattr(self, "_response_error_code", error_code)[:100])
+        except Exception:
+            pass
 
     def _do_GET(self):
         request_id = self._request_id
@@ -527,13 +624,14 @@ class Handler(BaseHTTPRequestHandler):
                 # 旧启动地址携带的 token 可能已轮换；已持有有效会话时仍直接回到控制台。
                 if not self.authenticated():
                     return
-            self.send_response(303)
-            self.headers_common()
+            headers = {"Location": "/"}
             if valid:
-                self.send_header("Set-Cookie", self.server.cookie_header(self.headers.get("Host")))
-            self.send_header("Location", "/")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+                headers["Set-Cookie"] = self.server.cookie_header(self.headers.get("Host"))
+            # 登录跳转也要走统一响应路径：带请求标识，并进入 request_log。
+            # 先记录再发送，避免浏览器已跳转而日志行尚未落库的竞态。
+            self._response_status, self._response_error_code = 303, ""
+            self._record_get(request_id, started)
+            self.redirect("/", headers=headers)
             return
         if not self.authenticated():
             return
@@ -1048,15 +1146,8 @@ class Handler(BaseHTTPRequestHandler):
                 error_code = "internal_error"
             self.api_error(exc)
         finally:
-            # Record only the route shape, never query values, bodies, headers or errors.
             if urlparse(self.path).path.startswith("/api/"):
-                try:
-                    self.server.runtime.store.record_request(
-                        request_id, "GET", urlparse(self.path).path[:300],
-                         getattr(self, "_response_status", 500), started, time.time(),
-                         getattr(self, "_response_error_code", error_code)[:100])
-                except Exception:
-                    pass
+                self._record_get(request_id, started, error_code)
 
     def do_POST(self):
         self._request_id = secrets.token_hex(8)
