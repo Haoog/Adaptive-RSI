@@ -131,7 +131,7 @@ class Runtime(Maintenance):
         self.evaluator = Evaluator(store)
         self._shutdown = {"phase": "running", "started": None, "ended": None,
                           "scheduler_timed_out": False, "maintenance_timed_out": False,
-                          "workers_timed_out": False}
+                          "workers_timed_out": False, "reconcile_failed": 0}
         self._close_lock = threading.Lock()
         self._closed = False
         # 领取与关闭的共同边界：close 先关闭准入，再排空线程池；竞态下不会留下已领取
@@ -941,6 +941,8 @@ class Runtime(Maintenance):
                 self._shutdown.update(phase='failed', ended=time.time())
                 raise
             self._closed = True
+            # completed 只表示关闭流程走完；reconcile_failed>0 表示仍有已领取的
+            # run 未能落终态，必须等下一次启动的 store.recover() 修复。
             self._shutdown.update(phase='completed', ended=time.time())
 
     def _close(self):
@@ -969,7 +971,8 @@ class Runtime(Maintenance):
             self._shutdown_workers()
         finally:
             # 即使线程池排空自身报错，也必须为已取消、从未启动的领取留下终态。
-            self._reconcile_unstarted_workers()
+            _, failed = self._reconcile_unstarted_workers()
+            self._shutdown['reconcile_failed'] = len(failed)
         self._shutdown['phase'] = 'maintenance'
         self._shutdown['maintenance_timed_out'] = False
         if self.maintenance_thread and self.maintenance_thread is not threading.current_thread():
@@ -1036,12 +1039,18 @@ class Runtime(Maintenance):
         The task returns to the queue, but the store transition still resolves an
         explicit cancellation or project pause first, so shutdown cannot revive
         work the user has already stopped.
+
+        Returns the number of reconciled runs and the ids whose transition failed.
+        A failed write must surface as shutdown evidence (``reconcile_failed``),
+        not only as a process log line: ``phase='completed'`` no longer implies
+        every claimed run reached a terminal state.
         """
         with self._futures_lock:
             pending = list(self._future_runs.items())
             self._future_runs.clear()
             for future, _ in pending:
                 self.futures.discard(future)
+        reconciled, failed = 0, []
         for future, run in pending:
             if not future.cancelled():
                 continue
@@ -1049,8 +1058,29 @@ class Runtime(Maintenance):
                 self.store.transition(run, "interrupted",
                                       {"reason": "Runtime shut down before the worker started"}, True,
                                       task_fields={"state": "queued"})
-            except Exception:
+                reconciled += 1
+            except Exception as error:
                 logging.getLogger(__name__).exception("Failed to reconcile unstarted worker %s", run)
+                failed.append(run)
+                self._record_reconcile_failure(run, error)
+        return reconciled, failed
+
+    def _record_reconcile_failure(self, run, error):
+        """Best-effort event for a run the shutdown could not reconcile."""
+        detail = f"{type(error).__name__}: {error}"[:200]
+        try:
+            row = self.store.one("SELECT project FROM runs WHERE id=?", (run,))
+            project = row["project"] if row else None
+        except Exception:
+            project = None
+        try:
+            self.store.event("shutdown_reconcile_failed",
+                             "Shutdown could not reconcile an unstarted worker; "
+                             "the run stays active until the next start recovers it",
+                             project, run, {"run": run, "error": detail})
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Failed to persist shutdown reconcile failure for %s", run)
 
     def schedule(self, project, config, now=None):
         # 与保存共用 RLock：已开始的 tick 先完成，随后保存重排；等待中的

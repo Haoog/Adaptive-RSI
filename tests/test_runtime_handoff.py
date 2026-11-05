@@ -1,4 +1,5 @@
 """Offline regression evidence for runtime handoff boundaries."""
+import concurrent.futures
 import datetime
 import json
 import os
@@ -142,8 +143,35 @@ class RuntimeHandoffTest(unittest.TestCase):
             self.assertIsNotNone(saved['ended'])
             self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (task,))['state'], 'queued')
             self.assertEqual(self.runtime._future_runs, {})
+            self.assertEqual(self.runtime.shutdown_status()['reconcile_failed'], 0)
         finally:
             gate.set()
+
+    def test_shutdown_reconcile_failure_is_reported(self):
+        # 已取消、从未启动的领取在关闭时必须落 interrupted；写入失败不能只留日志，
+        # 否则 shutdown-status 会报告 completed，而数据库里仍有 claimed run。
+        _, run = self.claim()
+        self.assertIsNotNone(run)
+        future = concurrent.futures.Future()
+        self.assertTrue(future.cancel())
+        with self.runtime._futures_lock:
+            self.runtime._future_runs[future] = run['id']
+        self.runtime.futures.add(future)
+        with patch.object(self.store, 'transition', side_effect=RuntimeError('database or disk is full')):
+            self.runtime.close()
+        status = self.runtime.shutdown_status()
+        self.assertEqual(status['phase'], 'completed')
+        self.assertEqual(status['reconcile_failed'], 1)
+        event = self.store.one("SELECT * FROM events WHERE kind='shutdown_reconcile_failed'")
+        self.assertIsNotNone(event)
+        self.assertEqual(event['run'], run['id'])
+        data = json.loads(event['data'])
+        self.assertEqual(data['run'], run['id'])
+        self.assertIn('database or disk is full', data['error'])
+        # 失败后 run 仍是残留，只能由下一次启动的 store.recover() 修复。
+        saved = self.store.one('SELECT state,ended FROM runs WHERE id=?', (run['id'],))
+        self.assertEqual(saved['state'], 'planning')
+        self.assertIsNone(saved['ended'])
 
     def test_shutdown_cancel_before_start_does_not_requeue_cancelled_task(self):
         gate = threading.Event()
