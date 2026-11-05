@@ -1281,6 +1281,79 @@ class ReliabilityTest(unittest.TestCase):
         self.assertIn("Change escaped planned scope: pkg/keep.py", json.loads(row["result"])["reason"])
         self.assertFalse(evaluate.called)
 
+    @staticmethod
+    def staged_diff_failure(real):
+        """只让读取暂存路径列表的 git 调用失败，其余 git 命令照常执行。"""
+        def runner(root, *args, **kwargs):
+            if tuple(args[:3]) == ("diff", "--cached", "--no-renames"):
+                raise RuntimeError("git diff --cached failed: index.lock exists")
+            return real(root, *args, **kwargs)
+        return runner
+
+    def test_scope_gate_fails_closed_when_touched_paths_cannot_be_read(self):
+        """git 读不到暂存改动时不能退回 rename 折叠列表，否则计划外删除会静默放行。"""
+        from adaptive_rsi import pipeline
+        self.scoped_repo({"conftest.py": "COLLECTED = True\n", "src/app.py": "VALUE = 1\n"})
+
+        def implementation(workspace):
+            git(workspace, "mv", "conftest.py", "src/conftest.py")
+            (workspace / "src/app.py").write_text("VALUE = 2\n")
+        self.runtime.agent = self.scope_agent(implementation)
+        task, run, project, base, directory, workspace = self.no_change_inputs(
+            "Refactor the scoped tree layout while preserving behavior")
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "fail", "reason": "Scope gate bypassed", "checks": {},
+                 "execution_environment": {"backend": "test", "build": "test"}}) as evaluate, \
+             patch("adaptive_rsi.pipeline.git", new=self.staged_diff_failure(git)):
+            with self.assertRaisesRegex(RuntimeError, "Cannot verify touched paths"):
+                pipeline.execute_candidate(self.runtime, run, project, task, project["path"], base,
+                                           directory, workspace, [])
+        self.assertFalse(evaluate.called)
+        self.assertFalse((directory / "candidate.patch").exists())
+
+    def test_documentation_gate_fails_closed_when_touched_paths_cannot_be_read(self):
+        """文档门禁同样不能退回折叠列表：读不到被删掉的源文件就必须拒绝。"""
+        from adaptive_rsi import pipeline
+        self.scoped_repo({"calculator.py": "VALUE = 1\n"})
+
+        def implementation(workspace):
+            (workspace / "docs").mkdir(exist_ok=True)
+            git(workspace, "mv", "calculator.py", "docs/guide.md")
+        self.runtime.agent = self.scope_agent(implementation, scope=("docs",), change_kind="documentation")
+        task, run, project, base, directory, workspace = self.no_change_inputs("Update usage guide")
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "fail", "reason": "Documentation gate bypassed", "checks": {},
+                 "execution_environment": {"backend": "test", "build": "test"}}) as evaluate, \
+             patch("adaptive_rsi.pipeline.git", new=self.staged_diff_failure(git)):
+            with self.assertRaisesRegex(RuntimeError, "Cannot verify touched paths"):
+                pipeline.execute_candidate(self.runtime, run, project, task, project["path"], base,
+                                           directory, workspace, [])
+        self.assertFalse(evaluate.called)
+        self.assertFalse((directory / "candidate.patch").exists())
+
+    def test_scope_gate_rejects_empty_touched_paths_for_non_empty_patch(self):
+        """读取“成功”却给出空列表时同样失败：非空补丁不可能一个路径都没有。"""
+        from adaptive_rsi import pipeline
+        self.scoped_repo({"src/app.py": "VALUE = 1\n"})
+
+        def implementation(workspace):
+            (workspace / "src/app.py").write_text("VALUE = 2\n")
+        self.runtime.agent = self.scope_agent(implementation)
+        task, run, project, base, directory, workspace = self.no_change_inputs(
+            "Refactor the scoped tree layout while preserving behavior")
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "fail", "reason": "Scope gate bypassed", "checks": {},
+                 "execution_environment": {"backend": "test", "build": "test"}}) as evaluate, \
+             patch("adaptive_rsi.pipeline._touched_paths", return_value=set()):
+            with self.assertRaisesRegex(RuntimeError, "git reported no staged paths"):
+                pipeline.execute_candidate(self.runtime, run, project, task, project["path"], base,
+                                           directory, workspace, [])
+        self.assertFalse(evaluate.called)
+        self.assertFalse((directory / "candidate.patch").exists())
+
     def high_risk_agent(self):
         """高风险计划且补丁触及敏感路径：未修复时 review 与 risk_review 都会被付费调用。"""
         class HighRisk(FakeAgent):
