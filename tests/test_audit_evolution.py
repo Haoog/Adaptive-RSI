@@ -1527,6 +1527,42 @@ class AuditEvolutionTest(unittest.TestCase):
         (destination / 'evidence.json').write_text('{}')
         self.assertFalse(Evolution.verify_bundle(destination)['valid'])
 
+    def test_bundle_evidence_drops_host_trial_report_paths(self):
+        """试验的评估报告绝对路径带出用户名与状态目录布局，导出时不得进包。"""
+        def report(variant):
+            return str(self.root / 'experiments' / 'experiments' / 'case-1-0' / variant / 'evaluation' / 'report.json')
+        trial = {'case': 'case-1', 'split': 'validation', 'repetition': 0,
+                 'order': ['stable', 'candidate'],
+                 'stable': {'pass': False, 'report': report('stable')},
+                 'candidate': {'pass': True, 'report': report('candidate')}}
+        ablation = {'state': 'complete', 'trials': [
+            {'case': 'case-1', 'repetition': 0,
+             'strategy_only': {'pass': True, 'report': report('strategy_only')},
+             'skill_only': {'pass': False, 'report': report('skill_only')}}]}
+        self.candidate({'trials': [trial], 'ablation': ablation})
+        destination = self.root / 'bundle-trial-report'
+        self.evolution.export_bundle('c', destination)
+
+        text = (destination / 'evidence.json').read_text(encoding='utf-8')
+        self.assertNotIn(str(self.root), text)
+        exported = json.loads(text)
+        # 判定字段保留，只有宿主路径被删除。
+        self.assertEqual(exported['trials'][0]['case'], 'case-1')
+        self.assertEqual(exported['trials'][0]['split'], 'validation')
+        self.assertEqual(exported['trials'][0]['repetition'], 0)
+        self.assertEqual(exported['trials'][0]['order'], ['stable', 'candidate'])
+        self.assertEqual([exported['trials'][0]['stable']['pass'],
+                          exported['trials'][0]['candidate']['pass']], [False, True])
+        self.assertNotIn('report', exported['trials'][0]['stable'])
+        self.assertNotIn('report', exported['trials'][0]['candidate'])
+        self.assertNotIn('report', exported['ablation']['trials'][0]['strategy_only'])
+        self.assertNotIn('report', exported['ablation']['trials'][0]['skill_only'])
+        self.assertFalse(exported['ablation']['trials'][0]['skill_only']['pass'])
+        # 导出只裁剪副本，本地候选证据仍保留完整路径。
+        stored = json.loads(self.store.one('SELECT evidence FROM candidates WHERE id=?', ('c',))['evidence'])
+        self.assertEqual(stored['trials'][0]['stable']['report'], trial['stable']['report'])
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+
     def test_bundle_hashing_streams_instead_of_reading_whole_files(self):
         """封存与校验摘要必须分块读取，峰值内存不随单个文件大小增长。
 
