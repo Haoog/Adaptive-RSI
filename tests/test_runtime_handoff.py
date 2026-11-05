@@ -430,6 +430,55 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.store.setting('stage-budget:' + task),
                          {'preparation': 35.0, 'evaluation': 0.0, 'run': run['id']})
 
+    def test_blocked_checkpoint_does_not_queue_another_runs_cancel_poll(self):
+        """一个 run 的检查点卡在存储上时，别的 run 的取消轮询不排进程级写锁。"""
+        # 两个项目各自一个 run：互不相关，取消轮询不应为对方的检查点排队。
+        other = self.runtime.add_project(fixture(self.root / 'other-project'))
+        self.runtime.configure({'sources': {'inspection': False, 'issues': False},
+                                'evolution': {'enabled': False}}, other)
+        tasks = [self.runtime.goal(self.project, 'Check boundary A'),
+                 self.runtime.goal(other, 'Check boundary B')]
+        for project in (self.project, other):
+            self.runtime.pause(project, False)
+        runs = [self.store.claim(project, self.runtime.config(project))
+                for project in (self.project, other)]
+        clock = [1000.0]
+        for run in runs:
+            run['_stage_used'] = {'preparation': 0.0, 'evaluation': 0.0}
+            run['_deadline_stage'], run['_deadline_started'] = 'preparation', clock[0]
+            run['_deadline_checkpoint'] = clock[0]
+        entered, gate = threading.Event(), threading.Event()
+        writer, connect = None, self.store.connect
+
+        def stalled():
+            if threading.current_thread() is writer:
+                entered.set()
+                gate.wait(5)
+            return connect()
+
+        def checkpoint():
+            snapshot = self.runtime._stage_budget_snapshot(runs[0], clock[0] + 20.0, keep=True)
+            self.runtime._persist_stage_budget(*snapshot, keep=True)
+
+        with patch.object(self.store, 'connect', side_effect=stalled), \
+             patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]):
+            writer = threading.Thread(target=checkpoint)
+            writer.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                clock[0] += 20.0
+                started = time.perf_counter()
+                self.assertFalse(self.runtime.is_cancelled(runs[1]))
+                self.assertLess(time.perf_counter() - started, 0.2)
+            finally:
+                gate.set()
+                writer.join(5)
+        self.assertFalse(writer.is_alive())
+        # 卡住的那次写最终落盘；撞车的另一个 run 只丢这一轮检查点，账本留给下个间隔。
+        self.assertEqual(self.store.setting('stage-budget:' + tasks[0]),
+                         {'preparation': 20.0, 'evaluation': 0.0, 'run': runs[0]['id']})
+        self.assertIsNone(self.store.setting('stage-budget:' + tasks[1]))
+
     def test_checkpoint_writes_never_regress_the_stage_ledger(self):
         """连续检查点与乱序完成的写都按阶段取最大值，账本只增不减。"""
         task, run = self.claim()

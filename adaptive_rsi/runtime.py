@@ -1732,26 +1732,49 @@ class Runtime(Maintenance):
     def _persist_stage_budget(self, key, values, run_id, keep):
         """落盘或清除任务已耗的阶段时间：只有中断把额度交接给下一次尝试。
 
-        必须在时钟锁外调用。同一任务的账本按阶段取最大值合并：两轮轮询的写可能
-        乱序完成，晚到的旧快照不得回退已经记录的额度。
+        必须在时钟锁外调用，但仍在取消轮询链上（is_cancelled → _deadline_expired），
+        因此这里不能用任何「排队等待」：写锁只做非阻塞抢占，抢不到就丢掉本轮检查点
+        （下个间隔重试），慢库不会让别的 run 的轮询排在这把进程级锁后面。
+
+        同一任务的账本按阶段取最大值合并：两轮轮询的写可能乱序完成，晚到的旧快照
+        不得回退已经记录的额度。读旧账与写新账共用一条连接，连接借出后先把
+        busy_timeout 压到检查点预算内，避免一次慢写等满默认的 15 秒。
+
+        终态那次写（process 的 finally）抢锁失败时同样丢弃：账本保留上一个检查点，
+        最多丢一个间隔的偏差，与硬崩溃的损失同量级，不会让收尾线程无限等待。
         """
+        if not _stage_budget_write_lock.acquire(blocking=False):
+            # 另一个线程正在写检查点，它可能卡在慢库上：本线程不排队，丢本轮。
+            logging.getLogger(__name__).info(
+                'Dropped stage budget checkpoint for %s: another checkpoint write is in flight', run_id)
+            return
         try:
-            with _stage_budget_write_lock:
-                if not keep or not any(values.values()):
-                    self.store.execute('DELETE FROM settings WHERE key=?', (key,),
-                                       busy_timeout=STAGE_BUDGET_CHECKPOINT_BUSY_MS)
-                    return
-                stored = self.store.setting(key, {})
-                if isinstance(stored, dict):
-                    previous = {name: self._stage_seconds(stored.get(name)) for name in values}
-                    # 账本只增不减：旧值更大说明那一笔更晚完成，归属尝试也以它为准。
-                    if all(previous[name] >= values[name] for name in values):
-                        run_id = stored.get('run') or run_id
-                    values = {name: max(values[name], previous[name]) for name in values}
-                # 记录归属尝试：终态提交后、finally 之前崩溃会留下键，载入时据此判定它是否还有效。
-                self.store.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',
-                                   (key, encode({**values, 'run': run_id})),
-                                   busy_timeout=STAGE_BUDGET_CHECKPOINT_BUSY_MS)
+            with self.store.connect() as db:
+                previous_timeout = db.execute('PRAGMA busy_timeout').fetchone()[0]
+                db.execute('PRAGMA busy_timeout=%d' % STAGE_BUDGET_CHECKPOINT_BUSY_MS)
+                try:
+                    if not keep or not any(values.values()):
+                        db.execute('DELETE FROM settings WHERE key=?', (key,))
+                        return
+                    row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+                    try:
+                        stored = json.loads(row['value']) if row else {}
+                    except (TypeError, ValueError):
+                        stored = {}
+                    if isinstance(stored, dict):
+                        previous = {name: self._stage_seconds(stored.get(name)) for name in values}
+                        # 账本只增不减：旧值更大说明那一笔更晚完成，归属尝试也以它为准。
+                        if all(previous[name] >= values[name] for name in values):
+                            run_id = stored.get('run') or run_id
+                        values = {name: max(values[name], previous[name]) for name in values}
+                    # 记录归属尝试：终态提交后、finally 之前崩溃会留下键，载入时据此判定它是否还有效。
+                    db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',
+                               (key, encode({**values, 'run': run_id})))
+                finally:
+                    try:
+                        db.execute('PRAGMA busy_timeout=%d' % previous_timeout)
+                    except Exception:
+                        pass
         except Exception as error:
             # 预算是尽力而为的护栏：写入失败不能反过来中断正在收尾的 run，也不能把
             # 取消轮询拖到 busy timeout。DB 忙只丢本轮检查点（下个间隔重试），
@@ -1761,6 +1784,8 @@ class Runtime(Maintenance):
                 logger.info('Dropped stage budget checkpoint for %s: %s', run_id, error)
             else:
                 logger.warning('Could not persist stage budget for %s', run_id, exc_info=True)
+        finally:
+            _stage_budget_write_lock.release()
 
     def _checkpoint_owner_budget(self, owner, now):
         """trial 轮询顺带为所属 run 取快照：时钟各自独立，账本仍按 owner 的阶段计。
