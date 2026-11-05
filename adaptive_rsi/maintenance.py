@@ -13,7 +13,17 @@ import stat
 
 
 CLEANUP_NAMES = ("workspace", "candidate", "baseline", "evaluation", "experiments",
-                 "dependencies", "acceptance-design", "feedback")
+                 "dependencies", "acceptance-design", "acceptance", "feedback")
+
+# pipeline.py 直接写到 runs/<id>/ 顶层的普通文件；它们不在 CLEANUP_NAMES 的
+# 目录分支里。漏掉任何一个，runs.path 置空后就没有入口再找到它，保留承诺
+# 只兑现一部分，磁盘与 inode 随每次过期运行无界增长。
+RUN_FILE_ARTIFACTS = ("plan.json", "tool-scope.json", "acceptance.json",
+                      "resume.patch", "review.json", "risk-review.json")
+
+# candidate.patch 有意保留：runs.path 置空后 revert_code 与 rollback 仍靠它
+# 还原历史改动。它也是运行目录里唯一允许存留的条目。
+RETAINED_RUN_ARTIFACTS = ("candidate.patch",)
 
 # 维护默认每小时一轮；失败后的最短重试间隔按次数指数增长，上限一小时。
 MAINTENANCE_INTERVAL = 3600
@@ -342,6 +352,30 @@ def _held_in_transaction(db, run_id, project):
     return None
 
 
+def _run_directory_settled(directory):
+    """Report whether only intentionally retained entries remain in a run directory.
+
+    ``candidate.patch`` is the sole survivor retention allows, because revert and
+    rollback still read it after ``runs.path`` is cleared.  Anything else - an
+    unknown file or directory, or a link swapped in for the retained name - keeps
+    the path so a later pass (or an upgraded cleaner) can still find and remove
+    it; detaching first would orphan it behind ``path IS NOT NULL``.
+    """
+    try:
+        entries = list(os.scandir(directory))
+    except FileNotFoundError:
+        return True
+    for entry in entries:
+        if entry.name not in RETAINED_RUN_ARTIFACTS:
+            return False
+        try:
+            if not entry.is_file(follow_symlinks=False):
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def _remove_run_artifacts(store, run_id, project, directory, stored=None):
     """Delete a finished run's own artifacts, one write transaction per artifact.
 
@@ -351,13 +385,19 @@ def _remove_run_artifacts(store, run_id, project, directory, stored=None):
     to finish.  Per-artifact transactions bound the write-lock span to a single
     artifact instead of the whole multi-project cleanup pass.  Once no artifacts
     remain, one final transaction detaches the run's path so later passes filter
-    it out through `path IS NOT NULL` instead of re-scanning it forever.
+    it out through `path IS NOT NULL` instead of re-scanning it forever; the
+    detach only happens when the directory holds nothing but the retained patch
+    (or is gone), so an unknown leftover keeps its only lookup key.
     ``stored`` is the exact runs.path value from the database, which may differ
     from the resolved ``directory`` by a symlink layer (e.g. /var on macOS).
     """
-    for name in CLEANUP_NAMES:
+    for name in CLEANUP_NAMES + RUN_FILE_ARTIFACTS:
         target = directory / name
-        if target.is_symlink() or not target.is_dir():
+        if target.is_symlink():
+            continue
+        is_directory = name in CLEANUP_NAMES
+        present = target.is_dir if is_directory else target.is_file
+        if not present():
             continue
         with store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -365,7 +405,7 @@ def _remove_run_artifacts(store, run_id, project, directory, stored=None):
                 return False
             # Re-check under the write lock: an entry swapped for a link after
             # the caller's lexical check must not be removed as the artifact.
-            if target.is_symlink() or not target.is_dir():
+            if target.is_symlink() or not present():
                 continue
             _remove_artifact(directory, name)
     # All own artifacts are gone (deleted here or already absent). Detach the
@@ -376,6 +416,8 @@ def _remove_run_artifacts(store, run_id, project, directory, stored=None):
     with store.connect() as db:
         db.execute('BEGIN IMMEDIATE')
         if _held_in_transaction(db, run_id, project):
+            return False
+        if not _run_directory_settled(directory):
             return False
         # Match the exact path that was cleaned so a concurrently rewritten
         # path is never detached from artifacts that still exist.
