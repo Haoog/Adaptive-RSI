@@ -875,6 +875,105 @@ class AuditMaintenanceRetentionTest(unittest.TestCase):
             finally:
                 store.close()
 
+    def archive_maintenance(self, store):
+        """Minimal Maintenance surface used by the archive-verification tail."""
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            store=store, dispatch_lock=threading.RLock(),
+            scheduler_scope=lambda *a, **k: contextlib.nullcontext(),
+            config=lambda project: {'providers': []},
+            model_center=SimpleNamespace(cleanup_credentials=lambda: None,
+                                         key=lambda *a: 'unused'))
+
+    @staticmethod
+    def repaired_events(store):
+        return store.one("SELECT count(*) AS n FROM events "
+                         "WHERE kind='archive_verification_repaired'")['n']
+
+    def test_corrupt_archive_verification_record_is_repaired_without_aborting(self):
+        from adaptive_rsi.maintenance import Maintenance
+        from adaptive_rsi.storage_tools import archive, verify_archive
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory)
+            try:
+                report = archive(store)
+                key = 'archive-verification:' + Path(report['path']).name
+                runtime = self.archive_maintenance(store)
+                # 字符串/None/NaN/无穷与非对象都按过期处理：重新验证并覆盖报告。
+                for corrupt in ({'checked_at': 'yesterday'}, {'checked_at': None},
+                                {'checked_at': float('nan')}, {'checked_at': float('inf')},
+                                ['yesterday'], 'yesterday'):
+                    store.put_setting(key, corrupt)
+                    store.execute("DELETE FROM settings WHERE key='maintenance-last'")
+                    repaired = self.repaired_events(store)
+                    with patch('adaptive_rsi.storage_tools.verify_archive',
+                               wraps=verify_archive) as checked:
+                        Maintenance.maintenance(runtime)
+                    self.assertEqual(checked.call_count, 1, corrupt)
+                    check = store.setting(key)
+                    self.assertIs(check['valid'], True, corrupt)
+                    self.assertEqual(type(check['checked_at']), float, corrupt)
+                    self.assertGreater(check['checked_at'], 0, corrupt)
+                    self.assertGreater(store.setting('maintenance-last', 0), 0, corrupt)
+                    self.assertEqual(self.repaired_events(store), repaired + 1, corrupt)
+                # 校验自身失败时仍写 valid:false 报告，本轮照常收尾且不阻断后续轮次。
+                Path(report['manifest']).unlink()
+                store.put_setting(key, {'checked_at': 'yesterday'})
+                store.execute("DELETE FROM settings WHERE key='maintenance-last'")
+                Maintenance.maintenance(runtime)
+                check = store.setting(key)
+                self.assertIs(check['valid'], False)
+                self.assertEqual(check['error_type'], 'ValueError')
+                self.assertEqual(type(check['checked_at']), float)
+                self.assertGreater(store.setting('maintenance-last', 0), 0)
+            finally:
+                store.close()
+
+    def test_unreadable_archive_verification_json_is_repaired_type_only(self):
+        from adaptive_rsi.maintenance import Maintenance
+        from adaptive_rsi.storage_tools import archive, verify_archive
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory)
+            try:
+                report = archive(store)
+                key = 'archive-verification:' + Path(report['path']).name
+                store.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, '{broken'))
+                store.execute("DELETE FROM settings WHERE key='maintenance-last'")
+                with patch('adaptive_rsi.storage_tools.verify_archive',
+                           wraps=verify_archive) as checked:
+                    Maintenance.maintenance(self.archive_maintenance(store))
+                self.assertEqual(checked.call_count, 1)
+                self.assertIs(store.setting(key)['valid'], True)
+                event = store.one("SELECT message,data FROM events "
+                                  "WHERE kind='archive_verification_repaired'")
+                self.assertEqual(json.loads(event['data'])['previous_type'], 'unreadable')
+                # 事件只记录形状，不回显损坏内容。
+                self.assertNotIn('broken', event['data'])
+                self.assertNotIn('broken', event['message'])
+            finally:
+                store.close()
+
+    def test_fresh_archive_verification_record_is_not_rechecked(self):
+        from adaptive_rsi.maintenance import Maintenance
+        from adaptive_rsi.storage_tools import archive, verify_archive
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory)
+            try:
+                report = archive(store)
+                key = 'archive-verification:' + Path(report['path']).name
+                fresh = time.time() - 60
+                store.put_setting(key, {'valid': True, 'checked_at': fresh})
+                store.execute("DELETE FROM settings WHERE key='maintenance-last'")
+                with patch('adaptive_rsi.storage_tools.verify_archive',
+                           wraps=verify_archive) as checked:
+                    Maintenance.maintenance(self.archive_maintenance(store))
+                self.assertEqual(checked.call_count, 0)
+                self.assertEqual(store.setting(key), {'checked_at': fresh, 'valid': True})
+                self.assertEqual(self.repaired_events(store), 0)
+                self.assertGreater(store.setting('maintenance-last', 0), 0)
+            finally:
+                store.close()
+
 
 class AuditResourceFairnessTest(unittest.TestCase):
     setUp = AuditRound6Test.setUp
