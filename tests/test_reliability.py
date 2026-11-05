@@ -1400,6 +1400,35 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"],
                          "awaiting_approval")
 
+    def test_evaluation_identity_probe_failure_keeps_completed_evaluation(self):
+        # 评估器返回缺 execution_environment 的记录时，保存前补写身份要探测沙箱；
+        # 探测失败只能放弃补写（缺键记录不会被复用），不能把已完成的评估判成环境故障。
+        class Docs(FakeAgent):
+            def invoke(self, role, *args, **kwargs):
+                if role == "planning":
+                    result = super().invoke(role, *args, **kwargs)
+                    result.update(change_kind="documentation", scope=["docs"])
+                    return result
+                if role == "implementation":
+                    (args[1] / "docs").mkdir(exist_ok=True)
+                    (args[1] / "docs/guide.md").write_text("guide\n")
+                    return {"summary": "Documented the arithmetic contract"}
+                return super().invoke(role, *args, **kwargs)
+        self.runtime.agent = Docs()
+        task, run = self.claim("Update usage guide")
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": [], "checks": CHECKS}), \
+             patch.object(self.runtime.evaluator, "execution_identity",
+                          side_effect=RuntimeError("No working sandbox")), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                "decision": "pass", "reason": "Fixed checks passed", "checks": {}}):
+            self.runtime.process(run)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"],
+                         "awaiting_approval")
+        saved = json.loads(self.store.one("SELECT data FROM stages WHERE run=? AND stage='evaluation'",
+                                          (run["id"],))["data"])
+        self.assertEqual(saved["decision"], "pass")
+        self.assertNotIn("execution_environment", saved)
+
     def test_stage_cache_keys_only_change_for_relevant_settings(self):
         config = self.runtime.config(self.project)
         before, _ = _stage_config(config, "planning")
@@ -1410,6 +1439,48 @@ class ReliabilityTest(unittest.TestCase):
         implementation_before, _ = _stage_config(config, "implementation")
         implementation_after, _ = _stage_config(changed, "implementation")
         self.assertNotEqual(fingerprint(implementation_before), fingerprint(implementation_after))
+
+    def test_stage_cache_keys_ignore_providers_the_stage_never_routes_to(self):
+        config = json.loads(json.dumps(self.runtime.config(self.project)))
+        config["providers"] = [
+            {"id": "local_gw", "name": "Local gateway", "protocol": "chat_completions",
+             "base_url": "http://127.0.0.1:8080/v1", "env_key": ""},
+            {"id": "spare_gw", "name": "Spare gateway", "protocol": "chat_completions",
+             "base_url": "http://127.0.0.1:8081/v1", "env_key": ""},
+        ]
+        config["models"]["evolution"]["provider"] = "local_gw"
+        stages = ["planning", "acceptance", "implementation", "review"]
+        before = {stage: fingerprint(_stage_config(config, stage)[0]) for stage in stages}
+        changed = json.loads(json.dumps(config))
+        changed["providers"][0]["base_url"] = "http://127.0.0.1:9080/v1"
+        changed["providers"][1]["base_url"] = "http://127.0.0.1:9081/v1"
+        for stage in stages:
+            self.assertEqual(fingerprint(_stage_config(changed, stage)[0]), before[stage], stage)
+
+    def test_stage_cache_keys_change_for_the_provider_the_stage_routes_to(self):
+        config = json.loads(json.dumps(self.runtime.config(self.project)))
+        config["providers"] = [
+            {"id": "plan_gw", "name": "Planning gateway", "protocol": "chat_completions",
+             "base_url": "http://127.0.0.1:8080/v1", "env_key": ""},
+            {"id": "fallback_gw", "name": "Fallback gateway", "protocol": "chat_completions",
+             "base_url": "http://127.0.0.1:8081/v1", "env_key": ""},
+        ]
+        config["models"]["planning"]["provider"] = "plan_gw"
+        config["models"]["planning"]["fallback"] = {"provider": "fallback_gw", "model": "local-model",
+                                                    "effort": "high", "fallback": None}
+        before_planning, _ = _stage_config(config, "planning")
+        before_acceptance, _ = _stage_config(config, "acceptance")
+        before_implementation, _ = _stage_config(config, "implementation")
+
+        primary = json.loads(json.dumps(config))
+        primary["providers"][0]["base_url"] = "http://127.0.0.1:9080/v1"
+        self.assertNotEqual(fingerprint(_stage_config(primary, "planning")[0]), fingerprint(before_planning))
+        self.assertNotEqual(fingerprint(_stage_config(primary, "acceptance")[0]), fingerprint(before_acceptance))
+        self.assertEqual(fingerprint(_stage_config(primary, "implementation")[0]), fingerprint(before_implementation))
+
+        fallback = json.loads(json.dumps(config))
+        fallback["providers"][1]["base_url"] = "http://127.0.0.1:9081/v1"
+        self.assertNotEqual(fingerprint(_stage_config(fallback, "planning")[0]), fingerprint(before_planning))
 
     def test_review_evidence_keeps_results_without_full_check_transcripts(self):
         evaluation = {"decision": "pass", "checks": {"candidate": [{
