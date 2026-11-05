@@ -1105,6 +1105,102 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertTrue(result['no_change'])
         self.assertEqual(result['reason'], 'Experiment produced no code changes')
 
+    def test_insufficient_stable_arm_is_not_a_paired_win(self):
+        """评估器不可用的 stable 臂没有结论：不能算作候选的 10 次「改进」。"""
+        config = {'evolution': {'repeats': 2, 'min_cases_per_split': 1, 'max_cost_ratio': 1.25}}
+        trials = [{'case': 'case-' + str(family), 'split': 'validation' if family % 2 else 'holdout',
+                   'repetition': repetition,
+                   'stable': {'pass': False, 'decision': 'insufficient_evidence', 'reason': 'evaluator unavailable'},
+                   'candidate': {'pass': True, 'decision': 'pass'}}
+                  for family in range(5) for repetition in range(2)]
+        decision = Evolution.decide(trials, config)
+        self.assertEqual(decision['decision'], 'insufficient_evidence')
+        self.assertEqual(decision['inconclusive_families'], 5)
+        self.assertIn('no conclusive result', decision['reason'])
+        summary = paired_summary(trials)
+        self.assertEqual((summary['wins'], summary['losses'], summary['ties'], summary['inconclusive']),
+                         (0, 0, 0, 5))
+        self.assertEqual(summary['cohorts']['case-0']['outcome'], 'inconclusive')
+        self.assertEqual(summary['cohorts']['case-0']['arms'],
+                         ['candidate:pass', 'stable:insufficient_evidence'])
+
+    def test_insufficient_candidate_arm_is_not_a_regression(self):
+        """瞬时评估器故障的 candidate 臂不能被记成「候选导致回归」。"""
+        config = {'evolution': {'repeats': 2, 'min_cases_per_split': 1, 'max_cost_ratio': 1.25}}
+        trials = [{'case': 'case-' + str(family), 'split': 'validation', 'repetition': repetition,
+                   'stable': {'pass': True, 'decision': 'pass'},
+                   'candidate': {'pass': False, 'decision': 'insufficient_evidence', 'reason': 'evaluator unavailable'}}
+                  for family in range(3) for repetition in range(2)]
+        decision = Evolution.decide(trials, config)
+        self.assertEqual(decision['decision'], 'insufficient_evidence')
+        self.assertNotIn('regressed', decision['reason'])
+        # 真实回归（两臂都有结论）仍判 fail，不会被同一批里的无结论臂掩盖。
+        trials[0]['candidate'] = {'pass': False, 'decision': 'fail'}
+        self.assertEqual(Evolution.decide(trials, config)['decision'], 'fail')
+
+    def test_confirmed_regression_survives_an_inconclusive_repetition(self):
+        """同族另一轮没跑完时，已确认的回归不能被抹掉成 inconclusive。"""
+        config = {'evolution': {'repeats': 2, 'min_cases_per_split': 1, 'max_cost_ratio': 1.25}}
+        trials = [
+            {'case': 'regressed', 'split': 'validation', 'repetition': 0,
+             'stable': {'pass': True, 'decision': 'pass'},
+             'candidate': {'pass': False, 'decision': 'fail'}},
+            {'case': 'regressed', 'split': 'validation', 'repetition': 1,
+             'stable': {'pass': True, 'decision': 'insufficient_evidence', 'reason': 'evaluator unavailable'},
+             'candidate': {'pass': False, 'decision': 'fail'}},
+        ]
+        trials += [{'case': 'improved', 'split': 'holdout', 'repetition': repetition,
+                    'stable': {'pass': False, 'decision': 'fail'},
+                    'candidate': {'pass': True, 'decision': 'pass'}}
+                   for repetition in range(2)]
+        summary = paired_summary(trials)
+        # 一轮无结论不能把同族的真实回归从分母里剔除：否则 losses=0、estimate=1.0。
+        self.assertEqual((summary['wins'], summary['losses'], summary['ties'], summary['inconclusive']),
+                         (1, 1, 0, 0))
+        self.assertEqual(summary['estimate'], 0.5)
+        self.assertEqual(summary['cohorts']['regressed']['outcome'], 'loss')
+        self.assertEqual(Evolution.decide(trials, config)['decision'], 'fail')
+
+    def test_erroring_stable_arm_blocks_promotion_and_skill_write(self):
+        """端到端：stable 臂报错、candidate 臂通过时不得晋升，也不写 verified 技能。"""
+        args = self.setup_proposal()
+
+        def execute(*positional, **kwargs):
+            # setup_proposal 里稳定臂的 guide 为空，候选臂带新策略。
+            return ({'decision': 'insufficient_evidence', 'reason': 'evaluator unavailable'}
+                    if not positional[7] else {'decision': 'pass'})
+
+        self.evolution.runtime.execute_candidate = execute
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(result['status'], 'insufficient_evidence')
+        self.assertIn('no conclusive result', result['reason'])
+        self.assertEqual(self.store.one('SELECT status FROM candidates WHERE id=?', (result['candidate'],))['status'],
+                         'insufficient_evidence')
+        self.assertEqual(self.store.query('SELECT * FROM skills') or [], [])
+        evidence = self.evidence_of(result['candidate'])
+        self.assertTrue(evidence['trials'])
+        # 每个臂都带 decision，报告/导出才能说明「该臂为何没结论」。
+        self.assertEqual({(t['stable']['decision'], t['candidate']['decision']) for t in evidence['trials']},
+                         {('insufficient_evidence', 'pass')})
+        self.assertEqual(evidence['win_rate']['inconclusive'], len({t['case'] for t in evidence['trials']}))
+
+    def test_erroring_candidate_arm_is_not_recorded_as_an_attempt_failure(self):
+        """端到端：candidate 臂报错时落 insufficient_evidence，不在去重状态里写 fail。"""
+        args = self.setup_proposal()
+
+        def execute(*positional, **kwargs):
+            return ({'decision': 'pass'} if not positional[7]
+                    else {'decision': 'insufficient_evidence', 'reason': 'evaluator unavailable'})
+
+        self.evolution.runtime.execute_candidate = execute
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(result['status'], 'insufficient_evidence')
+        self.assertNotIn('Candidate regressed', result['reason'])
+        self.assertIn('no conclusive result', result['reason'])
+        self.assertEqual(self.store.one('SELECT status FROM candidates WHERE id=?', (result['candidate'],))['status'],
+                         'insufficient_evidence')
+        self.assertEqual(self.store.setting('evolution-attempt:p', {}).get('status'), 'insufficient_evidence')
+
     def test_ablation_is_scheduled_only_when_the_skill_is_retrievable(self):
         proposal = {'kind': 'strategy', 'guidance': 'do x', 'triggers': ['checklist']}
         self.assertTrue(Evolution.ablation_required(proposal))
