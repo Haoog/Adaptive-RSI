@@ -15,9 +15,32 @@ KEY = "desktop-update-barrier"
 # 屏障记录是 settings 表里的一条 JSON，可能来自旧版本结构、人工改库或部分失败的
 # 写入。lease 协议读取 version/lease/phase；缺任意一个都会 KeyError，非映射记录
 # 则在 .get 处 AttributeError，最终变成 server 通用 except 的无诊断 500，且准入被
-# 永久锁死。固定语义：无法使用的记录等同于无屏障，与 expired/owner_exited 走同一
-# 条 desktop_update_recovered 清理路径（先写审计事件再删除），修复手段不再依赖改库。
+# 永久锁死。固定语义：无法使用的记录等同于无屏障，与 expired/owner_exited/
+# install_expired 走同一条 desktop_update_recovered 清理路径（先写审计事件再删除），
+# 修复手段不再依赖改库。
 _REQUIRED_FIELDS = ("version", "lease", "phase")
+
+# installing 阶段不像 draining 那样依赖 expires：commit 之后安装器崩溃、挂起，或 PID
+# 被无关进程复用时，os.kill 仍会成功，屏障就再也没有清除路径，全部运行准入永久关闭。
+# 因此 installing 记录以 commit 时间为锚点保留同样的硬上界；属主身份可核验时先按
+# 身份不匹配清理（owner_exited），否则到点按 install_expired 清理。窗口内再次 commit
+# （持有租约）会刷新 committed，供确实更长的安装使用。
+INSTALL_WINDOW = 3600
+
+
+def _process_start(pid):
+    """Stable per-process marker, so a reused PID is not mistaken for the installer.
+
+    Linux exposes it as field 22 of /proc/<pid>/stat. Platforms without procfs
+    (notably macOS) return None; there the bounded install window is the only
+    recovery path, so identity can only ever make recovery earlier, never later.
+    """
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as handle:
+            raw = handle.read()
+        return raw[raw.rindex(b")") + 2:].split()[19].decode("ascii")
+    except (OSError, ValueError, IndexError, UnicodeDecodeError):
+        return None
 
 
 def _usable_state(state):
@@ -44,20 +67,44 @@ def barrier(runtime):
         if not _usable_state(state):
             reason = "invalid_record"
         else:
+            phase = state.get("phase")
             expires = state.get("expires", 0)
             # 无法比较的 expires 同样会让状态接口抛 TypeError；非 installing 阶段视为已过期。
-            expired = (state.get("phase") != "installing" and
+            expired = (phase != "installing" and
                        (not isinstance(expires, (int, float)) or expires <= time.time()))
-            owner_exited = False
+            owner_exited = install_expired = False
             owner = state.get("owner_pid")
-            if state.get("phase") == "installing" and type(owner) is int and owner > 1:
-                try:
-                    os.kill(owner, 0)
-                except OSError as exc:
-                    # Permission errors and unknown process state must keep admission closed.
-                    owner_exited = exc.errno == errno.ESRCH
-            if expired or owner_exited:
-                reason = "owner_exited" if owner_exited else "drain_expired"
+            if phase == "installing":
+                # 缺乏可信 committed 的旧记录没有时间锚点，仍只能由持有租约的
+                # cancel/complete 清理；新记录一律受硬上界约束。
+                committed = state.get("committed")
+                if type(committed) in (int, float):
+                    install_expired = committed + INSTALL_WINDOW <= time.time()
+                if "owner_pid" in state:
+                    # os.kill 对超出 C int 的 pid 抛 OverflowError（不是 OSError），一旦
+                    # 穿出本函数，桌面进程会在 start 前退出，调度 tick 也会被整体跳过。
+                    # 已写入但不可用的属主值与其它损坏记录同属 invalid_record，走统一恢
+                    # 复路径；缺字段的旧记录仍保留屏障，等待带租约的 cancel/complete 清
+                    # 理，不擅自释放可替换窗口。
+                    if type(owner) is not int or not 1 < owner < 2 ** 31:
+                        reason = "invalid_record"
+                    else:
+                        try:
+                            os.kill(owner, 0)
+                        except OSError as exc:
+                            # Permission errors and unknown process state must keep admission closed.
+                            owner_exited = exc.errno == errno.ESRCH
+                        except (OverflowError, ValueError):
+                            # 防御平台差异：无法交给 os.kill 的值同样按不可用记录恢复。
+                            reason = "invalid_record"
+                        else:
+                            # 存活但启动标识不同 = PID 已被无关进程复用；无法核验
+                            # 身份（非 procfs 平台或旧记录）时不提前清理。
+                            recorded, current = state.get("owner_start"), _process_start(owner)
+                            if isinstance(recorded, str) and isinstance(current, str) and recorded != current:
+                                owner_exited = True
+            if reason is None and (expired or owner_exited or install_expired):
+                reason = "owner_exited" if owner_exited else ("install_expired" if install_expired else "drain_expired")
         if reason:
             with runtime.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
@@ -125,7 +172,9 @@ def readiness(runtime, action="status", version=None, lease=None):
                     runtime.wake.set()
                     state = None
                 raise ValueError("Desktop update has no observable installer owner")
-            state = {**state, "phase": "installing", "owner_pid": owner, "committed": time.time()}
+            started = _process_start(owner)
+            state = {**state, "phase": "installing", "owner_pid": owner, "committed": time.time(),
+                     "owner_start": started}
             runtime.store.put_setting(KEY, state)
         return {"ready": not reasons, "reasons": reasons, "runs": runs,
                 "barrier": state, "version": __version__}

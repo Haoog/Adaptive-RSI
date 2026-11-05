@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import time
 import threading
 import contextlib
@@ -36,6 +37,9 @@ HOST_TOOL_DIGEST_CACHE_LIMIT = 32
 _HOST_TOOL_DIGESTS = {}
 _HOST_TOOL_DIGESTS_LOCK = threading.Lock()
 CACHE_STDERR_LIMIT = 16 * 1024
+# report.json keeps only a bounded tail of each stream; the full bytes stay in
+# the evaluation directory so evidence remains auditable without copying logs.
+REPORT_STREAM_LIMIT = 64 * 1024
 # Cached rows keep only what gate and review comparisons read; raw artifact
 # contents stay in the run directory and are re-read on demand.
 CACHE_ARTIFACT_FIELDS = ("state", "reason", "bytes", "sha256")
@@ -181,12 +185,16 @@ def test_identities(text):
                 executed.append(identity)
             elif event.get("Action") == "skip":
                 skipped.append({"id": identity, "reason": "unspecified by go event"})
-        match = re.match(r"^(test\S+ \([^)]+\)) \.\.\. (.*)$", line)
+        match = re.match(r"^(test\S+ \(([^)]+)\)) \.\.\. (.*)$", line)
         if match:
-            if match[2].startswith("skipped"):
-                skipped.append({"id": match[1], "reason": match[2][7:].strip()})
+            if match[3].startswith("skipped"):
+                skipped.append({"id": match[1], "reason": match[3][7:].strip()})
             else:
-                executed.append(match[1])
+                # unittest -v prints "method (module.Class.method) ... ok".  The
+                # parenthesized part is the selector-compatible identity callers
+                # write in required_test_ids; the whole prefix is display only.
+                # Keep both so existing display-form contracts still verify.
+                executed.extend((match[2], match[1]))
         match = re.match(r"^(\S+::\S+) (PASSED|FAILED|SKIPPED)(.*)$", line)
         if match:
             if match[2] == "SKIPPED":
@@ -272,6 +280,10 @@ def check_with_fresh_artifacts(sandbox, check, target, cancel=None, protected=()
     """Run one check and collect only the reports that this run created or rewrote."""
     previous = artifact_snapshot(target)
     result = sandbox.check(check, target, cancel, protected, hidden)
+    # Result rows come from producers that only echo name/argv (Sandbox._check),
+    # while candidate_full merging pairs them with the spec by (name, argv, cwd).
+    # Bind the spec cwd here so a check in a subdirectory is not dropped.
+    result.setdefault("cwd", check.get("cwd") or ".")
     result["artifacts"] = collect_test_artifacts(target, previous=previous)
     return result
 
@@ -406,10 +418,12 @@ def clarity_test_summary(text):
     # test whose body already reported an outcome (``1 passed, 1 error``).
     # Merging them into ``failed`` double-counts that test in ``executed``, so
     # errors stay a separate field and ``executed`` only sums mutually
-    # exclusive test-body outcomes.
+    # exclusive test-body outcomes. Skipped tests never ran their body, so they
+    # stay out of ``executed`` too; counting them would report ``2 executed``
+    # for a skip-only run and hide the empty execution from ``empty_test_run``.
     # Deselected tests were filtered out before execution; keep them out of the
     # executed/skipped totals so the summary does not overstate coverage.
-    summary = {"format": "pytest_cli", "executed": passed + failed + skipped,
+    summary = {"format": "pytest_cli", "executed": passed + failed,
              "passed": passed, "failed": failed, "skipped": skipped}
     if fields.get("errors"):
         summary["errors"] = fields["errors"]
@@ -473,6 +487,70 @@ def _go_positive_evidence(text):
     return False
 
 
+def _skip_only_test_run(text, lowered):
+    """Return True when tests were collected but none executed (all skipped).
+
+    Exit code 0 alone cannot distinguish this: unittest prints
+    ``Ran 2 tests ... OK (skipped=2)``, node prints ``# pass 0 / # skipped 2``
+    and pytest prints ``===== 2 skipped in 0.01s =====``; all three exit 0
+    without running a single test body. TAP stays excluded on purpose: it
+    counts skipped test points as executed (``ok 1 - x # SKIP``). Mixed runs
+    with at least one executed test must stay non-empty.
+    """
+    if "skipped" not in lowered:
+        return False
+    empty = executed = False
+    # unittest: ``Ran N tests`` counts collected tests; ``OK (skipped=N)`` is
+    # printed right below. ``Ran 3 tests ... OK (skipped=2)`` executed one.
+    for match in re.finditer(r"\bRan (\d+) tests?\b(?: in [\d.]+s)?", text):
+        header = re.search(r"\b(OK|FAILED)\b[^\n]*", text[match.end():match.end() + 256])
+        if header is None:
+            continue
+        skipped = re.search(r"skipped=(\d+)", header.group(0))
+        if (header.group(1) == "OK" and skipped
+                and int(skipped.group(1)) >= int(match.group(1))):
+            empty = True
+        else:
+            executed = True
+    # node --test reports ``# tests/# pass/# fail/# skipped`` (TAP reporter)
+    # or the same names with ``ℹ`` (spec reporter); neither prefix uses them.
+    if "# pass" in lowered or "\u2139 pass" in lowered:
+        counts = {}
+        for name in ("tests", "pass", "fail", "skipped"):
+            match = re.search(r"(?m)^[ \t]*(?:#|\u2139)[ \t]*" + name + r"[ \t]+(\d+)[ \t]*$", text)
+            if match:
+                counts[name] = int(match.group(1))
+        if "pass" in counts or "fail" in counts:
+            if counts.get("pass", 0) == 0 and counts.get("fail", 0) == 0 and counts.get("skipped", 0) > 0:
+                empty = True
+            else:
+                executed = True
+    if "==" in text and " in " in lowered:
+        summary = clarity_test_summary(text)
+        if summary is not None:
+            if summary["executed"] == 0 and summary["skipped"] > 0:
+                empty = True
+            else:
+                executed = True
+    report = junit_test_summary(text)
+    if report is not None:
+        if (report["skipped"] > 0 and report["skipped"] >= report["tests"]
+                and not report["failures"] and not report["errors"]):
+            empty = True
+        elif report["tests"] - report["skipped"] > 0:
+            executed = True
+    if not empty and not executed:
+        # Verbose skip lines survive truncated output even when the summary is
+        # cut; only trust them when no other framework reported execution.
+        identities = test_identities(text)
+        if identities["state"] == "reported":
+            if identities["executed"]:
+                executed = True
+            elif identities["skipped"]:
+                empty = True
+    return empty and not executed
+
+
 def empty_test_run(text):
     # test2json 事件行是唯一的结构化输入；先做一次廉价子串判断，避免对大段
     # verbose 输出执行 splitlines 与逐行 json 解析。
@@ -482,7 +560,9 @@ def empty_test_run(text):
             return structured["executed"] == 0
     lowered = text.lower()
     if not _has_empty_test_cue(lowered):
-        return False
+        # 零收集线索缺失时仍可能是「全部跳过」：unittest/node/pytest 都以
+        # exit 0 结束，但没有任何测试体执行，不能算作通过证据。
+        return _skip_only_test_run(text, lowered)
     # zero 是确定性的零计数信号（含 TAP 计划行 1..0）。unittest 的 `Ran 0 tests` 输出
     # 结尾恒有独立的 OK 行，不能让它否决零计数，否则零用例检查被计为通过。
     zero = re.search(r"Ran 0 tests|running 0 tests|Total tests: 0|Tests run: 0|# tests 0|"
@@ -821,6 +901,73 @@ def checkpoint_reuse_enabled(config):
     return isinstance(recovery, dict) and recovery.get("reuse_sealed_checkpoints") is True
 
 
+def _report_output_location(directory, trail):
+    """Directory and file stem holding one row's complete output streams."""
+    if trail and isinstance(trail[-1], int):
+        parts, name = trail[:-1], str(trail[-1])
+    else:
+        parts, name = trail, "0"
+    parts = [re.sub(r"[^A-Za-z0-9_-]", "_", str(part)) for part in parts]
+    if parts and parts[0] == "checks":
+        parts = parts[1:]
+    return Path(directory).joinpath(*(parts + ["outputs"])), name
+
+
+def _bounded_report_row(row, directory, trail):
+    """Copy one result row, moving oversized streams to files next to the report."""
+    import hashlib
+    location, name = _report_output_location(directory, trail)
+    item = dict(row)
+    for stream, suffix in (("stdout", "out"), ("stderr", "err")):
+        text = row.get(stream)
+        if not isinstance(text, str):
+            continue
+        raw = text.encode("utf-8", "replace")
+        item[stream + "_bytes"] = len(raw)
+        item[stream + "_sha256"] = hashlib.sha256(raw).hexdigest()
+        item[stream + "_truncated"] = len(raw) > REPORT_STREAM_LIMIT
+        if len(raw) <= REPORT_STREAM_LIMIT:
+            continue
+        location.mkdir(parents=True, exist_ok=True)
+        path = location / (name + "." + suffix)
+        path.write_bytes(raw)
+        item[stream] = raw[-REPORT_STREAM_LIMIT:].decode("utf-8", "replace")
+        item[stream + "_path"] = path.relative_to(directory).as_posix()
+    return item
+
+
+def _bounded_report_node(node, directory, trail=(), memo=None):
+    """Copy report data while bounding every row's stdout/stderr to its tail.
+
+    Rows shared by several stages (candidate/candidate_full reuse) keep one
+    copy of the full streams, so duplicate stage evidence cannot multiply the
+    report size. Callers keep their in-memory rows untouched for gate logic.
+    """
+    if memo is None:
+        memo = {}
+    if isinstance(node, dict):
+        if "stdout" in node or "stderr" in node:
+            key = id(node)
+            if key not in memo:
+                memo[key] = _bounded_report_row(node, directory, trail)
+            return memo[key]
+        return {key: _bounded_report_node(value, directory, trail + (key,), memo)
+                for key, value in node.items()}
+    if isinstance(node, list):
+        return [_bounded_report_node(value, directory, trail + (index,), memo)
+                for index, value in enumerate(node)]
+    return node
+
+
+def write_evaluation_report(directory, data):
+    """Persist the evaluation report without inlining multi-megabyte logs."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    document = _bounded_report_node(data, directory)
+    (directory / "report.json").write_text(json.dumps(document, ensure_ascii=False, indent=2),
+                                           encoding="utf-8")
+
+
 class Evaluator:
     def __init__(self, store):
         self.store = store
@@ -1008,10 +1155,24 @@ class Evaluator:
         return copy.deepcopy(entry["rows"]) if entry and isinstance(entry.get("rows"), list) else None
 
     def _cache_put(self, scope, key, rows):
+        """Best-effort baseline cache write for cross-run reuse.
+
+        The cache only accelerates later evaluations, so a full disk, exhausted
+        connection capacity or a read-only state directory must not discard an
+        evaluation whose checks already finished. Failures are returned to the
+        caller to record in the report instead of escaping.
+        """
         if not key:
-            return
-        if any(row.get("error") or UNAVAILABLE_OUTPUT.search(row.get("stderr") or "") for row in rows):
-            return
+            return None
+        # Execution-layer failures leave no trustworthy baseline to reuse, and a
+        # failed check whose stderr reports a missing executable means the
+        # environment was unavailable. A check that passed can still mention
+        # that text (Go's os/exec reports absent tools this way), so only
+        # non-passing rows may veto the whole write.
+        if any(row.get("error") or
+               (not row.get("passed") and UNAVAILABLE_OUTPUT.search(row.get("stderr") or ""))
+               for row in rows):
+            return None
         compact = []
         for row in rows:
             item = {field: value for field, value in row.items() if field != "stdout"}
@@ -1025,34 +1186,39 @@ class Evaluator:
                 item["stderr"] = item["stderr"][-CACHE_STDERR_LIMIT:]
             item["cached"] = True
             compact.append(item)
-        # A CAS upsert per key prevents concurrent project checks from
-        # dropping each other's independently computed cache entries.
-        with self.store.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT value FROM settings WHERE key=?",
-                             ("evaluation-baseline-entry:" + scope + ":" + key,)).fetchone()
-            try:
-                previous = json.loads(row["value"]) if row and row["value"] else None
-            except (TypeError, ValueError):
-                previous = None
-            if previous and previous.get("at", 0) > time.time() - 60:
-                return
-            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
-                       ("evaluation-baseline-entry:" + scope + ":" + key,
-                        encode({"rows": compact, "at": time.time()})))
-        entries = self.store.query(
-            "SELECT key,value FROM settings WHERE key>=? AND key<? ORDER BY key",
-            ("evaluation-baseline-entry:" + scope + ":", "evaluation-baseline-entry:" + scope + ";"))
-        if len(entries) > BASELINE_CACHE_LIMIT:
-            def _entry_at(item):
+        try:
+            # A CAS upsert per key prevents concurrent project checks from
+            # dropping each other's independently computed cache entries.
+            with self.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT value FROM settings WHERE key=?",
+                                 ("evaluation-baseline-entry:" + scope + ":" + key,)).fetchone()
                 try:
-                    value = json.loads(item["value"] or "{}")
+                    previous = json.loads(row["value"]) if row and row["value"] else None
                 except (TypeError, ValueError):
-                    value = {}
-                return value.get("at", 0) if isinstance(value, dict) else 0
-            stale = sorted(entries, key=_entry_at)
-            for item in stale[:len(entries) - BASELINE_CACHE_LIMIT]:
-                self.store.execute("DELETE FROM settings WHERE key=?", (item["key"],))
+                    previous = None
+                if previous and previous.get("at", 0) > time.time() - 60:
+                    return None
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                           ("evaluation-baseline-entry:" + scope + ":" + key,
+                            encode({"rows": compact, "at": time.time()})))
+            entries = self.store.query(
+                "SELECT key,value FROM settings WHERE key>=? AND key<? ORDER BY key",
+                ("evaluation-baseline-entry:" + scope + ":", "evaluation-baseline-entry:" + scope + ";"))
+            if len(entries) > BASELINE_CACHE_LIMIT:
+                def _entry_at(item):
+                    try:
+                        value = json.loads(item["value"] or "{}")
+                    except (TypeError, ValueError):
+                        value = {}
+                    return value.get("at", 0) if isinstance(value, dict) else 0
+                stale = sorted(entries, key=_entry_at)
+                for item in stale[:len(entries) - BASELINE_CACHE_LIMIT]:
+                    self.store.execute("DELETE FROM settings WHERE key=?", (item["key"],))
+        except (sqlite3.Error, OSError) as exc:
+            # Cache writes are an optimization; cancellation still propagates.
+            return {"state": "failed", "reason": type(exc).__name__ + ": " + str(exc)}
+        return None
 
     @staticmethod
     def _seed_target(target, seeds, config, clear=False):
@@ -1130,6 +1296,7 @@ class Evaluator:
             outcome["test_first_rows"] = []
             for check in test_first_check if isinstance(test_first_check, list) else [test_first_check]:
                 focused = sandbox.check(check, target, cancel, protected, hidden)
+                focused.setdefault("cwd", check.get("cwd") or ".")
                 focused_text = focused["stdout"] + focused["stderr"]
                 focused["empty_tests"] = empty_test_run(focused_text)
                 focused["passed"] = focused["exit_code"] == 0 and not focused["error"] and not focused["empty_tests"]
@@ -1357,8 +1524,7 @@ class Evaluator:
             data = {"decision": "insufficient_evidence", "reason": acceptance_baseline["reason"],
                     "setup": acceptance_baseline.get("setup"), "checks": results,
                     "execution_environment": execution_identity}
-            Path(directory).mkdir(parents=True, exist_ok=True)
-            (Path(directory) / "report.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            write_evaluation_report(directory, data)
             return data
         stages = {}
         if "baseline" not in results:
@@ -1399,8 +1565,7 @@ class Evaluator:
                         if label.startswith("acceptance") else "Isolated dependency preparation failed",
                         "setup": outcome["setup"], "checks": results,
                         "execution_environment": execution_identity}
-                Path(directory).mkdir(parents=True, exist_ok=True)
-                (Path(directory) / "report.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                write_evaluation_report(directory, data)
                 return data
             results[label] = outcome["rows"]
             if "test_first_rows" in outcome:
@@ -1415,10 +1580,15 @@ class Evaluator:
             previous = {check_identity(row): row for row in results.get("candidate", [])}
             merged = [own.get(check_identity(check)) or previous.get(check_identity(check)) for check in full_checks]
             results["candidate_full"] = [row for row in merged if row]
+        cache_failures = []
         if cached_baseline is None and "baseline" in results:
-            self._cache_put(cache_scope, baseline_key, results["baseline"])
+            failure = self._cache_put(cache_scope, baseline_key, results["baseline"])
+            if failure:
+                cache_failures.append({**failure, "stage": "baseline"})
         if acceptance and "acceptance_baseline" in outcomes:
-            self._cache_put(cache_scope, acceptance_key, results["acceptance_baseline"])
+            failure = self._cache_put(cache_scope, acceptance_key, results["acceptance_baseline"])
+            if failure:
+                cache_failures.append({**failure, "stage": "acceptance_baseline"})
         passing = all(row["passed"] for label in ["candidate", "candidate_full", "acceptance_candidate"]
                       for row in results.get(label, []))
         unavailable = any(not row["passed"] and UNAVAILABLE_OUTPUT.search(row["stderr"])
@@ -1428,6 +1598,13 @@ class Evaluator:
                 "harness_hash": fingerprint(checks), "candidate_full_reused": reuse_full, "checks": results,
                 "execution_environment": execution_identity,
                 "host_tools": host_tool_versions(checks, execution_identity)}
+        if cache_failures:
+            # The baseline cache only accelerates later runs; record the failed
+            # write so it stays observable without changing the decision.
+            data["cache_write"] = {
+                "state": "failed",
+                "reason": "; ".join(item["reason"] for item in cache_failures),
+                "stages": [item["stage"] for item in cache_failures]}
         if seeds:
             from .process import scrub_tree
             scrub_tree(seeds)
@@ -1486,6 +1663,5 @@ class Evaluator:
             else:
                 data["controls"] = {"decision": "not_run", "reason": "Candidate checks did not pass",
                                     "controls": []}
-        Path(directory).mkdir(parents=True, exist_ok=True)
-        (Path(directory) / "report.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_evaluation_report(directory, data)
         return data

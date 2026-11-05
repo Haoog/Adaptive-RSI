@@ -1,4 +1,4 @@
-"""Admission recovery must observe installer death, never just elapsed wall time."""
+"""Admission recovery must observe installer death or the bounded install window."""
 import errno
 import json
 import os
@@ -54,7 +54,9 @@ class UpdateAdmissionTest(unittest.TestCase):
 
     def test_live_installer_remains_guarded_even_after_drain_expiry(self):
         state = self.commit(os.getpid())
-        with patch('adaptive_rsi.lifecycle.time.time', return_value=state['expires'] + 86400):
+        # installing 的硬上界独立于 draining 的 expires；窗口内仍由存活属主守护。
+        with patch('adaptive_rsi.lifecycle.INSTALL_WINDOW', 2 * 86400), \
+                patch('adaptive_rsi.lifecycle.time.time', return_value=state['expires'] + 86400):
             self.assertEqual(barrier(self.runtime)['phase'], 'installing')
 
     def test_unobservable_installer_does_not_reopen_admission(self):
@@ -62,6 +64,24 @@ class UpdateAdmissionTest(unittest.TestCase):
         for error in (PermissionError(errno.EPERM, 'denied'), OSError(errno.EIO, 'unknown')):
             with self.subTest(error=error), patch('adaptive_rsi.lifecycle.os.kill', side_effect=error):
                 self.assertIsNotNone(barrier(self.runtime))
+
+    def test_out_of_range_owner_pid_is_recovered(self):
+        # os.kill 对超出 C int 的 pid 抛 OverflowError（不是 OSError）；修复前异常穿出
+        # barrier()，桌面进程在 start 前退出，调度 tick 全部被跳过。已写入但不可用的
+        # 属主值必须按 invalid_record 恢复；合法存活属主仍保持屏障。
+        for owner in (10 ** 30, 2 ** 31, -1, True, 2.5, '123'):
+            with self.subTest(owner=owner):
+                self.store.put_setting(KEY, {'version': '9.0.0', 'lease': 'a' * 48,
+                                             'phase': 'installing', 'owner_pid': owner,
+                                             'expires': time.time() + 3600})
+                self.assertIsNone(barrier(self.runtime))
+                self.assertIsNone(self.store.setting(KEY))
+                self.assertEqual(self.recovered_events()[-1]['reason'], 'invalid_record')
+        state = self.commit(os.getpid())
+        self.assertEqual((state['phase'], state['owner_pid']), ('installing', os.getpid()))
+        self.assertEqual(barrier(self.runtime)['lease'], state['lease'])
+        readiness(self.runtime, 'cancel', lease=state['lease'])
+        self.assertIsNone(barrier(self.runtime))
 
     def test_recovery_audit_failure_keeps_barrier_and_tasks(self):
         self.commit(os.getpid())
@@ -75,7 +95,10 @@ class UpdateAdmissionTest(unittest.TestCase):
 
     def test_legacy_installing_barrier_requires_explicit_owned_recovery(self):
         state = self.commit(os.getpid())
+        # 旧记录既无属主也无可信的 committed，没有时间锚点，只能由持有租约方清理。
         state.pop('owner_pid')
+        state.pop('owner_start', None)
+        state.pop('committed')
         self.store.put_setting(KEY, state)
         with patch('adaptive_rsi.lifecycle.time.time', return_value=state['expires'] + 86400):
             self.assertIsNotNone(barrier(self.runtime))

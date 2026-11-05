@@ -11,6 +11,10 @@ from pathlib import Path
 
 from .store import uid
 
+# close() 等待后台操作收尾的上限：备份/诊断/恢复预演可能卡在不检查 stop 的 I/O 或
+# 第三方 CLI 里；超时记下 operation id 后放行，遗留操作由下次 recover() 按 interrupted 恢复。
+OPERATION_DRAIN_TIMEOUT = 30
+
 
 class Operations:
     def __init__(self, runtime):
@@ -18,6 +22,8 @@ class Operations:
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="rsi-operation")
         self.lock = threading.RLock()
         self.active = {}
+        self.pending = {}
+        self.timed_out = False
         self.progress = {}
         self.inflight = {}
         self.store.execute("CREATE TABLE IF NOT EXISTS operations "
@@ -128,12 +134,20 @@ class Operations:
                                (operation, kind, "queued", time.time()))
             self.active[operation] = stop
             try:
-                self.pool.submit(self._run, operation, kind, parameters, stop).add_done_callback(self._observe)
+                future = self.pool.submit(self._run, operation, kind, parameters, stop)
             except BaseException:
                 self.active.pop(operation)
                 self.store.execute("UPDATE operations SET state='interrupted',ended=? WHERE id=?", (time.time(), operation))
                 raise
+            # 记录 future 只为让 close() 有界等待；回调在完成（含失败）后清理。
+            self.pending[future] = operation
+            future.add_done_callback(self._observe)
+            future.add_done_callback(self._finish)
             return {"id": operation, "state": "queued"}
+
+    def _finish(self, future):
+        with self.lock:
+            self.pending.pop(future, None)
 
     def _execute(self, operation, kind, parameters, stop):
         from . import storage_tools
@@ -238,7 +252,30 @@ class Operations:
             return row
 
     def close(self):
+        """Stop background operations and wait at most OPERATION_DRAIN_TIMEOUT.
+
+        Queued work is not cancelled: an admitted operation would otherwise stay
+        ``queued`` with a live ``active`` entry. ``shutdown(wait=False)`` still
+        drains the queue within the bounded window.
+        """
         with self.lock:
             for stop in self.active.values():
                 stop.set()
-        self.pool.shutdown(wait=True)
+            pending = dict(self.pending)
+        self.pool.shutdown(wait=False)
+        # 已取消的 future 不会再通知 waiter，先滤掉已完成项再等待。
+        running = {future for future in pending if not future.done()}
+        _, unfinished = concurrent.futures.wait(running, timeout=OPERATION_DRAIN_TIMEOUT)
+        if not unfinished:
+            return
+        self.timed_out = True
+        operations = sorted(pending[future] for future in unfinished)
+        logging.getLogger(__name__).warning(
+            "Background operations did not stop within %ss; proceeding with shutdown (%s)",
+            OPERATION_DRAIN_TIMEOUT, ", ".join(operations))
+        try:
+            self.store.event('shutdown_operations_timed_out',
+                             'Shutdown proceeded while background operations were still running',
+                             data={'operations': operations, 'timeout_seconds': OPERATION_DRAIN_TIMEOUT})
+        except Exception:
+            logging.getLogger(__name__).exception('Failed to record operation shutdown timeout')
