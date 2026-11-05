@@ -304,6 +304,22 @@ def _reusable_evaluation(source, resolve_environment=None):
     return accept
 
 
+def _reusable_implementation(record):
+    """Only a complete implementation checkpoint can be replayed.
+
+    Legacy records stored the hash without the patch or the summary, so they
+    are unusable here; raising lets ``cached`` invalidate just this stage and
+    the retry implements again instead of failing on a missing key.
+    """
+    if not isinstance(record.get("patch"), str) or not record["patch"].strip():
+        raise RuntimeError("Stored implementation has no replayable patch")
+    if not isinstance(record.get("patch_hash"), str):
+        raise RuntimeError("Stored implementation has no patch hash")
+    if not isinstance(record.get("summary"), str):
+        raise RuntimeError("Stored implementation has no summary")
+    return record
+
+
 def _approved_review(value):
     return isinstance(value, dict) and value.get("decision") == "pass"
 
@@ -315,6 +331,30 @@ def _touched_paths(workspace):
     except RuntimeError:
         return set()
     return {path for path in raw.split("\0") if path}
+
+
+def _saved_patch_sources(patch):
+    """Rename/copy origins that reverse-applying a saved patch restores.
+
+    ``changes()`` captures the forward patch with rename detection, so the
+    run's ``files`` list names only a rename's destination.  Reversing the
+    patch also touches the source path and the scope gate judges every touched
+    path, so the rollback plan must declare that side up front.  Only origins
+    are read from the patch: destinations stay anchored to the persisted
+    ``files`` list, so a corrupted or tampered patch cannot widen the scope it
+    is checked against.
+    """
+    import codecs
+    sources = []
+    for line in patch.splitlines():
+        for marker in ("rename from ", "copy from "):
+            if not line.startswith(marker):
+                continue
+            value = line[len(marker):]
+            if value.startswith('"') and value.endswith('"'):
+                value = codecs.escape_decode(value[1:-1].encode("utf-8"))[0].decode("utf-8", errors="replace")
+            sources.append(relative_path(value))
+    return sources
 
 
 def _setup_changes(workspace):
@@ -556,8 +596,13 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             git(workspace, "apply", "--reverse", "--check", str(patch_path))
         except RuntimeError as exc:
             raise RuntimeError(f"Cannot cleanly reverse candidate patch: {exc}") from exc
+        # A rename is collapsed to its destination in ``files``; reversing the
+        # patch restores the source too, so the rollback scope has to name both
+        # sides or the unchanged scope gate rejects a legitimate rollback.
+        saved_patch = patch_path.read_text(encoding="utf-8", errors="replace")
+        scope = list(prior_result.get("files", [])) + _saved_patch_sources(saved_patch)
         plan = {"decision": "ready", "reason": "Explicit revert of this runner's own patch", "risk": "medium",
-                "scope": prior_result.get("files", []), "acceptance": ["Reverse the specified patch and pass independent regression checks"]}
+                "scope": scope, "acceptance": ["Reverse the specified patch and pass independent regression checks"]}
     else:
         plan = saved_plan
         if plan is None:
@@ -706,6 +751,16 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                                  "plan": plan, "acceptance_hash": acceptance["hash"] if acceptance else None,
                                  "test_first": test_first, "checks": checks})
     saved_candidate = None if experiment else cached(runtime, run, "validated_candidate", candidate_key)
+    saved_implementation = None
+    if saved_candidate is None and not experiment and task["source"] != "rollback":
+        # Evaluation runs after the patch is sealed, so a run that fails inside
+        # the evaluation window has no validated_candidate yet.  The
+        # implementation checkpoint is the recovery anchor for that gap: replay
+        # the sealed patch instead of paying for the same implementation call
+        # again.  Replay never carries a verdict, so evaluation, review and the
+        # scope gate still run on the replayed patch.
+        saved_implementation = cached(runtime, run, "implementation", candidate_key,
+                                      normalize=_reusable_implementation)
     baseline = snapshot(source, directory / "baseline", base)
     acceptance_executor = None
     acceptance_future = None
@@ -736,6 +791,13 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             patch = saved_candidate["patch"]
             if fingerprint(patch) != saved_candidate["patch_hash"]:
                 raise RuntimeError("Saved candidate evidence changed; retry refused")
+            (directory / "resume.patch").write_text(patch + "\n", encoding="utf-8")
+            git(workspace, "apply", "--index", str(directory / "resume.patch"))
+        elif saved_implementation is not None:
+            result = {"summary": saved_implementation["summary"]}
+            patch = saved_implementation["patch"]
+            if fingerprint(patch) != saved_implementation["patch_hash"]:
+                raise RuntimeError("Saved implementation evidence changed; retry refused")
             (directory / "resume.patch").write_text(patch + "\n", encoding="utf-8")
             git(workspace, "apply", "--index", str(directory / "resume.patch"))
         elif task["source"] == "rollback":
@@ -809,7 +871,11 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         if patch:
             git(workspace, "apply", "--index", str(directory / "candidate.patch"))
         if not experiment:
-            save(runtime, run, "implementation", {"files": files, "patch_hash": fingerprint(patch)}, candidate_key)
+            # Store the patch itself, not only its hash: an evaluation-window
+            # failure must be recoverable by replaying this exact change.
+            save(runtime, run, "implementation", {"files": files, "patch": patch,
+                                                  "patch_hash": fingerprint(patch),
+                                                  "summary": result["summary"]}, candidate_key)
         transition("evaluating")
         if experiment:
             # 实验路径不写 runs.state，必须在评估工作开始前显式起算评估相位。
@@ -865,7 +931,10 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                 evaluation = {**evaluation, "execution_environment": identity}
         save(runtime, run, "evaluation", evaluation, candidate_key)
     if evaluation["decision"] != "pass" and not experiment:
-        runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage='validated_candidate' AND run IN (SELECT id FROM runs WHERE task=?)", (candidate_key, task["id"]))
+        # A completed evaluation that did not pass rejects this exact patch, so
+        # the retry must implement again rather than replay it unchanged; only
+        # runs that never reached a verdict keep the implementation checkpoint.
+        runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage IN ('validated_candidate','implementation') AND run IN (SELECT id FROM runs WHERE task=?)", (candidate_key, task["id"]))
         return {**evaluation, "evaluation": evaluation}
     if not experiment and evaluation["decision"] == "pass":
         runtime.store.put_setting("verified-checks:" + project["id"], {"base": base, "checks": checks,
@@ -938,7 +1007,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         save(runtime, run, "review", review, review_key)
         if review["decision"] != "pass":
             # A rejected patch must be implemented again, not replayed unchanged.
-            runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage='validated_candidate' AND run IN (SELECT id FROM runs WHERE task=?)", (candidate_key, task["id"]))
+            runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage IN ('validated_candidate','implementation') AND run IN (SELECT id FROM runs WHERE task=?)", (candidate_key, task["id"]))
     outcome = {"decision": review["decision"] if evaluation["decision"] == "pass" else evaluation["decision"], "reason": review["reason"], "summary": result["summary"], "files": files,
                "evaluation": evaluation, "review": review, "risk": plan["risk"], "base": base,
                "risk_review": risk_review,
