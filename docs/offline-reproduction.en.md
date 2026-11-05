@@ -23,13 +23,14 @@ Sealed bundles adhere to deterministic input and credential exclusion principles
 
 - [ ] **1.1 Obtain bundle**: Retrieve the sealed bundle directory exported by `Evolution.export_bundle`.
 - [ ] **1.2 Place in isolated workspace**: Transfer the directory to the isolated host, ensuring the filesystem supports regular file reads and no escaping symlinks.
-- [ ] **1.3 Check structure**: Confirm root files `bundle.json`, `candidate.json`, `evidence.json`, and the `cases/` directory are present.
+- [ ] **1.3 Check structure**: Confirm root files `bundle.json`, `candidate.json`, `evidence.json`, and at least one registered case directory `cases/<id>/case.json` are present. A bundle containing only JSON files and no case is empty and cannot be reproduced offline.
 
 ### Stage 2: Input integrity verification
 
 - [ ] **2.1 Execute hash verification**: Run `scripts/reproduce_bundle.py` or call `Evolution.verify_bundle(bundle_dir)`.
 - [ ] **2.2 Compare manifest digests**: Ensure all files listed in `bundle.json` exist and match their SHA-256 digests.
 - [ ] **2.3 Verify path safety**: Confirm no absolute paths, parent directory traversals (`..`), or symlinks escape the bundle tree.
+- [ ] **2.4 Verify case completeness**: `files` must register at least one `cases/<id>/case.json`, and every sampled case listed in `evidence.json`'s `dataset.manifest` must appear in `files`. Integrity only proves exported files are untampered: empty bundles (exported from legacy candidates or hand-written `ready` rows, JSON files only) and bundles missing registered sampled cases can still pass integrity checks, but the reproduction script reports `reproducible=false`, lists missing cases under `cases.missing` and in the limitations, and `--strict` exits with code 2.
 
 ### Stage 3: Host tools and execution dependencies
 
@@ -63,14 +64,14 @@ python3 -B scripts/reproduce_bundle.py /path/to/bundle --json
 # Execute frozen checks when host tools are present
 python3 -B scripts/reproduce_bundle.py /path/to/bundle --run-checks
 
-# Strict mode: exit with code 2 if tools/credentials are missing or executed checks do not all pass
+# Strict mode: exit with code 2 if tools/credentials/cases are missing or executed checks do not all pass
 python3 -B scripts/reproduce_bundle.py /path/to/bundle --strict
 ```
 
 - `bundle`: Path to sealed bundle directory (required).
-- `--json`: Format result as JSON.
+- `--json`: Format result as JSON (including `cases.exported`, `cases.registered`, and `cases.missing`).
 - `--run-checks`: Run case check commands if tools are present; if any check fails, `checks_passed` and `reproducible` are both `false` and the summary reports it.
-- `--strict`: Return exit code 2 when any dependency or credential is missing, or executed checks do not all pass; default mode returns 0 after inspection, with check failures recorded only in the result and summary.
+- `--strict`: Return exit code 2 when any dependency, credential, or sampled registered case is missing, or executed checks do not all pass; default mode returns 0 after inspection, with check failures recorded only in the result and summary.
 
 ### Python API
 
@@ -86,6 +87,7 @@ report = Evolution.reproduce_bundle(
 )
 
 assert report["integrity"]["valid"] is True
+print("Cases:", report["cases"])  # exported / registered / missing
 print("Missing dependencies:", report["dependencies"]["missing"])
 print("Missing credentials:", report["credentials"]["missing"])
 print("Limitations:", report["limitations"])
@@ -121,4 +123,5 @@ Output on an air-gapped machine without credentials:
 
 1. **Credential protection**: Sealed bundles never leak credentials to offline or audit environments.
 2. **Causal and generalization scope**: Input integrity proves artifacts were not altered; it does not guarantee automatic offline reproduction of stochastic model outputs.
-3. **Non-blocking inspection**: Missing dependencies are enumerated across all cases rather than halting at the first failure.
+3. **Integrity is not completeness**: A passing `bundle.json` check only proves exported files are unchanged; when the bundle has no case, or sampled `dataset.manifest` cases were not all exported, `reproducible` is `false` and must not be used to pass automated acceptance.
+4. **Non-blocking inspection**: Missing dependencies are enumerated across all cases rather than halting at the first failure.
