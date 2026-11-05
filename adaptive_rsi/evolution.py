@@ -757,9 +757,23 @@ class Evolution:
             (root / "candidate.json").write_text(row["content"], encoding="utf-8")
             limitations = ["Credentials are excluded; external services, model availability and host tools must be supplied independently",
                            "Integrity verification is not proof of isolated-machine reproduction"]
+            # 每个 manifest 条目都登记身份；只有实际抽中执行的用例才封存工作树。
+            # 封存清单覆盖 eligible 全集，但未抽中项从未运行；逐项复制同一
+            # (repository, base) 的完整工作树只会让包体按候选集线性膨胀（N 份相同副本），
+            # 审计所需的 tree/spec 指纹仍由 evidence.json 的 manifest 与这里的身份条目
+            # 保留。无 sampled 标记的旧证据按抽中处理，与 verify_inputs 同口径。
+            entries = []
+            unsampled = 0
             for item in evidence.get("dataset", {}).get("manifest", []):
                 if item["case"] != Path(item["case"]).name or item["case"] in (".", ".."):
                     raise ValueError("Invalid sealed case identity")
+                sampled = bool(item.get("sampled", True))
+                entry = {"case": item["case"], "split": item.get("split"), "tree": item.get("tree"),
+                         "sampled": sampled, "exported": False}
+                entries.append(entry)
+                if not sampled:
+                    unsampled += 1
+                    continue
                 case = self.store.one("SELECT spec FROM cases WHERE id=? AND project=?", (item["case"], row["project"]))
                 if not case:
                     limitations.append("Missing case " + item["case"])
@@ -787,6 +801,10 @@ class Evolution:
                     sealed_tree(target / "overlay")
                 spec = {**spec, "repository": "repository", "overlay": "overlay" if spec.get("overlay") else None}
                 (target / "case.json").write_text(encode(spec), encoding="utf-8")
+                entry["exported"] = True
+            if unsampled:
+                limitations.append(f"{unsampled} unsampled case(s) are recorded by identity only; "
+                                   "their working trees are not sealed in this bundle")
             files = {}
             for path in sorted(root.rglob("*")):
                 if ".git" in path.relative_to(root).parts:
@@ -798,7 +816,9 @@ class Evolution:
                     raise ValueError("Reproduction bundles require regular files")
                 if path.is_file():
                     files[path.relative_to(root).as_posix()] = file_digest(path)
-            manifest = {"version": 1, "files": files, "limitations": limitations}
+            # `cases` 是解包方的索引：条目身份与 evidence.json 的 dataset.manifest 同源，
+            # 后者随 files 逐文件校验；未导出条目没有本地副本可校验，只登记身份。
+            manifest = {"version": 2, "files": files, "cases": entries, "limitations": limitations}
             (root / "bundle.json").write_text(encode(manifest), encoding="utf-8")
             return manifest
         except Exception:
@@ -904,12 +924,13 @@ class Evolution:
         available_tools = []
         missing_tools = []
 
-        # 1. VCS dependency (git)
+        # 1. VCS dependency (git) is derived from registered checks, not assumed.
+        # bundle 明确不含 .git（sealed_tree 导出时整棵删除，残留即判篡改），复现只按
+        # case.json 的 checks 执行，不需要 VCS 元数据。只有某个登记检查的 argv[0] 为
+        # git 时才把宿主 git 计入必需项；未被引用时只记录可用性，缺失既不参与
+        # reproducible 判定，也不阻止 --run-checks 执行其它可运行的检查。
         git_found = lookup("git", path=path_env) if path_env else lookup("git")
-        if git_found:
-            available_tools.append({"name": "git", "type": "vcs", "path": str(git_found)})
-        else:
-            missing_tools.append({"name": "git", "type": "vcs", "reason": "git executable not found in PATH"})
+        git_referenced = False
 
         # 2. Inspect case check dependencies across verified manifest entries only.
         # 未登记的用例目录一律不读、不执行；用例路径出现符号链接则按 verify_bundle
@@ -1019,6 +1040,8 @@ class Evolution:
                     continue
                 argv = check.get("argv")
                 cmd = argv[0]
+                if cmd == "git":
+                    git_referenced = True
                 check_name = check.get("name", "check")
                 # 同一个相对命令在不同用例（或同一用例的不同 cwd）里指向不同文件，
                 # 按「用例 + cwd + 命令」分别记录；宿主工具仍按命令名合并。
@@ -1062,6 +1085,14 @@ class Evolution:
                 available_tools.append(info)
             else:
                 missing_bundle.append(info)
+        # git 未被任何登记检查引用：可用时仍作为环境信息列出（required=False），
+        # 缺失时只记录说明，不进 missing、不参与 reproducible。
+        git_optional_missing = (bool(integrity.get("valid")) and not git_referenced
+                                and not git_found)
+        if not git_referenced and git_found:
+            available_tools.append({"name": "git", "type": "vcs", "path": str(git_found),
+                                    "required": False})
+
         for status, info in seen_tools.values():
             if status == "available":
                 available_tools.append(info)
@@ -1105,6 +1136,11 @@ class Evolution:
             repro_limitations.append(credential_limitation)
         if missing_creds:
             msg = f"Missing credentials: {', '.join(c['name'] for c in missing_creds)} not configured; online model generation cannot be reproduced without external provider access"
+            if msg not in repro_limitations:
+                repro_limitations.append(msg)
+        if git_optional_missing:
+            msg = ("git executable not found in PATH; no registered check invokes git, "
+                   "so it is not required for this bundle")
             if msg not in repro_limitations:
                 repro_limitations.append(msg)
         if missing_tools:
