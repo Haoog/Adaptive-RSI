@@ -1,6 +1,7 @@
 """Background artifact retention and bounded state maintenance."""
 import json
 import logging
+import math
 import shutil
 import sqlite3
 import threading
@@ -23,6 +24,9 @@ MAINTENANCE_RETRY_MAX_SECONDS = 3600
 # 运维把链接换成同名真实目录后 runs.path 并不变化，永久跳过会饿死该运行；
 # 超过窗口的标记重新进入候选，仍不安全则重写标记顺延，恢复正常则清除。
 RETENTION_REJECT_REVALIDATE_SECONDS = 6 * 3600
+
+# 归档校验报告的有效期：过期后才重新解压验证，每轮最多验证一个归档。
+ARCHIVE_VERIFICATION_SECONDS = 7 * 86400
 
 # 保留删除只把页移入 freelist；库以 auto_vacuum=0 创建，不 VACUUM 文件永不缩小。
 # 空闲页达到四分之一且磁盘留足重写整库的余量（VACUUM 峰值约需一份库文件）时
@@ -169,6 +173,31 @@ def _merged_monitoring_completed(result):
     return isinstance(parsed, dict) and bool(parsed.get("monitoring_completed"))
 
 
+def _archive_verification_due(store, key, now):
+    """Return (due, previous_type) for one stored archive verification report.
+
+    Settings are untrusted input: a restored backup or a hand edit can leave a
+    string, list or NaN under ``checked_at``.  The old subtraction raised
+    TypeError at the end of every pass, so ``maintenance-last`` never advanced
+    and each retry re-ran the whole retention sweep.  Unusable records count as
+    expired so the archive is verified again and the report overwritten; the
+    second item names the original shape (never its content) for the repair
+    event, and is None when no record existed or the stored one is usable.
+    """
+    row = store.one("SELECT value FROM settings WHERE key=?", (key,))
+    if row is None:
+        return True, None
+    try:
+        previous = json.loads(row["value"])
+    except (ValueError, TypeError):
+        return True, "unreadable"
+    checked_at = previous.get("checked_at") if isinstance(previous, dict) else None
+    if (type(checked_at) not in (int, float) or not math.isfinite(checked_at) or
+            checked_at <= 0):
+        return True, type(previous).__name__
+    return now - checked_at >= ARCHIVE_VERIFICATION_SECONDS, None
+
+
 def retention_hold(store, run_id, project):
     """Return the legal hold that protects a run from cleanup, or None.
 
@@ -179,6 +208,20 @@ def retention_hold(store, run_id, project):
         if _cleanup_hold(store, key):
             return key
     return None
+
+
+def _legal_hold_guard(alias):
+    """SQL condition excluding runs protected by a run- or project-level hold.
+
+    Mirrors retention_hold's fail-closed reading: only an explicit JSON false
+    releases a hold, so a corrupt or non-boolean value still keeps the run's
+    derived evidence keys.  ``alias`` is the runs table alias of the enclosing
+    eligibility query.
+    """
+    return ("AND NOT EXISTS (SELECT 1 FROM settings AS held WHERE "
+            "held.key IN ('legal-hold:'||%s.id, 'legal-hold-project:'||%s.project) "
+            "AND CASE WHEN json_valid(held.value) THEN json_type(held.value)='false' "
+            "ELSE 0 END=0) " % (alias, alias))
 
 
 def _remove_owned_tree(parent, name):
@@ -555,7 +598,9 @@ class Maintenance:
         self.store.execute("DELETE FROM submissions WHERE rowid IN (SELECT rowid FROM submissions WHERE task IN "
                            "(SELECT id FROM tasks WHERE updated<? AND state IN ('merged','obsolete','cancelled','expired','reverted','superseded','pr_closed')) LIMIT 500)", (stale,))
         # 交付生命周期未结束的运行（PR 跟踪、合并后监控）仍需要这些键；
-        # 与上方目录清理的保护范围保持一致，不做无条件删除。
+        # 与上方目录清理的保护范围保持一致，不做无条件删除。运行或项目
+        # legal hold 同样保留全部派生证据键（基线、推送、合并意图、交付），
+        # 只有显式 JSON false 解除。
         # 已清理的运行不能继续占据 LIMIT，否则后续周期永远无法排空积压。
         prefixes = ("run-baseline:", "automation:", "delivery:", "merge-intent:", "delivery-push:")
         # 在一致读快照中按索引扫描键；最长匹配的运行 ID 拥有该键。
@@ -582,8 +627,9 @@ class Maintenance:
                                 "THEN coalesce(json_extract(result,'$.pr'),'') ELSE 'x' END='' "
                                 "AND CASE WHEN json_valid(result) "
                                 "THEN coalesce(json_extract(result,'$.delivery_recovery_abandoned'),0) ELSE 0 END=0 "
-                                "AND EXISTS (SELECT 1 FROM settings WHERE key='delivery-push:'||runs.id)) AS eligible "
-                                "FROM runs WHERE id=?", (stale, candidate)).fetchone()
+                                "AND EXISTS (SELECT 1 FROM settings WHERE key='delivery-push:'||runs.id)) "
+                                + _legal_hold_guard("runs") +
+                                "AS eligible FROM runs WHERE id=?", (stale, candidate)).fetchone()
                             if owner:
                                 if owner["eligible"]:
                                     runs.add(owner["id"])
@@ -609,7 +655,8 @@ class Maintenance:
                     "THEN coalesce(json_extract(r.result,'$.pr'),'') ELSE 'x' END='' "
                     "AND CASE WHEN json_valid(r.result) "
                     "THEN coalesce(json_extract(r.result,'$.delivery_recovery_abandoned'),0) ELSE 0 END=0 "
-                    "AND EXISTS (SELECT 1 FROM settings WHERE key='delivery-push:'||r.id))",
+                    "AND EXISTS (SELECT 1 FROM settings WHERE key='delivery-push:'||r.id)) "
+                    + _legal_hold_guard("r"),
                     (run, stale)).fetchone()
                 if not eligible:
                     continue
@@ -745,9 +792,18 @@ class Maintenance:
             if path.is_symlink():
                 continue
             key = "archive-verification:" + path.name
-            previous = self.store.setting(key, {})
-            if isinstance(previous, dict) and now - previous.get("checked_at", 0) < 7 * 86400:
+            due, previous_type = _archive_verification_due(self.store, key, now)
+            if not due:
                 continue
+            if previous_type is not None:
+                # 只报形状，不回显原值：损坏内容可能是任意手工写入的文本。
+                try:
+                    self.store.event("archive_verification_repaired",
+                                     "Replaced unusable archive verification record: %s" % key,
+                                     data={"key": key, "previous_type": previous_type})
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Archive verification repair event persistence failed: %s", key)
             try:
                 report = verify_archive(path, timeout=5)
             except (OSError, ValueError, TimeoutError, sqlite3.Error, EOFError, zlib.error) as exc:
