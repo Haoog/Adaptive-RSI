@@ -139,6 +139,39 @@ class ReleaseAutomationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Reconciliation is blocked"):
             retry(self.runtime, self.project, self.run["id"], "release")
 
+    def _assert_transient_limit_keeps_tracking(self, exc):
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            first = self.tick()["release"]
+            self.remote = self.remote_run(first, state="in_progress")
+            self.assertEqual(self.tick()["release"]["state"], "running")
+        before = len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'"))
+        # 五轮远多于 ADVANCE_FAILURE_LIMIT：临时限流不能把在途回执推成终态。
+        with patch("adaptive_rsi.release.api", side_effect=exc):
+            for _ in range(5):
+                self.assertEqual(self.tick()["release"]["state"], "running")
+        saved = self.runtime.store.setting(key(self.run["id"], "release"))
+        self.assertEqual(saved["state"], "running")
+        self.assertNotIn("advance_failures", saved)
+        self.assertEqual(saved["last_advance_error"], str(exc))
+        self.assertGreater(saved["retry_at"], time.time())
+        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")), before)
+        self.assertTrue(pending(self.runtime, self.run))
+        # 限流结束后下一轮对账继续跟踪同一回执并正常收口。
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            self.remote = self.remote_run(saved)
+            self.assertEqual(self.tick()["release"]["state"], "workflow_succeeded")
+        self.assertNotIn("retry_at", self.runtime.store.setting(key(self.run["id"], "release")))
+
+    def test_local_cooldown_does_not_consume_the_permanent_failure_budget(self):
+        # local=True：请求从未离开本机，更不能算作一次永久对账失败。
+        self._assert_transient_limit_keeps_tracking(
+            ApiRejected("GitHub rate limit cooldown active; request was not sent", 429, local=True))
+
+    def test_github_rate_limit_does_not_consume_the_permanent_failure_budget(self):
+        # GitHub 明确但临时的拒绝（secondary/primary limit）同样只等待、不判死。
+        self._assert_transient_limit_keeps_tracking(
+            ApiRejected("gh: API rate limit exceeded (HTTP 403)", 403))
+
     def test_blocked_reconciliation_recovers_read_only_without_widening_abandon(self):
         from adaptive_rsi.release import ReconciliationRejected, abandon, resolve
         with patch("adaptive_rsi.release.api", side_effect=self.api):
@@ -367,7 +400,7 @@ class ReleaseAutomationTest(unittest.TestCase):
 
     def test_local_rate_limit_cooldown_keeps_release_pending_and_dispatches_later(self):
         # 冷却在请求发出前拦下：没有 gh 调用，也不能写成 GitHub 拒绝的终态失败。
-        with patch("adaptive_rsi.release._API_BACKOFF", {"github.com": time.monotonic() + 60}), \
+        with patch("adaptive_rsi.release._API_BACKOFF", {"example/project": time.monotonic() + 60}), \
                 patch("adaptive_rsi.release.checked") as command:
             first = self.tick()["release"]
         self.assertEqual(first["state"], "pending")
@@ -390,7 +423,7 @@ class ReleaseAutomationTest(unittest.TestCase):
     def test_local_rate_limit_cooldown_before_dispatch_post_reverts_to_pending(self):
         # validate_pin 之后才进入冷却：POST 没有发出，必须从 dispatching 退回 pending。
         with patch("adaptive_rsi.release.validate_pin"), \
-                patch("adaptive_rsi.release._API_BACKOFF", {"github.com": time.monotonic() + 60}), \
+                patch("adaptive_rsi.release._API_BACKOFF", {"example/project": time.monotonic() + 60}), \
                 patch("adaptive_rsi.release.checked") as command:
             first = self.tick()["release"]
         self.assertEqual(first["state"], "pending")
@@ -1797,6 +1830,35 @@ class WorkflowConfigurationTest(unittest.TestCase):
                     with self.subTest(workflow=name, path=step["with"]["path"]):
                         self.assertIn(step["with"]["path"], allowed_paths)
                         self.assertIn("hashFiles(", step["with"]["key"])
+
+
+class ApiCooldownScopeTest(unittest.TestCase):
+    def setUp(self):
+        from adaptive_rsi import release
+        self.release = release
+        release._API_BACKOFF.clear()
+        self.addCleanup(release._API_BACKOFF.clear)
+
+    def test_rate_limit_cooldown_is_scoped_to_the_repository(self):
+        with patch.object(self.release, "checked",
+                          side_effect=RuntimeError("API rate limit exceeded (HTTP 403)")):
+            with self.assertRaises(ApiRejected) as first:
+                self.release.api("example/one", "commits/main")
+        self.assertTrue(first.exception.transient)
+        self.assertEqual(first.exception.retry_after, self.release.API_COOLDOWN_SECONDS)
+        with self.assertRaisesRegex(ApiRejected, "cooldown active"):
+            self.release.api("example/one", "commits/main")
+        # 另一个仓库不受牵连：一次限流不应冻结所有项目的读写。
+        with patch.object(self.release, "checked", return_value='{"ok": true}') as command:
+            self.assertEqual(self.release.api("example/two", "commits/main"), {"ok": True})
+        command.assert_called_once()
+
+    def test_permanent_forbidden_is_not_transient_and_starts_no_cooldown(self):
+        with patch.object(self.release, "checked", side_effect=RuntimeError("gh: Forbidden (HTTP 403)")):
+            with self.assertRaises(ApiRejected) as exc:
+                self.release.api("example/one", "commits/main")
+        self.assertFalse(exc.exception.transient)
+        self.assertNotIn("example/one", self.release._API_BACKOFF)
 
 
 if __name__ == "__main__":
