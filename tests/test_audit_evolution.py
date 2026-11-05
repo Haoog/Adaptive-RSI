@@ -1527,6 +1527,42 @@ class AuditEvolutionTest(unittest.TestCase):
         (destination / 'evidence.json').write_text('{}')
         self.assertFalse(Evolution.verify_bundle(destination)['valid'])
 
+    def test_bundle_evidence_drops_host_trial_report_paths(self):
+        """试验的评估报告绝对路径带出用户名与状态目录布局，导出时不得进包。"""
+        def report(variant):
+            return str(self.root / 'experiments' / 'experiments' / 'case-1-0' / variant / 'evaluation' / 'report.json')
+        trial = {'case': 'case-1', 'split': 'validation', 'repetition': 0,
+                 'order': ['stable', 'candidate'],
+                 'stable': {'pass': False, 'report': report('stable')},
+                 'candidate': {'pass': True, 'report': report('candidate')}}
+        ablation = {'state': 'complete', 'trials': [
+            {'case': 'case-1', 'repetition': 0,
+             'strategy_only': {'pass': True, 'report': report('strategy_only')},
+             'skill_only': {'pass': False, 'report': report('skill_only')}}]}
+        self.candidate({'trials': [trial], 'ablation': ablation})
+        destination = self.root / 'bundle-trial-report'
+        self.evolution.export_bundle('c', destination)
+
+        text = (destination / 'evidence.json').read_text(encoding='utf-8')
+        self.assertNotIn(str(self.root), text)
+        exported = json.loads(text)
+        # 判定字段保留，只有宿主路径被删除。
+        self.assertEqual(exported['trials'][0]['case'], 'case-1')
+        self.assertEqual(exported['trials'][0]['split'], 'validation')
+        self.assertEqual(exported['trials'][0]['repetition'], 0)
+        self.assertEqual(exported['trials'][0]['order'], ['stable', 'candidate'])
+        self.assertEqual([exported['trials'][0]['stable']['pass'],
+                          exported['trials'][0]['candidate']['pass']], [False, True])
+        self.assertNotIn('report', exported['trials'][0]['stable'])
+        self.assertNotIn('report', exported['trials'][0]['candidate'])
+        self.assertNotIn('report', exported['ablation']['trials'][0]['strategy_only'])
+        self.assertNotIn('report', exported['ablation']['trials'][0]['skill_only'])
+        self.assertFalse(exported['ablation']['trials'][0]['skill_only']['pass'])
+        # 导出只裁剪副本，本地候选证据仍保留完整路径。
+        stored = json.loads(self.store.one('SELECT evidence FROM candidates WHERE id=?', ('c',))['evidence'])
+        self.assertEqual(stored['trials'][0]['stable']['report'], trial['stable']['report'])
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+
     def test_bundle_hashing_streams_instead_of_reading_whole_files(self):
         """封存与校验摘要必须分块读取，峰值内存不随单个文件大小增长。
 
@@ -2340,7 +2376,7 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertIs(result['checks_passed'], True)
         self.assertFalse(result['reproducible'])
 
-    def test_save_hotpath_skips_reverification_in_evaluating_state(self):
+    def test_save_refreshes_derived_evidence_when_plan_or_trial_count_changes(self):
         data = {'repeats': 2, 'samples': [{'id': 'x', 'split': 'validation'}]}
         plan = {'data': data, 'sha256': fingerprint(data)}
         evidence = {'preregistered_plan': plan, 'trials': []}
@@ -2354,32 +2390,41 @@ class AuditEvolutionTest(unittest.TestCase):
             self.assertEqual(mock_summary.call_count, 1)
             self.assertEqual(evidence['plan_verification']['analysis'], 'planned_in_progress')
 
-            # 2. 追加 trial 后再次以 evaluating 保存：跳过完整重验，但 trials 正常持久化
+            # 2. 证据未变化时再次保存：沿用缓存，不重复计算
+            self.evolution.save('c', 'evaluating', evidence)
+            self.assertEqual(mock_verify.call_count, 1)
+            self.assertEqual(mock_summary.call_count, 1)
+
+            # 3. 追加 trial 后再次以 evaluating 保存：试验数变化必须刷新派生证据，
+            #    否则中断后落库的仍是 0 条试验时的胜场与计划执行进度。
             trial1 = {'case': 'x', 'split': 'validation', 'repetition': 0,
                       'stable': {'pass': False}, 'candidate': {'pass': True}}
             evidence['trials'].append(trial1)
             self.evolution.save('c', 'evaluating', evidence)
-            self.assertEqual(mock_verify.call_count, 1)
-            self.assertEqual(mock_summary.call_count, 1)
+            self.assertEqual(mock_verify.call_count, 2)
+            self.assertEqual(mock_summary.call_count, 2)
             row1 = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
             assert row1 is not None
             persisted = json.loads(row1['evidence'])
             self.assertEqual(len(persisted['trials']), 1)
+            self.assertEqual(persisted['win_rate']['wins'], 1)
+            self.assertEqual(persisted['plan_verification']['observed'], 1)
+            self.assertFalse(persisted['plan_verification']['valid'])
 
-            # 3. 计划变化时：触发重新验证
+            # 4. 计划变化时：触发重新验证
             modified_data = {'repeats': 1, 'samples': [{'id': 'x', 'split': 'validation'}]}
             evidence['preregistered_plan'] = {'data': modified_data, 'sha256': fingerprint(modified_data)}
             self.evolution.save('c', 'evaluating', evidence)
-            self.assertEqual(mock_verify.call_count, 2)
-            self.assertEqual(mock_summary.call_count, 2)
+            self.assertEqual(mock_verify.call_count, 3)
+            self.assertEqual(mock_summary.call_count, 3)
 
-            # 4. 终态保存：触发完整重验
+            # 5. 终态保存：触发完整重验
             trial2 = {'case': 'x', 'split': 'validation', 'repetition': 1,
                       'stable': {'pass': False}, 'candidate': {'pass': True}}
             evidence['trials'].append(trial2)
             self.evolution.save('c', 'ready', evidence)
-            self.assertEqual(mock_verify.call_count, 3)
-            self.assertEqual(mock_summary.call_count, 3)
+            self.assertEqual(mock_verify.call_count, 4)
+            self.assertEqual(mock_summary.call_count, 4)
             row2 = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
             assert row2 is not None
             persisted = json.loads(row2['evidence'])
@@ -2387,6 +2432,61 @@ class AuditEvolutionTest(unittest.TestCase):
             self.assertIn('wilson_95', persisted['win_rate'])
             # 终态清理缓存
             self.assertNotIn('c', getattr(self.evolution, '_plan_keys', {}))
+
+    def test_evaluating_save_refreshes_win_rate_and_plan_verification_after_each_trial(self):
+        # 崩溃恢复只改状态、不重算派生证据：评估中的每次 save 都必须让落库的
+        # win_rate / plan_verification 与当前试验数一致，不能停在 0 条试验。
+        data = {'repeats': 2, 'samples': [{'id': 'v1', 'split': 'validation'},
+                                          {'id': 'h1', 'split': 'holdout'}]}
+        plan = {'data': data, 'sha256': fingerprint(data)}
+        evidence = {'preregistered_plan': plan, 'trials': []}
+        self.candidate(evidence)
+
+        def persisted():
+            row = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+            assert row is not None
+            return json.loads(row['evidence'])
+
+        self.evolution.save('c', 'evaluating', evidence)
+        stored = persisted()
+        self.assertEqual(stored['win_rate']['wins'], 0)
+        self.assertIsNone(stored['win_rate']['estimate'])
+        self.assertEqual(stored['plan_verification']['observed'], 0)
+        self.assertEqual(stored['plan_verification']['analysis'], 'planned_in_progress')
+
+        all_trials = [
+            {'case': case, 'split': split, 'repetition': repetition,
+             'stable': {'pass': False}, 'candidate': {'pass': True}}
+            for case, split in (('v1', 'validation'), ('h1', 'holdout'))
+            for repetition in range(2)]
+        evidence['trials'] = all_trials[:2]
+        self.evolution.save('c', 'evaluating', evidence)
+        stored = persisted()
+        self.assertEqual(len(stored['trials']), 2)
+        self.assertEqual(stored['win_rate']['wins'], 1)
+        self.assertEqual(stored['plan_verification']['observed'], 2)
+        self.assertEqual(stored['plan_verification']['expected'], 4)
+        self.assertFalse(stored['plan_verification']['valid'])
+        self.assertEqual(stored['plan_verification']['analysis'], 'planned_in_progress')
+
+        evidence['trials'] = all_trials
+        self.evolution.save('c', 'evaluating', evidence)
+        stored = persisted()
+        self.assertEqual(len(stored['trials']), 4)
+        self.assertEqual(stored['win_rate']['wins'], 2)
+        self.assertEqual(stored['win_rate']['estimate'], 1.0)
+        self.assertEqual(stored['plan_verification']['observed'], 4)
+        self.assertEqual(stored['plan_verification']['expected'], 4)
+        self.assertTrue(stored['plan_verification']['valid'])
+        self.assertEqual(stored['plan_verification']['analysis'], 'preregistered')
+
+        # 终态结果不变：完整计划通过，分析口径仍为 preregistered。
+        self.evolution.save('c', 'ready', evidence)
+        stored = persisted()
+        self.assertTrue(stored['plan_verification']['valid'])
+        self.assertEqual(stored['plan_verification']['analysis'], 'preregistered')
+        self.assertEqual(stored['plan_verification']['observed'], 4)
+        self.assertEqual(stored['plan_verification']['expected'], 4)
 
     def test_case_selection_follows_population_share(self):
         from adaptive_rsi.evolution import case_stratum, select_cases
