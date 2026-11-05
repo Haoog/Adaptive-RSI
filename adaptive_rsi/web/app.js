@@ -1260,7 +1260,7 @@ $('settings-form').addEventListener('submit',event=>{event.preventDefault();safe
  window.RSIProduct?.savingStatus(false,true,saveKey);toast(t(unchanged()?'已保存，无需重启；新任务使用新配置':'已保存提交的配置，后续修改仍未保存。'));}finally{finishPendingSettingsSave(saveKey);button.disabled=false;window.RSIProduct?.savingStatus(false,false,saveKey);}},event.target);});
 $('case-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const unchanged=unchangedForm(event.target);await api('cases',{project:projectId,manifest:JSON.parse($('case-json').value)});if(unchanged())$('case-form').reset();await refresh({force:true});toast(t('评估任务已导入'));},event.target);});
 const updateNames={checking:'正在检查更新',recovery_required:'更新恢复需要处理，请检查安装记录后重新启动服务',unchecked:'尚未检查更新',up_to_date:'已是最新稳定版',no_release:'尚无可用的正式发布包',available:'发现可用更新',waiting_idle:'等待任务结束后更新',downloading:'正在下载并校验',restarting:'正在重启服务',installed:'更新已完成',rolled_back:'更新失败，已恢复旧版',error:'更新检查或安装失败'};
-const releaseStates={waiting_verification:'等待合并后检查',blocked_verification:'合并后检查未通过，暂不发布',waiting_target:'等待同一服务的上次部署结束',superseded:'已有更新版本接管部署',healthy:'健康检查通过',health_failed:'上线后健康检查失败',rolling_back:'正在恢复上一正常版本',rolled_back:'已恢复上一正常版本',rollback_failed:'恢复上一正常版本失败',pending:'等待执行',submitted:'工作流已提交',dispatch_unknown:'是否启动仍待确认',running:'工作流执行中',rerunning:'工作流重试中',rerun_unknown:'重试是否启动仍待确认',waiting_release:'等待发布成功',not_authorized:'尚未授权',waiting:'等待前置步骤',dispatching:'正在启动工作流',dispatched:'工作流已启动',queued:'排队中',in_progress:'工作流执行中',workflow_succeeded:'工作流执行成功',workflow_failed:'工作流执行失败',failed:'操作失败',blocked:'发布被阻止',uncertain:'执行结果待确认',cancelled:'工作流已取消',disabled:'已关闭'};
+const releaseStates={waiting_verification:'等待合并后检查',blocked_verification:'合并后检查未通过，暂不发布',waiting_target:'等待同一服务的上次部署结束',superseded:'已有更新版本接管部署',healthy:'健康检查通过',health_failed:'上线后健康检查失败',rolling_back:'正在恢复上一正常版本',rolled_back:'已恢复上一正常版本',rollback_failed:'恢复上一正常版本失败',pending:'等待执行',submitted:'工作流已提交',dispatch_unknown:'是否启动仍待确认',running:'工作流执行中',rerunning:'工作流重试中',rerun_unknown:'重试是否启动仍待确认',reconciliation_blocked:'对账多次失败，已停止自动确认',waiting_release:'等待发布成功',not_authorized:'尚未授权',waiting:'等待前置步骤',dispatching:'正在启动工作流',dispatched:'工作流已启动',queued:'排队中',in_progress:'工作流执行中',workflow_succeeded:'工作流执行成功',workflow_failed:'工作流执行失败',failed:'操作失败',blocked:'发布被阻止',uncertain:'执行结果待确认',cancelled:'工作流已取消',disabled:'已关闭'};
 releaseStates.health_unconfirmed='健康状态未确认';
 releaseStates.rollback_health_unconfirmed='回滚健康状态未确认';
 let releaseWorkflowSequence=0;
@@ -1327,7 +1327,7 @@ async function reloadReleaseOutcome(project){
 }
 function renderReleaseReconciliation(row,operation,project,run,kind,target){
  const current=target==='rollback'?operation.rollback:operation;
- if(!current||!['dispatch_unknown','rerun_unknown'].includes(current.state))return;
+ if(!current||!['dispatch_unknown','rerun_unknown','reconciliation_blocked'].includes(current.state))return;
  const cacheKey=`${project}:${run.id}:${kind}:${target}`;
  const cachedSelectable=releaseCandidatesCache.get(cacheKey);
  const reconciliation=current.reconciliation&&typeof current.reconciliation==='object'?current.reconciliation:{};
@@ -1336,7 +1336,8 @@ function renderReleaseReconciliation(row,operation,project,run,kind,target){
   candidate&&Number.isInteger(candidate.id)&&typeof candidate.url==='string'&&/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/\d+$/.test(candidate.url));
  const candidateCount=Number.isInteger(reconciliation.candidate_count)?reconciliation.candidate_count:candidates.length;
  const panel=el('div',undefined,'release-reconciliation');
- panel.append(el('h5',t(current.state==='rerun_unknown'?'重试是否启动仍待确认':'是否启动仍待确认')));
+ panel.append(el('h5',t(current.state==='rerun_unknown'?'重试是否启动仍待确认':current.state==='reconciliation_blocked'?'自动对账已停止，需要人工确认':'是否启动仍待确认')));
+ if(current.state==='reconciliation_blocked')panel.append(el('p',t('恢复 GitHub 访问后，用下面的只读查询确认并关联已有工作流记录。'),'muted'));
  if(Number.isFinite(reconciliation.checked_at))panel.append(el('p',t('核对时间')+' '+stamp(reconciliation.checked_at),'muted'));
  const reason=releaseReconciliationReason(reconciliation);if(reason)panel.append(el('p',reason,'muted'));
  panel.append(el('p',t('只读查询只读取 GitHub 状态，不会启动或重试工作流。'),'muted'));

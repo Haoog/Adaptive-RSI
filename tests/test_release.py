@@ -113,6 +113,62 @@ class ReleaseAutomationTest(unittest.TestCase):
             self.assertEqual(result["state"], "workflow_succeeded")
             self.assertNotIn("remote_visibility", result)
 
+    def test_permanent_reconciliation_rejection_blocks_tracking_with_one_error_event(self):
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            first = self.tick()["release"]
+            self.remote = self.remote_run(first, state="in_progress")
+            self.assertEqual(self.tick()["release"]["state"], "running")
+        before = len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'"))
+        reads = []
+        def forbidden(repo, endpoint, method="GET", fields=None):
+            reads.append(endpoint)
+            raise ApiRejected("gh: Forbidden (HTTP 403)", 403)
+        with patch("adaptive_rsi.release.api", side_effect=forbidden):
+            for expected in ["running", "running", "reconciliation_blocked"]:
+                self.assertEqual(self.tick()["release"]["state"], expected)
+            # 转入终态后不再读取同一个必然失败的远端，也不再写事件。
+            self.assertEqual(self.tick()["release"]["state"], "reconciliation_blocked")
+        self.assertEqual(reads, ["actions/runs/17"] * 3)
+        saved = self.runtime.store.setting(key(self.run["id"], "release"))
+        self.assertEqual(saved["state"], "reconciliation_blocked")
+        self.assertEqual(saved["advance_failures"], 3)
+        self.assertEqual(saved["last_advance_error"], "gh: Forbidden (HTTP 403)")
+        self.assertIn("last_advance_error_at", saved)
+        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")) - before, 1)
+        self.assertFalse(pending(self.runtime, self.run))
+        with self.assertRaisesRegex(ValueError, "Reconciliation is blocked"):
+            retry(self.runtime, self.project, self.run["id"], "release")
+
+    def test_blocked_reconciliation_recovers_read_only_without_widening_abandon(self):
+        from adaptive_rsi.release import ReconciliationRejected, abandon, resolve
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            first = self.tick()["release"]
+        data = self.runtime.store.setting(key(self.run["id"], "release"))
+        data.update(state="reconciliation_blocked", error="gh: Forbidden (HTTP 403)", advance_failures=3)
+        self.runtime.store.put_setting(key(self.run["id"], "release"), data)
+        self.remote = self.remote_run(data, state="in_progress")
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            view = candidates(self.runtime, self.project, self.run["id"], "release")
+            self.assertEqual(view["state"], "reconciliation_blocked")
+            self.assertEqual([item["id"] for item in view["selectable_candidates"]], [17])
+            self.assertFalse(view["can_abandon"])
+            # 权限恢复后人工选择可见 run 即回到被跟踪的执行态，失败计数从头开始。
+            self.assertEqual(resolve(self.runtime, self.project, self.run["id"], "release", 17)["state"], "running")
+        saved = self.runtime.store.setting(key(self.run["id"], "release"))
+        self.assertEqual(saved["state"], "running")
+        for field in ("advance_failures", "last_advance_error", "last_advance_error_at"):
+            self.assertNotIn(field, saved)
+        # 可见性规则不因新状态放宽：有可见 run 时仍拒绝关闭。
+        saved.update(state="reconciliation_blocked", error="gh: Forbidden (HTTP 403)")
+        self.runtime.store.put_setting(key(self.run["id"], "release"), saved)
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            with self.assertRaisesRegex(ReconciliationRejected, "still exposes"):
+                abandon(self.runtime, self.project, self.run["id"], "release", "operator note")
+        self.assertEqual(self.runtime.store.setting(key(self.run["id"], "release"))["state"], "reconciliation_blocked")
+        with patch("adaptive_rsi.release.api", side_effect=ApiRejected("gh: Not Found (HTTP 404)", 404)):
+            closed = abandon(self.runtime, self.project, self.run["id"], "release", "GitHub access permanently revoked")
+        self.assertEqual(closed["state"], "failed")
+
     def test_corrupt_automation_receipt_is_preserved_and_blocks_dispatch(self):
         from adaptive_rsi.release import status
         for raw in ('{broken', '[]', 'null', '{}', '{"state":3}', '{"state":"submitted"}'):
@@ -322,8 +378,8 @@ class ReleaseAutomationTest(unittest.TestCase):
 
     def remote_run(self, data, state="completed", conclusion="success", attempt=1):
         return {"id": 17, "head_sha": TRUSTED, "display_title": data["operation_id"], "event": "workflow_dispatch",
-                "path": data["workflow"], "status": state, "conclusion": conclusion, "run_attempt": attempt,
-                "html_url": "https://github.com/example/project/actions/runs/17"}
+                "path": data["workflow"], "head_branch": data.get("ref"), "status": state, "conclusion": conclusion,
+                "run_attempt": attempt, "html_url": "https://github.com/example/project/actions/runs/17"}
 
     def test_dispatch_pins_target_and_reconciles_after_restart_without_duplicates(self):
         with patch("adaptive_rsi.release.api", side_effect=self.api):
