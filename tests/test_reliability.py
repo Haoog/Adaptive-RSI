@@ -1401,6 +1401,35 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"],
                          "awaiting_approval")
 
+    def test_evaluation_identity_probe_failure_keeps_completed_evaluation(self):
+        # 评估器返回缺 execution_environment 的记录时，保存前补写身份要探测沙箱；
+        # 探测失败只能放弃补写（缺键记录不会被复用），不能把已完成的评估判成环境故障。
+        class Docs(FakeAgent):
+            def invoke(self, role, *args, **kwargs):
+                if role == "planning":
+                    result = super().invoke(role, *args, **kwargs)
+                    result.update(change_kind="documentation", scope=["docs"])
+                    return result
+                if role == "implementation":
+                    (args[1] / "docs").mkdir(exist_ok=True)
+                    (args[1] / "docs/guide.md").write_text("guide\n")
+                    return {"summary": "Documented the arithmetic contract"}
+                return super().invoke(role, *args, **kwargs)
+        self.runtime.agent = Docs()
+        task, run = self.claim("Update usage guide")
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": [], "checks": CHECKS}), \
+             patch.object(self.runtime.evaluator, "execution_identity",
+                          side_effect=RuntimeError("No working sandbox")), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                "decision": "pass", "reason": "Fixed checks passed", "checks": {}}):
+            self.runtime.process(run)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"],
+                         "awaiting_approval")
+        saved = json.loads(self.store.one("SELECT data FROM stages WHERE run=? AND stage='evaluation'",
+                                          (run["id"],))["data"])
+        self.assertEqual(saved["decision"], "pass")
+        self.assertNotIn("execution_environment", saved)
+
     def test_stage_cache_keys_only_change_for_relevant_settings(self):
         config = self.runtime.config(self.project)
         before, _ = _stage_config(config, "planning")
