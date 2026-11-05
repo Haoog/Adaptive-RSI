@@ -64,6 +64,21 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.commands = []
         self.remote = None
 
+    def test_invalid_health_port_reports_once_and_treats_target_as_unowned(self):
+        from adaptive_rsi.release import deployment_owner
+        for index, url in enumerate(("https://app.example:99999/health", "https://app.example:0/health"), 1):
+            policy = {**self.policy, "health_url": url}
+            for _ in range(2):  # 每个 tick 都会重读；同一目标只报一次
+                self.assertIsNone(deployment_owner(self.runtime, self.project, "example/project", policy))
+            events = self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")
+            self.assertEqual(len(events), index)
+            self.assertEqual({json.loads(row["data"])["error_code"] for row in events},
+                             {"invalid_deployment_health_url"})
+        # 合法地址仍按 origin/port/path 归一：不同项目、仓库指向同一端点时共用归属。
+        deploy = {**self.policy, "health_url": "https://app.example/health"}
+        self.assertEqual(owner_key(self.project, "example/project", deploy),
+                         owner_key("another", "example/other", deploy))
+
     def test_missing_remote_run_preserves_identity_without_error_events(self):
         from adaptive_rsi.release import reconcile
         data = {'state': 'rerun_unknown', 'workflow_run_id': 17, 'repository': 'example/project',
@@ -1201,6 +1216,19 @@ class StableUpdatePolicyTest(unittest.TestCase):
         for url in ["http://example/health", "https://user:secret@example/health", "https://example/health?token=x", "https://example/health#x"]:
             with self.subTest(url=url), self.assertRaises(ValueError):
                 validate({"delivery": {"deploy": {"health_url": url}}})
+
+    def test_health_endpoint_port_must_be_in_range(self):
+        for url in ["https://example:0/health", "https://example:99999/health",
+                    "https://example:65536/health", "https://example:abc/health",
+                    "https://[::1/health"]:
+            with self.subTest(url=url), self.assertRaisesRegex(ValueError, "health URL.*port"):
+                validate({"delivery": {"deploy": {"health_url": url}}})
+        self.assertEqual(validate({"delivery": {"deploy": {"health_url": "https://example:8443/health"}}})
+                         ["delivery"]["deploy"]["health_url"], "https://example:8443/health")
+        # 追加端点走同一段校验，不能只在主地址上生效。
+        with self.assertRaises(ValueError):
+            validate({"delivery": {"deploy": {"health_url": "https://example/health",
+                                              "health_urls": ["https://b.example:99999/health"]}}})
 
 
 class ReleaseVersionPatchTest(unittest.TestCase):

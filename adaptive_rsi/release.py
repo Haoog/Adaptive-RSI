@@ -1162,32 +1162,57 @@ def stable_key(project, repo, url):
 
 
 def owner_key(project, repo, policy):
+    """Stable target key, or None when the configured health URL has no usable origin or port."""
     url = policy.get("health_url")
     if url:
-        parsed = urlsplit(url)
-        target = {"origin": parsed.hostname.lower(), "port": parsed.port or 443,
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+            origin = parsed.hostname.lower() if parsed.hostname else None
+        except (ValueError, UnicodeError):
+            return None
+        # Port 0 is not a usable endpoint; `or 443` would silently alias it to the default port.
+        if not origin or (port is not None and not 1 <= port <= 65535):
+            return None
+        target = {"origin": origin, "port": 443 if port is None else port,
                   "path": parsed.path or "/", "query": parsed.query}
     else:
         target = {"repository": repo.lower(), "workflow": policy["workflow"]}
     return "deployment-owner:" + fingerprint(target)
 
 
-def _owner_alert(runtime, name, project):
-    """Report an unreadable ownership record once; it is still treated as no owner."""
-    diagnostic = (name, "deployment-owner")
+def _owner_alert_once(runtime, diagnostic, message, project, error_code):
     with runtime.automation_receipt_failures_lock:
         if diagnostic in runtime.automation_receipt_failures:
             return
-        runtime.store.event("automation_error",
-                            "Deployment owner record is unreadable; repair the stored record before relying on it",
-                            project, None, {"kind": "deploy", "error_code": "invalid_deployment_owner"})
+        runtime.store.event("automation_error", message, project, None,
+                            {"kind": "deploy", "error_code": error_code})
         if len(runtime.automation_receipt_failures) >= 128:
             runtime.automation_receipt_failures.pop(next(iter(runtime.automation_receipt_failures)))
         runtime.automation_receipt_failures[diagnostic] = True
 
 
+def _owner_alert(runtime, name, project):
+    """Report an unreadable ownership record once; it is still treated as no owner."""
+    _owner_alert_once(runtime, (name, "deployment-owner"),
+                      "Deployment owner record is unreadable; repair the stored record before relying on it",
+                      project, "invalid_deployment_owner")
+
+
+def _invalid_target_alert(runtime, project, repo, policy):
+    """Report an unusable configured target once; it is still treated as no owner."""
+    diagnostic = ("invalid-deployment-target",
+                  fingerprint({"project": project, "repository": repo, "health_url": policy.get("health_url")}))
+    _owner_alert_once(runtime, diagnostic,
+                      "Deployment health URL has an invalid port; correct the deployment policy before relying on ownership tracking",
+                      project, "invalid_deployment_health_url")
+
+
 def deployment_owner(runtime, project, repo, policy):
     name = owner_key(project, repo, policy)
+    if not name:
+        _invalid_target_alert(runtime, project, repo, policy)
+        return None
     with runtime.dispatch_lock:
         stored = runtime.store.setting(name)
         current = _owner_record(stored)
@@ -1420,7 +1445,9 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
                                  "rollback_health_unconfirmed" if observed == "health_unconfirmed" else "rollback_failed")
                 if observed == "healthy":
                     owner_name = owner_key(project["id"], data["repository"], policy)
-                    ownership = (owner_name, current_owner, {"run": run["id"], "sha": rollback["sha"]})
+                    # 端口不可用时 owner_key 返回 None：不能把 None 写进 ownership 设置键。
+                    ownership = ((owner_name, current_owner, {"run": run["id"], "sha": rollback["sha"]})
+                                 if owner_name else None)
                     stable = (stable_key(project["id"], data["repository"], policy["health_url"]),
                               {"sha": rollback["sha"], "run": run["id"], "health": report})
                     persist(runtime, run, "deploy", data, ownership=ownership, stable=stable)
@@ -1802,8 +1829,9 @@ def advance(runtime, project, run, outcome, cancel=None):
                                          "github_environment": "unknown"}
                 # Persist the write intent first. Ambiguous failures are reconciled, never re-dispatched.
                 data.update(state="dispatching", error="")
-                ownership = ((owner_key(project["id"], repo, policy), expected_owner,
-                              {"run": run["id"], "sha": data["sha"]}) if kind == "deploy" else None)
+                owner_name = owner_key(project["id"], repo, policy) if kind == "deploy" else None
+                ownership = ((owner_name, expected_owner,
+                              {"run": run["id"], "sha": data["sha"]}) if owner_name else None)
                 persist(runtime, run, kind, data, ownership=ownership)
             try:
                 api(repo, "actions/workflows/" + quote(policy["workflow"].split("/")[-1], safe="") + "/dispatches", "POST",
@@ -1933,8 +1961,10 @@ def retry(runtime, project_id, run_id, kind):
                     if target.get("state") == "dispatching":
                         if deployment_owner(runtime, project_id, repo, policy) != expected_owner:
                             raise ValueError("Deployment ownership changed during validation")
-                        ownership = (owner_key(project_id, repo, policy), expected_owner,
-                                     {"run": run_id, "sha": target["sha"]})
+                        owner_name = owner_key(project_id, repo, policy)
+                        # owner_key 在端口不可用时返回 None；不能把 None 当作设置键。
+                        ownership = ((owner_name, expected_owner,
+                                      {"run": run_id, "sha": target["sha"]}) if owner_name else None)
                     else:
                         owner = deployment_owner(runtime, project_id, repo, policy)
                         if owner and owner["run"] != run_id:
