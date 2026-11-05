@@ -118,6 +118,121 @@ class ReliabilityTest(unittest.TestCase):
         stages = {r["stage"] for r in self.store.query("SELECT stage FROM stages WHERE run=?", (second["id"],))}
         self.assertTrue({"planning", "implementation", "evaluation", "review"} <= stages)
 
+    def _skill_retry_agent(self):
+        """Fail one review, then document a change so the retry exercises stage reuse."""
+        class Outage(FakeAgent):
+            unavailable = True
+
+            def __init__(self):
+                super().__init__()
+                self.planning_prompts = []
+                self.implementations = 0
+
+            def invoke(self, role, prompt, *args, **kwargs):
+                if role == "planning":
+                    self.planning_prompts.append(prompt)
+                    result = super().invoke(role, prompt, *args, **kwargs)
+                    # Documentation keeps this regression off the sandbox-only
+                    # test-first path while still exercising plan and candidate reuse.
+                    result.update(change_kind="documentation", scope=["docs"])
+                    return result
+                if role == "implementation":
+                    self.implementations += 1
+                    (args[0] / "docs").mkdir(exist_ok=True)
+                    (args[0] / "docs/guide.md").write_text("guide\n")
+                    return {"summary": "Documented the arithmetic contract"}
+                if role == "review" and self.unavailable:
+                    self.unavailable = False
+                    raise RuntimeError("Provider connection timeout")
+                return super().invoke(role, prompt, *args, **kwargs)
+        return Outage()
+
+    def _strategy_candidate(self, now):
+        self.store.execute("INSERT INTO candidates(id,project,kind,parent,status,content,evidence,created,promoted) "
+                           "VALUES(?,?,?,?,?,?,?,?,?)",
+                           ("cand-skill", self.project, "strategy", None, "stable",
+                            json.dumps({"guidance": "existing guidance"}), "{}", now, now))
+
+    def _insert_skill(self, skill, triggers, content, expires, now):
+        self.store.execute("INSERT INTO skills(id,project,task,status,triggers,content,evidence,expires,created) "
+                           "VALUES(?,?,?,?,?,?,?,?,?)",
+                           (skill, self.project, None, "verified", json.dumps(triggers), content,
+                            json.dumps({"candidate": "cand-skill"}), expires, now))
+
+    def test_promoted_skill_invalidates_reused_plan_and_candidate(self):
+        """A skill promoted between attempts must reach the retried prompts.
+
+        Planning and implementation prompts carry the retrieved skills, so a new
+        matching skill has to invalidate the cached plan and candidate; otherwise
+        the retry silently ships the pre-promotion result.
+        """
+        now = time.time()
+        self._strategy_candidate(now)
+        agent = self._skill_retry_agent()
+        self.runtime.agent = agent
+        task, run = self.claim("Fix addition")
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "pass", "reason": "Fixed checks passed", "checks": {},
+                 "execution_environment": None}):
+            self.runtime.process(run)
+            self.assertEqual([role for role, _ in agent.roles].count("planning"), 1)
+            self.assertEqual(agent.implementations, 1)
+            # The review outage requeues the task for the retry that follows.
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
+
+            self._insert_skill("skill-boundary", ["addition"],
+                               "NEW SKILL: reproduce boundary cases before editing", now + 3600, now)
+            body = self.store.one("SELECT body FROM tasks WHERE id=?", (task,))["body"]
+            self.assertTrue(any("NEW SKILL" in item["content"]
+                                for item in self.runtime.memories(self.project, body)))
+            agent.roles.clear()
+            agent.planning_prompts.clear()
+            agent.implementations = 0
+            self.runtime.retry(task)
+            second = self.store.claim(self.project, self.runtime.config(self.project))
+            self.runtime.process(second)
+
+        roles = [role for role, _ in agent.roles]
+        self.assertEqual(roles.count("planning"), 1)
+        self.assertEqual(agent.implementations, 1)
+        self.assertTrue(any("NEW SKILL" in prompt for prompt in agent.planning_prompts))
+        first_plan = self.store.one("SELECT signature FROM stages WHERE run=? AND stage='planning'", (run["id"],))
+        second_plan = self.store.one("SELECT signature FROM stages WHERE run=? AND stage='planning'", (second["id"],))
+        self.assertNotEqual(first_plan["signature"], second_plan["signature"])
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (second["id"],))["state"],
+                         "awaiting_approval")
+
+    def test_unretrievable_skills_do_not_invalidate_reused_stages(self):
+        """Expired or non-matching skills never reach the prompt, so they keep the cache warm."""
+        now = time.time()
+        self._strategy_candidate(now)
+        agent = self._skill_retry_agent()
+        self.runtime.agent = agent
+        task, run = self.claim("Fix addition")
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "pass", "reason": "Fixed checks passed", "checks": {},
+                 "execution_environment": None}):
+            self.runtime.process(run)
+            self.assertEqual(agent.implementations, 1)
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
+            # One matching skill is already expired; the other never matches the task.
+            self._insert_skill("skill-expired", ["addition"], "EXPIRED SKILL: stale guidance", now - 1, now)
+            self._insert_skill("skill-unrelated", ["kubernetes"], "UNRELATED SKILL: deploy guidance",
+                               now + 3600, now)
+            agent.roles.clear()
+            agent.implementations = 0
+            self.runtime.retry(task)
+            second = self.store.claim(self.project, self.runtime.config(self.project))
+            self.runtime.process(second)
+
+        roles = [role for role, _ in agent.roles]
+        self.assertEqual(roles.count("planning"), 0)
+        self.assertEqual(agent.implementations, 0)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (second["id"],))["state"],
+                         "awaiting_approval")
+
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_implementation_route_change_reuses_plan_without_acceptance(self):
         class Outage(FakeAgent):
