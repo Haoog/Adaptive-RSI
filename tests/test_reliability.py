@@ -118,6 +118,121 @@ class ReliabilityTest(unittest.TestCase):
         stages = {r["stage"] for r in self.store.query("SELECT stage FROM stages WHERE run=?", (second["id"],))}
         self.assertTrue({"planning", "implementation", "evaluation", "review"} <= stages)
 
+    def _skill_retry_agent(self):
+        """Fail one review, then document a change so the retry exercises stage reuse."""
+        class Outage(FakeAgent):
+            unavailable = True
+
+            def __init__(self):
+                super().__init__()
+                self.planning_prompts = []
+                self.implementations = 0
+
+            def invoke(self, role, prompt, *args, **kwargs):
+                if role == "planning":
+                    self.planning_prompts.append(prompt)
+                    result = super().invoke(role, prompt, *args, **kwargs)
+                    # Documentation keeps this regression off the sandbox-only
+                    # test-first path while still exercising plan and candidate reuse.
+                    result.update(change_kind="documentation", scope=["docs"])
+                    return result
+                if role == "implementation":
+                    self.implementations += 1
+                    (args[0] / "docs").mkdir(exist_ok=True)
+                    (args[0] / "docs/guide.md").write_text("guide\n")
+                    return {"summary": "Documented the arithmetic contract"}
+                if role == "review" and self.unavailable:
+                    self.unavailable = False
+                    raise RuntimeError("Provider connection timeout")
+                return super().invoke(role, prompt, *args, **kwargs)
+        return Outage()
+
+    def _strategy_candidate(self, now):
+        self.store.execute("INSERT INTO candidates(id,project,kind,parent,status,content,evidence,created,promoted) "
+                           "VALUES(?,?,?,?,?,?,?,?,?)",
+                           ("cand-skill", self.project, "strategy", None, "stable",
+                            json.dumps({"guidance": "existing guidance"}), "{}", now, now))
+
+    def _insert_skill(self, skill, triggers, content, expires, now):
+        self.store.execute("INSERT INTO skills(id,project,task,status,triggers,content,evidence,expires,created) "
+                           "VALUES(?,?,?,?,?,?,?,?,?)",
+                           (skill, self.project, None, "verified", json.dumps(triggers), content,
+                            json.dumps({"candidate": "cand-skill"}), expires, now))
+
+    def test_promoted_skill_invalidates_reused_plan_and_candidate(self):
+        """A skill promoted between attempts must reach the retried prompts.
+
+        Planning and implementation prompts carry the retrieved skills, so a new
+        matching skill has to invalidate the cached plan and candidate; otherwise
+        the retry silently ships the pre-promotion result.
+        """
+        now = time.time()
+        self._strategy_candidate(now)
+        agent = self._skill_retry_agent()
+        self.runtime.agent = agent
+        task, run = self.claim("Fix addition")
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "pass", "reason": "Fixed checks passed", "checks": {},
+                 "execution_environment": None}):
+            self.runtime.process(run)
+            self.assertEqual([role for role, _ in agent.roles].count("planning"), 1)
+            self.assertEqual(agent.implementations, 1)
+            # The review outage requeues the task for the retry that follows.
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
+
+            self._insert_skill("skill-boundary", ["addition"],
+                               "NEW SKILL: reproduce boundary cases before editing", now + 3600, now)
+            body = self.store.one("SELECT body FROM tasks WHERE id=?", (task,))["body"]
+            self.assertTrue(any("NEW SKILL" in item["content"]
+                                for item in self.runtime.memories(self.project, body)))
+            agent.roles.clear()
+            agent.planning_prompts.clear()
+            agent.implementations = 0
+            self.runtime.retry(task)
+            second = self.store.claim(self.project, self.runtime.config(self.project))
+            self.runtime.process(second)
+
+        roles = [role for role, _ in agent.roles]
+        self.assertEqual(roles.count("planning"), 1)
+        self.assertEqual(agent.implementations, 1)
+        self.assertTrue(any("NEW SKILL" in prompt for prompt in agent.planning_prompts))
+        first_plan = self.store.one("SELECT signature FROM stages WHERE run=? AND stage='planning'", (run["id"],))
+        second_plan = self.store.one("SELECT signature FROM stages WHERE run=? AND stage='planning'", (second["id"],))
+        self.assertNotEqual(first_plan["signature"], second_plan["signature"])
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (second["id"],))["state"],
+                         "awaiting_approval")
+
+    def test_unretrievable_skills_do_not_invalidate_reused_stages(self):
+        """Expired or non-matching skills never reach the prompt, so they keep the cache warm."""
+        now = time.time()
+        self._strategy_candidate(now)
+        agent = self._skill_retry_agent()
+        self.runtime.agent = agent
+        task, run = self.claim("Fix addition")
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "pass", "reason": "Fixed checks passed", "checks": {},
+                 "execution_environment": None}):
+            self.runtime.process(run)
+            self.assertEqual(agent.implementations, 1)
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
+            # One matching skill is already expired; the other never matches the task.
+            self._insert_skill("skill-expired", ["addition"], "EXPIRED SKILL: stale guidance", now - 1, now)
+            self._insert_skill("skill-unrelated", ["kubernetes"], "UNRELATED SKILL: deploy guidance",
+                               now + 3600, now)
+            agent.roles.clear()
+            agent.implementations = 0
+            self.runtime.retry(task)
+            second = self.store.claim(self.project, self.runtime.config(self.project))
+            self.runtime.process(second)
+
+        roles = [role for role, _ in agent.roles]
+        self.assertEqual(roles.count("planning"), 0)
+        self.assertEqual(agent.implementations, 0)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (second["id"],))["state"],
+                         "awaiting_approval")
+
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_implementation_route_change_reuses_plan_without_acceptance(self):
         class Outage(FakeAgent):
@@ -316,6 +431,76 @@ class ReliabilityTest(unittest.TestCase):
         self.assertIn(("stage_invalidated", "evaluation"), stages)
         result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (second["id"],))["result"])
         self.assertEqual(result["evaluation"]["decision"], "pass")
+
+    def interrupt_at_evaluation(self):
+        """One attempt that dies inside the evaluation window before any verdict."""
+        self.runtime.configure({"sources": {"inspection": False, "issues": False}}, self.project)
+        task, run = self.claim()
+        with ExitStack() as stack:
+            for scenario in self.evaluation_sandbox():
+                stack.enter_context(scenario)
+            stack.enter_context(patch.object(self.runtime.evaluator, "evaluate",
+                                             side_effect=RuntimeError("Sandbox backend disappeared")))
+            self.runtime.process(run)
+        return task, run
+
+    def saved_implementation(self, run):
+        row = self.store.one("SELECT data FROM stages WHERE run=? AND stage='implementation'", (run["id"],))
+        return json.loads(row["data"]) if row else None
+
+    def run_directory(self, run):
+        return Path(self.store.root) / "runs" / run["id"]
+
+    def test_resume_after_evaluation_failure_replays_saved_implementation(self):
+        """评估窗口内失败后重试重放已封存补丁，不再重复支付实现调用。"""
+        task, run = self.interrupt_at_evaluation()
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "blocked")
+        saved = self.saved_implementation(run)
+        self.assertTrue(saved["patch"])
+        self.assertEqual(saved["summary"], "Corrected addition")
+        self.assertEqual(self.store.query("SELECT * FROM stages WHERE run=? AND stage='validated_candidate'",
+                                          (run["id"],)), [])
+        with patch.object(self.runtime.evaluator, "evaluate",
+                          wraps=self.runtime.evaluator.evaluate) as evaluate:
+            second = self.resume(task)
+            # 重放只跳过付费实现；评估必须对重放的补丁真实重跑。
+            self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 1)
+        self.assertEqual((self.run_directory(second) / "resume.patch").read_text(encoding="utf-8"),
+                         (self.run_directory(run) / "candidate.patch").read_text(encoding="utf-8"))
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
+        result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (second["id"],))["result"])
+        self.assertEqual(result["evaluation"]["decision"], "pass")
+        self.assertEqual(result["review"]["decision"], "pass")
+
+    def test_tampered_implementation_checkpoint_refuses_retry(self):
+        """补丁与 hash 不一致时拒绝重放，不静默使用被改动的记录。"""
+        task, run = self.interrupt_at_evaluation()
+        tampered = self.saved_implementation(run)
+        tampered["patch"] = tampered["patch"].replace("return a + b", "return a - b")
+        self.store.execute("UPDATE stages SET data=? WHERE run=? AND stage='implementation'",
+                           (encode(tampered), run["id"]))
+        second = self.resume(task)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (second["id"],))
+        self.assertEqual(row["state"], "blocked")
+        self.assertIn("Saved implementation evidence changed", json.loads(row["result"])["reason"])
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 1)
+        self.assertFalse((self.run_directory(second) / "resume.patch").exists())
+
+    def test_legacy_implementation_checkpoint_without_patch_is_reimplemented(self):
+        """只有 hash 的旧记录不可重放：作废这一项后重新实现，而不是让重试崩掉。"""
+        task, run = self.interrupt_at_evaluation()
+        legacy = {"files": self.saved_implementation(run)["files"], "patch_hash": "legacy-hash"}
+        self.store.execute("UPDATE stages SET data=? WHERE run=? AND stage='implementation'",
+                           (encode(legacy), run["id"]))
+        second = self.resume(task)
+        events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (second["id"],))
+        invalidated = [json.loads(row["data"]) for row in events if row["kind"] == "stage_invalidated"]
+        self.assertEqual([row["stage"] for row in invalidated if row["reason"] == "reused_record_invalid"],
+                         ["implementation"])
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 2)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
+        self.assertTrue(self.saved_implementation(second)["patch"])
 
     def test_evaluation_reuse_requires_matching_tree_checks_and_controls(self):
         config = self.runtime.config(self.project)
@@ -974,6 +1159,75 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(outcome["decision"], "fail")
         self.assertIn("rename from src/a.py", (directory / "candidate.patch").read_text())
 
+    def rollback_fixture(self, forward, saved_files, patch_edit=None):
+        """构造一次已完成的候选 run（可含 rename）和它的 rollback 任务。"""
+        (self.repo / "pkg").mkdir(parents=True, exist_ok=True)
+        (self.repo / "pkg/keep.py").write_text("KEEP = 1\n")
+        (self.repo / "pkg/legacy.py").write_text(
+            "\n".join(f"VALUE_{index} = {index}" for index in range(40)) + "\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",
+            "commit", "-qm", "rollback baseline")
+        base_before = git(self.repo, "rev-parse", "HEAD")
+        forward(self.repo)
+        git(self.repo, "add", "-A")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",
+            "commit", "-qm", "prior candidate")
+        base_after = git(self.repo, "rev-parse", "HEAD")
+        patch = git(self.repo, "diff", "--binary", base_before, base_after)
+        if patch_edit:
+            patch = patch_edit(patch)
+        prior = self.store.root / "runs" / "prior-run"
+        prior.mkdir(parents=True)
+        (prior / "candidate.patch").write_text(patch + "\n", encoding="utf-8")
+        task = self.runtime.goal(self.project, "Revert the prior candidate")
+        # 原始 run 的 files 与 changes() 一致：rename 只留下目标路径。
+        self.store.execute(
+            "INSERT INTO runs(id,task,project,state,config,strategy,base,path,started,ended,result) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("prior-run", task, self.project, "merged", "{}", "[]", base_before, str(prior),
+             1.0, 2.0, json.dumps({"files": list(saved_files), "summary": "prior candidate"})))
+        self.store.execute("UPDATE tasks SET source='rollback', evidence=? WHERE id=?",
+                           (json.dumps([{"run": "prior-run"}]), task))
+        return self.store.claim(self.project, self.runtime.config(self.project))
+
+    def test_rollback_of_renamed_candidate_declares_rename_source(self):
+        """回滚含 rename 的候选：计划范围必须补上反向补丁恢复的源路径。"""
+        def forward(repo):
+            git(repo, "mv", "pkg/legacy.py", "pkg/moved.py")
+            with (repo / "pkg/moved.py").open("a") as stream:
+                stream.write("EXTRA = 1\n")
+        run = self.rollback_fixture(forward, ["pkg/moved.py"])
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "pass", "reason": "Reverse patch restores the baseline", "checks": {},
+                 "execution_environment": {"backend": "test", "build": "test"}}):
+            self.runtime.process(run)
+        row = self.store.one("SELECT state,result,path FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "awaiting_approval", row["result"])
+        plan = json.loads((Path(row["path"]) / "plan.json").read_text())
+        self.assertEqual(sorted(plan["scope"]), ["pkg/legacy.py", "pkg/moved.py"])
+
+    def test_rollback_rejects_paths_injected_into_saved_patch(self):
+        """损坏或篡改的存档补丁多出的路径仍被范围门禁拒绝。"""
+        def forward(repo):
+            git(repo, "mv", "pkg/legacy.py", "pkg/moved.py")
+            with (repo / "pkg/moved.py").open("a") as stream:
+                stream.write("EXTRA = 1\n")
+
+        def tamper(patch):
+            # git() 去掉了补丁末尾换行，拼接前补回，模拟被追加了一段额外 hunk。
+            return patch + "\ndiff --git a/pkg/keep.py b/pkg/keep.py\n--- a/pkg/keep.py\n+++ b/pkg/keep.py\n" \
+                           "@@ -1 +1 @@\n-KEEP = 0\n+KEEP = 1\n"
+        run = self.rollback_fixture(forward, ["pkg/moved.py"], patch_edit=tamper)
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate") as evaluate:
+            self.runtime.process(run)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "blocked", row["result"])
+        self.assertIn("Change escaped planned scope: pkg/keep.py", json.loads(row["result"])["reason"])
+        self.assertFalse(evaluate.called)
+
     @staticmethod
     def staged_diff_failure(real):
         """只让读取暂存路径列表的 git 调用失败，其余 git 命令照常执行。"""
@@ -1248,6 +1502,8 @@ class ReliabilityTest(unittest.TestCase):
             self.assertIn("findings", review)
         # 脏记录被作废后重新评审；取消候选后重试，修正后的记录照常复用，不再重跑评审角色。
         self.assertEqual([r[0] for r in self.runtime.agent.roles].count("review"), 2)
+        # 评审否决的是这个补丁本身，重试必须重新实现而不是重放被否决的补丁。
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 2)
         self.runtime.cancel_task(task)
         self.runtime.retry(task)
         third = self.store.claim(self.project, self.runtime.config(self.project))
