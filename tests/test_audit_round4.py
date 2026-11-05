@@ -220,7 +220,8 @@ class AuditRound4Test(unittest.TestCase):
         self.assertIsNotNone(passed_first)
         for key in ("executed", "passed", "failed", "skipped"):
             self.assertEqual(failure_first[key], passed_first[key])
-        self.assertEqual(failure_first["executed"], 6)
+        # Skipped tests never ran their body, so they do not inflate executed.
+        self.assertEqual(failure_first["executed"], 5)
         self.assertEqual(failure_first["failed"], 2)
         self.assertEqual(failure_first["skipped"], 1)
 
@@ -269,8 +270,33 @@ class AuditRound4Test(unittest.TestCase):
     def test_clarity_test_summary_counts_skipped_only_run(self):
         summary = clarity_test_summary("===== 2 skipped in 0.05s =====")
         self.assertIsNotNone(summary)
-        self.assertEqual(summary["executed"], 2)
+        # Skipped tests are collected but never executed.
+        self.assertEqual(summary["executed"], 0)
         self.assertEqual(summary["skipped"], 2)
+
+    def test_evaluator_empty_test_run_all_skipped(self):
+        # unittest: two collected tests, both skipped, exit code still 0.
+        self.assertTrue(empty_test_run("Ran 2 tests in 0.001s\n\nOK (skipped=2)\n"))
+        # node --test TAP and spec reporter summaries; zero pass/fail.
+        self.assertTrue(empty_test_run(
+            "# tests 2\n# suites 0\n# pass 0\n# fail 0\n# cancelled 0\n# skipped 2\n# todo 0\n"))
+        self.assertTrue(empty_test_run(
+            "\u2139 tests 2\n\u2139 suites 0\n\u2139 pass 0\n\u2139 fail 0\n\u2139 skipped 2\n"))
+        # pytest CLI summary for a run where every test was skipped.
+        self.assertTrue(empty_test_run("===== 2 skipped in 0.01s ====="))
+        # JUnit XML reporting only skipped cases.
+        self.assertTrue(empty_test_run('<testsuite tests="2" failures="0" errors="0" skipped="2"/>'))
+        # Verbose skip identities without a surviving summary line.
+        self.assertTrue(empty_test_run("test_a (m.T) ... skipped 'platform'\n"
+                                       "test_b (m.T) ... skipped 'platform'\n"))
+        # One executed test keeps the run non-empty even when others skip.
+        self.assertFalse(empty_test_run("Ran 3 tests in 0.002s\n\nOK (skipped=2)\n"))
+        self.assertFalse(empty_test_run("# tests 3\n# pass 1\n# fail 0\n# skipped 2\n"))
+        self.assertFalse(empty_test_run("===== 1 passed, 2 skipped in 0.02s ====="))
+        self.assertFalse(empty_test_run("test_a (m.T) ... ok\n"
+                                        "test_b (m.T) ... skipped 'platform'\n"))
+        # TAP skipped points still count as executed evidence for this gate.
+        self.assertFalse(empty_test_run("TAP version 13\nok 1 - x # SKIP\n1..1\n"))
 
     def test_review_enforce_finding_line_and_rank_defensive(self):
         valid_review = {
