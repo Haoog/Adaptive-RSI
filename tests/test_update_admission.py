@@ -65,6 +65,24 @@ class UpdateAdmissionTest(unittest.TestCase):
             with self.subTest(error=error), patch('adaptive_rsi.lifecycle.os.kill', side_effect=error):
                 self.assertIsNotNone(barrier(self.runtime))
 
+    def test_out_of_range_owner_pid_is_recovered(self):
+        # os.kill 对超出 C int 的 pid 抛 OverflowError（不是 OSError）；修复前异常穿出
+        # barrier()，桌面进程在 start 前退出，调度 tick 全部被跳过。已写入但不可用的
+        # 属主值必须按 invalid_record 恢复；合法存活属主仍保持屏障。
+        for owner in (10 ** 30, 2 ** 31, -1, True, 2.5, '123'):
+            with self.subTest(owner=owner):
+                self.store.put_setting(KEY, {'version': '9.0.0', 'lease': 'a' * 48,
+                                             'phase': 'installing', 'owner_pid': owner,
+                                             'expires': time.time() + 3600})
+                self.assertIsNone(barrier(self.runtime))
+                self.assertIsNone(self.store.setting(KEY))
+                self.assertEqual(self.recovered_events()[-1]['reason'], 'invalid_record')
+        state = self.commit(os.getpid())
+        self.assertEqual((state['phase'], state['owner_pid']), ('installing', os.getpid()))
+        self.assertEqual(barrier(self.runtime)['lease'], state['lease'])
+        readiness(self.runtime, 'cancel', lease=state['lease'])
+        self.assertIsNone(barrier(self.runtime))
+
     def test_recovery_audit_failure_keeps_barrier_and_tasks(self):
         self.commit(os.getpid())
         self.store.execute("CREATE TRIGGER fail_recovery BEFORE INSERT ON events WHEN NEW.kind='desktop_update_recovered' "

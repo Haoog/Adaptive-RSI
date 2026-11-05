@@ -80,19 +80,30 @@ def barrier(runtime):
                 committed = state.get("committed")
                 if type(committed) in (int, float):
                     install_expired = committed + INSTALL_WINDOW <= time.time()
-                if type(owner) is int and owner > 1:
-                    try:
-                        os.kill(owner, 0)
-                    except OSError as exc:
-                        # Permission errors and unknown process state must keep admission closed.
-                        owner_exited = exc.errno == errno.ESRCH
+                if "owner_pid" in state:
+                    # os.kill 对超出 C int 的 pid 抛 OverflowError（不是 OSError），一旦
+                    # 穿出本函数，桌面进程会在 start 前退出，调度 tick 也会被整体跳过。
+                    # 已写入但不可用的属主值与其它损坏记录同属 invalid_record，走统一恢
+                    # 复路径；缺字段的旧记录仍保留屏障，等待带租约的 cancel/complete 清
+                    # 理，不擅自释放可替换窗口。
+                    if type(owner) is not int or not 1 < owner < 2 ** 31:
+                        reason = "invalid_record"
                     else:
-                        # 存活但启动标识不同 = PID 已被无关进程复用；无法核验
-                        # 身份（非 procfs 平台或旧记录）时不提前清理。
-                        recorded, current = state.get("owner_start"), _process_start(owner)
-                        if isinstance(recorded, str) and isinstance(current, str) and recorded != current:
-                            owner_exited = True
-            if expired or owner_exited or install_expired:
+                        try:
+                            os.kill(owner, 0)
+                        except OSError as exc:
+                            # Permission errors and unknown process state must keep admission closed.
+                            owner_exited = exc.errno == errno.ESRCH
+                        except (OverflowError, ValueError):
+                            # 防御平台差异：无法交给 os.kill 的值同样按不可用记录恢复。
+                            reason = "invalid_record"
+                        else:
+                            # 存活但启动标识不同 = PID 已被无关进程复用；无法核验
+                            # 身份（非 procfs 平台或旧记录）时不提前清理。
+                            recorded, current = state.get("owner_start"), _process_start(owner)
+                            if isinstance(recorded, str) and isinstance(current, str) and recorded != current:
+                                owner_exited = True
+            if reason is None and (expired or owner_exited or install_expired):
                 reason = "owner_exited" if owner_exited else ("install_expired" if install_expired else "drain_expired")
         if reason:
             with runtime.store.connect() as db:
