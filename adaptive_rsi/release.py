@@ -18,12 +18,83 @@ from .store import encode
 
 
 KINDS = ("release", "deploy")
-TERMINAL = {"workflow_succeeded", "failed", "dispatch_unknown", "blocked", "rerun_unknown"}
+
+
+def _deploy_health_finished(data, policy):
+    """A deployment is finished once no health endpoint must be observed."""
+
+    return not (policy or {}).get("health_url")
+
+
+def _deploy_rollback_finished(data, policy):
+    """A failed deployment is finished once no automatic rollback can run."""
+
+    return not (policy or {}).get("automatic_rollback") or bool((data or {}).get("rollback_unavailable"))
+
+
+# 同一份回执的终态语义只在这里定义：pending()、deployment_terminal()、
+# advance() 与 retry() 全部从这里派生，禁止再各自维护状态集合。
+# terminal: pending() 不再跟踪，自动处理已经结束。
+# active: 仍有 GitHub 操作需要 reconcile 确认。
+# retryable: retry() 接受的人工重试状态。
+# ownership_terminal: 不再占用部署目标，较新的部署可用 compare 证明 ahead 后接管。
+# waiting: advance() 仍需继续派发或等待条件变化。
+AUTOMATION_STATES = {
+    "pending": {"terminal": False, "active": False, "retryable": False, "ownership_terminal": False, "waiting": True},
+    "blocked": {"terminal": False, "active": False, "retryable": False, "ownership_terminal": False, "waiting": True},
+    "waiting_verification": {"terminal": False, "active": False, "retryable": False, "ownership_terminal": False, "waiting": True},
+    "blocked_verification": {"terminal": False, "active": False, "retryable": False, "ownership_terminal": False, "waiting": True},
+    "waiting_target": {"terminal": False, "active": False, "retryable": False, "ownership_terminal": False, "waiting": True},
+    "waiting_release": {"terminal": False, "active": False, "retryable": False, "ownership_terminal": False, "waiting": True},
+    "dispatching": {"terminal": False, "active": True, "retryable": True, "ownership_terminal": False},
+    "submitted": {"terminal": False, "active": True, "retryable": True, "ownership_terminal": False},
+    "dispatch_unknown": {"terminal": False, "active": True, "retryable": True, "ownership_terminal": False},
+    "queued": {"terminal": False, "active": True, "retryable": True, "ownership_terminal": False},
+    "running": {"terminal": False, "active": True, "retryable": True, "ownership_terminal": False},
+    "rerunning": {"terminal": False, "active": True, "retryable": True, "ownership_terminal": False},
+    "rerun_unknown": {"terminal": True, "active": True, "retryable": True, "ownership_terminal": False},
+    "workflow_succeeded": {"terminal": _deploy_health_finished, "active": False, "retryable": False,
+                           "ownership_terminal": _deploy_health_finished},
+    "health_failed": {"terminal": _deploy_rollback_finished, "active": False, "retryable": True,
+                      "ownership_terminal": _deploy_rollback_finished},
+    # 健康端点无法确认（传输失败/超时）不是部署失败：回执不再自动跟踪，
+    # 但目标所有权按终态释放，新部署先 compare 证明 ahead 后接管，人工 retry 仍可用。
+    "health_unconfirmed": {"terminal": True, "active": False, "retryable": True, "ownership_terminal": True},
+    "rolling_back": {"terminal": False, "active": False, "retryable": True, "ownership_terminal": False},
+    # 回滚健康未确认仍占用目标（无法证明目标处于可知状态），但超过
+    # TARGET_WAIT_SECONDS 后等待中的新部署会明确失败，而不是永久占位。
+    "rollback_health_unconfirmed": {"terminal": True, "active": False, "retryable": True, "ownership_terminal": False},
+    "healthy": {"terminal": True, "active": False, "retryable": False, "ownership_terminal": True},
+    "failed": {"terminal": True, "active": False, "retryable": True, "ownership_terminal": True},
+    "rolled_back": {"terminal": True, "active": False, "retryable": False, "ownership_terminal": True},
+    "rollback_failed": {"terminal": True, "active": False, "retryable": True, "ownership_terminal": True},
+    "superseded": {"terminal": True, "active": False, "retryable": False, "ownership_terminal": True},
+    "reconciliation_blocked": {"terminal": True, "active": False, "retryable": False, "ownership_terminal": True},
+}
+
+ACTIVE_STATES = frozenset(name for name, rules in AUTOMATION_STATES.items() if rules.get("active"))
+WAITING_STATES = frozenset(name for name, rules in AUTOMATION_STATES.items() if rules.get("waiting"))
+
+
+def automation_state_flag(data, name, policy=None):
+    """Resolve one declared state property, including policy-dependent rules."""
+
+    state = data.get("state") if isinstance(data, dict) else None
+    entry = AUTOMATION_STATES.get(state)
+    if not entry:
+        return False
+    value = entry.get(name, False)
+    return bool(value(data or {}, policy or {})) if callable(value) else bool(value)
+
+
 RERUN_CONFIRM_SECONDS = 300
 RECONCILIATION_UNKNOWN = {"dispatch_unknown", "rerun_unknown", "reconciliation_blocked"}
 # 活动回执连续对账失败的上限。达到后转入 reconciliation_blocked：停止自动轮询、
 # 只保留一条错误事件，但仍允许只读的人工对账与关闭入口。
 ADVANCE_FAILURE_LIMIT = 3
+# 目标被非终态回执占用超过该时限后，等待中的新部署转 blocked 并指出阻塞它的
+# run；只释放等待者的队列位置，不会自动接管仍活跃的部署。
+TARGET_WAIT_SECONDS = 30 * 60
 RECONCILIATION_AUDIT_LIMIT = 10
 # A read-only query may read ten 100-run pages. Persist only the bounded
 # evidence reconciliation reads (identity, status, timestamps) and cap the
@@ -61,12 +132,16 @@ class ReconciliationRejected(ValueError):
 class ApiRejected(RuntimeError):
     """GitHub explicitly rejected a request before accepting its side effect."""
 
-    def __init__(self, message, status):
+    def __init__(self, message, status, local=False):
         super().__init__(message)
         self.status = status
+        # True 表示本机限流冷却在 `gh` 发出请求之前就拦下了它：GitHub 没有看到
+        # 这次调用，也就谈不上拒绝，调用方应把它当成可自动重试的本地等待。
+        self.local = local
 
 
 _API_BACKOFF = {}
+API_COOLDOWN_SECONDS = 60
 
 
 def api(repo, endpoint, method="GET", fields=None):
@@ -74,7 +149,7 @@ def api(repo, endpoint, method="GET", fields=None):
     # of this transport share the primary/secondary limit cooldown.
     retry_at = _API_BACKOFF.get("github.com", 0)
     if time.monotonic() < retry_at:
-        raise ApiRejected("GitHub rate limit cooldown active; request was not sent", 429)
+        raise ApiRejected("GitHub rate limit cooldown active; request was not sent", 429, local=True)
     path = "repos/" + repo + ("/" + endpoint if endpoint else "")
     argv = ["gh", "api", path, "--method", method]
     for key, value in (fields or {}).items():
@@ -85,7 +160,7 @@ def api(repo, endpoint, method="GET", fields=None):
         status = re.search(r"\(HTTP (\d{3})\)", str(exc))
         if status and (int(status[1]) == 429 or int(status[1]) == 403 and
                        any(term in str(exc).lower() for term in ("rate limit", "abuse detection"))):
-            _API_BACKOFF["github.com"] = time.monotonic() + 60
+            _API_BACKOFF["github.com"] = time.monotonic() + API_COOLDOWN_SECONDS
         if status and 400 <= int(status[1]) < 500 and int(status[1]) != 408:
             raise ApiRejected(str(exc), int(status[1])) from exc
         raise
@@ -247,7 +322,7 @@ def _read_automation(runtime, run_id, kind):
             raise ValueError("Invalid automation state")
         if any(field in data and not isinstance(data[field], dict) for field in ("rollback", "reconciliation")):
             raise ValueError("Invalid automation details")
-        active = {"dispatching", "submitted", "dispatch_unknown", "queued", "running", "rerunning", "rerun_unknown"}
+        active = ACTIVE_STATES
         targets = [data] + ([data["rollback"]] if data.get("state") == "rolling_back" and "rollback" in data else [])
         if data.get("state") == "rolling_back" and "rollback" not in data:
             raise ValueError("Missing rollback details")
@@ -292,7 +367,8 @@ def pending(runtime, run):
         saved = {}
     delivery = saved.get("delivery") or {}
     live = runtime.config(run["project"])
-    active = {"dispatching", "submitted", "dispatch_unknown", "queued", "running", "rerunning"}
+    # 策略变更后只需确认仍在途的操作；rerun_unknown 已停止自动跟踪，保持旧语义。
+    active = {name for name in ACTIVE_STATES if not AUTOMATION_STATES[name].get("terminal")}
     for kind in KINDS:
         if not delivery.get(kind, {}).get("enabled"):
             continue
@@ -305,17 +381,12 @@ def pending(runtime, run):
             if data.get("state") in active or data.get("state") == "rolling_back" and data.get("rollback", {}).get("state") in active:
                 return True
             continue
-        if kind == "deploy" and data.get("state") == "workflow_succeeded" and delivery[kind].get("health_url"):
-            return True
-        if data.get("state") == "health_failed":
-            if data.get("rollback_unavailable") or not delivery[kind].get("automatic_rollback"):
-                continue
         if kind == "deploy" and data.get("state") == "blocked" and data.get("blocked_by_release"):
             release, _ = _read_automation(runtime, run["id"], "release")
             release = release or {}
             if release.get("state") in {"failed", "rerun_unknown", "blocked", "reconciliation_blocked"}:
                 continue
-        if data.get("state") not in {"workflow_succeeded", "failed", "healthy", "health_unconfirmed", "rollback_health_unconfirmed", "rolled_back", "rollback_failed", "superseded", "rerun_unknown", "reconciliation_blocked"}:
+        if not automation_state_flag(data, "terminal", delivery[kind]):
             return True
     return False
 
@@ -1100,14 +1171,37 @@ def deployment_owner(runtime, project, repo, policy):
 
 
 def deployment_terminal(data, policy):
-    if data.get("state") == "workflow_succeeded":
-        return not policy.get("health_url")
-    if data.get("state") == "health_failed":
-        return not policy.get("automatic_rollback") or data.get("rollback_unavailable", False)
-    if data.get("state") == "health_unconfirmed":
-        return False
-    return data.get("state") in {"healthy", "failed", "rolled_back", "rollback_failed", "superseded",
-                                 "reconciliation_blocked"}
+    """Whether this receipt no longer owns the deployment target."""
+    return automation_state_flag(data, "ownership_terminal", policy)
+
+
+def _receipt_hold_since(data):
+    """Earliest reliable timestamp showing how long this receipt has held a target."""
+    rollback = data.get("rollback") if isinstance(data.get("rollback"), dict) else {}
+    for source in (rollback, data):
+        for field in ("health_observation_started_at", "health_started_at", "rerun_requested_at", "created_at"):
+            value = source.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                return float(value)
+    return None
+
+
+def target_wait_error(previous, owner_run, policy, waiting_since=None, now=None):
+    """Explain a target that has been held too long, or None while waiting is still useful."""
+    if deployment_terminal(previous, policy):
+        return None
+    now = time.time() if now is None else now
+    stamps = [value for value in (_receipt_hold_since(previous), waiting_since) if value is not None]
+    if not stamps or now - min(stamps) < TARGET_WAIT_SECONDS:
+        return None
+    state = previous.get("state", "unknown")
+    tracking = ("automatic tracking is still running" if not automation_state_flag(previous, "terminal", policy) else
+                "automatic tracking of that receipt has stopped")
+    return ("Deployment target is held by run %s (%s); %s and it has not released the target after %d minutes. "
+            "Retry that run or reconcile its delivery before deploying this one."
+            % (owner_run, state, tracking, TARGET_WAIT_SECONDS // 60))
+
+
 
 
 def health_sample(policy, sha):
@@ -1488,8 +1582,7 @@ def advance(runtime, project, run, outcome, cancel=None):
             if not isinstance(feedback, dict):
                 # A malformed historical receipt cannot prove verification.
                 feedback = {}
-            waiting = (not data or data.get("state") in {"pending", "blocked", "waiting_verification",
-                                                         "blocked_verification", "waiting_target", "waiting_release"})
+            waiting = (not data or data.get("state") in WAITING_STATES)
             # Qualification is bound to the exact commit that will be dispatched.
             # A later mainline pass cannot authorize this merge, and a legacy
             # verified receipt without a head is pinned locally only here, right
@@ -1506,7 +1599,7 @@ def advance(runtime, project, run, outcome, cancel=None):
                 data = {"state": state, "error": error}
                 result[kind] = persist(runtime, run, kind, data)
                 continue
-            if data and data.get("state") in {"dispatching", "submitted", "dispatch_unknown", "queued", "running", "rerunning", "rerun_unknown"}:
+            if data and data.get("state") in ACTIVE_STATES:
                 try:
                     data = reconcile(runtime, run, kind, data, persist=False)
                 except Cancelled:
@@ -1545,7 +1638,7 @@ def advance(runtime, project, run, outcome, cancel=None):
                     result[kind] = persist(runtime, run, kind, data)
                     continue
                 persist(runtime, run, kind, data)
-            if data and data["state"] not in {"pending", "blocked", "waiting_verification", "blocked_verification", "waiting_target", "waiting_release"}:
+            if data and data["state"] not in WAITING_STATES:
                 result[kind] = data
                 continue
             if kind == "deploy" and saved["delivery"].get("release", {}).get("enabled"):
@@ -1576,7 +1669,20 @@ def advance(runtime, project, run, outcome, cancel=None):
                 if owner and owner["run"] != run["id"]:
                     previous = _require_automation(runtime, owner["run"], "deploy")
                     if not deployment_terminal(previous, policy):
-                        result[kind] = persist(runtime, run, kind, {"state": "waiting_target", "error": "Another deployment is still active on this target"})
+                        since = data.get("waiting_target_since") if isinstance(data, dict) else None
+                        if isinstance(since, bool) or not isinstance(since, (int, float)) or since <= 0:
+                            since = time.time()
+                        blocked = target_wait_error(previous, owner["run"], policy, waiting_since=since)
+                        if blocked:
+                            result[kind] = persist(runtime, run, kind, {
+                                "state": "blocked", "error": blocked,
+                                "waiting_target_since": since,
+                                "blocked_by_target": {"run": owner["run"], "state": previous.get("state")}})
+                            continue
+                        result[kind] = persist(runtime, run, kind, {
+                            "state": "waiting_target", "error": "Another deployment is still active on this target",
+                            "waiting_target_since": since,
+                            "blocked_by_target": {"run": owner["run"], "state": previous.get("state")}})
                         continue
                     comparison = api(repo, "compare/" + owner["sha"] + "..." + outcome["merged_sha"])
                     if comparison.get("status") != "ahead":
@@ -1585,18 +1691,28 @@ def advance(runtime, project, run, outcome, cancel=None):
             try:
                 validate_pin(repo, policy)
             except ApiRejected as exc:
-                # Dispatch 前的只读校验被 GitHub 明确拒绝：显式落到失败态并留下
-                # 人工介入入口（retry 通道按被拒回执重新派发），不能留在 waiting_*
-                # 状态被轮询无限重试。
                 identity = {"repository": repo, "workflow": policy["workflow"], "ref": policy["ref"],
                             "workflow_sha": policy["sha"], "sha": outcome["merged_sha"], "kind": kind}
                 if not data:
-                    data = {"state": "failed", **identity}
+                    data = {"state": "pending", **identity}
                 for field, value in identity.items():
                     data.setdefault(field, value)
                 data.setdefault("operation_id", "rsi-" + fingerprint(
                     {"project": project["id"], "run": run["id"], "kind": kind,
                      "repository": repo, "sha": outcome["merged_sha"]})[:32])
+                if exc.local:
+                    # 冷却在请求发出前拦下：GitHub 从未看到这次校验，也没有产生
+                    # 任何远端副作用。保持待发并让下一个调度轮询自动重试，不能
+                    # 记成「GitHub 拒绝」的终态失败。
+                    data.update(state="pending", error=str(exc)[:500],
+                                retry_at=time.time() + API_COOLDOWN_SECONDS)
+                    data.pop("dispatch_receipt", None)
+                    data.pop("dispatch_http_status", None)
+                    result[kind] = persist(runtime, run, kind, data)
+                    continue
+                # Dispatch 前的只读校验被 GitHub 明确拒绝：显式落到失败态并留下
+                # 人工介入入口（retry 通道按被拒回执重新派发），不能留在 waiting_*
+                # 状态被轮询无限重试。
                 data.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
                             dispatch_http_status=exc.status)
                 raise
@@ -1626,6 +1742,15 @@ def advance(runtime, project, run, outcome, cancel=None):
                 api(repo, "actions/workflows/" + quote(policy["workflow"].split("/")[-1], safe="") + "/dispatches", "POST",
                     {"ref": policy["ref"], "inputs[rsi_operation_id]": data["operation_id"], "inputs[rsi_sha]": data["sha"]})
             except ApiRejected as exc:
+                if exc.local:
+                    # POST 同样没有发出：把已持久化的 dispatching 退回 pending，
+                    # 保留派发意图等待冷却结束后自动重发，而不是记为未知或失败。
+                    data.update(state="pending", error=str(exc)[:500],
+                                retry_at=time.time() + API_COOLDOWN_SECONDS)
+                    data.pop("dispatch_receipt", None)
+                    data.pop("dispatch_http_status", None)
+                    result[kind] = persist(runtime, run, kind, data)
+                    continue
                 data.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
                             dispatch_http_status=exc.status)
                 raise
@@ -1694,6 +1819,8 @@ def retry(runtime, project_id, run_id, kind):
             raise ValueError("Reconciliation is blocked; restore GitHub access and reconcile this operation instead of retrying")
         if not data.get("operation_id"):
             raise ValueError("This operation has no failed GitHub workflow to retry")
+        if not automation_state_flag(data, "retryable", policy):
+            raise ValueError("Only a confirmed failed workflow run can be retried; uncertain dispatches require reconciliation")
         is_preflight_rejected = (
             kind == "deploy" and
             data.get("state") == "failed" and
