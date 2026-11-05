@@ -213,6 +213,27 @@ def sealed_tree(root):
         raise ValueError("Reproduction bundle cannot contain git metadata")
 
 
+def sealed_evidence(evidence):
+    """就地删掉导出证据里的宿主绝对路径（试验的评估报告路径）。
+
+    ``run_configuration`` 把 ``<state>/experiments/<case>-<rep>/<variant>/evaluation/
+    report.json`` 的绝对路径记进每个试验，导出时会带上用户名与状态目录布局；报告
+    本身不随包导出，也没有读取方，因此导出副本直接删除该字段，而不是写一个包里
+    并不存在的相对路径。只裁剪传入的副本，数据库里的原始证据保持不变。
+    """
+    if isinstance(evidence, dict):
+        for key in list(evidence):
+            item = evidence[key]
+            if key == "report" and isinstance(item, str) and Path(item).is_absolute():
+                del evidence[key]
+            else:
+                sealed_evidence(item)
+    elif isinstance(evidence, list):
+        for item in evidence:
+            sealed_evidence(item)
+    return evidence
+
+
 def case_stratum(case):
     spec = case_spec(case) or {}
     # 历史数据或绕过 import_case 写入的 spec 可能把 task 存成非字符串；
@@ -717,6 +738,9 @@ class Evolution:
             evidence = {}
         if not isinstance(evidence, dict):
             evidence = {}
+        # 试验记录带有宿主状态目录下的 report 绝对路径；封存包用于跨机器分享，
+        # 只保留判定字段，路径不进包（本地候选证据仍保留完整路径）。
+        evidence = sealed_evidence(evidence)
         try:
             # 非机密 provider 需求随包导出：只记录 provider id 与所需环境变量名，不含密钥值。
             # 证据中已登记的列表逐项裁剪为 {id, env_key}，任何多余字段（可能夹带密钥值）
