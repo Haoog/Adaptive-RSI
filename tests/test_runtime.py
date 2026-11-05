@@ -479,6 +479,76 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (deferred["id"],))["state"], "queued")
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (rejected["id"],))["state"], "rejected")
 
+    def test_deferred_reassessment_diffs_each_baseline_once(self):
+        config = self.runtime.config(self.project)
+        first = git(self.repo, "rev-parse", "HEAD").strip()
+
+        def commit(message, path, text):
+            (self.repo / path).write_text(text)
+            git(self.repo, "add", path)
+            git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+                "commit", "--quiet", "-m", message)
+            return git(self.repo, "rev-parse", "HEAD").strip()
+
+        second = commit("Second baseline", "notes.txt", "baseline two\n")
+        third = commit("Third baseline", "tests/test_calculator.py",
+                       (self.repo / "tests/test_calculator.py").read_text() + "\n# baseline three\n")
+
+        def defer(key, base, paths):
+            task = self.store.add_task(self.project, "inspection", key, key)
+            row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
+            self.store.defer(task, {"base": base, "related_paths": paths, "dependency_scope_complete": True,
+                                    "triage_input": fingerprint({"body": row["body"], "evidence": row["evidence"],
+                                                                 "policy": config["triage"]["policy"]}),
+                                    "reason": "Dependency pending"})
+            return task
+
+        # 60 条共享同一 base 的暂缓任务应该共用一次变更集，而不是各起一次 git diff。
+        untouched = [defer("calculator " + str(index), first, ["calculator.py"]) for index in range(60)]
+        touched = defer("notes", first, ["notes.txt"])
+        directory = defer("tests directory", first, ["tests/"])
+        later = [defer("later " + str(index), second, ["calculator.py"]) for index in range(3)]
+        invalid = defer("invalid path", first, ["../outside.py"])
+        missing = defer("missing base", "0" * 40, ["calculator.py"])
+
+        calls = []
+
+        def counting(root, *arguments, **keywords):
+            if arguments and arguments[0] == "diff":
+                calls.append(arguments)
+            return git(root, *arguments, **keywords)
+
+        with patch("adaptive_rsi.runtime.git", side_effect=counting):
+            self.runtime.reassess_deferred(self.project, config, third)
+
+        # 每个不同 base 恰好一次全量 diff，且没有逐任务附加 pathspec 的查询。
+        self.assertEqual(len(calls), 3)
+        self.assertEqual({call[4] for call in calls}, {first, second, "0" * 40})
+        self.assertFalse(any("--" in call for call in calls))
+        states = {row["id"]: row["state"]
+                  for row in self.store.query("SELECT id,state FROM tasks WHERE project=?", (self.project,))}
+        self.assertTrue(all(states[task] == "deferred" for task in untouched))
+        self.assertTrue(all(states[task] == "deferred" for task in later))
+        for task in [touched, directory, invalid, missing]:
+            self.assertEqual(states[task], "queued")
+        # 未命中的任务把基线推进到新 head，避免下一次候选运行再重复判定同一区间。
+        decision = json.loads(self.store.one("SELECT data FROM task_decisions WHERE task=?", (untouched[0],))["data"])
+        self.assertEqual(decision["base"], third)
+        self.assertEqual(json.loads(self.store.one("SELECT data FROM task_decisions WHERE task=?",
+                                                   (touched,))["data"])["base"], first)
+        # 重命名必须仍命中旧路径：批量 diff 漏掉旧名会把任务静默留在暂缓。
+        git(self.repo, "mv", "calculator.py", "calc.py")
+        git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+            "commit", "--quiet", "-m", "Rename calculator")
+        fourth = git(self.repo, "rev-parse", "HEAD").strip()
+        with patch("adaptive_rsi.runtime.git", side_effect=counting):
+            self.runtime.reassess_deferred(self.project, config, fourth)
+        states = {row["id"]: row["state"]
+                  for row in self.store.query("SELECT id,state FROM tasks WHERE project=?", (self.project,))}
+        self.assertEqual(states[untouched[0]], "queued")
+        self.assertEqual(states[later[0]], "queued")
+        self.assertEqual(len(calls), 4)
+
     def test_corrupt_module_rotation_resets_to_zero_instead_of_failing_the_scan(self):
         with patch.object(self.runtime, "invoke", return_value={"findings": []}):
             for stored in ["bad", True, 1.7, -3, {"n": 2}, [1]]:
