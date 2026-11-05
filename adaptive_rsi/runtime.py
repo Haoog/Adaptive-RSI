@@ -35,6 +35,9 @@ The host runs acceptance checks independently. Missing evidence must be reported
 BUDGET_WAIT_SECONDS = 900
 BUDGET_WAIT_MAX_SECONDS = 3600
 BUDGET_WAIT_RETRIES = 3
+# 线程池准入失败的退避：claim 之后提交被拒（线程/内存耗尽）不构成一次任务尝试，
+# 归还额度并把任务延后重排；否则每个调度节拍（~5s）都会新建一条 interrupted run。
+ADMISSION_BACKOFF_SECONDS = 30
 # 阶段预算跨尝试累计时，崩溃最多丢失一个检查点间隔的已耗时间。
 STAGE_BUDGET_CHECKPOINT_SECONDS = 15
 
@@ -58,6 +61,11 @@ MAINTENANCE_JOIN_TIMEOUT = 30
 # 排在维护线程之前，不设界会让 close 在到达维护的上界前就永久阻塞；超时记
 # scheduler_timed_out 后继续关闭（线程为 daemon）。
 SCHEDULER_JOIN_TIMEOUT = 30
+
+# close() 等待 worker 池排空的上限：stop 只对轮询 is_cancelled 的代码生效，worker
+# 卡在不轮询的阻塞调用（模型 HTTP 读、内核/NFS I/O、CLI 死锁）时 shutdown(wait=True)
+# 没有终点；超时记 workers_timed_out、写事件，未收尾的 run 由下次 store.recover() 恢复。
+WORKER_DRAIN_TIMEOUT = 30
 
 # 这些状态的任务仍代表一条「在办」的发现；巡检不会为同一问题重建任务。
 LIVE_FINDING_STATES = ("queued", "planning", "executing", "evaluating", "awaiting_approval",
@@ -125,7 +133,8 @@ class Runtime(Maintenance):
         self.agent = agent or CodexAgent(store)
         self.evaluator = Evaluator(store)
         self._shutdown = {"phase": "running", "started": None, "ended": None,
-                          "scheduler_timed_out": False, "maintenance_timed_out": False}
+                          "scheduler_timed_out": False, "maintenance_timed_out": False,
+                          "workers_timed_out": False}
         self._close_lock = threading.Lock()
         self._closed = False
         # 领取与关闭的共同边界：close 先关闭准入，再排空线程池；竞态下不会留下已领取
@@ -136,6 +145,7 @@ class Runtime(Maintenance):
         self.wake = threading.Event()
         self.thread = None
         self.lockfile = None
+        # worker 线程是非 daemon：close() 有界返回后，卡死的 worker 仍会拖住解释器退出。
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="rsi")
         self.futures = set()
         self._futures_lock = threading.Lock()
@@ -916,6 +926,7 @@ class Runtime(Maintenance):
     def shutdown_status(self):
         return {**self._shutdown, 'remaining_workers': sum(not f.done() for f in tuple(self.futures)),
                 'remaining_operations': len(self.operations.active),
+                'operations_timed_out': self.operations.timed_out,
                 'maintenance_running': bool(self.maintenance_thread and self.maintenance_thread.is_alive())}
 
     def close(self):
@@ -956,11 +967,9 @@ class Runtime(Maintenance):
                     SCHEDULER_JOIN_TIMEOUT)
                 self._shutdown['scheduler_timed_out'] = True
         self._shutdown['phase'] = 'workers'
+        self._shutdown['workers_timed_out'] = False
         try:
-            try:
-                self.pool.shutdown(wait=True, cancel_futures=True)
-            except TypeError:
-                self.pool.shutdown(wait=True)
+            self._shutdown_workers()
         finally:
             # 即使线程池排空自身报错，也必须为已取消、从未启动的领取留下终态。
             self._reconcile_unstarted_workers()
@@ -980,6 +989,49 @@ class Runtime(Maintenance):
         self.store.close()
         if self.lockfile:
             self.lockfile.close()
+
+    def _shutdown_workers(self):
+        """Drain workers within WORKER_DRAIN_TIMEOUT, then record still-running runs.
+
+        Queued work is cancelled for ``_reconcile_unstarted_workers``; the rest
+        gets a bounded wait. A run stuck in a blocking call that never polls
+        ``stop`` would otherwise pin ``close`` in the workers phase; its open
+        row is recovered by ``store.recover()`` on the next start.
+        """
+        with self._futures_lock:
+            unfinished_runs = {future: run for future, run in self._future_runs.items()
+                               if not future.done()}
+            futures = set(self.futures) | set(self._future_runs)
+        try:
+            self.pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            # cancel_futures 在 3.9 之前不存在：显式取消排队中的领取以保持同样语义。
+            for future in futures:
+                future.cancel()
+            self.pool.shutdown(wait=False)
+        # 已取消的 future 不会再通知 waiter（cancel 早于 waiter 安装时状态停在
+        # CANCELLED），必须先滤掉已完成项，否则 wait() 会白等到 timeout。
+        running = {future for future in futures if not future.done()}
+        deadline = time.monotonic() + WORKER_DRAIN_TIMEOUT
+        while running:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            concurrent.futures.wait(running, timeout=remaining)
+            running = {future for future in running if not future.done()}
+        if not running:
+            return
+        self._shutdown['workers_timed_out'] = True
+        runs = sorted(unfinished_runs[future] for future in running if future in unfinished_runs)
+        logging.getLogger(__name__).warning(
+            "Worker threads did not stop within %ss; proceeding with shutdown (runs: %s)",
+            WORKER_DRAIN_TIMEOUT, ", ".join(runs) or "-")
+        try:
+            self.store.event('shutdown_workers_timed_out',
+                             'Shutdown proceeded while worker threads were still running',
+                             data={'runs': runs, 'timeout_seconds': WORKER_DRAIN_TIMEOUT})
+        except Exception:
+            logging.getLogger(__name__).exception('Failed to record worker shutdown timeout')
 
     def _reconcile_unstarted_workers(self):
         """Persist an interrupted run for each claimed worker cancelled before it started.
@@ -1361,8 +1413,22 @@ class Runtime(Maintenance):
                     try:
                         future = self.pool.submit(self.process, run)
                     except Exception:
-                        self.store.transition(run["id"], "interrupted", {"reason": "Worker admission failed"}, True,
-                                              task_fields={"state": "queued"})
+                        # 准入失败不是任务尝试：claim 已经自增 attempts，这里必须归还，
+                        # 否则一次线程/内存耗尽就会吃掉任务仅有的自动重试额度（与
+                        # provider 故障路径的归还约定一致）。同时写入退避时间，避免
+                        # 故障持续时每个调度节拍都新建一条 interrupted run。
+                        backoff = time.time() + ADMISSION_BACKOFF_SECONDS
+                        self.store.execute("UPDATE tasks SET attempts=max(0,attempts-1) WHERE id=?",
+                                           (run["task"],))
+                        transitioned = self.store.transition(
+                            run["id"], "interrupted", {"reason": "Worker admission failed"}, True,
+                            task_fields={"state": "queued", "available": backoff})
+                        if transitioned and self.store.one(
+                                "SELECT state FROM tasks WHERE id=?", (run["task"],))["state"] == "queued":
+                            self.store.event("infrastructure_retry",
+                                             "Worker pool rejected submission; retry scheduled",
+                                             run["project"], run["id"],
+                                             {"code": "admission", "retry_at": backoff})
                         raise
                     with self._futures_lock:
                         self.futures.add(future)
