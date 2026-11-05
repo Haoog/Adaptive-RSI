@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.parse
 from unittest.mock import patch
 
 from adaptive_rsi.config import DEFAULTS, validate
@@ -44,6 +45,25 @@ jobs:
     steps:
       - run: echo configured-by-maintainer
 """
+
+
+class _ReleaseClock:
+    """Controllable stand-in for ``adaptive_rsi.release.time``."""
+
+    def __init__(self, now):
+        self.now = now
+
+    def time(self):
+        return self.now
+
+    def monotonic(self):
+        return time.monotonic()
+
+    def gmtime(self, stamp=None):
+        return time.gmtime(stamp)
+
+    def strftime(self, fmt, stamp):
+        return time.strftime(fmt, stamp)
 
 
 class ReleaseAutomationTest(unittest.TestCase):
@@ -112,6 +132,77 @@ class ReleaseAutomationTest(unittest.TestCase):
             result = self.tick()["release"]
             self.assertEqual(result["state"], "workflow_succeeded")
             self.assertNotIn("remote_visibility", result)
+
+    def test_clock_skew_beyond_the_created_margin_falls_back_to_an_unfiltered_page(self):
+        from adaptive_rsi.release import reconcile
+        github_now = time.time()
+        github_created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(github_now))
+        clock = _ReleaseClock(github_now + 600)
+        with patch("adaptive_rsi.release.time", clock), patch("adaptive_rsi.release.api", side_effect=self.api):
+            receipt = self.tick()["release"]
+        self.assertEqual(receipt["state"], "submitted")
+        self.assertGreater(receipt["created_at"] - github_now, 120)
+
+        listing = []
+
+        def github(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("actions/runs/"):
+                return self.remote
+            self.assertIn("/runs?", endpoint)
+            listing.append(endpoint)
+            runs = [self.remote] if self.remote else []
+            if "created=" in endpoint:
+                # GitHub applies ``created`` as a lower bound against its own
+                # clock; ISO-8601 UTC stamps compare lexicographically.
+                since = urllib.parse.unquote(endpoint.split("created=")[1].split("&")[0])[2:]
+                runs = [item for item in runs if item["created_at"] >= since]
+            return {"workflow_runs": runs}
+
+        self.remote = dict(self.remote_run(receipt), created_at=github_created)
+        with patch("adaptive_rsi.release.time", clock), patch("adaptive_rsi.release.api", side_effect=github):
+            data = reconcile(self.runtime, self.run, "release", receipt, persist=True)
+        self.assertEqual(data["state"], "workflow_succeeded")
+        self.assertEqual(data["reconciliation"]["state"], "matched")
+        self.assertIsNotNone(data["reconciliation"].get("created_window_missed_at"))
+        self.assertEqual(len(listing), 2, "a zero-row created window must be followed by one unfiltered page")
+        self.assertIn("created=", listing[0])
+        self.assertNotIn("created=", listing[1])
+
+    def test_unfiltered_fallback_is_throttled_and_skipped_when_the_window_matches(self):
+        from adaptive_rsi.release import RECONCILIATION_RECHECK_SECONDS, _remote_runs
+        clock = _ReleaseClock(time.time())
+        calls = []
+        found = []
+
+        def listing(repo, endpoint, method="GET", fields=None):
+            calls.append(endpoint)
+            return {"workflow_runs": found}
+
+        data = {"workflow": ".github/workflows/publish.yml", "operation_id": "rsi-operation",
+                "created_at": clock.now}
+        with patch("adaptive_rsi.release.time", clock), patch("adaptive_rsi.release.api", side_effect=listing):
+            self.assertEqual(_remote_runs("example/project", data), [])
+            self.assertEqual(len(calls), 2)
+            self.assertNotIn("created=", calls[1])
+            self.assertIn("page=1", calls[1])
+            self.assertEqual(data["unfiltered_fallback_at"], clock.now)
+            clock.now += RECONCILIATION_RECHECK_SECONDS - 1
+            self.assertEqual(_remote_runs("example/project", data), [])
+            self.assertEqual(len(calls), 3, "the unfiltered page is throttled to one per recheck window")
+            clock.now += 1
+            self.assertEqual(_remote_runs("example/project", data), [])
+            self.assertEqual(len(calls), 5)
+            self.assertEqual(_remote_runs("example/project", data, force=True), [])
+            self.assertEqual(len(calls), 7, "an operator query re-reads GitHub immediately")
+
+            # 时钟正常且 run 在 created 窗口内：只查一次带下界的列表，不发生兜底。
+            calls.clear()
+            found.append({"id": 17, "display_title": "rsi-operation"})
+            fresh = {"workflow": ".github/workflows/publish.yml", "operation_id": "rsi-operation",
+                     "created_at": clock.now - 60}
+            self.assertEqual(len(_remote_runs("example/project", fresh)), 1)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("created=", calls[0])
 
     def test_permanent_reconciliation_rejection_blocks_tracking_with_one_error_event(self):
         with patch("adaptive_rsi.release.api", side_effect=self.api):
