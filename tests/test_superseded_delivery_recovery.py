@@ -257,9 +257,34 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
         command.assert_not_called()
         result = json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])
         self.assertIn('journal', result['delivery_recovery_abandoned'])
-        events = self.store.query("SELECT kind FROM events WHERE kind='recovery_abandoned' AND run=?",
+        self.assertNotIn('delivery_recovery_attempts', result)
+        events = self.store.query("SELECT kind FROM events WHERE kind='recovery_blocked' AND run=?",
                                   (self.run['id'],))
         self.assertEqual(len(events), 1)
+
+    def test_missing_baseline_identity_blocks_before_counting_or_query(self):
+        self.prepare()
+        self.store.execute('DELETE FROM settings WHERE key=?', ('run-baseline:' + self.run['id'],))
+        with patch.object(delivery, 'checked') as command:
+            for step in range(3):
+                delivery.tick(self.runtime, now=10000000000 + step * 3600, project_id=self.project)
+        command.assert_not_called()
+        result = json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])
+        # 未发出任何查询：既不计次，也不能留下「查了 72 次都没找到」的假终态。
+        self.assertNotIn('delivery_recovery_attempts', result)
+        self.assertIn('baseline identity', result['delivery_recovery_abandoned'])
+        events = self.store.query("SELECT kind FROM events WHERE kind='recovery_blocked' AND run=?",
+                                  (self.run['id'],))
+        self.assertEqual(len(events), 1)
+
+    def test_query_attempt_is_counted_only_when_remote_is_read(self):
+        self.prepare()
+        with patch.object(delivery, 'checked', return_value='[]') as command:
+            delivery.tick(self.runtime, now=10000000000, project_id=self.project)
+        result = json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])
+        self.assertEqual(result['delivery_recovery_attempts'], 1)
+        self.assertNotIn('delivery_recovery_abandoned', result)
+        self.assertEqual(command.call_count, 1)
 
     def test_untrusted_intent_never_queries_remote(self):
         self.prepare()
