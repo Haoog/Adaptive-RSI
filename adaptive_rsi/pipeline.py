@@ -340,11 +340,19 @@ def _approved_review(value):
 
 
 def _touched_paths(workspace):
-    """All paths the staged patch touches, with rename sources spelled out."""
+    """All paths the staged patch touches, with rename sources spelled out.
+
+    Callers use this list to fence the planned scope and the documentation
+    boundary, so a git failure must abort the candidate: ``files`` comes from
+    rename-collapsing ``git diff`` and silently omits deleted sources, which is
+    exactly the weaker list these gates exist to replace.
+    """
     try:
         raw = git(workspace, "diff", "--cached", "--no-renames", "--name-only", "-z")
-    except RuntimeError:
-        return set()
+    except Cancelled:
+        raise
+    except RuntimeError as exc:
+        raise RuntimeError("Cannot verify touched paths: " + str(exc)) from exc
     return {path for path in raw.split("\0") if path}
 
 
@@ -860,7 +868,14 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             return {"decision": "insufficient_evidence", "no_change": True,
                     "reason": "Experiment produced no code changes", "files": [],
                     "summary": result["summary"]}
-        if change_type == "documentation" and not documentation_only(_touched_paths(workspace) or files):
+        # git collapses a rename into its destination, so ``files`` omits the
+        # deleted source path.  Judge the gates on every touched path, otherwise
+        # an out-of-scope file can be "deleted" by renaming it into the plan
+        # scope; an empty list for a non-empty patch means the read failed.
+        touched = _touched_paths(workspace)
+        if not touched:
+            raise RuntimeError("Cannot verify touched paths: git reported no staged paths for a non-empty patch")
+        if change_type == "documentation" and not documentation_only(touched):
             # A declared documentation scope must not launder source edits past
             # the normal acceptance gate.  Mixed patches are rejected instead
             # of trying to infer comment-only source changes.
@@ -873,10 +888,6 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                             if path and test_path(path)}
         if test_first and not 1 <= len(added_test_files) <= 8:
             raise RuntimeError("Test-first changes require 1..8 new regression test files")
-        # git collapses a rename into its destination, so ``files`` omits the
-        # deleted source path.  Judge scope on every touched path, otherwise an
-        # out-of-scope file can be "deleted" by renaming it into the plan scope.
-        touched = _touched_paths(workspace) or files
         for path in sorted(touched):
             relative_path(path)
             if test_first and test_path(path):
