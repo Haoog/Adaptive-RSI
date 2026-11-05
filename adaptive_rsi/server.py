@@ -1051,7 +1051,9 @@ class Handler(BaseHTTPRequestHandler):
                             except (TypeError, ValueError):
                                 raise RequestError("Invalid revision") from None
                             if expected is not None and expected != runtime.store.config_revision(body.get("project")):
-                                raise RequestError("Configuration changed in another window; reload before saving")
+                                # 与 runtime._configure 抛同一类型，才能经 api_error 补上 config_revision_conflict；
+                                # 该文案同时受 SAFE_VALIDATION_MESSAGES 约束。
+                                raise ValueError("Configuration changed in another window; reload before saving")
                             result = center.save_routes(body.get("models"), project,
                                                         **({"inherit": body["inherit"]} if "inherit" in body else {}))
                         elif path == "/api/model-center/resume":
