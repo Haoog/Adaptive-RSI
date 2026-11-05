@@ -1,4 +1,5 @@
 """服务会话、认证、异常及备份资源边界的真实 HTTP 回归。"""
+import ast
 import base64
 import concurrent.futures
 import hashlib
@@ -519,6 +520,75 @@ class ServerHardeningTest(unittest.TestCase):
         self.server._failure_window = 0
         self.assertEqual(self.request(authenticated=False)[0], 401)
 
+    def test_login_redirect_is_recorded_with_request_identity(self):
+        status, headers, body = self.request("/?token=" + self.server.token, authenticated=False)
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/")
+        self.assertIn(self.server.cookie + "=" + self.server.token, headers["Set-Cookie"])
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertIn("default-src 'self'", headers["Content-Security-Policy"])
+        self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+        self.assertEqual(body, b"")
+        request_id = headers["X-RSI-Request-ID"]
+        # 记录在发送响应之前提交，因此客户端拿到 303 时日志行必然已存在。
+        rows = self.store.query("SELECT id,method,status,error_code FROM request_log WHERE path='/'")
+        self.assertEqual([(row["method"], row["status"], row["error_code"]) for row in rows], [("GET", 303, "")])
+        self.assertEqual(rows[0]["id"], request_id)
+        # 查询串里的 token 绝不进入日志。
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM request_log WHERE path LIKE '%token%'")["n"], 0)
+
+    def test_unsupported_api_method_returns_json_405_with_security_headers(self):
+        status, headers, body = self.request("/api/state", "PUT")
+        self.assertEqual(status, 405)
+        self.assertEqual([part.strip() for part in headers["Allow"].split(",")],
+                         ["GET", "HEAD", "POST", "OPTIONS"])
+        self.assertTrue(headers["Content-Type"].startswith("application/json"))
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertIn("Content-Security-Policy", headers)
+        self.assertTrue(headers["X-RSI-Request-ID"])
+        self.assertEqual(json.loads(body), {"error": "Method not allowed", "error_code": "http_405"})
+        # 未实现的方法在未知路径上仍是 4xx，不会退化成 500 或默认 HTML 页。
+        status, headers, body = self.request("/api/unknown", "PROPFIND")
+        self.assertEqual((status, headers["Content-Type"].split(";")[0]), (405, "application/json"))
+        self.assertEqual(json.loads(body)["error_code"], "http_405")
+        self.assertEqual(self.request("/unknown", "PROPFIND")[0], 405)
+        self.assertEqual(self.request("/unknown")[0], 404)
+
+    def test_head_and_options_share_the_get_header_contract(self):
+        status, headers, body = self.request("/api/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Length"], str(len(body)))
+        status, head_headers, head_body = self.request("/api/health", "HEAD")
+        self.assertEqual(status, 200)
+        self.assertEqual(head_body, b"")
+        self.assertEqual(head_headers["Content-Length"], headers["Content-Length"])
+        for name in ("Content-Type", "Cache-Control", "Content-Security-Policy",
+                     "X-Content-Type-Options", "Referrer-Policy"):
+            self.assertEqual(head_headers[name], headers[name])
+        status, headers, body = self.request("/api/health", "OPTIONS")
+        self.assertEqual((status, body), (204, b""))
+        self.assertEqual(headers["Allow"], "GET, HEAD, POST, OPTIONS")
+        # 备份流同样只发头：文件内容不会被 HEAD 传输，并发闸门也会释放。
+        self.backup.write_bytes(b"payload")
+        status, headers, body = self.request("/api/backup?id=" + self.identifier, "HEAD")
+        self.assertEqual((status, headers["Content-Length"], body), (200, "7", b""))
+        self.assertTrue(self.server._backup_gate.acquire(blocking=False))
+        self.server._backup_gate.release()
+
+    def test_unauthenticated_head_keeps_the_login_page_representation(self):
+        # 未登录访问控制台根路径时，HEAD 必须与 GET 一样返回登录页的 401 表示，
+        # 只是不传输 body；不能退化成 JSON 错误，否则 GET/HEAD 头契约被打破。
+        status, headers, body = self.request("/", authenticated=False)
+        self.assertEqual(status, 401)
+        self.assertTrue(headers["Content-Type"].startswith("text/html"))
+        self.assertEqual(headers["Content-Length"], str(len(body)))
+        status, head_headers, head_body = self.request("/", "HEAD", authenticated=False)
+        self.assertEqual((status, head_body), (401, b""))
+        for name in ("Content-Type", "Content-Length", "Cache-Control",
+                     "Content-Security-Policy", "X-Content-Type-Options", "Referrer-Policy"):
+            self.assertEqual(head_headers[name], headers[name])
+
     def test_audit_is_bounded_and_never_records_request_secrets(self):
         for _ in range(6):
             self.request("/?token=private-query-token", authenticated=False,
@@ -934,6 +1004,32 @@ class ServerHardeningTest(unittest.TestCase):
         status, _, body = self.request(f"/api/rehearsal?id={self.identifier}")
         self.assertEqual(status, 400)
         self.assertNotIn(b"SECRET-FILE-CONTENT", body)
+
+    def test_openapi_document_covers_every_dispatched_api_route(self):
+        # 文档由 OPENAPI_ROUTES 生成；从 _do_GET/_do_POST 的字面量重新推导路由集合，
+        # 新增或改名却漏登记时这里会点名缺哪条。
+        source = (Path(__file__).resolve().parents[1] / "adaptive_rsi" / "server.py").read_text()
+        handler = next(node for node in ast.parse(source).body
+                       if isinstance(node, ast.ClassDef) and node.name == "Handler")
+        functions = {node.name: node for node in handler.body
+                     if isinstance(node, ast.FunctionDef)}
+        # 前缀匹配是兜底分支，不是独立路由。
+        prefixes = {"/api/", "/api/auth/", "/api/model-center/"}
+        dispatched = {}
+        for name, method in (("_do_GET", "get"), ("_do_POST", "post")):
+            for node in ast.walk(functions[name]):
+                if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                        and node.value.startswith("/api/") and node.value not in prefixes):
+                    dispatched.setdefault(node.value, set()).add(method)
+        status, _, payload = self.request("/api/contract?format=openapi")
+        self.assertEqual(status, 200)
+        document = {path: set(item) for path, item in json.loads(payload)["paths"].items()}
+        self.assertEqual([], sorted(set(dispatched) - set(document)),
+                         "OpenAPI 文档缺少已实现路由")
+        self.assertEqual([], sorted(set(document) - set(dispatched)),
+                         "OpenAPI 文档包含未实现的路由")
+        for path in sorted(dispatched):
+            self.assertEqual(sorted(dispatched[path]), sorted(document[path]), path)
 
     def test_connection_gate_releases_permit_when_thread_spawn_fails(self):
         # Thread.start() 抛错时 process_request 必须退还 gate 名额，

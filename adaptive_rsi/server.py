@@ -1,4 +1,5 @@
 import hmac
+import html
 import json
 import mimetypes
 import os
@@ -38,6 +39,117 @@ from .server_validation import (SAFE_ERROR_CODES, SAFE_VALIDATION_MESSAGES, Requ
 PATCH_PREVIEW_LIMIT = 2 * 1024 * 1024
 PATCH_PREVIEW_TOO_LARGE = ("Candidate patch exceeds the 2 MiB UI size limit; "
                            "download it from the run directory instead")
+
+# Every literal /api route dispatched by Handler._do_GET and Handler._do_POST.
+# The OpenAPI document is generated from this catalog; tests.test_server_hardening
+# compares it with the dispatch code and names any route missing from either side.
+# Prefix matches (/api/, /api/auth/, /api/model-center/) are fallbacks, not routes.
+OPENAPI_ROUTES = """
+GET /api/attention
+POST /api/auth/cancel
+POST /api/auth/complete
+POST /api/auth/key
+POST /api/auth/logout
+GET /api/auth/providers
+GET /api/auth/session
+POST /api/auth/start
+GET /api/auth/status
+GET /api/backup
+POST /api/backup
+POST /api/cancel
+GET /api/candidate
+GET /api/capabilities
+POST /api/cases
+POST /api/config
+GET /api/config-history
+POST /api/config/repair
+POST /api/config/repair-global
+POST /api/config/undo
+GET /api/contract
+POST /api/deliver
+POST /api/desktop-update
+GET /api/diagnostics
+POST /api/diagnostics/export
+GET /api/diagnostics/preview
+GET /api/diff-files
+GET /api/events
+POST /api/evolution/promote
+POST /api/goal
+GET /api/health
+GET /api/mobile
+GET /api/model-center
+POST /api/model-center/diagnose
+POST /api/model-center/fetch
+POST /api/model-center/model
+POST /api/model-center/probe
+POST /api/model-center/provider
+POST /api/model-center/remove
+POST /api/model-center/resume
+POST /api/model-center/routes
+POST /api/models
+GET /api/monitoring-feedback
+GET /api/operation
+POST /api/operations
+POST /api/operations/cancel
+GET /api/patch
+POST /api/pause
+POST /api/project/archive
+POST /api/project/restore
+POST /api/projects
+POST /api/projects/import
+GET /api/readiness
+GET /api/rehearsal
+POST /api/rehearsal
+GET /api/rehearse-restore
+POST /api/rehearse-restore
+POST /api/release-abandon
+POST /api/release-authorize
+GET /api/release-candidates
+POST /api/release-resolve
+POST /api/release-retry
+GET /api/release-status
+GET /api/release-workflows
+POST /api/request
+POST /api/retry
+POST /api/revert-code
+POST /api/rollback
+GET /api/run
+POST /api/session/rotate
+GET /api/shutdown-status
+GET /api/state
+GET /api/storage
+GET /api/sys-metrics
+GET /api/task
+GET /api/task-blockers
+GET /api/task-cancel-preview
+GET /api/task-groups
+GET /api/task-interventions
+GET /api/task-revision
+GET /api/task-revisions
+GET /api/task-runs
+POST /api/task/revise
+POST /api/task/schedule
+POST /api/task/schedule-time
+POST /api/task/value-feedback
+GET /api/tasks/batch
+POST /api/tasks/batch
+GET /api/tasks/batches
+POST /api/updates/apply
+POST /api/updates/check
+GET /api/usage
+GET /api/workflow-metrics
+"""
+
+
+def openapi_paths():
+    """Return OpenAPI path items generated from the declared route catalog."""
+    paths = {}
+    for entry in OPENAPI_ROUTES.strip().splitlines():
+        method, path = entry.split()
+        paths.setdefault(path, {})[method.lower()] = {
+            "responses": {"200": {"description": "JSON response"}}}
+    return paths
+
 
 # POST body fields that reach SQLite bindings must be scalars. A dict/list
 # raises sqlite3.ProgrammingError, which the error boundary keeps as a 500 bug
@@ -193,6 +305,21 @@ class Server(ThreadingHTTPServer):
             return {"url": url, "csrf": csrf}
 
 
+def _start_response(handler, code, headers=None, content_type=None, length=None):
+    """Send status, shared security headers and one response's fixed headers."""
+    handler.send_response(code)
+    handler.headers_common()
+    for key, value in (headers or {}).items():
+        handler.send_header(key, value)
+    if getattr(handler, "_request_id", None):
+        handler.send_header("X-RSI-Request-ID", handler._request_id)
+    if content_type:
+        handler.send_header("Content-Type", content_type)
+    if length is not None:
+        handler.send_header("Content-Length", str(length))
+    handler.end_headers()
+
+
 class Handler(BaseHTTPRequestHandler):
     # 慢速或悬挂的连接最多占用线程 30 秒；超时由 handle_one_request 关闭连接。
     timeout = 30
@@ -215,16 +342,11 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(payload, str):
             payload = payload.encode()
         try:
-            self.send_response(code)
-            self.headers_common()
-            for key, value in (headers or {}).items():
-                self.send_header(key, value)
-            if getattr(self, "_request_id", None):
-                self.send_header("X-RSI-Request-ID", self._request_id)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+            _start_response(self, code, headers=headers, content_type=content_type, length=len(payload))
+            # HEAD shares GET's status and headers, including Content-Length,
+            # but never transfers a representation body (RFC 9110 9.3.2).
+            if getattr(self, "command", "") != "HEAD":
+                self.wfile.write(payload)
         except OSError:
             # Aborted browser fetches are normal during navigation; socket write
             # timeouts on slow clients are OSError subclasses as well. Do not
@@ -233,6 +355,58 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._response_status = 500
             self._response_error_code = "response_interrupted"
+
+    def redirect(self, location, headers=None):
+        """A 303 is a real response: it must carry the shared headers and request id."""
+        self._response_status, self._response_error_code = 303, ""
+        try:
+            _start_response(self, 303, headers={**(headers or {}), "Location": location}, length=0)
+        except OSError:
+            self.close_connection = True
+            self._response_status = 500
+            self._response_error_code = "response_interrupted"
+
+    def method_not_allowed(self):
+        # An unimplemented method on our own listener is not RFC 9110 501
+        # ("method not recognized"); the method is known but not offered here.
+        # The request body was never read, so the connection must not be reused.
+        path = getattr(self, "path", "") or ""
+        allowed = "GET, HEAD, POST, OPTIONS" if path.startswith("/api/") else "GET, HEAD, OPTIONS"
+        self.close_connection = True
+        self.respond({"error": "Method not allowed", "error_code": "http_405"}, 405,
+                     headers={"Allow": allowed, "Connection": "close"})
+
+    def send_error(self, code, message=None, explain=None):
+        """Protocol errors bypass route dispatch; keep the same header contract.
+
+        BaseHTTPRequestHandler answers unimplemented methods with 501 and other
+        parse failures with an HTML page, none of which pass through respond().
+        API callers get JSON, static callers keep the HTML page, and both get
+        no-store/CSP/nosniff plus a request id.
+        """
+        if not getattr(self, "_request_id", None):
+            self._request_id = secrets.token_hex(8)
+        if int(code) == 501:
+            return self.method_not_allowed()
+        short, long = self.responses.get(code, ("???", "???"))
+        detail = str(message or short)
+        if str(getattr(self, "path", "")).startswith("/api/"):
+            self.close_connection = True
+            self.respond({"error": detail, "error_code": "http_" + str(int(code))}, int(code),
+                         headers={"Connection": "close"})
+            return
+        payload = (self.error_message_format % {
+            "code": int(code), "message": html.escape(detail, quote=False),
+            "explain": html.escape(str(explain or long), quote=False)}).encode("utf-8", "replace")
+        self._response_status, self._response_error_code = int(code), "http_" + str(int(code))
+        self.close_connection = True
+        try:
+            _start_response(self, code, headers={"Connection": "close"},
+                            content_type="text/html; charset=utf-8", length=len(payload))
+            if getattr(self, "command", "") != "HEAD":
+                self.wfile.write(payload)
+        except OSError:
+            self.close_connection = True
 
     def api_error(self, exc):
         if isinstance(exc, RequestError):
@@ -326,6 +500,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/vnd.sqlite3")
                 self.send_header("Content-Length", str(size))
                 self.end_headers()
+                if getattr(self, "command", "") == "HEAD":
+                    # HEAD 只发送与 GET 相同的头，不传输整库内容。
+                    self._response_status, self._response_error_code = 200, ""
+                    self.close_connection = True
+                    return
                 remaining = size
                 deadline = time.monotonic() + 120
                 try:
@@ -355,7 +534,8 @@ class Handler(BaseHTTPRequestHandler):
         if retry:
             self.respond({"error": "Too many authentication failures", "error_code": "session_required"},
                          429, headers={"Retry-After": str(retry)})
-        elif self.command == "GET" and urlparse(self.path).path in ["/", "/index.html"]:
+        elif self.command in ("GET", "HEAD") and urlparse(self.path).path in ["/", "/index.html"]:
+            # HEAD 与 GET 共享登录页的 401 表示与头；respond() 负责不发送 body。
             self.respond(self.server.assets["login.html"], 401, "text/html; charset=utf-8")
         else:
             self.respond({"error": "Open the authenticated URL printed by adaptive-rsi serve/open", "error_code": "session_required"}, 401)
@@ -384,7 +564,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.authentication_failure()
         return True
 
-    def do_GET(self):
+    def _dispatch_GET(self):
         self._request_id = secrets.token_hex(8)
         # The shutdown probe must stay readable while the runtime closes its
         # store; it only reads in-memory phase and counters.
@@ -392,6 +572,34 @@ class Handler(BaseHTTPRequestHandler):
             return self._do_GET()
         with self.server.runtime.store.query_scope(request=self._request_id):
             return self._do_GET()
+
+    def do_GET(self):
+        return self._dispatch_GET()
+
+    def do_HEAD(self):
+        # Same status, headers and Content-Length as GET, without the body.
+        return self._dispatch_GET()
+
+    def do_OPTIONS(self):
+        self._request_id = secrets.token_hex(8)
+        path = urlparse(self.path).path
+        allowed = "GET, HEAD, POST, OPTIONS" if path.startswith("/api/") else "GET, HEAD, OPTIONS"
+        self._response_status, self._response_error_code = 204, ""
+        try:
+            _start_response(self, 204, headers={"Allow": allowed})
+        except OSError:
+            self.close_connection = True
+            self._response_status, self._response_error_code = 500, "response_interrupted"
+
+    def _record_get(self, request_id, started, error_code=""):
+        """Record only the route shape, never query values, bodies or headers."""
+        try:
+            self.server.runtime.store.record_request(
+                request_id, getattr(self, "command", "GET") or "GET", urlparse(self.path).path[:300],
+                getattr(self, "_response_status", 500), started, time.time(),
+                getattr(self, "_response_error_code", error_code)[:100])
+        except Exception:
+            pass
 
     def _do_GET(self):
         request_id = self._request_id
@@ -416,13 +624,14 @@ class Handler(BaseHTTPRequestHandler):
                 # 旧启动地址携带的 token 可能已轮换；已持有有效会话时仍直接回到控制台。
                 if not self.authenticated():
                     return
-            self.send_response(303)
-            self.headers_common()
+            headers = {"Location": "/"}
             if valid:
-                self.send_header("Set-Cookie", self.server.cookie_header(self.headers.get("Host")))
-            self.send_header("Location", "/")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+                headers["Set-Cookie"] = self.server.cookie_header(self.headers.get("Host"))
+            # 登录跳转也要走统一响应路径：带请求标识，并进入 request_log。
+            # 先记录再发送，避免浏览器已跳转而日志行尚未落库的竞态。
+            self._response_status, self._response_error_code = 303, ""
+            self._record_get(request_id, started)
+            self.redirect("/", headers=headers)
             return
         if not self.authenticated():
             return
@@ -440,13 +649,7 @@ class Handler(BaseHTTPRequestHandler):
                         "openapi": "3.1.0",
                         "info": {"title": "Adaptive RSI local API", "version": str(API_VERSION)},
                         "servers": [{"url": self.server.origin}],
-                        "paths": {
-                            "/api/health": {"get": {"responses": {"200": {"description": "Health and capabilities"}}}},
-                            "/api/state": {"get": {"responses": {"200": {"description": "Project-scoped state"}}}},
-                            "/api/config": {"post": {"responses": {"200": {"description": "Save settings"},
-                                                                    "400": {"description": "Revision conflict or validation error"}}}},
-                            "/api/operations": {"post": {"responses": {"200": {"description": "Background job receipt"}}}},
-                        },
+                        "paths": openapi_paths(),
                         "security": [{"sessionCookie": []}],
                         "components": {"securitySchemes": {"sessionCookie": {
                             "type": "apiKey", "in": "cookie", "name": self.server.cookie}}},
@@ -943,15 +1146,8 @@ class Handler(BaseHTTPRequestHandler):
                 error_code = "internal_error"
             self.api_error(exc)
         finally:
-            # Record only the route shape, never query values, bodies, headers or errors.
             if urlparse(self.path).path.startswith("/api/"):
-                try:
-                    self.server.runtime.store.record_request(
-                        request_id, "GET", urlparse(self.path).path[:300],
-                         getattr(self, "_response_status", 500), started, time.time(),
-                         getattr(self, "_response_error_code", error_code)[:100])
-                except Exception:
-                    pass
+                self._record_get(request_id, started, error_code)
 
     def do_POST(self):
         self._request_id = secrets.token_hex(8)
