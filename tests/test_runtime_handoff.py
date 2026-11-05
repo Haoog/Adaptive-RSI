@@ -1583,6 +1583,63 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.store.one('SELECT state,attempts FROM tasks WHERE id=?', (task,)),
                          {'state': 'planning', 'attempts': before['attempts'] + 1})
 
+    def test_fair_ledger_write_failure_does_not_leak_the_claimed_run(self):
+        # claim() 已经自增 attempts、把任务置为 planning、插入 runs 行；其后三次账本写入
+        # 是纯排序数据。一次瞬时写失败若逃出去，run 会永久停在 planning 且项目在
+        # recover() 前领不到普通任务，所以这里必须继续提交并且留下结构化事件。
+        self.runtime.pause(self.project, False)
+        task = self.runtime.goal(self.project, 'Ledger write fails after the claim')
+        config = self.runtime.config(self.project)
+        original = self.store.put_setting
+
+        def failing(key, value):
+            if key == 'fair-service':
+                raise sqlite3.OperationalError('database is locked')
+            return original(key, value)
+
+        processed = []
+
+        def work(run):
+            processed.append(run['id'])
+            self.store.transition(run['id'], 'interrupted', {'reason': 'test worker finished'}, True,
+                                  task_fields={'state': 'queued', 'available': 0})
+
+        with patch.object(self.store, 'put_setting', side_effect=failing), \
+                patch.object(self.runtime, 'process', side_effect=work):
+            self.runtime.dispatch([(self.runtime.project(self.project), config)])
+            for future in tuple(self.runtime.futures):
+                future.result(timeout=5)
+        run = self.store.one('SELECT * FROM runs WHERE task=?', (task,))
+        self.assertEqual(processed, [run['id']])
+        self.assertEqual(run['state'], 'interrupted')
+        self.assertIsNotNone(run['ended'])
+        self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (task,))['state'], 'queued')
+        event = self.store.one("SELECT * FROM events WHERE run=? AND kind='fair_ledger_skipped'", (run['id'],))
+        self.assertIsNotNone(event)
+        self.assertEqual(json.loads(event['data'])['error'], 'OperationalError')
+        # 项目没有被冻结：run 收尾后同项目的下一条普通任务仍能领取到新的 run。
+        self.assertIsNotNone(self.store.claim(self.project, config))
+
+    def test_corrupt_fair_ledger_is_discarded_instead_of_blocking_the_claim(self):
+        self.runtime.pause(self.project, False)
+        task = self.runtime.goal(self.project, 'Corrupt ledger entries must not block dispatch')
+        config = self.runtime.config(self.project)
+        self.store.put_setting('fair-service', {'stale-project': 'not-a-number'})
+        self.store.put_setting('fair-waiting', {'stale-project': 'never'})
+        self.store.put_setting('fair-clock', 'soon')
+        with patch.object(self.runtime, 'process', side_effect=lambda run: None):
+            self.runtime.dispatch([(self.runtime.project(self.project), config)])
+        self.assertEqual(self.store.one('SELECT count(*) AS n FROM runs WHERE task=?', (task,))['n'], 1)
+        self.assertEqual(len(self.runtime.futures), 1)
+        self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (task,))['state'], 'planning')
+        event = self.store.one("SELECT * FROM events WHERE kind='fair_ledger_repaired'")
+        self.assertIsNotNone(event)
+        self.assertEqual(json.loads(event['data'])['dropped'],
+                         ['fair-clock', 'fair-service:stale-project', 'fair-waiting:stale-project'])
+        self.assertEqual(self.store.setting('fair-service'), {self.project: 1.0})
+        # 坏时钟按清洗值回写：否则每个调度节拍都会重新判定损坏并重复记录事件。
+        self.assertIsInstance(self.store.setting('fair-clock'), (int, float))
+
     def test_auto_evolution_skips_unchanged_failed_inputs_until_inputs_change(self):
         from adaptive_rsi.evolution import Evolution
         self.runtime.configure({'evolution': {'enabled': True, 'every_completed': 1}}, self.project)
