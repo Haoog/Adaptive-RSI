@@ -642,8 +642,11 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                            task_fields={"state": "queued", "attempts": max(0, (task["attempts"] or 0) - 1), "available": 0})
                 return None
     if not checks:
-        transition("insufficient_evidence", {"reason": "No acceptance checks configured or discovered; implementation held."}, True)
-        return None
+        # 宿主侧缺少验收检查不是模型空转：实验路径同样返回决策字典，避免报告把
+        # 早退兜底成 reason="No change"、no_change=False。
+        reason = "No acceptance checks configured or discovered; implementation held."
+        transition("insufficient_evidence", {"reason": reason}, True)
+        return {"decision": "insufficient_evidence", "reason": reason} if experiment else None
     try:
         contract = evidence_contract(task, plan)
     except ValueError as exc:

@@ -2477,6 +2477,63 @@ class AuditEvolutionTest(unittest.TestCase):
             capture_output=True, text=True, env={'PATH': '/usr/bin:/bin'})
         self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
 
+    def test_bundle_reproduction_honours_declared_check_timeout(self):
+        # 评估侧按 checks[].timeout_seconds 执行；旧离线复现写死 60 s，会把声明
+        # 0.2 s 的检查跑满并判通过，掩盖真实超时行为、得出与基线相反的结论。
+        checks = [{'name': 'declared-short', 'cwd': '.', 'timeout_seconds': 0.2,
+                   'argv': ['python3', '-c',
+                            'import time; time.sleep(1.5); print("ran past declared budget")']}]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-check-short-timeout')
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(len(result['executed_checks']), 1)
+        row = result['executed_checks'][0]
+        self.assertFalse(row['passed'])
+        self.assertEqual(row['exit_code'], -1)
+        self.assertEqual(row['timeout_seconds'], 0.2)
+        self.assertIn('timed out', row['error'])
+        # 进程在打印前就被杀掉，证明没有跑满用例自身的 1.5 s。
+        self.assertNotIn('ran past declared budget', row.get('stdout', ''))
+        self.assertEqual(result['checks_failed'], 1)
+        self.assertFalse(result['reproducible'])
+        self.assertTrue(any('Offline checks failed: 1 of 1' in item for item in result['limitations']))
+
+    def test_bundle_reproduction_default_timeout_allows_slow_check(self):
+        # 未声明 timeout_seconds 时沿用评估侧的 300 s 缺省，不再用旧的 60 s 硬编码；
+        # 1.5 s 的检查必须通过，否则评估侧接受的慢检查会在离线侧被误杀。
+        checks = [{'name': 'undeclared-slow', 'cwd': '.',
+                   'argv': ['python3', '-c', 'import time; time.sleep(1.5); print("done")']}]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-check-default-timeout')
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(len(result['executed_checks']), 1)
+        row = result['executed_checks'][0]
+        self.assertTrue(row['passed'], row)
+        self.assertEqual(row['timeout_seconds'], 300)
+        self.assertIs(result['checks_passed'], True)
+        self.assertTrue(result['reproducible'])
+
+    def test_bundle_reproduction_rejects_invalid_check_timeout(self):
+        # 声明字段被读取后必须校验：字符串无法交给 subprocess，不能静默套用缺省值。
+        checks = [{'name': 'bad-timeout', 'cwd': '.', 'timeout_seconds': '30',
+                   'argv': ['python3', '-c', 'print("should not run")']}]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-check-bad-timeout')
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertEqual(len(result['executed_checks']), 1)
+        row = result['executed_checks'][0]
+        self.assertFalse(row['passed'])
+        self.assertEqual(row['exit_code'], -1)
+        self.assertIn('timeout_seconds must be a positive finite number', row['error'])
+        self.assertNotIn('should not run', row.get('stdout', ''))
+        self.assertEqual(result['checks_failed'], 1)
+        self.assertFalse(result['reproducible'])
+
     def test_bundle_malformed_check_specs_block_reproducibility(self):
         checks = [
             {'name': 'string-argv', 'cwd': '.', 'argv': "python3 -c 'print(1)'"},
