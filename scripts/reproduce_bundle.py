@@ -48,6 +48,15 @@ def format_report(result):
     for i, lim in enumerate(result.get("limitations", []), 1):
         lines.append(f"     {i}. {lim}")
 
+    cases = result.get("cases", {})
+    exported_cases = cases.get("exported", [])
+    missing_cases = cases.get("missing", [])
+    lines.append(f"\n[-] 封存用例 / Sealed Cases ({len(exported_cases)} 已导出, {len(missing_cases)} 缺失):")
+    for case in exported_cases:
+        lines.append(f"     [+] {case}")
+    for case in missing_cases:
+        lines.append(f"     [!] {case}: 已登记但未随包导出")
+
     executed = result.get("executed_checks", [])
     if executed:
         lines.append(f"\n[-] 离线用例执行 / Executed Checks ({len(executed)}):")
@@ -63,6 +72,10 @@ def format_report(result):
                      f"{result.get('checks_executed', 0)} 项未通过，不具备离线复现条件。")
     elif result.get("reproducible"):
         lines.append("完整性通过且所有依赖与凭据齐备，具备离线复现条件。")
+    elif not exported_cases:
+        lines.append("实验包不含任何已登记用例 (case.json)，没有可执行的离线基线，不具备离线复现条件。")
+    elif missing_cases:
+        lines.append(f"实验包缺少 {len(missing_cases)} 个已登记用例（{', '.join(missing_cases)}），不具备离线复现条件。")
     elif missing_creds or missing_deps:
         lines.append(f"输入完整性校验通过。缺凭据 ({len(missing_creds)} 项) 或外部依赖 ({len(missing_deps)} 项)，已逐项列出上述限制。")
     else:
@@ -76,7 +89,7 @@ def main(argv=None):
     parser.add_argument("bundle", help="Path to sealed reproduction bundle directory")
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON result")
     parser.add_argument("--run-checks", action="store_true", help="Execute evaluation checks if dependencies are satisfied; failed checks make the bundle non-reproducible")
-    parser.add_argument("--strict", action="store_true", help="Exit non-zero if dependencies/credentials are missing or executed checks fail")
+    parser.add_argument("--strict", action="store_true", help="Exit non-zero if dependencies/credentials/cases are missing or executed checks fail")
     args = parser.parse_args(argv)
 
     bundle_path = Path(args.bundle).expanduser().resolve()
