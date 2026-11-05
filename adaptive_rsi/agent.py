@@ -63,7 +63,7 @@ SCHEMAS["planning"]["properties"].update({
     "repetitions": {"type": "integer", "description": "Measurements per version and load, 1..100; performance plans require at least 3."},
     "load_conditions": {"type": "array", "items": TEXT, "description": "Load labels to measure, 1..20; empty or omitted for an unloaded benchmark."},
     "guardrails": {"type": "array", "items": PERFORMANCE_RULE, "description": "Secondary metrics that must not regress, 1..20 on performance plans."},
-    "required_test_ids": {"type": "array", "items": TEXT, "description": "Exact runner-reported test IDs that must execute."},
+    "required_test_ids": {"type": "array", "items": TEXT, "description": "Exact runner-reported test IDs that must execute; use module.Class.method for unittest and path::name for pytest."},
     "check_dependencies": {"type": "array", "items": object_schema({
         "name": TEXT, "paths": STRINGS, "depends_on": STRINGS, "checks": STRINGS}),
         "description": "Checked package graph entries; the contract stores them by name."},

@@ -9,12 +9,12 @@ This checklist is for operators and auditors performing integrity verification a
 Sealed experiment bundles exported through the strategy evolution subsystem (`Evolution.export_bundle`) bundle all hermetic local inputs required for reproduction:
 - Candidate strategy or skill definitions (`candidate.json`)
 - Historical experiment evidence and paired evaluation logs (`evidence.json`)
-- Evaluation case specifications, repository baseline snapshots, and protected test overlays (`cases/`)
+- Evaluation case specifications, repository baseline snapshots, and protected test overlays for sampled (executed) cases (`cases/`); unsampled cases are recorded by identity only (`case`, `split`, `tree`) in the `bundle.json` `cases` index, without sealing a working tree
 - Whole-input SHA-256 manifest and declared limitations (`bundle.json`)
 
 Sealed bundles adhere to deterministic input and credential exclusion principles:
 1. **Credential exclusion**: Bundles never include third-party API keys, private tokens, or environment credentials. `evidence.json` records only non-secret provider requirements (provider id and required environment variable name), never key values.
-2. **Frozen inputs**: Source code repositories, base commit SHAs, and check commands are frozen at export time to prevent external drift.
+2. **Frozen inputs**: The sealed manifest covers the identity, base commit SHA, and check-command fingerprints of the whole eligible set, but only cases actually sampled for execution seal a full working tree: unsampled cases never ran, and copying the same `(repository, base)` once per entry would inflate the bundle linearly with candidate-set size. They carry `exported: false` in `bundle.json`, while verification still compares every entry against the live `git rev-parse` tree hash from the store.
 3. **Isolation boundaries**: Input integrity verification establishes that files are untampered; it is not proof of standalone autonomous model execution in an air-gapped environment without external providers.
 
 ## Offline reproduction checklist
@@ -23,18 +23,19 @@ Sealed bundles adhere to deterministic input and credential exclusion principles
 
 - [ ] **1.1 Obtain bundle**: Retrieve the sealed bundle directory exported by `Evolution.export_bundle`.
 - [ ] **1.2 Place in isolated workspace**: Transfer the directory to the isolated host, ensuring the filesystem supports regular file reads and no escaping symlinks.
-- [ ] **1.3 Check structure**: Confirm root files `bundle.json`, `candidate.json`, `evidence.json`, and the `cases/` directory are present.
+- [ ] **1.3 Check structure**: Confirm root files `bundle.json`, `candidate.json`, `evidence.json`, and at least one registered case directory `cases/<id>/case.json` are present. A bundle containing only JSON files and no case is empty and cannot be reproduced offline.
 
 ### Stage 2: Input integrity verification
 
 - [ ] **2.1 Execute hash verification**: Run `scripts/reproduce_bundle.py` or call `Evolution.verify_bundle(bundle_dir)`.
 - [ ] **2.2 Compare manifest digests**: Ensure all files listed in `bundle.json` exist and match their SHA-256 digests.
 - [ ] **2.3 Verify path safety**: Confirm no absolute paths, parent directory traversals (`..`), or symlinks escape the bundle tree.
+- [ ] **2.4 Verify case completeness**: `files` must register at least one `cases/<id>/case.json`, and every sampled case listed in `evidence.json`'s `dataset.manifest` must appear in `files`. Integrity only proves exported files are untampered: empty bundles (exported from legacy candidates or hand-written `ready` rows, JSON files only) and bundles missing registered sampled cases can still pass integrity checks, but the reproduction script reports `reproducible=false`, lists missing cases under `cases.missing` and in the limitations, and `--strict` exits with code 2.
 
 ### Stage 3: Host tools and execution dependencies
 
-- [ ] **3.1 Check VCS tooling**: Verify `git` is available on the isolated host to operate on case repository snapshots.
-- [ ] **3.2 Itemize check dependencies**: Scan commands in `cases/*/case.json` checks registered in the `bundle.json` manifest and verify all required binaries (such as `python3`, `node`, `pytest`, `cargo`); unmanifested case directories are never read or executed and invalidate integrity verification. Each check's `argv` must be a non-empty array of strings and `cwd` must be a relative path inside the case; malformed specs are recorded in `limitations`, make the bundle non-reproducible, and are excluded from the dependency list.
+- [ ] **3.1 Check VCS tooling**: VCS requirements are derived from the registered case check commands. Bundles contain no `.git`; the host only needs `git` when a check's `argv[0]` is `git`. When no check invokes git, a missing git is recorded as informational and does not block the reproducibility verdict or `--run-checks` execution.
+- [ ] **3.2 Itemize check dependencies**: Scan commands in `cases/*/case.json` checks registered in the `bundle.json` manifest and verify all required binaries (such as `python3`, `node`, `pytest`, `cargo`); unmanifested case directories are never read or executed and invalidate integrity verification. Each check's `argv` must be a non-empty array of strings and `cwd` must be a relative path inside the case; malformed specs are recorded in `limitations`, make the bundle non-reproducible, and are excluded from the dependency list. Unsampled cases are recorded by identity only and seal no working tree, so they are excluded from dependency enumeration.
 - [ ] **3.3 Enumerate missing tools**: The reproduction script enumerates every missing dependency without aborting at the first failure, allowing comprehensive batch provisioning.
 
 ### Stage 4: Credentials and model access
@@ -63,14 +64,14 @@ python3 -B scripts/reproduce_bundle.py /path/to/bundle --json
 # Execute frozen checks when host tools are present
 python3 -B scripts/reproduce_bundle.py /path/to/bundle --run-checks
 
-# Strict mode: exit with code 2 if tools/credentials are missing or executed checks do not all pass
+# Strict mode: exit with code 2 if tools/credentials/cases are missing or executed checks do not all pass
 python3 -B scripts/reproduce_bundle.py /path/to/bundle --strict
 ```
 
 - `bundle`: Path to sealed bundle directory (required).
-- `--json`: Format result as JSON.
+- `--json`: Format result as JSON (including `cases.exported`, `cases.registered`, and `cases.missing`).
 - `--run-checks`: Run case check commands if tools are present; if any check fails, `checks_passed` and `reproducible` are both `false` and the summary reports it.
-- `--strict`: Return exit code 2 when any dependency or credential is missing, or executed checks do not all pass; default mode returns 0 after inspection, with check failures recorded only in the result and summary.
+- `--strict`: Return exit code 2 when any dependency, credential, or sampled registered case is missing, or executed checks do not all pass; default mode returns 0 after inspection, with check failures recorded only in the result and summary.
 
 ### Python API
 
@@ -86,6 +87,7 @@ report = Evolution.reproduce_bundle(
 )
 
 assert report["integrity"]["valid"] is True
+print("Cases:", report["cases"])  # exported / registered / missing
 print("Missing dependencies:", report["dependencies"]["missing"])
 print("Missing credentials:", report["credentials"]["missing"])
 print("Limitations:", report["limitations"])
@@ -121,4 +123,5 @@ Output on an air-gapped machine without credentials:
 
 1. **Credential protection**: Sealed bundles never leak credentials to offline or audit environments.
 2. **Causal and generalization scope**: Input integrity proves artifacts were not altered; it does not guarantee automatic offline reproduction of stochastic model outputs.
-3. **Non-blocking inspection**: Missing dependencies are enumerated across all cases rather than halting at the first failure.
+3. **Integrity is not completeness**: A passing `bundle.json` check only proves exported files are unchanged; when the bundle has no case, or sampled `dataset.manifest` cases were not all exported, `reproducible` is `false` and must not be used to pass automated acceptance.
+4. **Non-blocking inspection**: Missing dependencies are enumerated across all cases rather than halting at the first failure.
