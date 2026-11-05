@@ -1588,7 +1588,18 @@ class Runtime(Maintenance):
 
     def _postprocess_run(self, key, identifier, record):
         run = self.store.one('SELECT * FROM runs WHERE id=?', (identifier,))
-        if not run or run['ended'] is None:
+        if not run:
+            # 回执指向的 run 行已在备份恢复或手工清理中消失。此前这里直接返回，回执
+            # 保持 pending、attempts 永不增加，孤儿会永久占用每轮的有界批次且无任何
+            # 事件痕迹；这里落到终态，让待办索引按 completed/obsolete 规则摘除。
+            record.update(state='obsolete', reason='Run record is missing; postprocessing terminated',
+                          ended=time.time())
+            self.store.put_setting(key, record)
+            self.store.event('postprocess_orphaned',
+                             'Postprocessing terminated: run record is missing',
+                             run=identifier, data={'key': key})
+            return
+        if run['ended'] is None:
             return
         if self.store.setting('project-archived:' + run['project']):
             record.update(state='obsolete', reason='Project archived; postprocessing terminated', ended=time.time())

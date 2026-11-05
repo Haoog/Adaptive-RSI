@@ -1170,6 +1170,31 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.store.setting('postprocess:' + run['id'])['state'], 'completed')
         self.assertEqual(self.store.one("SELECT value FROM settings WHERE key='postprocess:corrupt'")['value'], '{')
 
+    def test_postprocess_orphaned_receipt_reaches_terminal_state_and_leaves_index(self):
+        identifier = 'missing-run'
+        self.store.put_setting('postprocess:' + identifier,
+                               {'state': 'pending', 'steps': [], 'created': time.time()})
+        self.store.put_setting('postprocess-pending:' + identifier, {'created': time.time()})
+        self.runtime.drain_postprocess()
+        record = self.store.setting('postprocess:' + identifier)
+        self.assertEqual(record['state'], 'obsolete')
+        self.assertIn('missing', record['reason'])
+        self.assertIsNotNone(record['ended'])
+        self.assertIsNone(self.store.setting('postprocess-pending:' + identifier))
+        events = self.store.query("SELECT kind, run FROM events WHERE kind='postprocess_orphaned'")
+        self.assertEqual([(row['kind'], row['run']) for row in events],
+                         [('postprocess_orphaned', identifier)])
+        reads = []
+        original = self.store.one
+        def observe(sql, args=()):
+            if tuple(args) == ('postprocess:' + identifier,):
+                reads.append(sql)
+            return original(sql, args)
+        with patch.object(self.store, 'one', side_effect=observe):
+            self.runtime.drain_postprocess()
+        self.assertEqual(reads, [])
+        self.assertEqual(self.store.setting('postprocess:' + identifier)['state'], 'obsolete')
+
     def test_postprocess_archived_project_does_not_block_another_project(self):
         other = self.runtime.add_project(fixture(self.root / 'other'))
         runs = []
