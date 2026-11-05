@@ -1445,7 +1445,9 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
                                  "rollback_health_unconfirmed" if observed == "health_unconfirmed" else "rollback_failed")
                 if observed == "healthy":
                     owner_name = owner_key(project["id"], data["repository"], policy)
-                    ownership = (owner_name, current_owner, {"run": run["id"], "sha": rollback["sha"]})
+                    # 端口不可用时 owner_key 返回 None：不能把 None 写进 ownership 设置键。
+                    ownership = ((owner_name, current_owner, {"run": run["id"], "sha": rollback["sha"]})
+                                 if owner_name else None)
                     stable = (stable_key(project["id"], data["repository"], policy["health_url"]),
                               {"sha": rollback["sha"], "run": run["id"], "health": report})
                     persist(runtime, run, "deploy", data, ownership=ownership, stable=stable)
@@ -1827,8 +1829,9 @@ def advance(runtime, project, run, outcome, cancel=None):
                                          "github_environment": "unknown"}
                 # Persist the write intent first. Ambiguous failures are reconciled, never re-dispatched.
                 data.update(state="dispatching", error="")
-                ownership = ((owner_key(project["id"], repo, policy), expected_owner,
-                              {"run": run["id"], "sha": data["sha"]}) if kind == "deploy" else None)
+                owner_name = owner_key(project["id"], repo, policy) if kind == "deploy" else None
+                ownership = ((owner_name, expected_owner,
+                              {"run": run["id"], "sha": data["sha"]}) if owner_name else None)
                 persist(runtime, run, kind, data, ownership=ownership)
             try:
                 api(repo, "actions/workflows/" + quote(policy["workflow"].split("/")[-1], safe="") + "/dispatches", "POST",
@@ -1958,8 +1961,10 @@ def retry(runtime, project_id, run_id, kind):
                     if target.get("state") == "dispatching":
                         if deployment_owner(runtime, project_id, repo, policy) != expected_owner:
                             raise ValueError("Deployment ownership changed during validation")
-                        ownership = (owner_key(project_id, repo, policy), expected_owner,
-                                     {"run": run_id, "sha": target["sha"]})
+                        owner_name = owner_key(project_id, repo, policy)
+                        # owner_key 在端口不可用时返回 None；不能把 None 当作设置键。
+                        ownership = ((owner_name, expected_owner,
+                                      {"run": run_id, "sha": target["sha"]}) if owner_name else None)
                     else:
                         owner = deployment_owner(runtime, project_id, repo, policy)
                         if owner and owner["run"] != run_id:

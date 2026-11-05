@@ -245,18 +245,25 @@ def validate(config):
     if len([url for url in urls if url]) != len(set(url for url in urls if url)):
         raise ValueError("Deployment health URLs must be unique")
     for url in urls:
-        health = urlsplit(url)
-        if url and (health.scheme != "https" or not health.hostname or health.username is not None or
+        if url == "":
+            continue
+        # urlsplit 与 .port 都会对无括号的 IPv6 地址、非数字或越界端口抛 ValueError；
+        # 在这里就拒绝，否则配置保存成功、第一次部署 tick 才在 owner_key 里崩掉。
+        try:
+            health = urlsplit(url)
+        except ValueError:
+            raise ValueError("Deployment health URL requires a valid HTTPS address and a port between 1 and 65535") from None
+        if (health.scheme != "https" or not health.hostname or health.username is not None or
                 health.password is not None or health.query or health.fragment or
                 any(c.isspace() or ord(c) < 32 for c in url)):
             raise ValueError("Deployment health URL requires HTTPS without credentials, query or fragment")
-        if url:
-            try:
-                port = health.port
-            except ValueError:
-                raise ValueError("Deployment health URL requires a valid port between 1 and 65535") from None
-            if port is not None and not 1 <= port <= 65535:
-                raise ValueError("Deployment health URL requires a valid port between 1 and 65535")
+        try:
+            port = health.port
+        except ValueError:
+            raise ValueError("Deployment health URL requires a valid HTTPS address and a port between 1 and 65535") from None
+        # 端口 0 能被 urlsplit 解析，却会被 owner_key 的 `or 443` 静默当成 443。
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError("Deployment health URL requires a valid HTTPS address and a port between 1 and 65535")
     if delivery["deploy"]["automatic_rollback"] and not delivery["deploy"]["health_url"]:
         raise ValueError("Automatic deployment rollback requires an explicit health URL")
     if delivery["deploy"]["rollback_data_policy"] not in ("manual", "backward_compatible"):

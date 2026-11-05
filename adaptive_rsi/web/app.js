@@ -41,7 +41,7 @@ const configReasonLabels={
  "config_resource_threshold": "资源准入门槛须为 0–1048576 MiB，0 表示关闭。",
  "config_health_observation": "连续成功次数不能超过总检查轮数；请检查轮数、间隔和预热范围。",
  "config_health_targets": "请保留主检查地址，最多增加 7 个不同的 HTTPS 端点。",
- "config_health_url": "健康检查地址须为 HTTPS，且不含账号、查询参数或片段。",
+ "config_health_url": "健康检查地址须为 HTTPS、端口为 1–65535，且不含账号、查询参数或片段。",
  "config_rollback_health": "自动回滚需要主健康检查地址。",
  "config_rollback_data": "请选择人工恢复或明确确认数据向后兼容。",
  "config_rollback_notes": "人工恢复说明不能超过 2000 个字符。",
