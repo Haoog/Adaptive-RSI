@@ -39,6 +39,15 @@ WORKFLOW_VISIBILITY_RECHECK_SECONDS = 900
 WORKFLOW_NOT_VISIBLE_REASON = ("The authorized workflow file is not visible on the default branch; it may have been "
                                "renamed or deleted. Restore the file or re-authorize its replacement, then reconcile "
                                "the returned candidates; selecting never starts or repeats a run.")
+RUN_NOT_VISIBLE_REASON = ("The recorded workflow run is no longer visible; it may have been deleted. Check repository "
+                          "access, then abandon the unconfirmed operation or re-authorize a replacement.")
+# A dispatch whose POST failed before GitHub accepted it may never appear as a
+# run. The workflow listing stays readable in that case, so waiting alone cannot
+# distinguish a lost request from a slow one. Abandoning stays refused until
+# this grace period has passed, and still refuses any visible run.
+ABANDON_GRACE_SECONDS = 900
+NO_RUN_AFTER_GRACE_REASON = ("The authorized workflow is visible but no matching run appeared within the grace period. "
+                             "The dispatch may never have reached GitHub; confirm that no run exists before abandoning.")
 RECONCILIATION_AUDIT_FIELDS = (
     "at", "source", "selected_run_id", "repository", "workflow", "ref",
     "operation_id", "sha", "workflow_sha", "candidate_count", "candidates", "previous",
@@ -665,8 +674,19 @@ def _require_unknown(target_data):
         raise ReconciliationRejected("Manual reconciliation is only available while a workflow start or retry is unconfirmed")
 
 
+def _abandon_grace_elapsed(data, now=None):
+    """An unknown dispatch may be abandoned once it had time to surface as a run."""
+    if data.get("dispatch_receipt") != "unknown" or _run_number(data.get("workflow_run_id")) is not None:
+        return False
+    created = data.get("created_at")
+    if isinstance(created, bool) or not isinstance(created, (int, float)):
+        return False
+    return (now if now is not None else time.time()) - created >= ABANDON_GRACE_SECONDS
+
+
 def _reconciliation_view(kind, target, data, repo, selectable=None):
     reconciliation = data.get("reconciliation") if isinstance(data.get("reconciliation"), dict) else {}
+    visibility = (data.get("remote_visibility") or {}).get("state")
     total = reconciliation.get("candidate_count")
     if total is None or not isinstance(total, int):
         total = len(selectable) if isinstance(selectable, list) else len(reconciliation.get("candidates") or [])
@@ -687,10 +707,13 @@ def _reconciliation_view(kind, target, data, repo, selectable=None):
         "candidates": reconciliation.get("candidates") or [],
         "manual_reconciliation": data.get("manual_reconciliation"),
         # Abandoning is the only exit once GitHub stopped exposing the workflow
-        # (404 on the listing or on the recorded run).
+        # (404 on the listing or the recorded run), or when a dispatch that never
+        # landed produced no run within the grace period while the workflow
+        # itself stayed visible. Any visible run still wins over abandoning.
         "can_abandon": bool(target == "operation" and data.get("state") in RECONCILIATION_UNKNOWN and
-                            (data.get("remote_visibility") or {}).get("state") in
-                            {"workflow_not_visible", "run_not_visible"}),
+                            (visibility in {"workflow_not_visible", "run_not_visible"} or
+                             (reconciliation.get("state") == "awaiting_remote_visibility" and
+                              _abandon_grace_elapsed(data)))),
     }
     if selectable is not None:
         view["selectable_candidates"] = [item for item in selectable if isinstance(item, dict)][:RECONCILIATION_SELECTABLE_LIMIT]
@@ -866,13 +889,15 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
 
 
 def abandon(runtime, project_id, run_id, kind, reason, target="operation", source="console"):
-    """Close an unconfirmed workflow start that GitHub no longer exposes.
+    """Close an unconfirmed workflow start that can no longer produce a run.
 
     ``dispatch_unknown``/``rerun_unknown`` only ends through reconciliation, but
     once the workflow file or the recorded run answers 404 there is no run left
-    to bind. This is the single operator exit: it requires a written reason,
-    re-reads GitHub first and refuses whenever a run is still visible, then
-    records ``failed`` plus an audit entry. It never dispatches or reruns.
+    to bind. A dispatch with an unknown receipt that produced no run within
+    ``ABANDON_GRACE_SECONDS`` is equally unbound: the request likely never
+    reached GitHub. This is the single operator exit: it requires a written
+    reason, re-reads GitHub first and refuses whenever a run is still visible,
+    then records ``failed`` plus an audit entry. It never dispatches or reruns.
     """
     note = reason.strip()[:500] if isinstance(reason, str) else ""
     if not note:
@@ -890,10 +915,15 @@ def abandon(runtime, project_id, run_id, kind, reason, target="operation", sourc
         remotes = [] if existing else (_remote_runs(repo, target_data, force=True) or [])
         if isinstance(remote, dict) or remotes:
             raise ReconciliationRejected("GitHub still exposes this workflow; reconcile the visible run instead of abandoning it")
+        now = time.time()
         visibility = (target_data.get("remote_visibility") or {}).get("state")
         if visibility not in {"workflow_not_visible", "run_not_visible"}:
-            raise ReconciliationRejected("GitHub still exposes this workflow; wait for its run instead of abandoning it")
-        now = time.time()
+            # A successful read with no candidate is the lost-dispatch shape: the
+            # workflow is visible but this operation's POST never produced a run.
+            # Only an unknown receipt past the grace period may take this exit.
+            if existing or not _abandon_grace_elapsed(target_data, now):
+                raise ReconciliationRejected("GitHub still exposes this workflow; wait for its run instead of abandoning it")
+            visibility = "no_run_after_grace"
         reconciliation = target_data.get("reconciliation") if isinstance(target_data.get("reconciliation"), dict) else {}
         audit = _audit_entry({
             "at": now, "source": origin, "repository": repo, "candidate_count": 0, "candidates": [],
@@ -908,9 +938,18 @@ def abandon(runtime, project_id, run_id, kind, reason, target="operation", sourc
         audit.update(outcome="failed", reason=note, visibility=visibility)
         target_data["operator_abandon"] = audit
         target_data["state"] = "failed"
-        target_data["error"] = WORKFLOW_NOT_VISIBLE_REASON
+        if visibility == "workflow_not_visible":
+            target_data["error"] = WORKFLOW_NOT_VISIBLE_REASON
+            closed = "GitHub no longer exposes its workflow"
+        elif visibility == "run_not_visible":
+            target_data["error"] = RUN_NOT_VISIBLE_REASON
+            closed = "GitHub no longer exposes its recorded run"
+        else:
+            target_data["error"] = NO_RUN_AFTER_GRACE_REASON
+            closed = "no matching workflow run appeared within the grace period"
         _record_reconciliation(target_data, repo, [], "abandoned",
-                               "An operator closed this unconfirmed operation because GitHub no longer exposes its workflow. No run was started or rerun.",
+                               "An operator closed this unconfirmed operation because " + closed +
+                               ". No run was started or rerun.",
                                checked_at=now)
         try:
             save(runtime, run, kind, data, expected=original)

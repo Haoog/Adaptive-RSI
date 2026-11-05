@@ -867,6 +867,39 @@ class ServerHardeningTest(unittest.TestCase):
             self.assertEqual(json.loads(payload)["error"], "report_outside_state_directory")
             self.assertFalse(escaped.exists())
 
+    def test_rehearsal_report_read_rejects_symlinked_file(self):
+        reports = self.store.root / "reports"
+        reports.mkdir()
+        # 合法报告仍按原样返回，字段结构不变。
+        report = {"id": self.identifier, "valid": True, "source": "fixture"}
+        report_file = reports / f"rehearsal-{self.identifier}.json"
+        report_file.write_text(json.dumps(report), encoding="utf-8")
+        status, _, body = self.request(f"/api/rehearsal?id={self.identifier}")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), report)
+
+        # 同一路径替换为指向状态目录外文件的符号链接后不得跟随读取。
+        secret = self.root / "secret.txt"
+        secret.write_text('{"leaked":"SECRET-FILE-CONTENT"}', encoding="utf-8")
+        report_file.unlink()
+        report_file.symlink_to(secret)
+        for endpoint in ("/api/rehearsal", "/api/rehearse-restore"):
+            with self.subTest(endpoint=endpoint):
+                status, _, body = self.request(f"{endpoint}?id={self.identifier}")
+                self.assertEqual(status, 400)
+                self.assertNotIn(b"SECRET-FILE-CONTENT", body)
+                self.assertEqual(json.loads(body)["error"], "Rehearsal report not found")
+
+    def test_rehearsal_report_read_rejects_symlinked_reports_directory(self):
+        outside = self.root / "outside-reports"
+        outside.mkdir()
+        (outside / f"rehearsal-{self.identifier}.json").write_text(
+            '{"leaked":"SECRET-FILE-CONTENT"}', encoding="utf-8")
+        (self.store.root / "reports").symlink_to(outside, target_is_directory=True)
+        status, _, body = self.request(f"/api/rehearsal?id={self.identifier}")
+        self.assertEqual(status, 400)
+        self.assertNotIn(b"SECRET-FILE-CONTENT", body)
+
     def test_connection_gate_releases_permit_when_thread_spawn_fails(self):
         # Thread.start() 抛错时 process_request 必须退还 gate 名额，
         # 否则反复失败会耗尽信号量并让服务器永久拒接新连接。
