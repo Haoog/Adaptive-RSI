@@ -332,6 +332,30 @@ def _touched_paths(workspace):
     return {path for path in raw.split("\0") if path}
 
 
+def _saved_patch_sources(patch):
+    """Rename/copy origins that reverse-applying a saved patch restores.
+
+    ``changes()`` captures the forward patch with rename detection, so the
+    run's ``files`` list names only a rename's destination.  Reversing the
+    patch also touches the source path and the scope gate judges every touched
+    path, so the rollback plan must declare that side up front.  Only origins
+    are read from the patch: destinations stay anchored to the persisted
+    ``files`` list, so a corrupted or tampered patch cannot widen the scope it
+    is checked against.
+    """
+    import codecs
+    sources = []
+    for line in patch.splitlines():
+        for marker in ("rename from ", "copy from "):
+            if not line.startswith(marker):
+                continue
+            value = line[len(marker):]
+            if value.startswith('"') and value.endswith('"'):
+                value = codecs.escape_decode(value[1:-1].encode("utf-8"))[0].decode("utf-8", errors="replace")
+            sources.append(relative_path(value))
+    return sources
+
+
 def _setup_changes(workspace):
     """Paths the environment setup step wrote into the shared candidate workspace.
 
@@ -576,8 +600,13 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             git(workspace, "apply", "--reverse", "--check", str(patch_path))
         except RuntimeError as exc:
             raise RuntimeError(f"Cannot cleanly reverse candidate patch: {exc}") from exc
+        # A rename is collapsed to its destination in ``files``; reversing the
+        # patch restores the source too, so the rollback scope has to name both
+        # sides or the unchanged scope gate rejects a legitimate rollback.
+        saved_patch = patch_path.read_text(encoding="utf-8", errors="replace")
+        scope = list(prior_result.get("files", [])) + _saved_patch_sources(saved_patch)
         plan = {"decision": "ready", "reason": "Explicit revert of this runner's own patch", "risk": "medium",
-                "scope": prior_result.get("files", []), "acceptance": ["Reverse the specified patch and pass independent regression checks"]}
+                "scope": scope, "acceptance": ["Reverse the specified patch and pass independent regression checks"]}
     else:
         plan = saved_plan
         if plan is None:
