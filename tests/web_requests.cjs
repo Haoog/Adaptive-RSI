@@ -2820,8 +2820,9 @@ function modelScopePage(savedDrafts = new Map()) {
   for(const id of ['view-models','mc-provider-list','mc-model-list','mc-role-list','mc-extra-role-list'])page.node(id).removeAttribute=()=>{};
   page.node('mc-probe-effort').querySelector=()=>page.node('mc-probe-effort').children[0];
   page.context.window.RSIDraftStore={get:(_type,key)=>structuredClone(savedDrafts.get(key)),set:(_type,key,value)=>savedDrafts.set(key,structuredClone(value)),remove:(_type,key)=>savedDrafts.delete(key)};
-  page.context.api=async(path,body)=>{
-    if(body){posts.push({path,body:structuredClone(body)});if(holdNext){holdNext=false;held=true;await new Promise(resolve=>{release=resolve;});held=false;}}
+  const probeSignals=[];
+  page.context.api=async(path,body,options={})=>{
+    if(body){posts.push({path,body:structuredClone(body)});if(path==='model-center/probe')probeSignals.push(options.signal);if(holdNext){holdNext=false;held=true;await new Promise(resolve=>{release=resolve;});held=false;}}
     if(path==='model-center/routes'){
       overrides.set(body.project,Object.fromEntries(Object.entries(body.models).filter(([role,route])=>!body.inherit?.includes(role)&&JSON.stringify(route)!==JSON.stringify(globals[role]))));
       return {saved:true,models:effective(body.project)};
@@ -2834,15 +2835,16 @@ function modelScopePage(savedDrafts = new Map()) {
   const modelSource=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/model-center.js'),'utf8');
   // Keep production loading, saving, draft persistence and event handlers; omit unrelated catalog rendering.
   const instrumented=modelSource.replace('  init();',`  render=renderRoles=()=>{updateDirty();persistRouteDraft();};
-  window.modelScopeTest={openProbe:()=>openProbe(data.providers[0],data.providers[0].catalog.models[0]),edit:effort=>{routes().planning.effort=effort;renderRoles();},draft:()=>structuredClone(routes())};
+  window.modelScopeTest={openProbe:()=>openProbe(data.providers[0],data.providers[0].catalog.models[0]),otherProbe:()=>openProbe({id:'ollama',name:'Ollama'},{id:'other-coder',name:'Other coder'}),edit:effort=>{routes().planning.effort=effort;renderRoles();},draft:()=>structuredClone(routes())};
   init();`);
   vm.runInContext(instrumented,page.context);
-  return {...page,posts,globals,overrides,savedDrafts,
+  return {...page,posts,globals,overrides,savedDrafts,probeSignals,
     async show(project){page.context.window.RSIModelCenter.show(project,true);await page.context.lastAction;},
     click(id){page.node(id).handlers.click();return page.context.lastAction;},
     edit(effort){page.context.window.modelScopeTest.edit(effort);},
     draft(){return page.context.window.modelScopeTest.draft();},
     openProbe(){page.context.window.modelScopeTest.openProbe();},
+    otherProbe(){page.context.window.modelScopeTest.otherProbe();},
     hold(){holdNext=true;},failProbe(){probeFailure=true;},release(){assert(held);release();}
   };
 }
@@ -3036,6 +3038,37 @@ for(const failure of [false,true])test(`delayed probe ${failure?'failure':'succe
   await page.show('a');page.openProbe();assert.equal(page.node('mc-probe-result').textContent,'');
   page.node('mc-probe-dialog').close();
   await page.click('mc-probe-start');assert.equal(page.posts.length,1);
+});
+
+test('closing the probe dialog aborts the abandoned request and unblocks other models',async()=>{
+  const page=modelScopePage();await page.show('a');page.openProbe();page.hold();
+  const probing=page.click('mc-probe-start');await new Promise(setImmediate);
+  assert.equal(page.probeSignals.length,1);assert.equal(page.probeSignals[0].aborted,false);
+  assert.equal(page.node('mc-probe-start').textContent,'取消测试');
+  page.node('mc-probe-dialog').close();
+  assert.equal(page.node('mc-probe-dialog').open,false);
+  assert.equal(page.probeSignals[0].aborted,true,'closing the dialog must abort the abandoned probe');
+  page.otherProbe();
+  assert.equal(page.node('mc-probe-dialog').open,true,'a closed probe must not keep other models blocked');
+  assert.equal(page.node('mc-probe-dialog').dataset.model,'other-coder');
+  page.openProbe();
+  assert.equal(page.node('mc-probe-result').textContent,'上一次测试已取消');
+  page.release();await probing;
+  assert.equal(page.node('mc-probe-start').disabled,false);
+  await page.click('mc-probe-start');
+  assert.equal(page.posts.filter(post=>post.path==='model-center/probe').length,2,'the same model can be tested again after cancelling');
+});
+
+test('the probe button cancels a running test without closing the dialog',async()=>{
+  const page=modelScopePage();await page.show('a');page.openProbe();page.hold();
+  const probing=page.click('mc-probe-start');await new Promise(setImmediate);
+  await page.click('mc-probe-start');
+  assert.equal(page.probeSignals[0].aborted,true);
+  assert.equal(page.node('mc-probe-result').textContent,'上一次测试已取消');
+  assert.equal(page.node('mc-probe-start').textContent,'运行基础能力测试');
+  assert.equal(page.node('mc-probe-start').disabled,false);
+  page.release();await probing;
+  assert.equal(page.node('mc-probe-dialog').open,true,'cancelling keeps the dialog open for another attempt');
 });
 
 for(const fails of [false,true])test(`catalog callback ${fails?'failure':'success'} preserves feedback after provider switch`,async()=>{
