@@ -55,9 +55,12 @@ window.RSIAuth = (() => {
       if(error.code==='session_required'){pollingStopped=true;session.pollMessage='控制台登录已失效，请重新打开控制台后继续授权。';}
       else{
         // 固定输入类错误重试不会成功；瞬时故障最多自动重试 4 次，避免无限轮询。
-        const transient=error instanceof TypeError||error.name==='AbortError'||error.status>=500;
+        // 429 是限流，不代表登录失效：提示稍候，不要显示「登录已失效」。
+        const limited=error.status===429;
+        const transient=error instanceof TypeError||error.name==='AbortError'||error.status>=500||limited;
         session.refreshAttempts=(session.refreshAttempts||0)+1;
-        if(transient&&session.refreshAttempts<5)session.pollMessage='登录已完成，账号状态或模型目录更新失败，正在重试。';
+        if(limited&&session.refreshAttempts<5)session.pollMessage='尝试过于频繁，请稍候再继续授权。';
+        else if(transient&&session.refreshAttempts<5)session.pollMessage='登录已完成，账号状态或模型目录更新失败，正在重试。';
         else{
           session.refreshStage='';session.refreshAttempts=0;
           session.pollMessage='登录已完成，但模型目录刷新失败。可稍后在模型列表手动刷新目录，或重新登录。';
@@ -78,7 +81,7 @@ window.RSIAuth = (() => {
         if(error.code==='session_required'){pollingStopped=true;sessions.set(id,{...session,pollMessage:'控制台登录已失效，请重新打开控制台后继续授权。'});continue;}
         const terminalState={auth_expired:'expired',auth_timeout:'expired',process_interrupted:'interrupted',unknown_session:'interrupted',invalid_auth_state:'interrupted',authorization_failed:'failed'}[error.code];
         if(terminalState){sessions.set(id,{...session,state:terminalState,error:error.code,pollMessage:''});continue;}
-        if(error instanceof TypeError||error.name==='AbortError'||error.status>=500){sessions.set(id,{...session,pollMessage:'暂时无法连接，授权状态已保留，正在重试。'});continue;}
+        if(error instanceof TypeError||error.name==='AbortError'||error.status>=500||error.status===429){sessions.set(id,{...session,pollMessage:error.status===429?'尝试过于频繁，请稍候再继续授权。':'暂时无法连接，授权状态已保留，正在重试。'});continue;}
         sessions.set(id,{...session,state:'failed',error:error.code||'authorization_failed',pollMessage:''});
       }
     }}finally{polling=false;render();schedule();}

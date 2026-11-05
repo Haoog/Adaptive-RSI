@@ -1028,6 +1028,8 @@ const english = {
 
   "无法连接本地服务。输入已保留，请确认服务仍在运行后重试。": "Cannot connect to the local service. Your input is preserved. Check that the service is running, then retry.",
   "登录已失效，输入已保留。请从启动入口重新打开控制台，无需重启。": "Your session has expired. Input is preserved. Reopen the console from its launcher; no restart is needed.",
+  "尝试过于频繁，请稍候再试。": "Too many attempts. Wait a moment, then try again.",
+  "尝试过于频繁，请稍候再继续授权。": "Too many attempts. Wait a moment before continuing authorization.",
   "服务返回了无法识别的结果。输入已保留，请稍后重试。": "The service returned an unreadable response. Your input is preserved. Please retry later.",
   "JSON 格式有误，请检查逗号、引号和括号；输入已保留。": "Invalid JSON. Check commas, quotes and brackets. Your input is preserved.",
   "需要重新登录": "Sign in again",
