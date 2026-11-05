@@ -98,7 +98,7 @@ async function checkAccountAndReleaseUI(browser,url,errors){
   await page.waitForFunction(()=>document.getElementById('mc-feedback').textContent.includes('模型列表已更新'));assert.equal(catalogs,2);assert(completionStatusFailures>=2);assert.equal(probes,0);assert.equal(authStarts,2);assert.equal(requests.filter(r=>r.path.endsWith('/complete')).length,1);
   await page.waitForTimeout(1650);assert.equal(catalogs,2,'successful completion refresh must stop retrying');
   await page.getByRole('button',{name:'退出账号',exact:true}).click();await page.locator('#mc-auth').filter({hasText:'尚未登录'}).waitFor();assert.equal(requests.find(r=>r.path.endsWith('/logout')).body.provider,null);
-  await page.getByRole('button',{name:'OpenCode',exact:true}).click();await page.locator('#mc-auth-provider').selectOption('github-copilot');
+  await page.locator('#mc-provider-list .mc-provider').filter({hasText:'OpenCode'}).click();await page.locator('#mc-auth-provider').selectOption('github-copilot');
   const domain=page.getByLabel('Enterprise domain');assert.equal(await domain.isVisible(),false);await page.getByLabel('Account type').selectOption('enterprise');await domain.fill('github.example.com');
   await page.getByRole('button',{name:'官方登录 · Device login',exact:true}).click();await page.locator('#mc-auth-provider').selectOption('openai');
   await page.waitForFunction(()=>document.querySelector('#mc-auth input[type="password"]'));
@@ -191,7 +191,7 @@ async function main() {
     assert.equal(await page.locator('[data-path="limits.daily_calls"], [data-path="limits.run_calls"], [data-path="limits.run_seconds"]').count(), 0);
     await page.locator('.sidebar [data-view=models]').click();
     await page.locator('[data-mc-tab="providers"]').click();
-    await page.getByRole('button', {name:'OpenCode', exact:true}).click();
+    await page.locator('#mc-provider-list .mc-provider').filter({hasText:'OpenCode'}).click();
     await page.getByRole('heading', {name:'OpenCode', exact:true}).waitFor();
     await page.locator('#project-settings').click();
     await page.locator('[data-settings-scope="global"]').click();
