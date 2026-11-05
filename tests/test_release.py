@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from adaptive_rsi.config import DEFAULTS, validate
 from adaptive_rsi.gitops import git
-from adaptive_rsi.release import ApiRejected, advance, api as real_api, authorize_workflow, candidates, health_check, key, owner_key, pending, retry, workflow_choices
+from adaptive_rsi.release import ApiRejected, advance, api as real_api, authorize_workflow, candidates, health_check, key, owner_key, pending, reconcile, retry, workflow_choices
 from adaptive_rsi.delivery import pr_body
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store, encode
@@ -429,6 +429,80 @@ class ReleaseAutomationTest(unittest.TestCase):
         return {"id": 17, "head_sha": TRUSTED, "display_title": data["operation_id"], "event": "workflow_dispatch",
                 "path": data["workflow"], "head_branch": data.get("ref"), "status": state, "conclusion": conclusion,
                 "run_attempt": attempt, "html_url": "https://github.com/example/project/actions/runs/17"}
+
+    def jobs_api(self, response, reads):
+        def api(repo, endpoint, method="GET", fields=None):
+            if endpoint.endswith("jobs?per_page=20"):
+                reads.append(endpoint)
+                if isinstance(response, Exception):
+                    raise response
+                return response
+            return self.api(repo, endpoint, method, fields)
+        return api
+
+    def completed_with_job_read(self, response):
+        reads = []
+        with patch("adaptive_rsi.release.api", side_effect=self.jobs_api(response, reads)):
+            first = self.tick()["release"]
+            events_before = len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'"))
+            self.remote = self.remote_run(first)
+            self.remote.update(created_at="2026-01-01T00:00:00Z", run_started_at="2026-01-01T00:00:10Z",
+                               updated_at="2026-01-01T00:10:10Z")
+            return self.tick()["release"], reads, events_before
+
+    def test_completed_reconcile_records_job_timing_once_per_attempt(self):
+        reads = []
+        jobs = {"total_count": 2, "jobs": [
+            {"name": "build", "status": "completed", "conclusion": "success",
+             "started_at": "2026-01-01T00:00:20Z", "completed_at": "2026-01-01T00:05:20Z"},
+            {"name": "reverify", "status": "completed", "conclusion": "success",
+             "started_at": "2026-01-01T00:05:30Z", "completed_at": "2026-01-01T00:10:00Z"}]}
+        done, reads, _ = self.completed_with_job_read(jobs)
+        timing = done["timing"]
+        self.assertEqual(done["state"], "workflow_succeeded")
+        self.assertEqual([job["name"] for job in timing["jobs"]], ["build", "reverify"])
+        self.assertEqual(timing["jobs"][1]["started_at"], "2026-01-01T00:05:30Z")
+        self.assertEqual((timing["jobs_attempt"], timing["jobs_total_count"]), (1, 2))
+        # Run-level fields keep their previous values; job data is additive only.
+        self.assertEqual((timing["queue_seconds"], timing["execution_seconds"]), (10.0, 600.0))
+        self.assertEqual(reads, ["actions/runs/17/jobs?per_page=20"])
+        with patch("adaptive_rsi.release.api", side_effect=self.jobs_api(jobs, reads)):
+            self.assertEqual(reconcile(self.runtime, self.run, "release", done, persist=False)["timing"], timing)
+            self.remote["run_attempt"] = 2
+            reconcile(self.runtime, self.run, "release", done, persist=False)
+        self.assertEqual(reads, ["actions/runs/17/jobs?per_page=20",
+                                 "actions/runs/17/attempts/2/jobs?per_page=20"])
+
+    def test_job_timing_is_bounded_and_read_once_for_a_finished_attempt(self):
+        jobs = {"total_count": 12, "jobs": [{"name": "job-%d" % index, "started_at": "2026-01-01T00:00:20Z",
+                                            "completed_at": "2026-01-01T00:01:00Z"} for index in range(11)] +
+               [{"name": "x" * 400, "started_at": "2026-01-01T00:00:20Z"}]}
+        done, reads, _ = self.completed_with_job_read(jobs)
+        timing = done["timing"]
+        self.assertEqual(len(timing["jobs"]), 10)
+        self.assertEqual(timing["jobs_total_count"], 12)
+        self.assertEqual(len(timing["jobs"][0]["name"]), len("job-0"))
+        self.assertTrue(all(len(job["name"]) <= 120 for job in timing["jobs"]))
+        self.assertEqual(reads, ["actions/runs/17/jobs?per_page=20"])
+
+    def test_job_timing_read_rejection_never_changes_state_or_failure_counter(self):
+        done, reads, events_before = self.completed_with_job_read(ApiRejected("gh: Server error (HTTP 500)", 500))
+        self.assertEqual(done["state"], "workflow_succeeded")
+        self.assertNotIn("jobs", done["timing"])
+        self.assertTrue(done["timing"]["jobs_error"])
+        self.assertEqual((done["timing"]["queue_seconds"], done["timing"]["execution_seconds"]), (10.0, 600.0))
+        self.assertNotIn("advance_failures", done)
+        self.assertEqual(reads, ["actions/runs/17/jobs?per_page=20"])
+        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")), events_before)
+
+    def test_malformed_job_listing_is_ignored_without_error_events(self):
+        done, reads, events_before = self.completed_with_job_read({"total_count": 2, "jobs": "not-a-list"})
+        self.assertEqual(done["state"], "workflow_succeeded")
+        self.assertNotIn("jobs", done["timing"])
+        self.assertNotIn("jobs_attempt", done["timing"])
+        self.assertNotIn("advance_failures", done)
+        self.assertEqual(reads, ["actions/runs/17/jobs?per_page=20"])
+        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")), events_before)
 
     def test_dispatch_pins_target_and_reconciles_after_restart_without_duplicates(self):
         with patch("adaptive_rsi.release.api", side_effect=self.api):

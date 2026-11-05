@@ -699,6 +699,43 @@ def _existing_remote(repo, data):
     return remote
 
 
+def _job_timing(repo, remote, attempt, previous, page=20, limit=10, name_limit=120):
+    """Read one bounded page of per-job timings for a completed run attempt.
+
+    The workflow run object only carries run-level timestamps; GitHub exposes
+    ``started_at``/``completed_at`` per job. The read is best-effort: a rejection,
+    a malformed payload or a transport error only records a bounded reason, so it
+    never changes the operation state, the failure counter or the base timing.
+    """
+    run_id = _run_number(remote.get("id"))
+    if run_id is None:
+        return {}
+    cached = previous.get("jobs") if isinstance(previous.get("jobs"), list) else None
+    if cached is not None and previous.get("jobs_attempt") == attempt:
+        total = previous.get("jobs_total_count")
+        return {"jobs": cached, "jobs_attempt": attempt,
+                "jobs_total_count": total if type(total) is int and total >= len(cached) else len(cached)}
+    endpoint = ("actions/runs/%d/attempts/%d/jobs?per_page=%d" % (run_id, attempt, page) if attempt > 1 else
+                "actions/runs/%d/jobs?per_page=%d" % (run_id, page))
+    try:
+        payload = api(repo, endpoint)
+        jobs = payload.get("jobs") if isinstance(payload, dict) else None
+        if not isinstance(jobs, list):
+            raise ValueError("Job listing has no job list")
+        timing = [{"name": _bounded_text(job.get("name"), name_limit),
+                   "status": _bounded_text(job.get("status"), 40),
+                   "conclusion": _bounded_text(job.get("conclusion"), 40),
+                   "started_at": _bounded_text(job.get("started_at"), 64),
+                   "completed_at": _bounded_text(job.get("completed_at"), 64)}
+                  for job in jobs[:limit] if isinstance(job, dict)]
+        total = payload.get("total_count")
+        # Never claim more jobs than were normalized; a bogus count is repaired.
+        return {"jobs": timing, "jobs_attempt": attempt,
+                "jobs_total_count": total if type(total) is int and total >= len(timing) else len(timing)}
+    except (ApiRejected, RuntimeError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        return {"jobs_error": _bounded_text(str(exc), 200) or "Job timing unavailable"}
+
+
 def reconcile(runtime, run, kind, data, persist=True):
     if not data.get("workflow_run_id") and _reconciliation_backoff_active(data):
         # A saturated no-match listing was just read; the scheduler re-checks
@@ -735,15 +772,21 @@ def reconcile(runtime, run, kind, data, persist=True):
             return None
     created, started = timestamp("created_at"), timestamp("run_started_at")
     finished = timestamp("updated_at") if remote.get("status") == "completed" else None
-    # Reconciled timing covers queue, execution, build and reverification phases.
-    # Missing phases stay explicit None (unknown) rather than omitted or defaulted to 0;
-    # GitHub workflow_run timestamps do not isolate build or reverification phases.
+    # Reconciled timing keeps queue and execution at run level. Missing phases stay
+    # explicit None (unknown) rather than omitted or defaulted to 0: the workflow run
+    # object does not isolate build or reverification, so per-job timings are read
+    # separately below and job names are never guessed into phases.
+    prior = data.get("timing") if isinstance(data.get("timing"), dict) else {}
     data["timing"] = {"created_at": remote.get("created_at"), "started_at": remote.get("run_started_at"),
                       "completed_at": remote.get("updated_at") if finished is not None else None,
                       "completed_at_basis": "updated_at" if finished is not None else None,
                       "queue_seconds": started - created if created is not None and started is not None and started >= created else None,
                       "execution_seconds": finished - started if started is not None and finished is not None and finished >= started else None,
                       "build_seconds": None, "reverification_seconds": None}
+    attempt = _run_number(remote.get("run_attempt")) or _run_number(data.get("attempt")) or 1
+    if remote.get("status") == "completed":
+        # One bounded request per finished attempt; a later reconcile reuses it.
+        data["timing"].update(_job_timing(repo, remote, attempt, prior))
     data.update(workflow_run_id=remote["id"], url=remote.get("html_url", ""),
                 attempt=remote.get("run_attempt", 1), checked_at=time.time(), conclusion=remote.get("conclusion"))
     if remote.get("status") == "completed":
