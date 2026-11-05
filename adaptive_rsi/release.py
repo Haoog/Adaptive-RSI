@@ -1526,7 +1526,8 @@ def _pin_legacy_feedback(runtime, run, outcome, target_sha):
     retry_key = "legacy-release-pin:" + run["id"] + ":" + target_sha
     previous = runtime.store.setting(retry_key, {})
     if previous.get("retry_at", 0) > time.time():
-        raise _PinUnavailable(previous.get("error", "Legacy release verification could not run locally; retry is temporarily deferred"), deferred=True)
+        raise _PinUnavailable(previous.get("error", "Legacy release verification is deferred after an earlier attempt"),
+                              deferred=True)
     try:
         source = runtime.project(run["project"])["path"]
         with tempfile.TemporaryDirectory(prefix="legacy-release-", dir=runtime.store.root) as folder:
@@ -1546,6 +1547,11 @@ def _pin_legacy_feedback(runtime, run, outcome, target_sha):
                 runtime.store.put_setting(retry_key, {"retry_at": time.time() + 600, "error": message})
                 raise _PinUnavailable(message)
     except Cancelled:
+        raise
+    except _PinUnavailable:
+        # 检查结论不是本地执行异常：保留原始文案与已写好的 retry 设置，不能再被
+        # 下面的执行异常分支改写成「could not run locally」，否则审计事件把
+        # 「固定检查未通过」记成宿主机故障，排查方向与证据边界都被污染。
         raise
     except (ValueError, OSError, RuntimeError) as exc:
         message = ("Legacy release verification could not run locally: " + type(exc).__name__ + ": " + str(exc))[:500]
