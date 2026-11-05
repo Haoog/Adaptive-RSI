@@ -333,6 +333,65 @@ def merge_gate(pr, head, base):
     return "ready"
 
 
+STALE_REF_LIMIT = 12
+STALE_BRANCH_LIMIT = 120
+
+
+def _short_identity(value, limit=STALE_REF_LIMIT):
+    """Bounded identity fragment: full SHAs and long refs never enter run results."""
+    if not isinstance(value, str) or not value:
+        return None
+    return value[:limit]
+
+
+def stale_reason(pr, policy, configured_branch=None):
+    """Explain which sealed identity invalidated the candidate.
+
+    `merge_gate` already ranks a moved head above a moved base. A retargeted
+    base branch replaces `baseRefOid` with another branch's tip, so it is
+    classified before the base comparison: otherwise every retarget would look
+    like an ordinary base advance and the operator would re-verify the wrong
+    thing. Head/base/retarget need different remedies, so the audit record keeps
+    them apart instead of collapsing everything into `stale`.
+    """
+    expected_branch = policy.get("branch")
+    observed_branch = pr.get("baseRefName")
+    retargeted = observed_branch not in (None, expected_branch)
+    if not retargeted and configured_branch and configured_branch != expected_branch:
+        retargeted = True
+    if pr.get("headRefOid") != policy.get("head"):
+        cause = "head"
+    elif retargeted:
+        cause = "retarget"
+    else:
+        cause = "base"
+    reason = {
+        "cause": cause,
+        "expected_head": _short_identity(policy.get("head")),
+        "observed_head": _short_identity(pr.get("headRefOid")),
+        "expected_base": _short_identity(policy.get("base")),
+        "observed_base": _short_identity(pr.get("baseRefOid")),
+        "expected_branch": _short_identity(expected_branch, STALE_BRANCH_LIMIT),
+        "observed_branch": _short_identity(observed_branch, STALE_BRANCH_LIMIT),
+    }
+    if configured_branch and configured_branch != expected_branch:
+        # 配置层换目标时 PR 的 baseRefName 仍是旧分支，单独留下实际配置值。
+        reason["configured_branch"] = _short_identity(configured_branch, STALE_BRANCH_LIMIT)
+    return reason
+
+
+def _record_superseded(store, run, outcome):
+    """Audit one supersession: why it fired and whether the remote close landed."""
+    reason = outcome.get("delivery_stale")
+    cause = reason.get("cause") if isinstance(reason, dict) else None
+    close = "abandoned" if outcome.get("close_abandoned") else outcome.get("close_status")
+    if not close:
+        close = "pending" if outcome.get("close_pending") else "unknown"
+    store.event("delivery_superseded",
+                "PR superseded: cause=%s pr=%s close=%s" % (cause or "unknown", outcome.get("pr"), close),
+                run["project"], run["id"])
+
+
 def baseline_change(source, previous, current):
     """Diagnose a changed baseline using objects already fetched; never alter refs."""
     result = {"previous": previous, "current": current, "relation": "unknown",
@@ -1142,9 +1201,18 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                 if pr.get("baseRefName", policy["branch"]) != policy["branch"] or (
                         config["delivery"]["base_branch"] and config["delivery"]["base_branch"] != policy["branch"]):
                     gate = "stale"
+                if gate == "stale":
+                    # 落库判定依据而不只是结论：head 被推、主线前进、目标被改指
+                    # 三种成因的补救动作不同，只留一个 stale 会诱使人重做候选。
+                    outcome["delivery_stale"] = stale_reason(pr, policy, config["delivery"]["base_branch"])
                 # 与状态同点落库：读方不必跳 GitHub 就能分辨哪条检查在排队、哪条失败。
                 # 全绿或无可展示项时清掉上一 tick 的明细，避免状态前进后面板仍显示旧失败。
-                details = delivery_checks(pr) if gate != "stale" else []
+                # 目标失效时只有在本轮反馈与失败检查都不存在时才清空，否则基线前进
+                # 会顺带吞掉同一次读取里的失败检查名，用户只能回本地翻 observation。
+                details = delivery_checks(pr)
+                if gate == "stale" and not feedback_keys and not any(
+                        item["state"] in CHECK_FAILURE_STATES for item in details):
+                    details = []
                 if details:
                     outcome["delivery_checks"] = details
                 else:
@@ -1226,10 +1294,16 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         previous = dict(outcome)
                         outcome["delivery_status"] = "feedback_replan"
                         if _supersede_pr(store, run, outcome, state, now, feedback_keys):
-                            if _close_superseded_pr(store, run, outcome, repo, pr,
-                                                    lambda: tracking_cancelled() or runtime.project(project["id"])["paused"], now):
-                                _finish_merge(runtime, project, run, outcome, config, now,
-                                              active_run, tracking_cancelled, tick_baselines)
+                            try:
+                                if _close_superseded_pr(store, run, outcome, repo, pr,
+                                                        lambda: tracking_cancelled() or runtime.project(project["id"])["paused"], now):
+                                    _finish_merge(runtime, project, run, outcome, config, now,
+                                                  active_run, tracking_cancelled, tick_baselines)
+                            finally:
+                                # 基线同时前进时同样要留下成因，否则反馈重排的日志
+                                # 会丢掉“为什么这个候选已经不能合并”。
+                                if gate == "stale":
+                                    _record_superseded(store, run, outcome)
                             continue
                         outcome = previous
                     outcome["delivery_status"] = gate
@@ -1319,10 +1393,13 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         task = store.one("SELECT attempts FROM tasks WHERE id=?", (run["task"],))
                         state = "queued" if (task["attempts"] or 0) <= config["limits"]["retries"] else "blocked"
                         if _supersede_pr(store, run, outcome, state, now):
-                            if _close_superseded_pr(store, run, outcome, repo,
-                                                    pr_view(repo, outcome["pr"]), tracking_cancelled, now):
-                                _finish_merge(runtime, project, run, outcome, config, now,
-                                              active_run, tracking_cancelled, tick_baselines)
+                            try:
+                                if _close_superseded_pr(store, run, outcome, repo,
+                                                        pr_view(repo, outcome["pr"]), tracking_cancelled, now):
+                                    _finish_merge(runtime, project, run, outcome, config, now,
+                                                  active_run, tracking_cancelled, tick_baselines)
+                            finally:
+                                _record_superseded(store, run, outcome)
                         continue
                 status = outcome.get("delivery_status")
                 store.remote_wait(run["id"], status if status in ["waiting_ci", "waiting_review", "waiting", "merge_submitted"] else None, now)
