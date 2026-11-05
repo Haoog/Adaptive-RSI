@@ -908,6 +908,72 @@ class ReliabilityTest(unittest.TestCase):
         self.assertFalse(evaluate.called)
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "obsolete")
 
+    def scope_agent(self, implementation, scope=("src",), change_kind="refactor"):
+        """计划范围固定为窄目录，实现模型在工作区直接执行给定的文件动作。"""
+        class Scoped(FakeAgent):
+            def invoke(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):
+                if role == "implementation":
+                    self.roles.append((role, config["models"][role]))
+                    implementation(Path(workspace))
+                    return {"summary": "Scoped implementation"}
+                result = super().invoke(role, prompt, workspace, project, run, config, cancel, protected)
+                if role == "planning":
+                    result["scope"] = list(scope)
+                    result["change_kind"] = change_kind
+                return result
+        return Scoped()
+
+    def scoped_repo(self, files):
+        for path, content in files.items():
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",
+            "commit", "-qm", "scoped tree")
+
+    def test_scope_gate_rejects_rename_source_outside_plan(self):
+        """rename 只报目标路径时，计划外文件可以借改名“删除”而躲过范围门禁。"""
+        from adaptive_rsi import pipeline
+        self.scoped_repo({"conftest.py": "COLLECTED = True\n", "src/app.py": "VALUE = 1\n"})
+
+        def implementation(workspace):
+            git(workspace, "mv", "conftest.py", "src/conftest.py")
+            (workspace / "src/app.py").write_text("VALUE = 2\n")
+        self.runtime.agent = self.scope_agent(implementation)
+        task, run, project, base, directory, workspace = self.no_change_inputs(
+            "Refactor the scoped tree layout while preserving behavior")
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "fail", "reason": "Scope gate bypassed", "checks": {},
+                 "execution_environment": {"backend": "test", "build": "test"}}) as evaluate:
+            with self.assertRaisesRegex(RuntimeError, "Change escaped planned scope: conftest.py"):
+                pipeline.execute_candidate(self.runtime, run, project, task, project["path"], base,
+                                           directory, workspace, [])
+        self.assertFalse(evaluate.called)
+        self.assertFalse((directory / "candidate.patch").exists())
+
+    def test_scope_gate_allows_rename_inside_plan(self):
+        """范围内 rename 仍通过范围校验，补丁照常封存。"""
+        from adaptive_rsi import pipeline
+        self.scoped_repo({"src/a.py": "VALUE = 1\n", "src/app.py": "VALUE = 1\n"})
+
+        def implementation(workspace):
+            git(workspace, "mv", "src/a.py", "src/b.py")
+            (workspace / "src/app.py").write_text("VALUE = 2\n")
+        self.runtime.agent = self.scope_agent(implementation)
+        task, run, project, base, directory, workspace = self.no_change_inputs(
+            "Refactor the scoped tree layout while preserving behavior")
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "fail", "reason": "Scope gate passed", "checks": {},
+                 "execution_environment": {"backend": "test", "build": "test"}}) as evaluate:
+            outcome = pipeline.execute_candidate(self.runtime, run, project, task, project["path"], base,
+                                                 directory, workspace, [])
+        self.assertTrue(evaluate.called)
+        self.assertEqual(outcome["decision"], "fail")
+        self.assertIn("rename from src/a.py", (directory / "candidate.patch").read_text())
+
     def high_risk_agent(self):
         """高风险计划且补丁触及敏感路径：未修复时 review 与 risk_review 都会被付费调用。"""
         class HighRisk(FakeAgent):

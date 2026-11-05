@@ -775,7 +775,11 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                             if path and test_path(path)}
         if test_first and not 1 <= len(added_test_files) <= 8:
             raise RuntimeError("Test-first changes require 1..8 new regression test files")
-        for path in files:
+        # git collapses a rename into its destination, so ``files`` omits the
+        # deleted source path.  Judge scope on every touched path, otherwise an
+        # out-of-scope file can be "deleted" by renaming it into the plan scope.
+        touched = _touched_paths(workspace) or files
+        for path in sorted(touched):
             relative_path(path)
             if test_first and test_path(path):
                 if path not in added_test_files or not _within_scope(path, regression_test_scope or ""):
