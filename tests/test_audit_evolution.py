@@ -1698,6 +1698,60 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertIn('Missing host tools', limitations_text)
         self.assertIn('Isolated offline environment', limitations_text)
 
+    def test_bundle_relative_check_commands_resolve_inside_case_bundle(self):
+        # 用例自带的相对命令（./run.sh）是包内依赖：必须按检查 cwd 在用例仓库
+        # 中定位并真实执行，不能被当成「宿主缺少工具」而跳过全部检查。
+        destination = self.sealed_bundle(repo_name='repo-relative-argv')
+        case = destination / 'cases' / 'case-relative-argv'
+        script = case / 'repository' / 'run.sh'
+        script.write_text('#!/bin/sh\nexit 0\n')
+        script.chmod(0o755)
+        spec = json.loads((case / 'case.json').read_text(encoding='utf-8'))
+        spec['checks'] = [{'name': 'repo-script', 'cwd': '.', 'argv': ['./run.sh']}]
+        (case / 'case.json').write_text(encode(spec), encoding='utf-8')
+        self.reseal_bundle(destination)
+
+        probed = []
+
+        def which(cmd, **kwargs):
+            probed.append(cmd)
+            return '/usr/bin/' + cmd if cmd in ('git', 'python3') else None
+
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True, which=which)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(result['dependencies']['missing'], [])
+        # 包内路径不进入宿主 which() 查询。
+        self.assertNotIn('./run.sh', probed)
+        available = {item['name']: item for item in result['dependencies']['available']}
+        self.assertEqual(available['./run.sh']['type'], 'bundle')
+        self.assertEqual([(row['case'], row['check'], row['passed'])
+                          for row in result['executed_checks']],
+                         [('case-relative-argv', 'repo-script', True)])
+        self.assertEqual(result['checks_executed'], 1)
+        self.assertTrue(result['reproducible'])
+
+        # 真正缺失的宿主工具仍按宿主依赖记录；包内缺失的脚本单独归类，
+        # 两者都继续阻止复现，且不会再执行任何检查。
+        spec['checks'] = [
+            {'name': 'repo-script', 'cwd': '.', 'argv': ['./run.sh']},
+            {'name': 'missing-host-tool', 'cwd': '.', 'argv': ['definitely-missing-binary']},
+            {'name': 'missing-bundle-script', 'cwd': '.', 'argv': ['tools/missing.sh']},
+        ]
+        (case / 'case.json').write_text(encode(spec), encoding='utf-8')
+        self.reseal_bundle(destination)
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True, which=which)
+        missing = {item['name']: item for item in result['dependencies']['missing']}
+        self.assertEqual(missing['definitely-missing-binary']['type'], 'executable')
+        self.assertEqual(missing['tools/missing.sh']['type'], 'bundle')
+        self.assertNotIn('./run.sh', missing)
+        self.assertEqual(result['executed_checks'], [])
+        self.assertFalse(result['reproducible'])
+        limitations = ' '.join(result['limitations'])
+        self.assertIn('Missing host tools: 1', limitations)
+        self.assertIn('Missing bundle executables: 1', limitations)
+
     def test_bundle_offline_reproduction_detects_tampered_bundle(self):
         self.candidate({'preregistered_plan': {'data': {'x': 1}, 'sha256': fingerprint({'x': 1})},
                         'providers': []})
