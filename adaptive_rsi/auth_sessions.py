@@ -104,6 +104,40 @@ def _http_error_detail(status, raw):
 
 
 AuthenticationError = AuthError
+_ACCOUNT_TEXT_LIMIT = 160
+
+
+def _account_entries(account):
+    """把 account/read 的身份载荷收敛成可展示的 label/plan，其余字段一律丢弃。"""
+    if not isinstance(account, dict):
+        return []
+    label = account.get("email")
+    if not isinstance(label, str) or not label.strip():
+        label = account.get("type")
+    plan = account.get("planType")
+    if not isinstance(plan, str) or not plan.strip():
+        plan = account.get("plan")
+    label = label.strip()[:_ACCOUNT_TEXT_LIMIT] if isinstance(label, str) else ""
+    plan = plan.strip()[:_ACCOUNT_TEXT_LIMIT] if isinstance(plan, str) else ""
+    return [{"label": label, "plan": plan}] if label or plan else []
+
+
+def _account_rows(value):
+    """只接受已经收敛的展示行，防止状态文件或旧会话带出额外字段。"""
+    rows = []
+    if not isinstance(value, list):
+        return rows
+    for row in value:
+        if len(rows) == 2:
+            break
+        if not isinstance(row, dict):
+            continue
+        label = row.get("label") if isinstance(row.get("label"), str) else ""
+        plan = row.get("plan") if isinstance(row.get("plan"), str) else ""
+        label, plan = label.strip()[:_ACCOUNT_TEXT_LIMIT], plan.strip()[:_ACCOUNT_TEXT_LIMIT]
+        if label or plan:
+            rows.append({"label": label, "plan": plan})
+    return rows
 
 
 def _read_json(path):
@@ -298,6 +332,8 @@ class CodexAuth(_Process):
         self.messages = queue.Queue(maxsize=128)
         self.notifications = []
         self.request_id = 0
+        # account/read 的载荷只留在进程内；对外快照只取收敛后的 label/plan。
+        self.account = {}
         try:
             binary = self.binary()
         except AuthError:
@@ -402,8 +438,10 @@ class CodexAuth(_Process):
                     if params.get("success") is not True:
                         raise AuthError("authorization_failed")
                     result = self.request("account/read", {"refreshToken": False})
-                    if not result.get("account"):
+                    account = result.get("account")
+                    if not account:
                         raise AuthError("authorization_failed")
+                    self.account = account if isinstance(account, dict) else {}
                     return True
         return False
 
@@ -653,9 +691,10 @@ class OpenCodeAuth(_Process):
             except AuthError:
                 continue
             connections = integration.get("connections", [])
-            connected = provider in host_connected or (
-                isinstance(connections, list) and any(
-                    isinstance(connection, dict) and connection.get("type") == "credential" for connection in connections))
+            credentials = [connection for connection in connections
+                           if isinstance(connection, dict) and connection.get("type") == "credential"
+                           ] if isinstance(connections, list) else []
+            connected = provider in host_connected or bool(credentials)
             items = []
             for index, method in enumerate(integration.get("methods", [])):
                 if not isinstance(method, dict) or method.get("type") not in {"key", "oauth"}:
@@ -681,7 +720,8 @@ class OpenCodeAuth(_Process):
                 methods_by_index[(provider, index)] = method
             if items:
                 result.append({"id": provider, "name": str(integration.get("name", provider))[:160],
-                               "methods": items, "connected": connected})
+                               "methods": items, "connected": connected,
+                               "connection_count": len(credentials)})
         self._v2_methods = methods_by_index
         result.sort(key=lambda row: (not row["connected"], row["name"].casefold()))
         return result
@@ -951,7 +991,8 @@ class AuthSessions:
             if (isinstance(item, dict) and isinstance(session_id, str) and item.get("id") == session_id
                     and item.get("backend") in {"codex", "opencode"} and item.get("state") in ACTIVE | TERMINAL
                     and isinstance(item.get("expires_at"), (float, int))):
-                item = {key: value for key, value in item.items() if key in {"id", "backend", "provider", "state", "expires_at", "error"}}
+                item = {key: value for key, value in item.items() if key in {"id", "backend", "provider", "state", "expires_at", "error", "accounts"}}
+                item["accounts"] = _account_rows(item.get("accounts"))
                 if item.get("state") in ACTIVE:
                     item.update(state="interrupted", error="process_interrupted")
                 self.sessions[session_id] = item
@@ -969,19 +1010,26 @@ class AuthSessions:
         recent = set(list(self.sessions)[-30:])
         retained = {key: item for key, item in self.sessions.items()
                     if key in recent or item["state"] in ACTIVE or key in self.workers}
-        rows = list(retained.items())
-        _write_json(self.file, {key: {field: value for field, value in item.items()
-                                     if field in {"id", "backend", "provider", "state", "expires_at", "error"}}
-                                for key, item in rows})
+        stored = {}
+        for key, item in retained.items():
+            row = {field: value for field, value in item.items()
+                   if field in {"id", "backend", "provider", "state", "expires_at", "error"}}
+            accounts = _account_rows(item.get("accounts"))
+            if accounts:
+                row["accounts"] = accounts
+            stored[key] = row
+        _write_json(self.file, stored)
         self.sessions = retained
         self._publish_sessions()
 
     @staticmethod
     def _public(item):
         """对外快照按白名单复制稳定字段；私有标记与新增敏感字段默认不离开进程。"""
-        return copy.deepcopy({key: item[key] for key in
-                              ("id", "backend", "provider", "state", "expires_at", "error", "attempt_generation",
-                               "method", "verification_url", "user_code", "instructions") if key in item})
+        result = copy.deepcopy({key: item[key] for key in
+                                ("id", "backend", "provider", "state", "expires_at", "error", "attempt_generation",
+                                 "method", "verification_url", "user_code", "instructions") if key in item})
+        result["accounts"] = _account_rows(item.get("accounts"))
+        return result
 
     def _invalidate_caches(self, backend):
         # 调用方持有 self.lock；阻止失效前启动的发现任务重新发布旧结果。
@@ -1127,7 +1175,8 @@ class AuthSessions:
                         result[backend]["transport"] = "docker"
                         result[backend].setdefault("error", error)
         with self.view_lock:
-            result["sessions"] = [{key: item.get(key) for key in ("id", "backend", "provider", "state", "expires_at", "error")}
+            result["sessions"] = [{key: item.get(key) for key in
+                                   ("id", "backend", "provider", "state", "expires_at", "error", "accounts")}
                                   for item in list(self.public_sessions.values())[-30:]]
         return result
 
@@ -1552,7 +1601,10 @@ class AuthSessions:
                 if not success:
                     self._update(session_id, state="failed", error="authorization_failed")
                     return
-                self._update(session_id, state="completing")
+                values = {"state": "completing"}
+                if item["backend"] == "codex":
+                    values["accounts"] = _account_entries(getattr(worker, "account", None))
+                self._update(session_id, **values)
             self._save(worker, item["backend"], item["provider"], session_id, stop)
         except Exception as exc:
             if not isinstance(exc, AuthError):
