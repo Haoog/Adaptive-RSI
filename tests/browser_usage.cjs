@@ -199,6 +199,21 @@ const {chromium}=require('playwright');
    await detailContent.locator('span').filter({hasText:'价值初筛'}).first().waitFor();
    await page.locator('#usage-detail .close-dialog').click();
   }finally{await page.unroute('**/api/usage?*',usageRoute);}
+  // —— 角色汇总：未知用量必须与顶部 summary 同口径标出，全部已知时文本与改动前一致。
+  const roleBox=page.locator('#usage-role-summary'),roleValues=async()=>Object.fromEntries(await roleBox.locator('span').evaluateAll(nodes=>nodes.map(node=>[node.querySelector('small').textContent,node.querySelector('strong').textContent])));
+  let roleRows=[{role:'planning',tokens:150,unknown_calls:1},{role:'acceptance',tokens:12,unknown_calls:0},{role:'triage',tokens:0,unknown_calls:1}];
+  const roleRoute=async route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({summary:{tokens:162,unknown_calls:2,tasks:1,model_seconds:1,cache_read_tokens:0,estimated_usd:null,unpriced_calls:1},daily:[],roles:roleRows,tasks:[],total:0})});
+  await page.route('**/api/usage?*',roleRoute);
+  try{
+   await page.locator('#usage-refresh').click();
+   await page.waitForFunction(()=>document.querySelector('#usage-role-summary').textContent.includes('部分未知'));
+   assert.deepEqual(await roleValues(),{'规划':'150 + 部分未知','验收设计':'12 tokens','价值初筛':'用量未知'});
+   assert.equal(await page.locator('#usage-totals strong').first().textContent(),'162 + 部分未知');
+   roleRows=[{role:'planning',tokens:150,unknown_calls:0},{role:'acceptance',tokens:12,unknown_calls:0}];
+   await page.locator('#usage-refresh').click();
+   await page.waitForFunction(()=>!document.querySelector('#usage-role-summary').textContent.includes('部分未知'));
+   assert.deepEqual(await roleValues(),{'规划':'150 tokens','验收设计':'12 tokens'});
+  }finally{await page.unroute('**/api/usage?*',roleRoute);}
   console.log('Usage page: real API, empty/filter state, English, mobile and no JS errors passed.');
  }finally{if(browser)await browser.close();server.stdin.end('\n');await new Promise(resolve=>server.once('exit',resolve));}
 })().catch(e=>{console.error(e);process.exitCode=1;});
