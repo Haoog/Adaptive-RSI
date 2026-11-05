@@ -64,6 +64,15 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.commands = []
         self.remote = None
 
+    def test_invalid_health_port_reports_once_and_treats_target_as_unowned(self):
+        from adaptive_rsi.release import deployment_owner
+        policy = {**self.policy, "health_url": "https://app.example:99999/health"}
+        for _ in range(2):
+            self.assertIsNone(deployment_owner(self.runtime, self.project, "example/project", policy))
+        events = self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(json.loads(events[0]["data"])["error_code"], "invalid_deployment_health_url")
+
     def test_missing_remote_run_preserves_identity_without_error_events(self):
         from adaptive_rsi.release import reconcile
         data = {'state': 'rerun_unknown', 'workflow_run_id': 17, 'repository': 'example/project',
@@ -1201,6 +1210,13 @@ class StableUpdatePolicyTest(unittest.TestCase):
         for url in ["http://example/health", "https://user:secret@example/health", "https://example/health?token=x", "https://example/health#x"]:
             with self.subTest(url=url), self.assertRaises(ValueError):
                 validate({"delivery": {"deploy": {"health_url": url}}})
+
+    def test_health_endpoint_port_must_be_in_range(self):
+        for url in ["https://example:0/health", "https://example:99999/health",
+                    "https://example:65536/health", "https://example:abc/health"]:
+            with self.subTest(url=url), self.assertRaisesRegex(ValueError, "health URL.*port"):
+                validate({"delivery": {"deploy": {"health_url": url}}})
+        self.assertTrue(validate({"delivery": {"deploy": {"health_url": "https://example:8443/health"}}})["delivery"]["deploy"]["health_url"])
 
 
 class ReleaseVersionPatchTest(unittest.TestCase):

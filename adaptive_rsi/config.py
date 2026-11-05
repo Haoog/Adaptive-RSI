@@ -250,6 +250,13 @@ def validate(config):
                 health.password is not None or health.query or health.fragment or
                 any(c.isspace() or ord(c) < 32 for c in url)):
             raise ValueError("Deployment health URL requires HTTPS without credentials, query or fragment")
+        if url:
+            try:
+                port = health.port
+            except ValueError:
+                raise ValueError("Deployment health URL requires a valid port between 1 and 65535") from None
+            if port is not None and not 1 <= port <= 65535:
+                raise ValueError("Deployment health URL requires a valid port between 1 and 65535")
     if delivery["deploy"]["automatic_rollback"] and not delivery["deploy"]["health_url"]:
         raise ValueError("Automatic deployment rollback requires an explicit health URL")
     if delivery["deploy"]["rollback_data_policy"] not in ("manual", "backward_compatible"):
