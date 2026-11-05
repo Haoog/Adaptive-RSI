@@ -562,6 +562,46 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertNotIn(b"private-secret-field", body)
         self.assertIn(b"core, candidates or analytics", body)
 
+    def test_revision_conflict_reports_the_same_structured_reason_for_config_and_routes(self):
+        # 同一条 revision 冲突必须让两个写端点返回相同的可操作原因码，而不是一个带原因、一个只剩通用兜底。
+        from adaptive_rsi.runtime import Runtime
+        runtime = Runtime(Store(self.root / "revision-state"))
+        server = Server(runtime)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        headers = {"Cookie": server.cookie + "=" + server.token, "Origin": server.local_origin,
+                   "X-RSI-CSRF": server.csrf, "Content-Type": "application/json"}
+
+        def post(path, body):
+            payload = json.dumps(body).encode()
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            try:
+                connection.request("POST", path, body=payload, headers=headers)
+                response = connection.getresponse()
+                return response.status, response.read()
+            finally:
+                connection.close()
+
+        try:
+            stale = runtime.store.config_revision()
+            runtime.configure({"schedule": {"weight": 3}})
+            self.assertNotEqual(runtime.store.config_revision(), stale)
+            secret = "private-revision-secret"
+            status, config_body = post("/api/config", {"values": {"schedule": {"weight": 4}}, "revision": stale})
+            self.assertEqual(status, 400)
+            status, routes_body = post("/api/model-center/routes",
+                                       {"models": {"planning": {"provider": secret}}, "revision": stale})
+            self.assertEqual(status, 400)
+            self.assertEqual(json.loads(config_body), json.loads(routes_body))
+            self.assertEqual(json.loads(routes_body)["reason_code"], "config_revision_conflict")
+            self.assertIsNone(json.loads(routes_body)["field_path"])
+            self.assertNotIn(secret.encode(), config_body + routes_body)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(3)
+            runtime.close()
+
     def test_feedback_overview_is_read_only_and_project_scoped(self):
         for candidate, project in [("feedback-p", "p"), ("feedback-q", "q")]:
             self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
@@ -826,6 +866,39 @@ class ServerHardeningTest(unittest.TestCase):
             self.assertEqual(status, 400)
             self.assertEqual(json.loads(payload)["error"], "report_outside_state_directory")
             self.assertFalse(escaped.exists())
+
+    def test_rehearsal_report_read_rejects_symlinked_file(self):
+        reports = self.store.root / "reports"
+        reports.mkdir()
+        # 合法报告仍按原样返回，字段结构不变。
+        report = {"id": self.identifier, "valid": True, "source": "fixture"}
+        report_file = reports / f"rehearsal-{self.identifier}.json"
+        report_file.write_text(json.dumps(report), encoding="utf-8")
+        status, _, body = self.request(f"/api/rehearsal?id={self.identifier}")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), report)
+
+        # 同一路径替换为指向状态目录外文件的符号链接后不得跟随读取。
+        secret = self.root / "secret.txt"
+        secret.write_text('{"leaked":"SECRET-FILE-CONTENT"}', encoding="utf-8")
+        report_file.unlink()
+        report_file.symlink_to(secret)
+        for endpoint in ("/api/rehearsal", "/api/rehearse-restore"):
+            with self.subTest(endpoint=endpoint):
+                status, _, body = self.request(f"{endpoint}?id={self.identifier}")
+                self.assertEqual(status, 400)
+                self.assertNotIn(b"SECRET-FILE-CONTENT", body)
+                self.assertEqual(json.loads(body)["error"], "Rehearsal report not found")
+
+    def test_rehearsal_report_read_rejects_symlinked_reports_directory(self):
+        outside = self.root / "outside-reports"
+        outside.mkdir()
+        (outside / f"rehearsal-{self.identifier}.json").write_text(
+            '{"leaked":"SECRET-FILE-CONTENT"}', encoding="utf-8")
+        (self.store.root / "reports").symlink_to(outside, target_is_directory=True)
+        status, _, body = self.request(f"/api/rehearsal?id={self.identifier}")
+        self.assertEqual(status, 400)
+        self.assertNotIn(b"SECRET-FILE-CONTENT", body)
 
     def test_connection_gate_releases_permit_when_thread_spawn_fails(self):
         # Thread.start() 抛错时 process_request 必须退还 gate 名额，

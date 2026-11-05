@@ -681,6 +681,11 @@ def _close_retry_due(outcome, now):
 
 
 def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
+    """Observe a superseded PR and record a merge instead of discarding it.
+
+    Returns True when the run was advanced to merged, so the caller still runs
+    post-merge feedback and release advancement for code that already landed.
+    """
     # A failed/lost response leaves the intent durable. Always observe remote state
     # before retrying, including manual closes and merges while the worker was down.
     if pr["state"] == "OPEN":
@@ -711,11 +716,54 @@ def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
             store.remote_wait(run["id"], None, time.time())
             return
         outcome["close_status"] = "close_submitted"
-    else:
-        outcome["close_status"] = pr["state"].lower()
+        outcome["close_pending"] = False
+        store.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run["id"]))
+        store.remote_wait(run["id"], None, time.time())
+        return False
+    outcome["close_status"] = pr["state"].lower()
+    if pr["state"] == "MERGED":
+        # 反馈重排/用户重排与人工合并并发时，代码已经进入主线。此前这里只写
+        # close_status=merged，丢掉 merged_sha：run 永远退出监控，既没有合并后
+        # 验证与发布资格，任务还会以 queued 重新实现同一改动。
+        previous = outcome.get("delivery_status")
+        merge_commit = pr.get("mergeCommit")
+        oid = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
+        if isinstance(oid, str) and oid:
+            outcome["merged_sha"] = oid
+            outcome["merged_at"] = now
+            outcome["delivery_status"] = "merged"
+            outcome["close_pending"] = False
+            state = "merged"
+        else:
+            # 合并事实已确认但拿不到 mergeCommit.oid：保留关闭意图让下一 tick
+            # 复查补齐，绝不落成「已合并但 merged_sha 永远为空」的终态。
+            outcome["delivery_status"] = "merge_sha_pending"
+            outcome["close_pending"] = True
+            state = "superseded"
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            # 任务可能已被用户或反馈主动重排：置 blocked 保留重排意图，同时阻止
+            # 下一轮把已合入的改动再实现一遍。存在更新的 run 时只记事件，绝不
+            # 改写新 run 持有的任务状态。
+            db.execute("UPDATE tasks SET state='blocked',updated=? WHERE id=? "
+                       "AND state IN ('queued','pr_open','blocked','obsolete') "
+                       "AND NOT EXISTS (SELECT 1 FROM runs WHERE task=? AND "
+                       "(started>? OR (started=? AND id>?)))",
+                       (now, run["task"], run["task"], run["started"], run["started"], run["id"]))
+            db.execute("UPDATE runs SET state=?,result=? WHERE id=? AND state='superseded'",
+                       (state, encode(outcome), run["id"]))
+        if previous not in ("merged", "merge_sha_pending"):
+            store.event("delivery_merged_after_supersede",
+                        "Superseded PR was already merged; merge evidence recorded",
+                        run["project"], run["id"])
+        store.remote_wait(run["id"], None, time.time())
+        if state == "merged":
+            run["state"] = "merged"
+        return state == "merged"
     outcome["close_pending"] = False
     store.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run["id"]))
     store.remote_wait(run["id"], None, time.time())
+    return False
 
 
 # 对账放弃后该运行永久退出恢复候选：退避只限频，尝试次数上限才让无果的
@@ -911,6 +959,18 @@ def schedule(runtime, now=None):
             store.put_setting("delivery-scheduled:" + project_id, now)
 
 
+def _finish_merge(runtime, project, run, outcome, config, now, active_run, tracking_cancelled, shared=None):
+    """Run post-merge feedback and release advancement for a recorded merge."""
+    store = runtime.store
+    active = store.one("SELECT * FROM runs WHERE id=?", (active_run,)) if active_run else None
+    feedback(runtime, project, run, outcome, config, now,
+             (lambda: runtime.is_cancelled(active)) if active else None,
+             shared=shared)
+    from .release import advance
+    outcome["automation"] = advance(runtime, project, run, outcome, tracking_cancelled)
+    store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+
+
 def tick(runtime, now=None, project_id=None, active_run=None):
     now = now or time.time()
     store = runtime.store
@@ -1049,8 +1109,10 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     store.event('delivery_close_blocked', outcome['close_blocked_reason'],
                                 project['id'], run['id'])
                     continue
-                _close_superseded_pr(store, run, outcome, repo, pr,
-                                     lambda: tracking_cancelled() or runtime.project(project['id'])['paused'], now)
+                if _close_superseded_pr(store, run, outcome, repo, pr,
+                                        lambda: tracking_cancelled() or runtime.project(project['id'])['paused'], now):
+                    _finish_merge(runtime, project, run, outcome, config, now,
+                                  active_run, tracking_cancelled, tick_baselines)
                 continue
             if run["state"] == "pr_open":
                 gate = merge_gate(pr, policy["head"], policy["base"])
@@ -1141,8 +1203,10 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         previous = dict(outcome)
                         outcome["delivery_status"] = "feedback_replan"
                         if _supersede_pr(store, run, outcome, state, now, feedback_keys):
-                            _close_superseded_pr(store, run, outcome, repo, pr,
-                                                 lambda: tracking_cancelled() or runtime.project(project["id"])["paused"], now)
+                            if _close_superseded_pr(store, run, outcome, repo, pr,
+                                                    lambda: tracking_cancelled() or runtime.project(project["id"])["paused"], now):
+                                _finish_merge(runtime, project, run, outcome, config, now,
+                                              active_run, tracking_cancelled, tick_baselines)
                             continue
                         outcome = previous
                     outcome["delivery_status"] = gate
@@ -1183,8 +1247,10 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                     outcome["delivery_status"] = "issue_changed"
                                     # Issue sync will refresh evidence and requeue this task if it is still eligible.
                                     if _supersede_pr(store, run, outcome, "blocked", now):
-                                        _close_superseded_pr(store, run, outcome, repo,
-                                                             pr_view(repo, outcome["pr"]), tracking_cancelled, now)
+                                        if _close_superseded_pr(store, run, outcome, repo,
+                                                                pr_view(repo, outcome["pr"]), tracking_cancelled, now):
+                                            _finish_merge(runtime, project, run, outcome, config, now,
+                                                          active_run, tracking_cancelled, tick_baselines)
                                     continue
                         # Fetch and Issue checks can outlive a settings change. Re-read the complete
                         # local authorization under the same lock used by configuration writes.
@@ -1230,19 +1296,17 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         task = store.one("SELECT attempts FROM tasks WHERE id=?", (run["task"],))
                         state = "queued" if (task["attempts"] or 0) <= config["limits"]["retries"] else "blocked"
                         if _supersede_pr(store, run, outcome, state, now):
-                            _close_superseded_pr(store, run, outcome, repo,
-                                                 pr_view(repo, outcome["pr"]), tracking_cancelled, now)
+                            if _close_superseded_pr(store, run, outcome, repo,
+                                                    pr_view(repo, outcome["pr"]), tracking_cancelled, now):
+                                _finish_merge(runtime, project, run, outcome, config, now,
+                                              active_run, tracking_cancelled, tick_baselines)
                         continue
                 status = outcome.get("delivery_status")
                 store.remote_wait(run["id"], status if status in ["waiting_ci", "waiting_review", "waiting", "merge_submitted"] else None, now)
                 store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
             if outcome.get("merged_sha"):
-                active = store.one("SELECT * FROM runs WHERE id=?", (active_run,)) if active_run else None
-                feedback(runtime, project, run, outcome, config, now,
-                         (lambda: runtime.is_cancelled(active)) if active else None,
-                         shared=tick_baselines)
-                from .release import advance
-                outcome["automation"] = advance(runtime, project, run, outcome, tracking_cancelled)
+                _finish_merge(runtime, project, run, outcome, config, now,
+                              active_run, tracking_cancelled, tick_baselines)
             store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
         except Exception as exc:
             store.event("delivery_error", str(exc), project["id"], run["id"])
