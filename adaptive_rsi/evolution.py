@@ -27,6 +27,13 @@ DEFAULT_PROVIDER_ENV_KEYS = {
     "openrouter": "OPENROUTER_API_KEY",
     "opencode_go": "OPENCODE_API_KEY",
 }
+# 复现包的完整性校验只覆盖「已导出的文件未被篡改」，不证明包里存在可执行的
+# 基线用例：没有 dataset.manifest 的旧候选/手写 ready 行会导出只有 json 的空包，
+# manifest 登记但库中缺失的用例也可能没有随包导出。复现侧据此判不可复现，
+# 并在限制说明里写明缺了哪些用例。
+BUNDLE_NO_CASES = ("Bundle is incomplete: no registered case.json was exported, "
+                   "so offline reproduction has no executable baseline")
+BUNDLE_MISSING_CASES = "Bundle is incomplete: %d of %d registered dataset cases are missing (%s)"
 
 # 重复抑制签名的失败文本归一化：临时目录、绝对路径、run/case/请求 id、UUID 与
 # 时间戳逐实例变化，但同属一类故障；剥掉这些易变成分后同一根因聚成一个签名，
@@ -864,8 +871,10 @@ class Evolution:
     def reproduce_bundle(directory, env=None, which=None, required_credentials=None, run_checks=False):
         """Inspect and verify offline reproduction readiness for a sealed bundle.
 
-        Verifies input integrity and itemizes all missing tool dependencies and
-        credentials without failing fast on the first missing requirement.
+        Verifies input integrity, requires at least one exported case with every
+        registered dataset case present, and itemizes all missing tool
+        dependencies and credentials without failing fast on the first missing
+        requirement.
         """
         import os
         import shutil
@@ -877,6 +886,7 @@ class Evolution:
             return {
                 "valid": False,
                 "integrity": {"valid": False, "mismatches": ["bundle.json"]},
+                "cases": {"exported": [], "registered": [], "missing": []},
                 "dependencies": {"available": [], "missing": []},
                 "credentials": {"available": [], "missing": []},
                 "limitations": ["Missing bundle.json: target is not a valid reproduction bundle directory"],
@@ -929,10 +939,32 @@ class Evolution:
         # 2. Inspect case check dependencies across verified manifest entries only.
         # 未登记的用例目录一律不读、不执行；用例路径出现符号链接则按 verify_bundle
         # 同一套规则判 integrity 失效（防 verify 与读取之间被调包）。
+        # 先按 bundle.json 自身登记的 cases/<id>/case.json 统计「随包导出的用例」：
+        # 空包与缺包即便 integrity 有效，也没有可执行的离线基线。
+        files = manifest.get("files")
+        exported_cases = []
+        if isinstance(files, dict):
+            for relative in sorted(files):
+                parts = Path(relative).parts
+                if len(parts) == 3 and parts[0] == "cases" and parts[2] == "case.json":
+                    exported_cases.append(parts[1])
+        registered_cases = []
+        dataset = evidence.get("dataset") if isinstance(evidence, dict) else None
+        if isinstance(dataset, dict) and isinstance(dataset.get("manifest"), list):
+            for item in dataset["manifest"]:
+                if not isinstance(item, dict):
+                    continue
+                # 未抽中执行的条目（sampled=false）只登记身份、不封存工作树，
+                # 不属于必须随包导出的基线；无标记的旧证据按抽中处理。
+                if not item.get("sampled", True):
+                    continue
+                case_id = item.get("case")
+                if isinstance(case_id, str) and case_id not in registered_cases:
+                    registered_cases.append(case_id)
+        missing_cases = [case_id for case_id in registered_cases if case_id not in exported_cases]
         case_items = []
         invalid_cases = []
         if integrity.get("valid"):
-            files = manifest.get("files")
             if isinstance(files, dict):
                 for relative in sorted(files):
                     parts = Path(relative).parts
@@ -1150,6 +1182,16 @@ class Evolution:
         if offline_note not in repro_limitations:
             repro_limitations.append(offline_note)
 
+        # 用例齐备性：integrity 只覆盖已导出文件，空包/缺包此前仍被判「具备离线
+        # 复现条件」。没有已登记 case.json，或 evidence.dataset.manifest 的用例
+        # 没有全部随包导出，都意味着没有（完整的）可执行基线。
+        if not exported_cases and BUNDLE_NO_CASES not in repro_limitations:
+            repro_limitations.append(BUNDLE_NO_CASES)
+        if missing_cases:
+            msg = BUNDLE_MISSING_CASES % (len(missing_cases), len(registered_cases), ", ".join(missing_cases))
+            if msg not in repro_limitations:
+                repro_limitations.append(msg)
+
         if malformed_checks:
             msg = f"Malformed check specifications: {'; '.join(malformed_checks)}"
             if msg not in repro_limitations:
@@ -1280,6 +1322,8 @@ class Evolution:
                 repro_limitations.append(msg)
         is_reproducible = (
             bool(integrity.get("valid")) and
+            len(exported_cases) > 0 and
+            len(missing_cases) == 0 and
             len(missing_tools) == 0 and
             len(missing_bundle) == 0 and
             len(missing_creds) == 0 and
@@ -1291,6 +1335,11 @@ class Evolution:
         return {
             "valid": bool(integrity.get("valid")),
             "integrity": integrity,
+            "cases": {
+                "exported": exported_cases,
+                "registered": registered_cases,
+                "missing": missing_cases,
+            },
             "dependencies": {
                 "available": available_tools,
                 "missing": missing_tools + missing_bundle,
