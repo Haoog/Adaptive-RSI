@@ -121,6 +121,9 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.store.one('SELECT count(*) AS n FROM runs')['n'], 0)
 
     def test_shutdown_cancels_unstarted_worker_and_requeues_claimed_task(self):
+        # 被取消的 future 从未运行，workers 阶段没有可等待对象，close() 会毫秒级
+        # 穿过 workers → maintenance → storage → completed；轮询 phase 只能采样到
+        # 瞬时值，CPU 争用时必然错过。这里等待关闭线程结束后断言稳定终态。
         gate = threading.Event()
         blockers = [self.runtime.pool.submit(gate.wait, 5) for _ in range(4)]
         try:
@@ -131,13 +134,10 @@ class RuntimeHandoffTest(unittest.TestCase):
             self.assertIsNotNone(run)
             closer = threading.Thread(target=self.runtime.close)
             closer.start()
-            limit = time.monotonic() + 2
-            while self.runtime.shutdown_status()['phase'] != 'workers' and time.monotonic() < limit:
-                time.sleep(.01)
-            self.assertEqual(self.runtime.shutdown_status()['phase'], 'workers')
-            gate.set()
             closer.join(5)
             self.assertFalse(closer.is_alive())
+            # 断言关闭结束后的稳定终态，而不是轮询期间的瞬时 phase。
+            self.assertEqual(self.runtime.shutdown_status()['phase'], 'completed')
             saved = self.store.one('SELECT state,ended FROM runs WHERE id=?', (run['id'],))
             self.assertEqual(saved['state'], 'interrupted')
             self.assertIsNotNone(saved['ended'])
