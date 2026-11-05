@@ -1027,6 +1027,75 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(outcome["decision"], "fail")
         self.assertIn("rename from src/a.py", (directory / "candidate.patch").read_text())
 
+    def rollback_fixture(self, forward, saved_files, patch_edit=None):
+        """构造一次已完成的候选 run（可含 rename）和它的 rollback 任务。"""
+        (self.repo / "pkg").mkdir(parents=True, exist_ok=True)
+        (self.repo / "pkg/keep.py").write_text("KEEP = 1\n")
+        (self.repo / "pkg/legacy.py").write_text(
+            "\n".join(f"VALUE_{index} = {index}" for index in range(40)) + "\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",
+            "commit", "-qm", "rollback baseline")
+        base_before = git(self.repo, "rev-parse", "HEAD")
+        forward(self.repo)
+        git(self.repo, "add", "-A")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",
+            "commit", "-qm", "prior candidate")
+        base_after = git(self.repo, "rev-parse", "HEAD")
+        patch = git(self.repo, "diff", "--binary", base_before, base_after)
+        if patch_edit:
+            patch = patch_edit(patch)
+        prior = self.store.root / "runs" / "prior-run"
+        prior.mkdir(parents=True)
+        (prior / "candidate.patch").write_text(patch + "\n", encoding="utf-8")
+        task = self.runtime.goal(self.project, "Revert the prior candidate")
+        # 原始 run 的 files 与 changes() 一致：rename 只留下目标路径。
+        self.store.execute(
+            "INSERT INTO runs(id,task,project,state,config,strategy,base,path,started,ended,result) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("prior-run", task, self.project, "merged", "{}", "[]", base_before, str(prior),
+             1.0, 2.0, json.dumps({"files": list(saved_files), "summary": "prior candidate"})))
+        self.store.execute("UPDATE tasks SET source='rollback', evidence=? WHERE id=?",
+                           (json.dumps([{"run": "prior-run"}]), task))
+        return self.store.claim(self.project, self.runtime.config(self.project))
+
+    def test_rollback_of_renamed_candidate_declares_rename_source(self):
+        """回滚含 rename 的候选：计划范围必须补上反向补丁恢复的源路径。"""
+        def forward(repo):
+            git(repo, "mv", "pkg/legacy.py", "pkg/moved.py")
+            with (repo / "pkg/moved.py").open("a") as stream:
+                stream.write("EXTRA = 1\n")
+        run = self.rollback_fixture(forward, ["pkg/moved.py"])
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "pass", "reason": "Reverse patch restores the baseline", "checks": {},
+                 "execution_environment": {"backend": "test", "build": "test"}}):
+            self.runtime.process(run)
+        row = self.store.one("SELECT state,result,path FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "awaiting_approval", row["result"])
+        plan = json.loads((Path(row["path"]) / "plan.json").read_text())
+        self.assertEqual(sorted(plan["scope"]), ["pkg/legacy.py", "pkg/moved.py"])
+
+    def test_rollback_rejects_paths_injected_into_saved_patch(self):
+        """损坏或篡改的存档补丁多出的路径仍被范围门禁拒绝。"""
+        def forward(repo):
+            git(repo, "mv", "pkg/legacy.py", "pkg/moved.py")
+            with (repo / "pkg/moved.py").open("a") as stream:
+                stream.write("EXTRA = 1\n")
+
+        def tamper(patch):
+            # git() 去掉了补丁末尾换行，拼接前补回，模拟被追加了一段额外 hunk。
+            return patch + "\ndiff --git a/pkg/keep.py b/pkg/keep.py\n--- a/pkg/keep.py\n+++ b/pkg/keep.py\n" \
+                           "@@ -1 +1 @@\n-KEEP = 0\n+KEEP = 1\n"
+        run = self.rollback_fixture(forward, ["pkg/moved.py"], patch_edit=tamper)
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate") as evaluate:
+            self.runtime.process(run)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "blocked", row["result"])
+        self.assertIn("Change escaped planned scope: pkg/keep.py", json.loads(row["result"])["reason"])
+        self.assertFalse(evaluate.called)
+
     def high_risk_agent(self):
         """高风险计划且补丁触及敏感路径：未修复时 review 与 risk_review 都会被付费调用。"""
         class HighRisk(FakeAgent):
