@@ -1033,6 +1033,45 @@ class AuditEvaluationTest(unittest.TestCase):
                 self.assertEqual(rows[1]['artifacts']['junit.xml']['state'], 'missing')
                 self.assertEqual(rows[1]['artifacts']['coverage/lcov.info']['state'], 'missing')
 
+    def test_report_moves_large_artifacts_to_outputs_and_keeps_small_ones_inline(self):
+        """20 个检查 × 两阶段各 2 MiB 产物曾把 report.json 撑到 82 MiB。"""
+        import hashlib
+        prefix = '<testsuite tests="1"><testcase classname="m" name="t"/></testsuite>'
+        junit = prefix + 'y' * (2 * 1024 * 1024 - 4096 - len(prefix))
+        lcov = 'TN:\nSF:app.py\n'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / 'workspace'
+            workspace.mkdir()
+            (workspace / 'junit.xml').write_text(junit)
+            (workspace / 'lcov.info').write_text(lcov)
+            artifacts = evaluator.collect_test_artifacts(workspace)
+            digest = hashlib.sha256(junit.encode()).hexdigest()
+            self.assertEqual(artifacts['junit.xml']['state'], 'collected')
+            self.assertEqual(artifacts['junit.xml']['sha256'], digest)
+
+            def rows():
+                return [{'name': 'check_%d' % index, 'argv': ['pytest'], 'stdout': '',
+                         'stderr': '', 'artifacts': artifacts} for index in range(20)]
+
+            report = {'decision': 'pass', 'checks': {'baseline': rows(), 'candidate': rows()}}
+            evaluator.write_evaluation_report(root / 'evaluation', report)
+            path = root / 'evaluation' / 'report.json'
+            self.assertLess(path.stat().st_size, 1024 * 1024)
+            document = json.loads(path.read_text(encoding='utf-8'))
+            for stage in ('baseline', 'candidate'):
+                saved = document['checks'][stage][7]['artifacts']['junit.xml']
+                self.assertNotIn('content', saved)
+                self.assertEqual(saved['state'], 'collected')
+                self.assertEqual(saved['bytes'], len(junit.encode()))
+                self.assertEqual(saved['sha256'], digest)
+                self.assertEqual((root / 'evaluation' / saved['path']).read_bytes(), junit.encode())
+                inline = document['checks'][stage][7]['artifacts']['lcov.info']
+                self.assertEqual(inline['content'], lcov)
+                self.assertNotIn('path', inline)
+            # 写报告不能改动内存行：判定与基线缓存仍读取原文。
+            self.assertEqual(report['checks']['baseline'][7]['artifacts']['junit.xml']['content'], junit)
+
     def test_dependency_graph_closes_over_dependents_and_unknown_falls_back(self):
         checks = [{'name': 'a'}, {'name': 'b'}, {'name': 'all'}]
         graph = {'a': {'paths': ['packages/a/'], 'depends_on': [], 'checks': ['a']},

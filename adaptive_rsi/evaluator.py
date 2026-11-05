@@ -40,6 +40,9 @@ CACHE_STDERR_LIMIT = 16 * 1024
 # report.json keeps only a bounded tail of each stream; the full bytes stay in
 # the evaluation directory so evidence remains auditable without copying logs.
 REPORT_STREAM_LIMIT = 64 * 1024
+# Collected artifact bodies above this size move next to the report; the row
+# keeps the collector's state/bytes/sha256 and the file path instead of the body.
+REPORT_ARTIFACT_LIMIT = 64 * 1024
 # Cached rows keep only what gate and review comparisons read; raw artifact
 # contents stay in the run directory and are re-read on demand.
 CACHE_ARTIFACT_FIELDS = ("state", "reason", "bytes", "sha256")
@@ -901,11 +904,41 @@ def _report_output_location(directory, trail):
     return Path(directory).joinpath(*(parts + ["outputs"])), name
 
 
+def _bounded_report_artifacts(artifacts, location, name, directory):
+    """Copy artifact rows, moving oversized bodies to files next to the report.
+
+    The collector's ``state``/``bytes``/``sha256`` fields stay untouched so the
+    report still identifies the original bytes; the body is replaced by a
+    report-relative ``path`` once it exceeds the inline limit.
+    """
+    item = {}
+    for relative, artifact in artifacts.items():
+        if not isinstance(artifact, dict):
+            item[relative] = artifact
+            continue
+        entry = dict(artifact)
+        content = entry.get("content")
+        if isinstance(content, str):
+            raw = content.encode("utf-8", "replace")
+            if len(raw) > REPORT_ARTIFACT_LIMIT:
+                location.mkdir(parents=True, exist_ok=True)
+                suffix = re.sub(r"[^A-Za-z0-9_.-]", "_", str(relative).replace("/", "__"))
+                path = location / (name + "." + suffix)
+                path.write_bytes(raw)
+                entry.pop("content")
+                entry["path"] = path.relative_to(directory).as_posix()
+        item[relative] = entry
+    return item
+
+
 def _bounded_report_row(row, directory, trail):
-    """Copy one result row, moving oversized streams to files next to the report."""
+    """Copy one result row, moving oversized streams and artifacts to files."""
     import hashlib
     location, name = _report_output_location(directory, trail)
     item = dict(row)
+    artifacts = row.get("artifacts")
+    if isinstance(artifacts, dict):
+        item["artifacts"] = _bounded_report_artifacts(artifacts, location, name, directory)
     for stream, suffix in (("stdout", "out"), ("stderr", "err")):
         text = row.get(stream)
         if not isinstance(text, str):
@@ -948,7 +981,7 @@ def _bounded_report_node(node, directory, trail=(), memo=None):
 
 
 def write_evaluation_report(directory, data):
-    """Persist the evaluation report without inlining multi-megabyte logs."""
+    """Persist the evaluation report without inlining multi-megabyte logs or artifacts."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     document = _bounded_report_node(data, directory)
