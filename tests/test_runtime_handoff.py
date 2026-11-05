@@ -157,8 +157,10 @@ class RuntimeHandoffTest(unittest.TestCase):
         with self.runtime._futures_lock:
             self.runtime._future_runs[future] = run['id']
         self.runtime.futures.add(future)
-        with patch.object(self.store, 'transition', side_effect=RuntimeError('database or disk is full')):
-            self.runtime.close()
+        with self.assertLogs('adaptive_rsi.runtime', level='ERROR') as logged:
+            with patch.object(self.store, 'transition', side_effect=RuntimeError('database or disk is full')):
+                self.runtime.close()
+        self.assertIn('Failed to reconcile unstarted worker', logged.output[0])
         status = self.runtime.shutdown_status()
         self.assertEqual(status['phase'], 'completed')
         self.assertEqual(status['reconcile_failed'], 1)
