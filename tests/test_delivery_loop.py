@@ -127,8 +127,17 @@ class DeliveryLoopTest(unittest.TestCase):
         run = self.store.claim(self.project, self.runtime.config(self.project))
         self.runtime.process(run)
         result = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        payload = json.loads(result["result"] or "{}")
         self.assertEqual([r[0] for r in self.runtime.agent.roles], ["planning"], result["result"])
-        self.assertEqual(result["state"], "blocked")
+        # 计划契约失败（范围里夹带注释）是需要重新收集证据的业务问题，不是内部故障：
+        # 运行停在 insufficient_evidence 并给出可执行的下一步，而不是 blocked/execution。
+        self.assertEqual(result["state"], "insufficient_evidence", payload)
+        self.assertEqual(payload["reason"], "Plan must name narrower scope than the entire repository")
+        self.assertEqual(payload["failure"], {"code": "improvement", "action": "inspect_evidence"})
+        # 原始计划保留为证据，被拒绝的范围从未生成授权文件。
+        directory = self.store.root / "runs" / run["id"]
+        self.assertEqual(json.loads((directory / "plan.json").read_text())["scope"], ["calculator.py：修改加法"])
+        self.assertFalse((directory / "tool-scope.json").exists())
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_high_risk_acceptance_artifacts_never_enter_implementer_workspace(self):
