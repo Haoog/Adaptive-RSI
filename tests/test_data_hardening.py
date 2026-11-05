@@ -138,6 +138,32 @@ class DataHardeningTest(unittest.TestCase):
         self.assertEqual(visible["task_counts"], [{"state": "failed", "count": 1}])
         self.assertEqual(next(row["count"] for row in included["task_counts"] if row["state"] == "failed"), 2)
 
+    def test_task_page_omits_bodies_and_evidence_but_detail_keeps_them(self):
+        body = "检查登录失败问题。" * 3000
+        evidence = json.dumps({"sources": ["a"] * 20, "notes": "证据" * 100})
+        for index in range(50):
+            self.runtime.store.execute(
+                "INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,acceptance,state,"
+                "priority,attempts,overrides,available,created,updated) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("bulk-%d" % index, self.project, "user", "bulk-fp-%d" % index, "任务 %d" % index,
+                 body, evidence, "[]", "queued", 50, 0, "{}", 0, 0, 0))
+
+        page = records(self.runtime.store, self.project, limit=50)
+        self.assertEqual(len(page["tasks"]), 50)
+        self.assertEqual([task for task in page["tasks"] if "body" in task or "evidence" in task], [])
+        self.assertLess(len(json.dumps(page, ensure_ascii=False, default=str).encode()), 100 * 1024)
+
+        response = self.get("/api/state?project=" + self.project + "&limit=50")
+        state = json.loads(response)
+        self.assertEqual(len(state["tasks"]), 50)
+        self.assertEqual([task for task in state["tasks"] if "body" in task or "evidence" in task], [])
+        self.assertLess(len(response), 100 * 1024)
+
+        detail = json.loads(self.get("/api/task?id=bulk-0&project=" + self.project))
+        self.assertEqual(detail["body"], body)
+        self.assertEqual(detail["evidence"], evidence)
+
     def test_readiness_names_missing_tools_and_dependencies_without_model_calls(self):
         config = merge(DEFAULTS, {"checks": [{"name": "missing", "cwd": ".", "argv": ["missing-tool"]}],
                                  "environment": {"seed_paths": ["missing-seed"]}})
