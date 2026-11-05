@@ -133,6 +133,21 @@ def _issue_comment_cache_evidence(issue_comments):
             if key not in {"status", "fetched_at", "checked_at", "cached_at", "updated_at"}}
 
 
+def _skills_cache_evidence(skills):
+    """Name the retrieved skills that actually reach the prompt, not the whole table.
+
+    Promoted or newly matching skills change what planning and implementation see,
+    so the retrieved set belongs in their stage keys; unrelated skills must not
+    invalidate a cached stage.
+    """
+    evidence = []
+    for item in skills:
+        source = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
+        evidence.append({"content": item.get("content", ""), "triggers": item.get("triggers", []),
+                         "candidate": source.get("candidate")})
+    return evidence
+
+
 def _stage_config(config, stage):
     """Keep unrelated settings out of a cached stage's invalidation key."""
     role = "planning" if stage == "acceptance" else stage
@@ -502,14 +517,19 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                 for item in runtime.store.setting("prs:" + project["id"], [])[:20]
                 if isinstance(item, dict)]
     planning_config, _ = _stage_config(config, "planning")
+    extra = experiment_skills if experiment else None
+    skills = runtime.memories(project["id"], task["body"], extra=extra)
+    # Experiments never read the stage cache, and their injected candidate skills
+    # are an ablation input rather than a promotion event; keep them out of the key.
+    skill_evidence = None if experiment else _skills_cache_evidence(skills)
     plan_key = fingerprint({"inputs": signature(run, task, base, strategies, planning_config),
                             "dependencies": environment["sha256"], "outcomes": planning_outcomes, "prs": open_prs,
-                            "related_work": overlaps, "issue_comments": comment_evidence, "pr_feedback": pr_feedback})
+                            "related_work": overlaps, "issue_comments": comment_evidence, "pr_feedback": pr_feedback,
+                            "skills": skill_evidence})
     saved_plan = None if experiment else cached(runtime, run, "planning", plan_key)
     saved_acceptance = None if experiment else cached(runtime, run, "acceptance", plan_key)
-    extra = experiment_skills if experiment else None
     context = {"task": {k: task[k] for k in ["title", "body", "source", "evidence", "acceptance"]},
-               "stable_strategies": strategies, "skills": runtime.memories(project["id"], task["body"], extra=extra),
+               "stable_strategies": strategies, "skills": skills,
                "toolchains": detect(workspace), "code_map": code_map(workspace, task["body"], limit=12), "baseline": base,
                "postmerge_outcomes": planning_outcomes,
                "open_prs": open_prs,
@@ -682,6 +702,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     candidate_key = fingerprint({"inputs": signature(run, task, base, strategies, implementation_config),
                                  "dependencies": environment["sha256"], "outcomes": planning_outcomes, "prs": open_prs,
                                  "related_work": overlaps, "issue_comments": comment_evidence, "pr_feedback": pr_feedback,
+                                 "skills": skill_evidence,
                                  "plan": plan, "acceptance_hash": acceptance["hash"] if acceptance else None,
                                  "test_first": test_first, "checks": checks})
     saved_candidate = None if experiment else cached(runtime, run, "validated_candidate", candidate_key)
