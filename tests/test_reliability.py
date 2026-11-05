@@ -1760,7 +1760,11 @@ class ReliabilityTest(unittest.TestCase):
                 return super().invoke(role, *args, **kwargs)
         self.runtime.agent = Docs()
         task, run = self.claim("Update usage guide")
+        # 保存被替换的评估结果时会在缺少执行身份的情况下回填 execution_identity，
+        # 真实探测宿主机 docker；CI 冷启动探测偶发失败，就会把「文档改动仍跑固定
+        # 检查」误报成 blocked。后端探测与本用例无关，固定返回值即可。
         with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": [], "checks": CHECKS}), \
+             patch("adaptive_rsi.evaluator.Sandbox.backend", return_value="stub"), \
              patch.object(self.runtime.evaluator, "evaluate", return_value={
                 "decision": "pass", "reason": "Fixed checks passed", "checks": {}}) as evaluate:
             self.runtime.process(run)
