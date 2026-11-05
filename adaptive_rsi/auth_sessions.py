@@ -1316,6 +1316,8 @@ class AuthSessions:
             with self.threads_lock:
                 self.threads.discard(thread)
             raise
+        # 返回是否真的启动了线程：close() 竞争时调用方需要据此把会话落成终态。
+        return True
 
     def start(self, backend, provider=None, method=0, inputs=None):
         """reserve + launch 的便捷组合；更新准入场景在临界区内只调用 reserve。
@@ -1378,6 +1380,10 @@ class AuthSessions:
         返回该会话状态即可，不能对刚登记、worker 从未启动的会话抛
         invalid_auth_state。只 reserve 未 launch 的会话仍由 status()/busy 的
         过期扫描兜底回收（更新准入可能在登记后拦下 launch）。
+
+        worker 起不来（线程创建失败或服务已关闭）时不能返回一个永远 starting 的
+        会话：_reserved 已被消费，行会一直占着同后端的 busy 名额，直到 TTL 到期
+        才被收成 expired。这里把它落成终态再抛 AuthError，让前端立即提示重试。
         """
         if not isinstance(method, int) or isinstance(method, bool) or method < 0 or method > 100:
             raise AuthError("invalid_auth_method")
@@ -1405,8 +1411,39 @@ class AuthSessions:
                 return self._public(item)
             if item["state"] != "starting":
                 raise AuthError("invalid_auth_state")
-        self._thread(lambda: self._run(session_id, method, inputs))
+        try:
+            started = self._thread(lambda: self._run(session_id, method, inputs))
+        except Exception:
+            # 低内存下 thread.start() 会抛 RuntimeError("can't start new thread")，
+            # 而 _reserved 已被消费、worker 从未运行：不释放这条行就会让同后端在
+            # TTL 内持续 auth_busy，桌面更新与自动更新也被挡在 authentication 上。
+            self._abort_launch(session_id)
+            raise AuthError("auth_protocol_error") from None
+        except BaseException:
+            self._abort_launch(session_id)
+            raise
+        if not started:
+            # _thread() 在 close() 置位后静默不启动；这里同样不能留下 starting 行。
+            self._abort_launch(session_id, state="interrupted")
+            raise AuthError("service_closed")
         return self.status(session_id)
+
+    def _abort_launch(self, session_id, state="failed"):
+        """worker 未能启动时把会话落成终态，写盘失败按 _run() 的内存兜底释放 busy。"""
+        values = {"state": state, "error": "process_interrupted"}
+        try:
+            self._update(session_id, **values)
+        except AuthError:
+            # 会话已被并发路径移除，没有需要释放的 busy 行。
+            return
+        except OSError:
+            with self.lock:
+                item = self.sessions.get(session_id)
+                if item is None:
+                    return
+                if item["state"] in ACTIVE:
+                    self._terminate(item, **values)
+                    self._publish_sessions()
 
     @staticmethod
     def _terminate(item, **values):
