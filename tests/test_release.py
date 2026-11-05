@@ -692,6 +692,57 @@ class ReleaseAutomationTest(unittest.TestCase):
             self.tick()
         self.assertEqual(len(calls), 1)
 
+    def test_permanent_rollback_read_failure_blocks_tracking_and_keeps_manual_exits(self):
+        from adaptive_rsi.release import abandon, candidates, deployment_terminal, resolve
+        deploy = self.setup_deployment(rollback=True)
+        rollback = {"state": "running", "operation_id": "fixture-rollback", "sha": PREVIOUS,
+                    "repository": "example/project", "workflow": deploy["workflow"], "ref": deploy["ref"],
+                    "workflow_sha": deploy["sha"], "workflow_run_id": 18}
+        self.runtime.store.put_setting(key(self.run["id"], "deploy"), {
+            "state": "rolling_back", "operation_id": "fixture", "sha": MERGED,
+            "repository": "example/project", "workflow": deploy["workflow"], "ref": deploy["ref"],
+            "workflow_sha": deploy["sha"], "workflow_run_id": 17, "rollback": rollback})
+        before = len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'"))
+        reads = []
+        def forbidden(repo, endpoint, method="GET", fields=None):
+            reads.append(endpoint)
+            raise ApiRejected("gh: Forbidden (HTTP 403)", 403)
+        with patch("adaptive_rsi.release.api", side_effect=forbidden):
+            for expected in ("rolling_back", "rolling_back", "reconciliation_blocked"):
+                self.assertEqual(self.tick()["deploy"]["state"], expected)
+            self.assertFalse(pending(self.runtime, self.run))
+            # 转入终态后不再读取同一个必然失败的远端，也不再写事件。
+            self.assertEqual(self.tick()["deploy"]["state"], "reconciliation_blocked")
+        self.assertEqual(reads, ["actions/runs/18"] * 3)
+        saved = self.runtime.store.setting(key(self.run["id"], "deploy"))
+        self.assertEqual(saved["state"], "reconciliation_blocked")
+        self.assertEqual(saved["advance_failures"], 3)
+        self.assertEqual(saved["last_advance_error"], "gh: Forbidden (HTTP 403)")
+        self.assertEqual(saved["rollback"]["state"], "reconciliation_blocked")
+        self.assertTrue(deployment_terminal(saved, deploy))
+        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")) - before, 1)
+        # 恢复读取权限后，回滚 run 的只读对账入口可用，而不是只剩 ValueError。
+        def readable(repo, endpoint, method="GET", fields=None):
+            self.assertEqual(endpoint, "actions/runs/18")
+            return {"id": 18, "head_sha": TRUSTED, "display_title": "fixture-rollback",
+                    "event": "workflow_dispatch", "path": deploy["workflow"], "head_branch": deploy["ref"],
+                    "status": "in_progress", "conclusion": None, "run_attempt": 1}
+        with patch("adaptive_rsi.release.api", side_effect=readable):
+            view = candidates(self.runtime, self.project, self.run["id"], "deploy", target="rollback")
+            self.assertEqual(view["state"], "reconciliation_blocked")
+            self.assertEqual([item["id"] for item in view["selectable_candidates"]], [18])
+            resolve(self.runtime, self.project, self.run["id"], "deploy", 18, target="rollback")
+        resumed = self.runtime.store.setting(key(self.run["id"], "deploy"))
+        self.assertEqual(resumed["state"], "rolling_back")
+        for field in ("advance_failures", "last_advance_error", "last_advance_error_at"):
+            self.assertNotIn(field, resumed)
+        # 阻塞状态没有放宽关闭条件：确认远端不可见时人工仍可关闭。
+        resumed.update(state="reconciliation_blocked", error="gh: Forbidden (HTTP 403)")
+        self.runtime.store.put_setting(key(self.run["id"], "deploy"), resumed)
+        with patch("adaptive_rsi.release.api", side_effect=ApiRejected("gh: Not Found (HTTP 404)", 404)):
+            closed = abandon(self.runtime, self.project, self.run["id"], "deploy", "GitHub access permanently revoked")
+        self.assertEqual(closed["state"], "failed")
+
     def test_health_exception_does_not_modify_concurrent_receipt(self):
         deploy = self.setup_deployment(rollback=True)
         name = key(self.run['id'], 'deploy')
