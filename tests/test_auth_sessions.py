@@ -1265,6 +1265,44 @@ class AuthSessionTests(unittest.TestCase):
         finally:
             second.close()
 
+    @unittest.skipIf(getattr(os, "geteuid", lambda: -1)() == 0, "root 不受目录权限限制")
+    def test_read_only_state_directory_keeps_loaded_sessions(self):
+        # 状态目录只读（磁盘满/属主变化同属 OSError）不能让整个服务起不来：
+        # 原文件仍完好，先带内存会话启动，恢复可写后再落盘。
+        state = self.root / "readonly-state"
+        state.mkdir()
+        session_id = "restored-session"
+        payload = {session_id: {"id": session_id, "backend": "codex", "state": "completed",
+                                "expires_at": time.time() + 600, "error": ""}}
+        (state / "auth-sessions.json").write_text(json.dumps(payload))
+        state.chmod(0o500)
+        try:
+            manager = AuthSessions(state, factory=self.factory, ttl=600)
+            self.addCleanup(manager.close)
+            self.assertIsInstance(manager._persist_error, OSError)
+            self.assertEqual([row["id"] for row in manager.snapshot()["sessions"]], [session_id])
+            self.assertEqual(json.loads((state / "auth-sessions.json").read_text()), payload)
+        finally:
+            state.chmod(0o700)
+        reserved = manager.reserve("codex")
+        stored = json.loads((state / "auth-sessions.json").read_text())
+        self.assertEqual(stored[session_id]["state"], "completed")
+        self.assertEqual(stored[reserved["id"]]["state"], "starting")
+
+    @unittest.skipIf(getattr(os, "geteuid", lambda: -1)() == 0, "root 不受目录权限限制")
+    def test_read_only_missing_state_directory_still_starts(self):
+        state = self.root / "readonly-empty"
+        state.mkdir()
+        state.chmod(0o500)
+        try:
+            manager = AuthSessions(state, factory=self.factory, ttl=600)
+            self.addCleanup(manager.close)
+            self.assertIsNone(manager._persist_error)
+            self.assertEqual(manager.snapshot()["sessions"], [])
+            self.assertFalse((state / "auth-sessions.json").exists())
+        finally:
+            state.chmod(0o700)
+
     def test_codex_login_merges_with_existing_auth_fields(self):
         # 用户在目标文件里手放的 OPENAI_API_KEY 或新版本未知字段不能被登录写回抹掉。
         path = self.root / "codex/auth.json"

@@ -967,6 +967,8 @@ class AuthSessions:
         self.closed = False
         # close() 期间状态文件写失败时保留首个异常，供排查；不向调用方抛出。
         self._close_error = None
+        # 构造时整理旧文件的写盘失败（只读目录、磁盘满）只记录，不阻断服务启动。
+        self._persist_error = None
         self.shutdown = threading.Event()
         self.ttl = ttl
         self.config = config
@@ -1001,7 +1003,13 @@ class AuthSessions:
                     item.update(state="interrupted", error="process_interrupted")
                 self.sessions[session_id] = item
         if previous:
-            self._persist()
+            try:
+                self._persist()
+            except OSError as exc:
+                # 状态目录只读/磁盘满时原文件仍完好：保留已加载会话继续启动，
+                # 等目录恢复可写后由下一次 reserve/_update 正常落盘。
+                self._persist_error = exc
+                self._publish_sessions()
         else:
             self._publish_sessions()
 
