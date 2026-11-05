@@ -97,6 +97,23 @@ DEAD_DEPENDENCY_STATES = ("failed", "cancelled", "expired", "obsolete", "rejecte
                           "pr_closed", "unverified_merge", "reverted", "superseded")
 
 
+def _fair_ledger(value):
+    """公平账本只参与排序：形状或数值损坏的条目丢弃并报告，不能让一次调度失败。
+
+    与 `rotation`、`postprocess-pending-cursor` 等设置读取的防御一致；返回
+    (清洗后的账本, 被丢弃的键)。
+    """
+    if not isinstance(value, dict):
+        return {}, ["<%s>" % type(value).__name__]
+    cleaned, dropped = {}, []
+    for key, entry in value.items():
+        if isinstance(entry, bool) or not isinstance(entry, (int, float)):
+            dropped.append(str(key))
+        else:
+            cleaned[key] = entry
+    return cleaned, dropped
+
+
 def _clock_lock(run):
     """Return the lock that guards one run's deadline clock fields.
 
@@ -1409,9 +1426,27 @@ class Runtime(Maintenance):
                         (now, now, now - 86400, project["id"], now - 86400))["seconds"]
             if not ready:
                 return
-            services = self.store.setting("fair-service", {})
+            services, dropped = _fair_ledger(self.store.setting("fair-service", {}))
+            dropped = ["fair-service:" + key for key in dropped]
             clock = self.store.setting("fair-clock", max(services.values(), default=0))
-            waiting = self.store.setting("fair-waiting", {})
+            if isinstance(clock, bool) or not isinstance(clock, (int, float)):
+                dropped.append("fair-clock")
+                clock = max(services.values(), default=0)
+            waiting, waiting_dropped = _fair_ledger(self.store.setting("fair-waiting", {}))
+            dropped += ["fair-waiting:" + key for key in waiting_dropped]
+            if dropped:
+                # 账本只影响排序：坏条目在内存里丢弃后按清洗值回写并记录一次，避免每个
+                # 调度节拍重复报告；回写或事件失败时继续用清洗后的内存值调度。
+                try:
+                    self.store.put_setting("fair-service", services)
+                    self.store.put_setting("fair-waiting", waiting)
+                    if "fair-clock" in dropped:
+                        self.store.put_setting("fair-clock", clock)
+                    self.store.event("fair_ledger_repaired",
+                                     "Discarded corrupt fair ledger entries",
+                                     data={"dropped": sorted(set(dropped))})
+                except Exception:
+                    logging.getLogger(__name__).warning("Fair ledger repair failed", exc_info=True)
             active = {p["id"] for p, _ in ready}
             waiting = {key: value for key, value in waiting.items() if key in active}
             for key in active:
@@ -1451,11 +1486,27 @@ class Runtime(Maintenance):
                     run = None if self.updates.is_busy() else self.store.claim(project["id"], config)
                     if not run:
                         return
-                    services[project["id"]] += 1 / max(1, config["schedule"].get("weight", 1))
-                    self.store.put_setting("fair-service", services)
-                    self.store.put_setting("fair-clock", max(clock, min(services[key] for key in active)))
-                    waiting[project["id"]] = now
-                    self.store.put_setting("fair-waiting", waiting)
+                    # 账本只服务下一次调度的排序，claim 却已经改写任务与 runs 行；若这里
+                    # 让一次瞬时写失败（database is locked / 磁盘满）逃出去，run 会永久
+                    # 停在 planning、任务停在 planning，同项目的普通任务在 recover() 前
+                    # 全部领不到。记账失败只告警并继续提交，run 由 worker 正常收尾。
+                    try:
+                        services[project["id"]] = (services.get(project["id"], clock) +
+                                                   1 / max(1, config["schedule"].get("weight", 1)))
+                        self.store.put_setting("fair-service", services)
+                        self.store.put_setting("fair-clock", max(clock, min(services[key] for key in active)))
+                        waiting[project["id"]] = now
+                        self.store.put_setting("fair-waiting", waiting)
+                    except Exception as exc:
+                        logging.getLogger(__name__).warning(
+                            "Fair ledger update failed for %s: %s", project["id"], exc)
+                        try:
+                            self.store.event("fair_ledger_skipped",
+                                             "Fair ledger update failed; dispatching the claimed run anyway",
+                                             run["project"], run["id"], {"error": type(exc).__name__})
+                        except Exception:
+                            logging.getLogger(__name__).warning(
+                                "Fair ledger failure event could not be recorded", exc_info=True)
                     try:
                         future = self.pool.submit(self.process, run)
                     except Exception:
