@@ -298,6 +298,70 @@ class AuditRound4Test(unittest.TestCase):
         # TAP skipped points still count as executed evidence for this gate.
         self.assertFalse(empty_test_run("TAP version 13\nok 1 - x # SKIP\n1..1\n"))
 
+    def test_evaluator_empty_test_run_quiet_pytest_all_skipped(self):
+        # ``pytest -q`` prints no ``=`` rule; the bare summary line is the only
+        # evidence that every collected test body was skipped.
+        self.assertTrue(empty_test_run("ss                                                                       [100%]\n"
+                                       "2 skipped in 0.01s\n"))
+        self.assertTrue(empty_test_run("2 skipped, 1 warning in 0.01s\n"))
+        self.assertTrue(empty_test_run("2 skipped in 65.00s (0:01:05)\n"))
+        # One executed test keeps the quiet run non-empty.
+        self.assertFalse(empty_test_run("1 passed, 1 skipped in 0.01s\n"))
+        # A timing line without a test outcome is not a quiet summary.
+        self.assertFalse(empty_test_run("3 warnings in 2.1s\n"))
+        # The decorated form stays the only ``clarity_test_summary`` source.
+        self.assertIsNone(clarity_test_summary("2 skipped in 0.01s\n"))
+
+    def test_evaluator_empty_test_run_quiet_pytest_multiple_suites(self):
+        # A wrapper script runs several suites and prints one quiet summary
+        # per suite. A skip-only first suite must not hide a later suite that
+        # executed tests, and the verdict cannot depend on the print order.
+        self.assertFalse(empty_test_run("2 skipped in 0.01s\n3 passed in 0.02s\n"))
+        self.assertFalse(empty_test_run("3 passed in 0.02s\n2 skipped in 0.01s\n"))
+        self.assertFalse(empty_test_run("1 failed, 1 skipped in 0.01s\n2 skipped in 0.02s\n"))
+        # Only when every recognizable suite reports skips does it stay empty.
+        self.assertTrue(empty_test_run("2 skipped in 0.01s\n5 skipped, 1 warning in 0.02s\n"))
+
+    def test_evaluator_empty_test_run_cargo_all_ignored(self):
+        ignored = ("test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; "
+                   "0 filtered out; finished in 0.00s")
+        self.assertTrue(empty_test_run(ignored))
+        self.assertFalse(empty_test_run(
+            "test result: ok. 1 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; "
+            "finished in 0.01s"))
+        # A separate binary that really ran tests keeps the whole run non-empty.
+        self.assertFalse(empty_test_run(
+            ignored + "\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; "
+                      "0 filtered out; finished in 0.01s"))
+        # An executed count anywhere still means the run was not skip-only.
+        self.assertFalse(empty_test_run("test result: ok. 0 passed; 4 ignored; 1 passed"))
+
+    def test_standard_stage_flags_quiet_pytest_all_skipped(self):
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.evaluator import Evaluator
+        checks = [{"name": "unit", "argv": ["python3", "-m", "pytest", "-q"]}]
+
+        def execute(_sandbox, check, workspace, *args, **kwargs):
+            return {"name": check["name"], "argv": check["argv"], "exit_code": 0,
+                    "stdout": "ss                                                                       [100%]\n"
+                              "2 skipped in 0.01s\n",
+                    "stderr": "", "error": None}
+
+        source = self.root / "source"
+        source.mkdir()
+        (source / "app.py").write_text("VALUE = 1\n")
+        store = Store(self.root / "state")
+        self.addCleanup(store.close)
+        runner = Evaluator(store)
+        config = merge(DEFAULTS, {})
+        with patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=execute):
+            rows = runner._standard_stage("candidate", source, source, source, checks,
+                                          self.root / "evaluation", config, None, None, None,
+                                          [])["rows"]
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["empty_tests"])
+        self.assertFalse(rows[0]["passed"])
+
     def test_review_enforce_finding_line_and_rank_defensive(self):
         valid_review = {
             "decision": "pass",
