@@ -17,7 +17,7 @@ from adaptive_rsi.delivery import CHECK_DETAIL_LIMIT, baseline, delivery_checks,
 from adaptive_rsi.evaluator import Evaluator, freeze_harness, write_evaluation_report
 from adaptive_rsi.gitops import changes, git, snapshot
 from adaptive_rsi.runtime import Runtime
-from adaptive_rsi.process import Sandbox, run_process
+from adaptive_rsi.process import Cancelled, Sandbox, run_process
 from adaptive_rsi.store import Store, encode
 from tests.test_runtime import CHECKS, FakeAgent, fixture
 
@@ -584,6 +584,17 @@ print('BOUNDARIES_OK')
         # 同一 tick 内 origin 探测也只做一次，逐 run 重复探测不再随 PR 数增长。
         probe.assert_called_once_with(str(self.repo))
         self.assert_tracked_status(runs)
+
+    def test_cancelled_read_propagates_instead_of_logging_a_delivery_error(self):
+        # 暂停/取消是正常控制流：Cancelled 必须交给运行器收尾为 interrupted，
+        # 既不能写 delivery_error，也不能被当成一次失败的远端读继续跟踪。
+        self.tracked_pr()
+        with patch("adaptive_rsi.delivery.pr_view",
+                   side_effect=Cancelled("Project paused or run cancelled")):
+            with self.assertRaises(Cancelled):
+                tick(self.runtime, 1000)
+        self.assertEqual(self.store.query("SELECT * FROM events WHERE kind='delivery_error'"), [])
+        self.assertEqual(self.store.one("SELECT COUNT(*) AS n FROM runs WHERE state='pr_open'")["n"], 1)
 
     def test_pr_missing_from_listing_falls_back_to_exact_read_without_affecting_others(self):
         urls, runs, rows = self.tracked_prs()

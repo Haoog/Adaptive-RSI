@@ -226,6 +226,18 @@ def pr_feedback_context(store, project, task):
 
 
 _PROTECTION_CACHE = {}
+_PROTECTION_CACHE_SECONDS = 300
+_HTTP_STATUS = re.compile(r"\(HTTP (\d{3})\)")
+
+
+def _protection_definitive(exc):
+    """A 404 states that the branch has no classic protection; nothing else is an answer.
+
+    Timeouts, 5xx, 403 and malformed payloads are failed reads. Caching them
+    keeps the readiness page on a stale warning long after GitHub recovered.
+    """
+    status = _HTTP_STATUS.search(str(exc))
+    return bool(status and status[1] == "404")
 
 
 def merge_protection(config):
@@ -234,12 +246,15 @@ def merge_protection(config):
     branch = config["delivery"]["base_branch"]
     key = (repo, branch)
     cached = _PROTECTION_CACHE.get(key)
-    if cached and time.monotonic() - cached[0] < 300:
+    if cached and time.monotonic() - cached[0] < _PROTECTION_CACHE_SECONDS:
         return cached[1]
     result = {"state": "unknown", "strict_checks": None, "branch": branch,
               "merge_queue": None, "complete": False,
               "sources": {"classic": "unknown", "rulesets": "unknown"}}
     from urllib.parse import quote
+    # 只有每个来源都给出确定答案（读到规则，或 404「未保护」）才缓存；
+    # 传输层失败下一次必须重试，不能把一次抖动固定成 5 分钟的错误读数。
+    cacheable = True
     try:
         if not branch:
             branch = json.loads(checked(["gh", "api", "repos/" + repo], timeout=10))["default_branch"]
@@ -250,8 +265,10 @@ def merge_protection(config):
                                          "/protection"], timeout=10))
             strict_values.append(bool((policy.get("required_status_checks") or {}).get("strict")))
             result["sources"]["classic"] = "observed"
-        except (RuntimeError, OSError, ValueError, KeyError, TypeError, AttributeError):
-            pass
+        except Cancelled:
+            raise
+        except (ProcessError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            cacheable = cacheable and _protection_definitive(exc)
         try:
             # The effective branch rules endpoint includes inherited active rulesets.
             rules = json.loads(checked(["gh", "api", "repos/" + repo + "/rules/branches/" +
@@ -265,18 +282,23 @@ def merge_protection(config):
             result["merge_queue"] = any(rule.get("type") == "merge_queue" for rule in rules)
             strict_values.extend(bool((rule.get("parameters") or {}).get("strict_required_status_checks_policy"))
                                  for rule in rules if rule.get("type") == "required_status_checks")
-        except (RuntimeError, OSError, ValueError, KeyError, TypeError, AttributeError):
-            pass
+        except Cancelled:
+            raise
+        except (ProcessError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            cacheable = cacheable and _protection_definitive(exc)
         result["complete"] = all(value == "observed" for value in result["sources"].values())
         if any(strict_values):
             result.update(state="strict", strict_checks=True)
         elif result["complete"]:
             result.update(state="review_rules", strict_checks=False)
-    except (RuntimeError, OSError, ValueError, KeyError, TypeError):
-        pass
-    if len(_PROTECTION_CACHE) >= 64:
-        _PROTECTION_CACHE.clear()
-    _PROTECTION_CACHE[key] = (time.monotonic(), result)
+    except Cancelled:
+        raise
+    except (ProcessError, OSError, ValueError, KeyError, TypeError):
+        cacheable = False
+    if cacheable:
+        if len(_PROTECTION_CACHE) >= 64:
+            _PROTECTION_CACHE.clear()
+        _PROTECTION_CACHE[key] = (time.monotonic(), result)
     return result
 
 
@@ -1331,6 +1353,10 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                 _finish_merge(runtime, project, run, outcome, config, now,
                               active_run, tracking_cancelled, tick_baselines)
             _persist_result(store, run, outcome)
+        except Cancelled:
+            # 暂停项目/取消 run 是正常控制流：交给运行器把本次 run 收尾为
+            # interrupted，不能落进错误事件流污染真实失败信号。
+            raise
         except Exception as exc:
             store.event("delivery_error", str(exc), project["id"], run["id"])
 
