@@ -113,6 +113,25 @@ def _clock_lock(run):
     return lock
 
 
+def _literal_pathspec(path):
+    """只有普通相对路径才能与一次全量 diff 的结果做字面比较。
+
+    glob（`*?[`）、排除（`!`/`^`）、pathspec 魔法（`:`）、`.`/`..` 段以及空路径
+    在 git 里有各自的匹配语义，交由 git 逐条判定，避免改变唤醒结论。
+    """
+    if not isinstance(path, str) or not path or path.startswith(("/", "!", "^", ":")):
+        return False
+    segments = path.rstrip("/").split("/")
+    return all(segment not in ("", ".", "..") for segment in segments) and \
+        not any(character in path for character in "*?[")
+
+
+def _diff_touches(changed, path):
+    """路径本身或其目录前缀出现在变更集里，等价于 git pathspec 命中。"""
+    path = path.rstrip("/")
+    return any(name == path or name.startswith(path + "/") for name in changed)
+
+
 class IssueSyncCorruptPending(ValueError):
     """_deliver 因 issue-sync 进度行损坏而拒绝交付；携带项目供调用方在回滚后补写事件。"""
 
@@ -1190,6 +1209,22 @@ class Runtime(Maintenance):
             candidate = boundary
 
     def reassess_deferred(self, project, config, head):
+        # 同一 base 的暂缓任务共享一次 base→head 变更集：逐条 git diff 会把完全相同的区间
+        # 重复 fork/exec N 次，而 related_paths 只是各自的过滤条件。
+        changes_by_base = {}
+
+        def changes_for(base):
+            if base not in changes_by_base:
+                try:
+                    # --no-renames 让重命名两侧的旧路径也出现在集合里，与逐条 pathspec 查询一致。
+                    output = git(self.project(project)["path"], "diff", "--name-only", "-z",
+                                 "--no-renames", base, head)
+                    changes_by_base[base] = {path for path in output.split("\0") if path}
+                except RuntimeError:
+                    # base 已不存在等情况：该 base 的任务按「无法判定」保持唤醒，与逐条 diff 一致。
+                    changes_by_base[base] = None
+            return changes_by_base[base]
+
         for task in self.store.query("SELECT * FROM tasks WHERE project=? AND state='deferred'", (project,)):
             decision = self.store.one("SELECT data FROM task_decisions WHERE task=?", (task["id"],))
             run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC,rowid DESC LIMIT 1", (task["id"],)) if not decision else None
@@ -1222,8 +1257,15 @@ class Runtime(Maintenance):
                 try:
                     for path in paths:
                         relative_path(path)
-                    changed = git(self.project(project)["path"], "diff", "--name-only", prior["base"], head, "--", *paths).strip()
-                    if not changed:
+                    if all(_literal_pathspec(path) for path in paths):
+                        changed = changes_for(prior["base"])
+                        # 无法取得变更集（base 已失效）时保持原结论：唤醒并重新评估。
+                        touched = True if changed is None else any(_diff_touches(changed, path) for path in paths)
+                    else:
+                        # glob、排除或 "." 等 pathspec 语法不能按字面比较，退回逐条查询。
+                        touched = bool(git(self.project(project)["path"], "diff", "--name-only",
+                                           prior["base"], head, "--", *paths).strip())
+                    if not touched:
                         baseline_changed = False
                         self.store.execute("INSERT OR REPLACE INTO task_decisions VALUES (?,?,?)",
                                            (task["id"], encode({**prior, "base": head}), time.time()))
