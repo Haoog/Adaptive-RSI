@@ -1470,6 +1470,112 @@ test('temporary auth polling failures preserve authorization; explicit expiry st
   assert.equal(terminal.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
 });
 
+test('a failed session recovery retries on the next view and renders the authorization panel', async () => {
+  const visibleText=node=>[node.textContent||'',...(node.children||[]).map(visibleText)].join(' ');
+  const page=browser();let statusCalls=0,sessionCalls=0;
+  page.context.URL=URL;
+  const recovered={id:'session-1',backend:'codex',state:'awaiting_authorization',method:'auto',verification_url:'https://example.test/device',user_code:'TEST-DEVICE-CODE'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){statusCalls++;return response({sessions:[{backend:'codex',provider:null,id:'session-1',state:'awaiting_authorization'}],codex:{available:true,state:'signed_out'}});}
+    if(url.includes('/api/auth/session?id=session-1')){sessionCalls++;return sessionCalls===1?response({error:'gateway unavailable'},500):response(recovered);}
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);
+  const show=()=>page.context.window.RSIAuth.show('openai',()=>Promise.resolve());
+  show();await new Promise(setImmediate);await new Promise(setImmediate);
+  assert.equal(statusCalls,1);
+  assert.equal(sessionCalls,1);
+  const failedText=visibleText(page.node('mc-auth'));
+  assert.match(failedText,/账号状态读取失败，正在重试/);
+  assert.doesNotMatch(failedText,/TEST-DEVICE-CODE/);
+  assert.equal(page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
+
+  show();await new Promise(setImmediate);await new Promise(setImmediate);
+  assert.equal(statusCalls,2);
+  assert.equal(sessionCalls,2);
+  const recoveredText=visibleText(page.node('mc-auth'));
+  assert.match(recoveredText,/打开官方授权页面/);
+  assert.match(recoveredText,/TEST-DEVICE-CODE/);
+  assert.match(recoveredText,/取消登录/);
+  assert.doesNotMatch(recoveredText,/账号状态读取失败/);
+  assert.equal(page.timers.filter(timer=>timer.active&&timer.delay===5000).length,0);
+});
+
+test('a persistent session recovery failure backs off instead of polling every 1.5s', async () => {
+  const visibleText=node=>[node.textContent||'',...(node.children||[]).map(visibleText)].join(' ');
+  const page=browser();let sessionCalls=0;const before=page.timers.length;
+  page.context.URL=URL;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[{backend:'codex',provider:null,id:'session-1',state:'awaiting_authorization'}],codex:{available:true,state:'signed_out'}});
+    if(url.includes('/api/auth/session?id=session-1')){
+      sessionCalls++;
+      if(sessionCalls<4)return response({error:'gateway unavailable'},503);
+      return response({id:'session-1',backend:'codex',state:'awaiting_authorization',method:'auto',verification_url:'https://example.test/device',user_code:'RECOVERED-CODE'});
+    }
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);
+  page.context.window.RSIAuth.show('openai',()=>Promise.resolve());
+  const settle=async()=>{await new Promise(setImmediate);await new Promise(setImmediate);};
+  // Only timers created by the auth module count: the app owns its own long refresh poll timer.
+  const authTimers=()=>page.timers.slice(before).filter(timer=>timer.active&&!/refreshPollTimer/.test(String(timer.callback)));
+  const delays=()=>authTimers().map(timer=>timer.delay);
+  const fire=delay=>{
+    const timer=authTimers().find(value=>value.delay===delay);
+    assert.ok(timer,`pending ${delay}ms timer`);timer.active=false;timer.callback();
+  };
+  await settle();
+  assert.deepEqual(delays(),[5000]);
+  assert.match(visibleText(page.node('mc-auth')),/账号状态读取失败，正在重试/);
+
+  fire(5000);await settle();
+  assert.deepEqual(delays(),[15000]);
+  fire(15000);await settle();
+  assert.deepEqual(delays(),[60000]);
+  fire(60000);await settle();
+  const recoveredText=visibleText(page.node('mc-auth'));
+  assert.equal(sessionCalls,4);
+  assert.doesNotMatch(recoveredText,/账号状态读取失败/);
+  assert.match(recoveredText,/RECOVERED-CODE/);
+});
+
+test('a live session poll does not postpone the pending status retry', async () => {
+  const visibleText=node=>[node.textContent||'',...(node.children||[]).map(visibleText)].join(' ');
+  const page=browser();let codexSessions=0,opencodeSessions=0;const before=page.timers.length;
+  page.context.URL=URL;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[
+      {backend:'opencode',provider:'p1',id:'session-open',state:'awaiting_authorization'},
+      {backend:'codex',provider:null,id:'session-codex',state:'awaiting_authorization'}],codex:{available:true,state:'signed_out'},opencode:{authenticated_providers:[]}});
+    if(url.includes('/api/auth/session?id=session-open')){opencodeSessions++;return response({id:'session-open',backend:'opencode',provider:'p1',state:'awaiting_authorization',method:'auto'});}
+    if(url.includes('/api/auth/session?id=session-codex')){codexSessions++;return codexSessions===1?response({error:'gateway unavailable'},503):response({id:'session-codex',backend:'codex',state:'awaiting_authorization',method:'auto',verification_url:'https://example.test/device',user_code:'LATE-CODE'});}
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);
+  page.context.window.RSIAuth.show('openai',()=>Promise.resolve());
+  const settle=async()=>{await new Promise(setImmediate);await new Promise(setImmediate);};
+  const authTimers=()=>page.timers.slice(before).filter(timer=>timer.active&&!/refreshPollTimer/.test(String(timer.callback)));
+  const fire=delay=>{
+    const timer=authTimers().find(value=>value.delay===delay);
+    assert.ok(timer,`pending ${delay}ms timer`);timer.active=false;timer.callback();
+  };
+  await settle();
+  assert.deepEqual(authTimers().map(timer=>timer.delay).sort((a,b)=>a-b),[1500,5000]);
+  assert.match(visibleText(page.node('mc-auth')),/账号状态读取失败，正在重试/);
+
+  // The opencode poll keeps the codex retry at its own 5s slot instead of pushing it out.
+  fire(1500);await settle();
+  assert.deepEqual(authTimers().map(timer=>timer.delay).sort((a,b)=>a-b),[1500,5000]);
+  assert.equal(opencodeSessions,2);
+  assert.equal(codexSessions,1);
+  fire(5000);await settle();
+  assert.equal(codexSessions,2);
+  assert.equal(opencodeSessions,2);
+  const recoveredText=visibleText(page.node('mc-auth'));
+  assert.match(recoveredText,/LATE-CODE/);
+  assert.doesNotMatch(recoveredText,/账号状态读取失败/);
+});
+
 test('non JSON errors give recovery instructions rather than a parser exception', async () => {
   const page=browser();
   page.context.fetch=async()=>({ok:false,status:502,json:async()=>{throw new SyntaxError('HTML error page');}});
