@@ -1044,6 +1044,130 @@ print('BOUNDARIES_OK')
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "pr_open")
         self.assertNotIn("close_pending", json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"]))
 
+    # 跟踪期 stale 的三种成因各自需要不同补救，常量和辅助函数放在用例类里避免
+    # 每个断言重复拼 40 位 SHA。
+    STALE_HEAD = "1" * 40
+    STALE_MOVED_HEAD = "2" * 40
+    STALE_BASE = "3" * 40
+    STALE_MOVED_BASE = "4" * 40
+
+    def stale_run(self):
+        run = self.tracked_pr(head=self.STALE_HEAD)
+        # tracked_pr 只写入占位 SHA；这里换成 40 位真值以验证落库截断。
+        self.store.put_setting("delivery:" + run["id"],
+                               {"head": self.STALE_HEAD, "base": self.STALE_BASE, "branch": "main"})
+        self.store.put_setting("run-baseline:" + run["id"],
+                               {"repository": "example/project", "branch": "main", "sha": self.STALE_BASE})
+        return run
+
+    def stale_tick(self, pr):
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.checked", return_value="") as remote:
+            tick(self.runtime, 1000)
+        return remote
+
+    def saved_result(self, run):
+        return json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+
+    def superseded_events(self, run):
+        return [row["message"] for row in self.store.query(
+            "SELECT message FROM events WHERE run=? AND kind='delivery_superseded' ORDER BY seq", (run["id"],))]
+
+    def test_stale_head_mismatch_records_cause_and_truncated_identities(self):
+        run = self.stale_run()
+        pr = {"state": "OPEN", "headRefOid": self.STALE_MOVED_HEAD, "baseRefOid": self.STALE_BASE,
+              "baseRefName": "main", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+        self.stale_tick(pr)
+        result = self.saved_result(run)
+        self.assertEqual(result["delivery_status"], "stale")
+        self.assertEqual(result["delivery_stale"], {
+            "cause": "head",
+            "expected_head": self.STALE_HEAD[:12], "observed_head": self.STALE_MOVED_HEAD[:12],
+            "expected_base": self.STALE_BASE[:12], "observed_base": self.STALE_BASE[:12],
+            "expected_branch": "main", "observed_branch": "main"})
+        # 纯 stale 且无失败检查：旧明细仍要清掉，避免面板显示上一 tick 的结果。
+        self.assertNotIn("delivery_checks", result)
+        events = self.superseded_events(run)
+        self.assertEqual(len(events), 1)
+        self.assertIn("cause=head", events[0])
+        self.assertIn("close=close_submitted", events[0])
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "superseded")
+
+    def test_stale_base_advance_records_cause_and_truncated_identities(self):
+        run = self.stale_run()
+        pr = {"state": "OPEN", "headRefOid": self.STALE_HEAD, "baseRefOid": self.STALE_MOVED_BASE,
+              "baseRefName": "main", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+        self.stale_tick(pr)
+        result = self.saved_result(run)
+        self.assertEqual(result["delivery_status"], "stale")
+        self.assertEqual(result["delivery_stale"]["cause"], "base")
+        self.assertEqual(result["delivery_stale"]["expected_base"], self.STALE_BASE[:12])
+        self.assertEqual(result["delivery_stale"]["observed_base"], self.STALE_MOVED_BASE[:12])
+        self.assertEqual(result["delivery_stale"]["expected_head"], self.STALE_HEAD[:12])
+        self.assertEqual(result["delivery_stale"]["observed_head"], self.STALE_HEAD[:12])
+        events = self.superseded_events(run)
+        self.assertEqual(len(events), 1)
+        self.assertIn("cause=base", events[0])
+
+    def test_stale_retarget_records_branch_instead_of_base_sha(self):
+        run = self.stale_run()
+        # 同一个 base SHA 指到另一个分支：base 比对不出差异，只有分支名能说明问题。
+        pr = {"state": "OPEN", "headRefOid": self.STALE_HEAD, "baseRefOid": self.STALE_BASE,
+              "baseRefName": "release", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+        self.stale_tick(pr)
+        result = self.saved_result(run)
+        self.assertEqual(result["delivery_status"], "stale")
+        self.assertEqual(result["delivery_stale"]["cause"], "retarget")
+        self.assertEqual(result["delivery_stale"]["expected_branch"], "main")
+        self.assertEqual(result["delivery_stale"]["observed_branch"], "release")
+        self.assertEqual(result["delivery_stale"]["expected_base"], self.STALE_BASE[:12])
+        self.assertEqual(result["delivery_stale"]["observed_base"], self.STALE_BASE[:12])
+        events = self.superseded_events(run)
+        self.assertEqual(len(events), 1)
+        self.assertIn("cause=retarget", events[0])
+
+    def test_stale_base_advance_keeps_failing_check_detail_on_feedback_replan(self):
+        run = self.stale_run()
+        pr = {"state": "OPEN", "headRefOid": self.STALE_HEAD, "baseRefOid": self.STALE_MOVED_BASE,
+              "baseRefName": "main",
+              "statusCheckRollup": [{"name": "verify", "conclusion": "FAILURE", "detailsUrl": "http://x"}]}
+        self.stale_tick(pr)
+        result = self.saved_result(run)
+        # 触发信号与「基线未变 + 同一失败检查」一致：重排状态不变，但明细不能再丢。
+        self.assertEqual(result["delivery_status"], "feedback_replan")
+        self.assertEqual(result["delivery_checks"], [{"name": "verify", "state": "FAILURE", "url": "http://x"}])
+        self.assertEqual(result["delivery_stale"]["cause"], "base")
+        events = self.superseded_events(run)
+        self.assertEqual(len(events), 1)
+        self.assertIn("cause=base", events[0])
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "blocked")
+
+    def test_feedback_replan_without_baseline_change_stays_unchanged(self):
+        run = self.stale_run()
+        pr = {"state": "OPEN", "headRefOid": self.STALE_HEAD, "baseRefOid": self.STALE_BASE,
+              "baseRefName": "main",
+              "statusCheckRollup": [{"name": "verify", "conclusion": "FAILURE", "detailsUrl": "http://x"}]}
+        self.stale_tick(pr)
+        result = self.saved_result(run)
+        self.assertEqual(result["delivery_status"], "feedback_replan")
+        self.assertEqual(result["delivery_checks"], [{"name": "verify", "state": "FAILURE", "url": "http://x"}])
+        self.assertNotIn("delivery_stale", result)
+        self.assertEqual(self.superseded_events(run), [])
+
+    def test_stale_payload_is_bounded_for_a_large_failing_matrix(self):
+        run = self.stale_run()
+        pr = {"state": "OPEN", "headRefOid": self.STALE_MOVED_HEAD, "baseRefOid": self.STALE_BASE,
+              "baseRefName": "main",
+              "statusCheckRollup": [{"name": "job-%d" % number, "conclusion": "FAILURE",
+                                     "detailsUrl": "http://x/%d" % number} for number in range(50)]}
+        self.stale_tick(pr)
+        result = self.saved_result(run)
+        self.assertEqual(len(result["delivery_checks"]), CHECK_DETAIL_LIMIT)
+        payload = encode(result["delivery_stale"])
+        self.assertLess(len(payload), 1024)
+        self.assertNotIn(self.STALE_MOVED_HEAD, payload)
+        self.assertEqual(result["delivery_stale"]["observed_head"], self.STALE_MOVED_HEAD[:12])
+
     def test_legacy_tracking_cannot_overwrite_new_attempt_even_when_it_has_a_pr(self):
         old = self.tracked_pr()
         self.store.execute("UPDATE tasks SET state='queued' WHERE id=?", (old["task"],))
