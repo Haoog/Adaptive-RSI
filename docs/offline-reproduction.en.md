@@ -9,12 +9,12 @@ This checklist is for operators and auditors performing integrity verification a
 Sealed experiment bundles exported through the strategy evolution subsystem (`Evolution.export_bundle`) bundle all hermetic local inputs required for reproduction:
 - Candidate strategy or skill definitions (`candidate.json`)
 - Historical experiment evidence and paired evaluation logs (`evidence.json`)
-- Evaluation case specifications, repository baseline snapshots, and protected test overlays (`cases/`)
+- Evaluation case specifications, repository baseline snapshots, and protected test overlays for sampled (executed) cases (`cases/`); unsampled cases are recorded by identity only (`case`, `split`, `tree`) in the `bundle.json` `cases` index, without sealing a working tree
 - Whole-input SHA-256 manifest and declared limitations (`bundle.json`)
 
 Sealed bundles adhere to deterministic input and credential exclusion principles:
 1. **Credential exclusion**: Bundles never include third-party API keys, private tokens, or environment credentials. `evidence.json` records only non-secret provider requirements (provider id and required environment variable name), never key values.
-2. **Frozen inputs**: Source code repositories, base commit SHAs, and check commands are frozen at export time to prevent external drift.
+2. **Frozen inputs**: The sealed manifest covers the identity, base commit SHA, and check-command fingerprints of the whole eligible set, but only cases actually sampled for execution seal a full working tree: unsampled cases never ran, and copying the same `(repository, base)` once per entry would inflate the bundle linearly with candidate-set size. They carry `exported: false` in `bundle.json`, while verification still compares every entry against the live `git rev-parse` tree hash from the store.
 3. **Isolation boundaries**: Input integrity verification establishes that files are untampered; it is not proof of standalone autonomous model execution in an air-gapped environment without external providers.
 
 ## Offline reproduction checklist
@@ -34,8 +34,8 @@ Sealed bundles adhere to deterministic input and credential exclusion principles
 
 ### Stage 3: Host tools and execution dependencies
 
-- [ ] **3.1 Check VCS tooling**: Verify `git` is available on the isolated host to operate on case repository snapshots.
-- [ ] **3.2 Itemize check dependencies**: Scan commands in `cases/*/case.json` checks registered in the `bundle.json` manifest and verify all required binaries (such as `python3`, `node`, `pytest`, `cargo`); unmanifested case directories are never read or executed and invalidate integrity verification. Each check's `argv` must be a non-empty array of strings and `cwd` must be a relative path inside the case; malformed specs are recorded in `limitations`, make the bundle non-reproducible, and are excluded from the dependency list.
+- [ ] **3.1 Check VCS tooling**: VCS requirements are derived from the registered case check commands. Bundles contain no `.git`; the host only needs `git` when a check's `argv[0]` is `git`. When no check invokes git, a missing git is recorded as informational and does not block the reproducibility verdict or `--run-checks` execution.
+- [ ] **3.2 Itemize check dependencies**: Scan commands in `cases/*/case.json` checks registered in the `bundle.json` manifest and verify all required binaries (such as `python3`, `node`, `pytest`, `cargo`); unmanifested case directories are never read or executed and invalidate integrity verification. Each check's `argv` must be a non-empty array of strings and `cwd` must be a relative path inside the case; malformed specs are recorded in `limitations`, make the bundle non-reproducible, and are excluded from the dependency list. Unsampled cases are recorded by identity only and seal no working tree, so they are excluded from dependency enumeration.
 - [ ] **3.3 Enumerate missing tools**: The reproduction script enumerates every missing dependency without aborting at the first failure, allowing comprehensive batch provisioning.
 
 ### Stage 4: Credentials and model access
