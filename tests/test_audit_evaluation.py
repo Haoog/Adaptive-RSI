@@ -1065,12 +1065,14 @@ class AuditEvaluationTest(unittest.TestCase):
         return source, checks, acceptance
 
     def run_scheduled_evaluation(self, root, source, checks, acceptance, changed_files, scheduling=True,
-                                 detected=True, evaluation='evaluation'):
+                                 detected=True, evaluation='evaluation', concurrency=1, setup=()):
         from adaptive_rsi.config import DEFAULTS, merge
         from adaptive_rsi.store import Store
         from unittest.mock import patch
         detected_check = {'name': 'detected', 'argv': ['python3', '-c', 'print(3)']} if detected else None
-        config = merge(DEFAULTS, {'validation': {'affected_check_scheduling': scheduling}})
+        config = merge(DEFAULTS, {'validation': {'affected_check_scheduling': scheduling},
+                                  'limits': {'concurrency': concurrency},
+                                  'environment': {'setup': list(setup)}})
         acceptance_baseline = {'decision': 'pass', 'execution_environment': None,
                                'rows': [{'name': 'ac', 'argv': ['python3', '-c', 'print(9)'], 'passed': True,
                                          'exit_code': 0, 'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}]}
@@ -1096,7 +1098,7 @@ class AuditEvaluationTest(unittest.TestCase):
             root = Path(directory)
             source, checks, acceptance = self.scheduling_fixtures(root, graph)
             result, calls = self.run_scheduled_evaluation(
-                root, source, checks, acceptance, ['pkg_a/value.py'])
+                root, source, checks, acceptance, ['pkg_a/value.py'], concurrency=2)
         # 跨包闭包：pkg_a 变更触发自身与依赖方 pkg_b 的检查，无关 pkg_c 留给全量阶段。
         self.assertEqual([name for stage, name in calls if stage == 'candidate'], ['check_a', 'check_b'])
         self.assertEqual([name for stage, name in calls if stage == 'candidate_full'], ['check_c', 'detected'])
@@ -1115,7 +1117,7 @@ class AuditEvaluationTest(unittest.TestCase):
             root = Path(directory)
             source, checks, acceptance = self.scheduling_fixtures(root, graph)
             result, calls = self.run_scheduled_evaluation(
-                root, source, checks, acceptance, ['pkg_b/value.py'])
+                root, source, checks, acceptance, ['pkg_b/value.py'], concurrency=2)
         # 前置闭包：只改 pkg_b 时，前置包 pkg_a 也在同一 candidate workspace 里先执行。
         self.assertEqual([name for stage, name in calls if stage == 'candidate'], ['check_a', 'check_b'])
         self.assertEqual([name for stage, name in calls if stage == 'candidate_full'], ['check_c', 'detected'])
@@ -1126,6 +1128,35 @@ class AuditEvaluationTest(unittest.TestCase):
         self.assertEqual(result['check_dependency_analysis']['scheduled'], ['check_a', 'check_b'])
         self.assertEqual(result['decision'], 'pass')
 
+    def test_scheduling_keeps_single_candidate_stage_with_one_stage_worker(self):
+        graph = {'pa': {'paths': ['pkg_a/'], 'depends_on': [], 'checks': ['check_a']},
+                 'pb': {'paths': ['pkg_b/'], 'depends_on': ['pa'], 'checks': ['check_b']},
+                 'pc': {'paths': ['pkg_c/'], 'depends_on': [], 'checks': ['check_c']}}
+        setup = [{'name': 'setup-install', 'argv': ['python3', '-c', 'print(0)']}]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, checks, acceptance = self.scheduling_fixtures(root, graph)
+            baseline, baseline_calls = self.run_scheduled_evaluation(
+                root, source, checks, acceptance, ['pkg_a/value.py'], scheduling=False, detected=False,
+                evaluation='evaluation-single-off', setup=setup)
+            result, calls = self.run_scheduled_evaluation(
+                root, source, checks, acceptance, ['pkg_a/value.py'], detected=False,
+                evaluation='evaluation-single-on', setup=setup)
+        # 单 worker：候选阶段不能与全量阶段重叠，拆分只会多复制一份工程并重跑 setup。
+        self.assertEqual([name for stage, name in calls
+                          if stage == 'candidate' and name != 'setup-install'],
+                         ['check_a', 'check_b', 'check_c'])
+        self.assertEqual([stage for stage, _ in calls if stage == 'candidate_full'], [])
+        self.assertTrue(result['candidate_full_reused'])
+        self.assertIsNone(result['check_dependency_analysis']['scheduled'])
+        self.assertEqual(result['check_dependency_analysis']['reason'],
+                         'scheduled_checks_need_parallel_stages')
+        setup_runs = [c for c in calls if c[1] == 'setup-install']
+        self.assertEqual(len(setup_runs), len([c for c in baseline_calls if c[1] == 'setup-install']))
+        # 夹具已注入 acceptance_baseline：baseline、candidate、acceptance_candidate 各一次。
+        self.assertEqual(len(setup_runs), 3)
+        self.assertEqual(result['decision'], baseline['decision'])
+
     def test_scheduling_fallback_runs_complete_configured_surface(self):
         graph = {'pa': {'paths': ['pkg_a/'], 'depends_on': [], 'checks': ['check_a']},
                  'pb': {'paths': ['pkg_b/'], 'depends_on': ['pa'], 'checks': ['check_b']},
@@ -1135,7 +1166,7 @@ class AuditEvaluationTest(unittest.TestCase):
             source, checks, acceptance = self.scheduling_fixtures(root, graph)
             # 未知路径：回退完整集合，candidate 阶段执行全部配置检查。
             result, calls = self.run_scheduled_evaluation(
-                root, source, checks, acceptance, ['docs/readme.md'], detected=False)
+                root, source, checks, acceptance, ['docs/readme.md'], detected=False, concurrency=2)
             self.assertEqual([name for stage, name in calls if stage == 'candidate'],
                              ['check_a', 'check_b', 'check_c'])
             self.assertEqual([stage for stage, _ in calls if stage == 'candidate_full'], [])
@@ -1145,7 +1176,8 @@ class AuditEvaluationTest(unittest.TestCase):
             calls.clear()
             # 空 diff 同样回退。
             result, calls = self.run_scheduled_evaluation(
-                root, source, checks, acceptance, [], detected=False, evaluation='evaluation-empty')
+                root, source, checks, acceptance, [], detected=False, evaluation='evaluation-empty',
+                concurrency=2)
             self.assertEqual([name for stage, name in calls if stage == 'candidate'],
                              ['check_a', 'check_b', 'check_c'])
             self.assertTrue(result['candidate_full_reused'])
@@ -1155,7 +1187,7 @@ class AuditEvaluationTest(unittest.TestCase):
             acceptance = {**acceptance, 'contract': {'check_dependencies': invalid}}
             result, calls = self.run_scheduled_evaluation(
                 root, source, checks, acceptance, ['pkg_b/value.py'], detected=False,
-                evaluation='evaluation-invalid')
+                evaluation='evaluation-invalid', concurrency=2)
             self.assertEqual([name for stage, name in calls if stage == 'candidate'],
                              ['check_a', 'check_b', 'check_c'])
             self.assertTrue(result['candidate_full_reused'])
@@ -1173,7 +1205,8 @@ class AuditEvaluationTest(unittest.TestCase):
             root = Path(directory)
             source, checks, acceptance = self.scheduling_fixtures(root, graph)
             result, calls = self.run_scheduled_evaluation(
-                root, source, checks, acceptance, ['pkg_a/value.py'], scheduling=False, detected=False)
+                root, source, checks, acceptance, ['pkg_a/value.py'], scheduling=False, detected=False,
+                concurrency=2)
             # 默认关闭：调度不改变既有行为，配置检查全部照常执行。
             self.assertEqual([name for stage, name in calls if stage == 'candidate'],
                              ['check_a', 'check_b', 'check_c'])
