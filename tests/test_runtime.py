@@ -911,6 +911,69 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(row["state"], "awaiting_approval", row["result"])
         self.assertEqual([role for role, _ in self.runtime.agent.roles].count("implementation"), 1)
 
+    def test_environment_setup_rewriting_tracked_file_stops_before_planning(self):
+        """准备命令改写 tracked 文件时点名 setup，并在任何付费调用前收尾。"""
+        (self.repo / "package-lock.json").write_text('{"lockfileVersion": 2}\n')
+        git(self.repo, "add", "package-lock.json")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",
+            "commit", "--quiet", "-m", "lockfile")
+        self.runtime.configure({"environment": {"setup": [
+            {"name": "refresh lockfile", "cwd": ".", "argv": ["refresh-lockfile"]}]}}, self.project)
+
+        def setup(_sandbox, check, workspace, *args, **kwargs):
+            (Path(workspace) / "package-lock.json").write_text('{"lockfileVersion": 3}\n')
+            return {"argv": check["argv"], "name": check["name"], "exit_code": 0, "stdout": "",
+                    "stderr": "", "seconds": 0.01, "error": None}
+
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch("adaptive_rsi.process.Sandbox.check", autospec=True, side_effect=setup):
+            task, run = self.claim()
+            self.runtime.process(run)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        result = json.loads(row["result"])
+        # 归因必须是准备命令，不是模型越界；且在任何规划/实现调用前就停。
+        self.assertEqual(row["state"], "insufficient_evidence", result)
+        self.assertEqual(result["failure"]["paths"], ["package-lock.json"])
+        self.assertIn("setup", result["reason"].lower())
+        self.assertNotIn("escaped planned scope", result["reason"])
+        self.assertEqual(self.runtime.agent.roles, [])
+        self.assertFalse((self.store.root / "runs" / run["id"] / "candidate.patch").exists())
+
+    def test_environment_setup_writing_ignored_paths_still_plans(self):
+        """setup 只写 .gitignore 覆盖的路径时照常进入规划，不误报也不进入补丁。"""
+        (self.repo / ".gitignore").write_text("node_modules/\n")
+        git(self.repo, "add", ".gitignore")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",
+            "commit", "--quiet", "-m", "ignore dependencies")
+        self.runtime.configure({"environment": {"setup": [
+            {"name": "install dependencies", "cwd": ".", "argv": ["install-dependencies"]}]}}, self.project)
+
+        def setup(_sandbox, check, workspace, *args, **kwargs):
+            target = Path(workspace) / "node_modules/left-pad/package.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('{"name": "left-pad"}\n')
+            return {"argv": check["argv"], "name": check["name"], "exit_code": 0, "stdout": "",
+                    "stderr": "", "seconds": 0.01, "error": None}
+
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch("adaptive_rsi.process.Sandbox.check", autospec=True, side_effect=setup), \
+             patch.object(self.runtime.evaluator, "execution_identity",
+                          return_value={"backend": "none", "image": None}), \
+             patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline",
+                          return_value={"rows": [], "execution_environment": None}), \
+             patch.object(self.runtime.evaluator, "evaluate",
+                          return_value={"decision": "pass", "checks": {},
+                                        "improvement": {"decision": "pass"}}):
+            task, run = self.claim()
+            self.runtime.process(run)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "awaiting_approval", row["result"])
+        roles = [role for role, _ in self.runtime.agent.roles]
+        self.assertIn("planning", roles)
+        self.assertIn("implementation", roles)
+        patch_text = (self.store.root / "runs" / run["id"] / "candidate.patch").read_text()
+        self.assertNotIn("left-pad", patch_text)
+
     def test_project_pause_still_ends_the_run_as_interrupted(self):
         """用户暂停/取消导致的 Cancelled 仍以 interrupted 收尾，与验收环境故障区分。"""
         class Pausing(FakeAgent):
