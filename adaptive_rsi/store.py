@@ -20,6 +20,9 @@ from zoneinfo import ZoneInfoNotFoundError
 # 池满时新借出的连接用完直接关闭，不阻塞调用方。
 POOL_SIZE = 8
 MAX_CONNECTIONS = 32
+# 连接容量等待上限：与 sqlite3.connect(timeout=15) 的写锁等待保持一致，
+# 短暂排队的请求仍有机会完成；超时后由 HTTP 层返回可重试的 503。
+CONNECTION_WAIT_SECONDS = 15
 # claim 候选分页大小：pending publish 积压时按页推进，避免每条被跳过的候选
 # 都重跑一次整条候选扫描。
 CLAIM_PAGE = 64
@@ -31,6 +34,12 @@ WAL_SIZE_LIMIT_BYTES = 8 * 1024 * 1024
 # TRUNCATE checkpoint 需要短暂的排他窗口；维护路径最多等 1 秒，遇到读者就
 # 放弃并在诊断中报告，不能把小时级维护卡在 15 秒的默认 busy timeout 上。
 WAL_TRUNCATE_BUSY_MS = 1000
+
+_BUSY_MESSAGE = re.compile(r"database(?: table| schema)? is (?:locked|busy)", re.IGNORECASE)
+
+
+class StoreBusy(sqlite3.OperationalError):
+    """数据库暂时无法服务（容量等待超时或锁冲突），调用方应稍后重试。"""
 
 
 def uid():
@@ -259,6 +268,7 @@ class Store:
         self._pool_generation = 0
         self._clock_samples = {}
         self._connection_capacity = threading.BoundedSemaphore(MAX_CONNECTIONS + POOL_SIZE)
+        self.connection_wait = CONNECTION_WAIT_SECONDS
         self._metrics_lock = threading.Lock()
         self._metrics = {"opened": 0, "borrowed": 0, "waiting": 0, "peak": 0}
         self._read_snapshot = threading.local()
@@ -279,6 +289,12 @@ class Store:
             if not sealed:
                 self._bootstrap(db)
             apply(db)
+            # 实例 ID 是启动期常量：打开状态目录时确定一次。只读端点（如
+            # GET /api/attention）只读取它，不在请求里再开写事务；已有 ID 时
+            # 连启动期写事务也不开。
+            if not db.execute("SELECT 1 FROM settings WHERE key='instance-id'").fetchone():
+                db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)",
+                           ("instance-id", encode(uid())))
 
     def _bootstrap(self, db):
         from .schema_migrations import BOOTSTRAP_SCHEMA
@@ -387,14 +403,14 @@ class Store:
         waiting_since = time.monotonic()
         with self._metrics_lock:
             self._metrics["waiting"] += 1
-        if not self._connection_capacity.acquire(timeout=15):
+        if not self._connection_capacity.acquire(timeout=self.connection_wait):
             with self._metrics_lock:
                 self._metrics["waiting"] -= 1
                 self._metrics["timeouts"] = self._metrics.get("timeouts", 0) + 1
                 waited = time.monotonic() - waiting_since
                 self._metrics["wait_seconds"] = self._metrics.get("wait_seconds", 0) + waited
                 self._wait_samples.append(waited)
-            raise sqlite3.OperationalError("Database connection capacity exhausted")
+            raise StoreBusy("Database connection capacity exhausted")
         with self._metrics_lock:
             self._metrics["waiting"] -= 1
             self._metrics["borrowed"] += 1
@@ -433,6 +449,12 @@ class Store:
                         db = None
                     except queue.Full:
                         pass
+        except sqlite3.OperationalError as exc:
+            # SQLITE_BUSY/LOCKED 是瞬时写冲突，与容量超时共用可重试语义；
+            # StoreBusy 仍是 OperationalError 子类，既有捕获方无需改动。
+            if isinstance(exc, StoreBusy) or not _BUSY_MESSAGE.search(str(exc)):
+                raise
+            raise StoreBusy(str(exc)) from None
         finally:
             try:
                 if db is not None:
@@ -648,7 +670,8 @@ class Store:
             waits = sorted(self._wait_samples)
             quantile = lambda fraction: waits[max(0, math.ceil(len(waits) * fraction) - 1)] if waits else None
             values.update(wait_p50_seconds=quantile(.5), wait_p95_seconds=quantile(.95), wait_p99_seconds=quantile(.99),
-                          wait_samples=len(waits), wait_window=512, wait_quantile="nearest_rank", wait_timeout_seconds=15,
+                          wait_samples=len(waits), wait_window=512, wait_quantile="nearest_rank",
+                          wait_timeout_seconds=self.connection_wait,
                           wait_scope="completed_admissions_including_timeouts_this_process",
                           slow_queries=list(self._slow_queries))
             values["request_logging"] = {**self._request_log_counts, "poll_sample_seconds": 60,

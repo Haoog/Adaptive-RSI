@@ -20,6 +20,7 @@ ERRORS = {
     "invalid_request": "The request body or parameters are invalid",
     "config_revision_conflict": "Settings changed in another window",
     "session_required": "The local console session must be reopened",
+    "session_required_rate_limited": "Too many unauthenticated console requests; retry shortly",
     "internal_error": "The request could not be completed",
 }
 
