@@ -1830,18 +1830,32 @@ class Runtime(Maintenance):
             owner['_deadline_checkpoint'] = now
 
     def _load_stage_budget(self, run):
-        """载入同一任务上一尝试的额度；不属于未结尝试的残留直接丢弃。"""
-        key = self._stage_budget_key(run.get('task'))
-        stored = self.store.setting(key, {})
-        if not isinstance(stored, dict):
-            stored = {}
-        owner = stored.get('run')
-        if owner and owner != run.get('id'):
-            row = self.store.one('SELECT state,ended FROM runs WHERE id=?', (owner,))
-            # 与 process() finally 的交接条件一致：只有未结或中断的尝试才把额度交给下一次。
-            if not row or not (row['ended'] is None or row['state'] == 'interrupted'):
-                self.store.execute('DELETE FROM settings WHERE key=?', (key,))
+        """载入同一任务上一尝试的额度；不属于未结尝试的残留直接丢弃。
+
+        账本读不出来时按满额度降级，并只在 run 上留下标记交给 process() 收尾：
+        预算只是护栏，读失败不能把 run 卡在 planning。未结 run 会让同项目普通
+        任务领不到（兼容来源被收紧到 system_issues），桌面 readiness() 也会一直
+        报 running_tasks，直到进程重启才由 recover() 收走。
+        """
+        try:
+            key = self._stage_budget_key(run.get('task'))
+            stored = self.store.setting(key, {})
+            if not isinstance(stored, dict):
                 stored = {}
+            owner = stored.get('run')
+            if owner and owner != run.get('id'):
+                row = self.store.one('SELECT state,ended FROM runs WHERE id=?', (owner,))
+                # 与 process() finally 的交接条件一致：只有未结或中断的尝试才把额度交给下一次。
+                if not row or not (row['ended'] is None or row['state'] == 'interrupted'):
+                    self.store.execute('DELETE FROM settings WHERE key=?', (key,))
+                    stored = {}
+        except Exception as exc:
+            # database is locked、I/O 错误、库损坏都属于要支持的环境故障：
+            # 读不到已耗时间就按满额度起算，异常不得穿出本方法。
+            logging.getLogger(__name__).warning(
+                'Could not load stage budget for %s', run.get('id'), exc_info=True)
+            run['_stage_budget_error'] = str(exc)[:300]
+            return {'preparation': 0.0, 'evaluation': 0.0}
         return {name: self._stage_seconds(stored.get(name)) for name in ('preparation', 'evaluation')}
 
     def new_trial_context(self, parent):
@@ -2091,14 +2105,56 @@ class Runtime(Maintenance):
             run['_deadline_stage'] = 'preparation'
             run['_deadline_checkpoint'] = now
         try:
+            # 账本不可读时不进入执行：状态库既不健康，带着未知的已耗时间开跑
+            # 只会把故障推到更晚、还要先付出模型成本。本次尝试收成 interrupted
+            # 并交还任务名额，下一次尝试从满额度重来。
+            unavailable = run.pop('_stage_budget_error', None)
+            if unavailable is not None:
+                self._interrupt_unavailable_stage_budget(run, unavailable)
+                return
             with operation_cancellation(lambda: self.is_cancelled(run)), self.store.query_scope(run=run["id"], task=run.get("task")):
                 return self._process(run)
         finally:
-            row = self.store.one('SELECT state,ended FROM runs WHERE id=?', (run['id'],))
+            try:
+                row = self.store.one('SELECT state,ended FROM runs WHERE id=?', (run['id'],))
+            except Exception:
+                # 读不到终态就按「不交接」结算：_save_stage_budget 仍必须执行，
+                # 否则预算读取失败会连带跳过收尾，残留键把已耗时间带给下一次尝试。
+                logging.getLogger(__name__).warning(
+                    'Could not read run state while settling stage budget for %s',
+                    run.get('id'), exc_info=True)
+                row = None
             # 只有中断会交接给下一次尝试；其他终态（含 deadline 阻塞）视为本轮已结案。
             keep = bool(row) and (row['ended'] is None or row['state'] == 'interrupted')
             with _clock_lock(run):
                 self._save_stage_budget(run, time.monotonic(), keep)
+
+    def _interrupt_unavailable_stage_budget(self, run, detail):
+        """预算账本不可读时收尾本次尝试：留下结构化回执并把任务名额交还队列。
+
+        不做这一步，run 会一直停在 planning：同项目普通任务领不到、桌面更新
+        永远报 running_tasks，而 worker future 只留下一条 run 字段为空的
+        scheduler_error。落终态的顺序是事件在前、状态在后，即使状态写入也失败
+        仍能在 events 里看到失败原因。
+        """
+        detail = str(detail or '')[:300] or 'Stage budget ledger is unreadable'
+        try:
+            self.store.event('stage_budget_unavailable',
+                             'Stage budget ledger unavailable; run interrupted and task requeued',
+                             run.get('project'), run.get('id'),
+                             {'run': run.get('id'), 'error': detail})
+        except Exception:
+            logging.getLogger(__name__).exception(
+                'Could not record stage budget failure for %s', run.get('id'))
+        try:
+            self.store.transition(run['id'], 'interrupted',
+                                  {'reason': 'Stage budget unavailable',
+                                   'failure': {'code': 'environment', 'action': 'check_environment',
+                                               'detail': detail}},
+                                  True, task_fields={'state': 'queued'})
+        except Exception:
+            logging.getLogger(__name__).exception(
+                'Could not interrupt run %s after stage budget failure', run.get('id'))
 
     def _process(self, run):
         try:
