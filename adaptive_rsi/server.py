@@ -512,9 +512,25 @@ class Handler(BaseHTTPRequestHandler):
                     if len(identifier) != 16 or any(c not in "0123456789abcdef" for c in identifier):
                         raise RequestError("Invalid backup ID")
                     report_file = reports_dir / f"rehearsal-{identifier}.json"
-                    if not report_file.exists():
+                    # 报告必须是状态目录 reports/ 内的常规文件：reports/ 不得为
+                    # 符号链接，打开末级文件也不跟随链接，避免把状态目录外的
+                    # 任意文件读进控制台。
+                    try:
+                        confined = (not report_file.is_symlink()
+                                    and report_file.resolve().parent == store.root.resolve() / "reports")
+                    except (OSError, RuntimeError):
+                        confined = False
+                    if not confined:
                         raise RequestError("Rehearsal report not found")
-                    self.respond(json.loads(report_file.read_text(encoding="utf-8")))
+                    try:
+                        handle = os.open(report_file, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+                    except OSError:
+                        raise RequestError("Rehearsal report not found") from None
+                    with os.fdopen(handle, "r", encoding="utf-8") as stream:
+                        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                            raise RequestError("Rehearsal report not found")
+                        report = json.load(stream)
+                    self.respond(report)
                 else:
                     reports = sorted((p for p in reports_dir.glob("rehearsal-*.json")
                                       if p.is_file() and not p.is_symlink()),
