@@ -1,3 +1,4 @@
+import ast
 import concurrent.futures
 import contextlib
 import datetime
@@ -569,6 +570,63 @@ class SchedulerIsolationTest(unittest.TestCase):
             self.runtime.maintenance()
         remove.assert_not_called()
 
+    def test_retention_removes_every_pipeline_artifact_and_detaches_path(self):
+        run = self.historical_run("healthy", "completed")
+        directory = Path(run["path"])
+        for name in maintenance_module.CLEANUP_NAMES:
+            (directory / name / "payload").mkdir(parents=True)
+            (directory / name / "payload" / "blob.bin").write_bytes(b"x" * 32)
+        sealed = directory / "acceptance" / ".rsi-acceptance"
+        sealed.mkdir(parents=True)
+        (sealed / "test_acceptance.py").write_text("# sealed\n")
+        for name in maintenance_module.RUN_FILE_ARTIFACTS:
+            (directory / name).write_text("{}")
+        (directory / "candidate.patch").write_text("diff --git\n")
+
+        self.runtime.maintenance()
+
+        self.assertIsNone(self.store.one("SELECT path FROM runs WHERE id=?", (run["id"],))["path"])
+        # 保留清理只留下 revert 依赖的 patch，其余运行级产物全部消失。
+        self.assertEqual([entry.name for entry in directory.iterdir()], ["candidate.patch"])
+        self.assertEqual((directory / "candidate.patch").read_text(), "diff --git\n")
+        for name in maintenance_module.CLEANUP_NAMES + maintenance_module.RUN_FILE_ARTIFACTS:
+            self.assertFalse((directory / name).exists(), name)
+
+    def test_unknown_leftover_keeps_run_path_for_a_later_pass(self):
+        run = self.historical_run("healthy", "completed")
+        directory = Path(run["path"])
+        directory.mkdir(parents=True)
+        (directory / "plan.json").write_text("{}")
+        (directory / "unknown.bin").write_text("unrecognised evidence")
+
+        self.runtime.maintenance()
+
+        self.assertFalse((directory / "plan.json").exists())
+        # 未登记的条目保留运行路径：path IS NOT NULL 是后续轮次唯一的查找入口。
+        self.assertEqual(self.store.one("SELECT path FROM runs WHERE id=?", (run["id"],))["path"],
+                         run["path"])
+
+        (directory / "unknown.bin").unlink()
+        self.store.put_setting("maintenance-last", 0)
+        self.runtime.maintenance()
+        self.assertIsNone(self.store.one("SELECT path FROM runs WHERE id=?", (run["id"],))["path"])
+
+    def test_symlinked_run_artifact_is_left_untouched_and_keeps_path(self):
+        run = self.historical_run("healthy", "completed")
+        directory = Path(run["path"])
+        directory.mkdir(parents=True)
+        outside = self.root / "outside.txt"
+        outside.write_text("must remain")
+        (directory / "plan.json").symlink_to(outside)
+
+        self.runtime.maintenance()
+
+        # 顶层产物为链接时不 unlink、不跟随；未知条目因此保留运行路径。
+        self.assertEqual(outside.read_text(), "must remain")
+        self.assertTrue((directory / "plan.json").is_symlink())
+        self.assertEqual(self.store.one("SELECT path FROM runs WHERE id=?", (run["id"],))["path"],
+                         run["path"])
+
     def test_retained_patch_can_be_reverted_after_run_path_is_cleared(self):
         from tests.test_runtime import FakeAgent, fixture, CHECKS
         repo = fixture(self.root / 'healthy')
@@ -843,6 +901,36 @@ class SchedulerIsolationTest(unittest.TestCase):
         self.store.execute("UPDATE runs SET result='{' WHERE id=?", (run["id"],))
         schedule_delivery(self.runtime, now + 183)
         self.assertEqual(len(self.errors("delivery_run")), 2)
+
+
+class RetentionArtifactCoverageTest(unittest.TestCase):
+    """保留清单必须覆盖 pipeline.py 写到运行目录顶层的每个产物。"""
+
+    @staticmethod
+    def pipeline_artifacts():
+        source = (Path(__file__).resolve().parents[1] / "adaptive_rsi" / "pipeline.py").read_text(
+            encoding="utf-8")
+        artifacts = set()
+        for node in ast.walk(ast.parse(source)):
+            if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)
+                    and isinstance(node.left, ast.Name)
+                    and node.left.id in ("directory", "prior_directory")
+                    and isinstance(node.right, ast.Constant)
+                    and isinstance(node.right.value, str)):
+                artifacts.add(node.right.value)
+        return artifacts
+
+    def test_pipeline_write_points_are_registered_for_retention(self):
+        written = self.pipeline_artifacts()
+        # 扫描必须仍命中当前全部写点；变量改名会让这里失败，而不是空跑通过。
+        self.assertTrue(set(maintenance_module.RUN_FILE_ARTIFACTS) <= written)
+        self.assertTrue({"acceptance", "acceptance-design", "baseline", "candidate",
+                         "dependencies", "evaluation"} <= written)
+        covered = (set(maintenance_module.CLEANUP_NAMES)
+                   | set(maintenance_module.RUN_FILE_ARTIFACTS)
+                   | set(maintenance_module.RETAINED_RUN_ARTIFACTS))
+        self.assertEqual(written - covered, set(),
+                         "pipeline.py 新增了运行产物；请登记到保留清理清单")
 
 
 if __name__ == "__main__":
