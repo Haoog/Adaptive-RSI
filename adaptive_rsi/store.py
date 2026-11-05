@@ -291,10 +291,12 @@ class Store:
             apply(db)
             # 实例 ID 是启动期常量：打开状态目录时确定一次。只读端点（如
             # GET /api/attention）只读取它，不在请求里再开写事务；已有 ID 时
-            # 连启动期写事务也不开。
-            if not db.execute("SELECT 1 FROM settings WHERE key='instance-id'").fetchone():
-                db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)",
-                           ("instance-id", encode(uid())))
+            # 连启动期写事务也不开。账本已 sealed 却缺 settings 表的历史库
+            # （如只保留迁移痕迹的最小库）跳过初始化，不静默补建核心表。
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'").fetchone():
+                if not db.execute("SELECT 1 FROM settings WHERE key='instance-id'").fetchone():
+                    db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)",
+                               ("instance-id", encode(uid())))
 
     def _bootstrap(self, db):
         from .schema_migrations import BOOTSTRAP_SCHEMA
