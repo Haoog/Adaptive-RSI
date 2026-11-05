@@ -20,7 +20,10 @@ from .store import encode
 KINDS = ("release", "deploy")
 TERMINAL = {"workflow_succeeded", "failed", "dispatch_unknown", "blocked", "rerun_unknown"}
 RERUN_CONFIRM_SECONDS = 300
-RECONCILIATION_UNKNOWN = {"dispatch_unknown", "rerun_unknown"}
+RECONCILIATION_UNKNOWN = {"dispatch_unknown", "rerun_unknown", "reconciliation_blocked"}
+# 活动回执连续对账失败的上限。达到后转入 reconciliation_blocked：停止自动轮询、
+# 只保留一条错误事件，但仍允许只读的人工对账与关闭入口。
+ADVANCE_FAILURE_LIMIT = 3
 RECONCILIATION_AUDIT_LIMIT = 10
 # A read-only query may read ten 100-run pages. Persist only the bounded
 # evidence reconciliation reads (identity, status, timestamps) and cap the
@@ -305,9 +308,9 @@ def pending(runtime, run):
         if kind == "deploy" and data.get("state") == "blocked" and data.get("blocked_by_release"):
             release, _ = _read_automation(runtime, run["id"], "release")
             release = release or {}
-            if release.get("state") in {"failed", "rerun_unknown", "blocked"}:
+            if release.get("state") in {"failed", "rerun_unknown", "blocked", "reconciliation_blocked"}:
                 continue
-        if data.get("state") not in {"workflow_succeeded", "failed", "healthy", "health_unconfirmed", "rollback_health_unconfirmed", "rolled_back", "rollback_failed", "superseded", "rerun_unknown"}:
+        if data.get("state") not in {"workflow_succeeded", "failed", "healthy", "health_unconfirmed", "rollback_health_unconfirmed", "rolled_back", "rollback_failed", "superseded", "rerun_unknown", "reconciliation_blocked"}:
             return True
     return False
 
@@ -841,6 +844,10 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
             reject_missing()
         if not isinstance(reconciled, dict) or reconciled.get("state") in RECONCILIATION_UNKNOWN:
             raise ReconciliationRejected("GitHub did not return a confirmed status for the selected workflow run; query again before selecting")
+        # 人工对账已成功读取 GitHub：恢复后的失败重新从零计数，避免一次瞬时错误
+        # 立刻再次转入 reconciliation_blocked。
+        for field in ("advance_failures", "last_advance_error", "last_advance_error_at"):
+            target_data.pop(field, None)
         if target == "rollback":
             data["rollback"] = reconciled
             if reconciled.get("state") in {"queued", "running", "workflow_succeeded"}:
@@ -1366,6 +1373,14 @@ def _retry_target_allowed(runtime, run, outcome, data, target):
     return eligible
 
 
+def _advance_failure_count(data):
+    """Bound a stored consecutive-failure counter; corrupted values restart at zero."""
+    value = data.get("advance_failures")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return min(value, ADVANCE_FAILURE_LIMIT - 1)
+    return 0
+
+
 def advance(runtime, project, run, outcome, cancel=None):
     if not re.fullmatch(r"[a-f0-9]{40}", outcome.get("merged_sha", "")):
         return {}
@@ -1423,7 +1438,28 @@ def advance(runtime, project, run, outcome, cancel=None):
                 result[kind] = persist(runtime, run, kind, data)
                 continue
             if data and data.get("state") in {"dispatching", "submitted", "dispatch_unknown", "queued", "running", "rerunning", "rerun_unknown"}:
-                data = reconcile(runtime, run, kind, data, persist=False)
+                try:
+                    data = reconcile(runtime, run, kind, data, persist=False)
+                except Cancelled:
+                    raise
+                except Exception as exc:
+                    # 永久性对账错误（403、身份不一致等）若原样上抛，下一次 tick 会
+                    # 再次读取同一必然失败的远端，并每次写一条 automation_error。
+                    # 连续失败达到上限后转入终态：停止自动轮询，只在转入时记一条事件，
+                    # 人工仍可经 candidates/resolve/abandon 收口（这些路径不派发、不重跑）。
+                    failures = _advance_failure_count(data) + 1
+                    data["advance_failures"] = failures
+                    data["last_advance_error"] = str(exc)[:500]
+                    data["last_advance_error_at"] = time.time()
+                    if failures >= ADVANCE_FAILURE_LIMIT:
+                        data["state"] = "reconciliation_blocked"
+                        data["error"] = str(exc)[:500]
+                        runtime.store.event("automation_error", str(exc)[:500], project["id"], run["id"],
+                                            {"kind": kind, "state": "reconciliation_blocked"})
+                    result[kind] = persist(runtime, run, kind, data)
+                    continue
+                for field in ("advance_failures", "last_advance_error", "last_advance_error_at"):
+                    data.pop(field, None)
                 persist(runtime, run, kind, data)
             if kind == "deploy" and data and data["state"] in {"workflow_succeeded", "health_failed", "rolling_back"}:
                 try:
@@ -1440,10 +1476,12 @@ def advance(runtime, project, run, outcome, cancel=None):
                 continue
             if kind == "deploy" and saved["delivery"].get("release", {}).get("enabled"):
                 if result.get("release", {}).get("state") != "workflow_succeeded":
-                    if result.get("release", {}).get("state") in {"failed", "rerun_unknown", "blocked"}:
+                    if result.get("release", {}).get("state") in {"failed", "rerun_unknown", "blocked", "reconciliation_blocked"}:
                         data = {**(data or {}), "state": "blocked", "blocked_by_release": True,
                                 "error": ("Release rerun result is unconfirmed; reconcile release before deployment"
                                           if result["release"]["state"] == "rerun_unknown" else
+                                          "Release reconciliation is blocked; restore access and reconcile release before deployment"
+                                          if result["release"]["state"] == "reconciliation_blocked" else
                                           "Release authorization is blocked; restore it before deployment"
                                           if result["release"]["state"] == "blocked" else
                                           "Release workflow failed; retry release before deployment")}
@@ -1596,6 +1634,9 @@ def retry(runtime, project_id, run_id, kind):
         repo = authorized(runtime, project, run, kind, policy)
         if not data or data.get("state") == "blocked":
             raise ValueError("Restore the original authorization and let tracking retry the pending operation")
+        if data.get("state") == "reconciliation_blocked":
+            # 回执并未确认失败，重跑可能重复已存在的 run；只能先人工只读对账。
+            raise ValueError("Reconciliation is blocked; restore GitHub access and reconcile this operation instead of retrying")
         if not data.get("operation_id"):
             raise ValueError("This operation has no failed GitHub workflow to retry")
         is_preflight_rejected = (
