@@ -432,6 +432,76 @@ class ReliabilityTest(unittest.TestCase):
         result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (second["id"],))["result"])
         self.assertEqual(result["evaluation"]["decision"], "pass")
 
+    def interrupt_at_evaluation(self):
+        """One attempt that dies inside the evaluation window before any verdict."""
+        self.runtime.configure({"sources": {"inspection": False, "issues": False}}, self.project)
+        task, run = self.claim()
+        with ExitStack() as stack:
+            for scenario in self.evaluation_sandbox():
+                stack.enter_context(scenario)
+            stack.enter_context(patch.object(self.runtime.evaluator, "evaluate",
+                                             side_effect=RuntimeError("Sandbox backend disappeared")))
+            self.runtime.process(run)
+        return task, run
+
+    def saved_implementation(self, run):
+        row = self.store.one("SELECT data FROM stages WHERE run=? AND stage='implementation'", (run["id"],))
+        return json.loads(row["data"]) if row else None
+
+    def run_directory(self, run):
+        return Path(self.store.root) / "runs" / run["id"]
+
+    def test_resume_after_evaluation_failure_replays_saved_implementation(self):
+        """评估窗口内失败后重试重放已封存补丁，不再重复支付实现调用。"""
+        task, run = self.interrupt_at_evaluation()
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "blocked")
+        saved = self.saved_implementation(run)
+        self.assertTrue(saved["patch"])
+        self.assertEqual(saved["summary"], "Corrected addition")
+        self.assertEqual(self.store.query("SELECT * FROM stages WHERE run=? AND stage='validated_candidate'",
+                                          (run["id"],)), [])
+        with patch.object(self.runtime.evaluator, "evaluate",
+                          wraps=self.runtime.evaluator.evaluate) as evaluate:
+            second = self.resume(task)
+            # 重放只跳过付费实现；评估必须对重放的补丁真实重跑。
+            self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 1)
+        self.assertEqual((self.run_directory(second) / "resume.patch").read_text(encoding="utf-8"),
+                         (self.run_directory(run) / "candidate.patch").read_text(encoding="utf-8"))
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
+        result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (second["id"],))["result"])
+        self.assertEqual(result["evaluation"]["decision"], "pass")
+        self.assertEqual(result["review"]["decision"], "pass")
+
+    def test_tampered_implementation_checkpoint_refuses_retry(self):
+        """补丁与 hash 不一致时拒绝重放，不静默使用被改动的记录。"""
+        task, run = self.interrupt_at_evaluation()
+        tampered = self.saved_implementation(run)
+        tampered["patch"] = tampered["patch"].replace("return a + b", "return a - b")
+        self.store.execute("UPDATE stages SET data=? WHERE run=? AND stage='implementation'",
+                           (encode(tampered), run["id"]))
+        second = self.resume(task)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (second["id"],))
+        self.assertEqual(row["state"], "blocked")
+        self.assertIn("Saved implementation evidence changed", json.loads(row["result"])["reason"])
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 1)
+        self.assertFalse((self.run_directory(second) / "resume.patch").exists())
+
+    def test_legacy_implementation_checkpoint_without_patch_is_reimplemented(self):
+        """只有 hash 的旧记录不可重放：作废这一项后重新实现，而不是让重试崩掉。"""
+        task, run = self.interrupt_at_evaluation()
+        legacy = {"files": self.saved_implementation(run)["files"], "patch_hash": "legacy-hash"}
+        self.store.execute("UPDATE stages SET data=? WHERE run=? AND stage='implementation'",
+                           (encode(legacy), run["id"]))
+        second = self.resume(task)
+        events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (second["id"],))
+        invalidated = [json.loads(row["data"]) for row in events if row["kind"] == "stage_invalidated"]
+        self.assertEqual([row["stage"] for row in invalidated if row["reason"] == "reused_record_invalid"],
+                         ["implementation"])
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 2)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
+        self.assertTrue(self.saved_implementation(second)["patch"])
+
     def test_evaluation_reuse_requires_matching_tree_checks_and_controls(self):
         config = self.runtime.config(self.project)
         source = _evaluation_source(config, "a" * 40, CHECKS, "candidate patch", "digest", None,
@@ -1359,6 +1429,8 @@ class ReliabilityTest(unittest.TestCase):
             self.assertIn("findings", review)
         # 脏记录被作废后重新评审；取消候选后重试，修正后的记录照常复用，不再重跑评审角色。
         self.assertEqual([r[0] for r in self.runtime.agent.roles].count("review"), 2)
+        # 评审否决的是这个补丁本身，重试必须重新实现而不是重放被否决的补丁。
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 2)
         self.runtime.cancel_task(task)
         self.runtime.retry(task)
         third = self.store.claim(self.project, self.runtime.config(self.project))
