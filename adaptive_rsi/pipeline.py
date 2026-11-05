@@ -53,6 +53,39 @@ def _within_scope(path, scope):
     return scope == "." or path == scope.rstrip("/") or path.startswith(scope.rstrip("/") + "/")
 
 
+class AcceptanceBaselineUnavailable(RuntimeError):
+    """独立验收基线因确定性环境问题不可用，而不是用户暂停或取消。
+
+    验收检查的 setup 命令失败（缺依赖、缺命令、权限）时，候选实现再跑完也无法
+    通过验收；调用方必须按环境故障收尾，而不是记成可重试的 ``interrupted``。
+    """
+
+    failure_code = "environment"
+
+    def __init__(self, outcome=None):
+        outcome = outcome if isinstance(outcome, dict) else {}
+        self.reason = str(outcome.get("reason") or "Independent acceptance environment preparation failed")
+        setup = outcome.get("setup") if isinstance(outcome.get("setup"), dict) else {}
+        self.detail = next((str(setup[key]).strip() for key in ("error", "stderr", "stdout")
+                            if isinstance(setup.get(key), str) and setup[key].strip()), self.reason)
+        super().__init__(self.reason)
+
+    def failure(self):
+        """Bounded failure payload; setup stderr is the actionable part."""
+        return {"code": "environment", "action": "check_readiness",
+                "stage": "acceptance_baseline", "detail": self.detail[:2000]}
+
+
+def _acceptance_baseline_outcome(future):
+    """确定性失败基线的原因与 setup 摘要；评估线程抛错时降级为异常文本。"""
+    try:
+        outcome = future.result() if future is not None else None
+    except BaseException as exc:
+        reason = str(exc).strip() or type(exc).__name__
+        return {"reason": "Acceptance baseline evaluation failed: " + reason}
+    return outcome if isinstance(outcome, dict) else {"reason": "Acceptance baseline evaluation failed"}
+
+
 def _acceptance_baseline_failed(future):
     """并发验收基线是否已确定失败（不阻塞）。
 
@@ -278,6 +311,22 @@ def _touched_paths(workspace):
     return {path for path in raw.split("\0") if path}
 
 
+def _setup_changes(workspace):
+    """Paths the environment setup step wrote into the shared candidate workspace.
+
+    ``changes()`` later stages everything with ``git add -A`` against the base
+    commit, so a setup command that rewrites a tracked file (or leaves an
+    untracked, non-ignored file) would be indistinguishable from a model edit:
+    it either trips the planned-scope gate or enters the delivered patch. This
+    snapshot taken right after setup keeps that attribution separate. Ignored
+    paths (dependency seeds in ``.git/info/exclude``, ``node_modules``) are
+    excluded exactly like the later patch capture excludes them.
+    """
+    tracked = git(workspace, "diff", "HEAD", "--name-only", "-z").split("\0")
+    untracked = git(workspace, "ls-files", "--others", "--exclude-standard", "-z").split("\0")
+    return sorted({path for path in tracked + untracked if path})
+
+
 def _prepare_environment(runtime, run, project, config, directory, workspace, checks):
     """Seal selected dependency seeds once and restore a private copy per workspace."""
     from .environment import capture, materialize, prepare_cached, restore
@@ -408,6 +457,19 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         if prepared["exit_code"] or prepared["error"]:
             raise ProcessError(prepared, "Dependency preparation failed before planning: " +
                                (prepared.get("error") or prepared.get("stderr") or prepared.get("stdout") or "Command failed"))
+    setup_changes = _setup_changes(workspace)
+    if setup_changes:
+        # Setup runs before any paid planning call and shares the workspace with
+        # the model. Its writes must be named here, not reported later as the
+        # model escaping the planned scope or shipped as an unapproved change.
+        shown = ", ".join(setup_changes[:10])
+        extra = len(setup_changes) - 10
+        reason = "Environment setup modified workspace files: " + shown + \
+            (" (+%d more)" % extra if extra > 0 else "")
+        failure = {"code": "environment", "action": "check_readiness",
+                   "stage": "environment_setup", "paths": setup_changes}
+        transition("insufficient_evidence", {"reason": reason, "failure": failure}, True)
+        return {"decision": "insufficient_evidence", "reason": reason, "failure": failure} if experiment else None
     from .context import code_map
     from .recovery import signature, cached, save, enforce_cached_review
     from .discovery import related_work
@@ -629,10 +691,6 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     acceptance_cancel = threading.Event()
     if (saved_candidate is None and task["source"] != "rollback" and acceptance and
             acceptance.get("change_kind") != "performance"):
-        if experiment:
-            # 实验路径的 transition() 不写 runs.state（见本函数开头），后台验收基线
-            # 评估会一直按 preparation 预算计时；评估工作开始前显式切到评估相位。
-            runtime.begin_phase(run, "evaluation")
         acceptance_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="rsi-acceptance-baseline")
         try:
@@ -682,8 +740,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             except Cancelled:
                 if _acceptance_baseline_failed(acceptance_future):
                     # 验收基线在实现期间已确定失败：中止的是一次注定白付的实现调用，
-                    # 按准确原因收尾而不是泛化的 cancel 文案。
-                    raise Cancelled("Acceptance baseline evaluation failed; implementation aborted")
+                    # 按准确原因（验收环境/setup 故障）收尾而不是泛化的 cancel 文案。
+                    raise AcceptanceBaselineUnavailable(_acceptance_baseline_outcome(acceptance_future)) from None
                 raise
         scrub_tree(workspace)
         files, patch = changes(workspace)
@@ -728,10 +786,10 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         if not experiment:
             save(runtime, run, "implementation", {"files": files, "patch_hash": fingerprint(patch)}, candidate_key)
         transition("evaluating")
-        if experiment and run.get("_explicit_phase") != "evaluation":
-            # 实验路径没有 runs.state 迁移，必须显式切相位；否则五个评估阶段仍共用
-            # preparation 的 900 秒预算，长评估会被误判超时。验收基线已切过相位时
-            # 不再重置计时，避免同一试验拿到双份评估预算。
+        if experiment:
+            # 实验路径不写 runs.state，必须在评估工作开始前显式起算评估相位。
+            # 实现与并发的验收基线都按 preparation 计时（与生产路径一致），
+            # 不能提前切到 evaluation，否则实现越慢，留给评估的预算越少。
             runtime.begin_phase(run, "evaluation")
         if acceptance_future is not None:
             acceptance_baseline = acceptance_future.result()
