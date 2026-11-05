@@ -306,6 +306,13 @@ class DeliveryLoopTest(unittest.TestCase):
                               ({"mergeable": "CONFLICTING"}, "waiting"), ({"reviewDecision": "REVIEW_REQUIRED"}, "waiting_review"),
                               ({"statusCheckRollup": []}, "waiting_ci"),
                               ({"statusCheckRollup": [{"conclusion": "FAILURE"}]}, "ci_failed"),
+                              # 未决结论只说明检查没跑起来：不判失败，等待人工重跑。
+                              ({"statusCheckRollup": [{"conclusion": "CANCELLED"}]}, "waiting_ci"),
+                              ({"statusCheckRollup": [{"conclusion": "STALE"}]}, "waiting_ci"),
+                              ({"statusCheckRollup": [{"conclusion": "STARTUP_FAILURE"}]}, "waiting_ci"),
+                              # 可归因失败仍优先于同批被取消的检查。
+                              ({"statusCheckRollup": [{"conclusion": "FAILURE"},
+                                                      {"conclusion": "CANCELLED"}]}, "ci_failed"),
                               ({"statusCheckRollup": [{"status": "IN_PROGRESS"}]}, "waiting_ci"),
                               # 全 SKIPPED/NEUTRAL 且远端已裁决可合：以 mergeable/CLEAN 为准放行。
                               ({"statusCheckRollup": [{"conclusion": "SKIPPED"}]}, "ready"),
@@ -517,6 +524,84 @@ print('BOUNDARIES_OK')
         self.assertEqual(len(details), CHECK_DETAIL_LIMIT)
         self.assertEqual([item["name"] for item in details[:3]], ["failed-0", "failed-1", "failed-2"])
         self.assertEqual(details[3], {"name": "pending-0", "state": "IN_PROGRESS", "url": None})
+
+    def assert_inconclusive_check_waits(self, conclusion):
+        """取消/作废/启动失败只让 PR 停在 waiting_ci，不关 PR 也不重排任务。"""
+        run = self.tracked_pr()
+        self.runtime.configure({"limits": {"retries": 3}}, self.project)
+        pr = {"state": "OPEN", "headRefOid": "head", "baseRefOid": "base", "baseRefName": "main",
+              "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "reviewDecision": "",
+              "statusCheckRollup": [
+                  {"name": "verify", "conclusion": conclusion, "detailsUrl": "https://example.test/verify"},
+                  {"name": "linux", "conclusion": "SUCCESS"}]}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.checked", return_value="") as remote:
+            tick(self.runtime, 1000)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        saved = json.loads(row["result"])
+        self.assertEqual(row["state"], "pr_open")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "pr_open")
+        self.assertEqual(saved["delivery_status"], "waiting_ci")
+        self.assertIn("verify", [detail["name"] for detail in saved["delivery_checks"]])
+        self.assertFalse([call for call in remote.call_args_list
+                          if call.args and call.args[0][:3] == ["gh", "pr", "close"]])
+
+    def test_cancelled_check_is_not_candidate_evidence(self):
+        self.assert_inconclusive_check_waits("CANCELLED")
+
+    def test_stale_check_is_not_candidate_evidence(self):
+        self.assert_inconclusive_check_waits("STALE")
+
+    def test_startup_failure_is_not_candidate_evidence(self):
+        # 修复前 STARTUP_FAILURE 会让 PR 永久停在 ci_failed，且没有重排出口。
+        self.assert_inconclusive_check_waits("STARTUP_FAILURE")
+
+    def test_attributable_check_failure_still_replans_once(self):
+        run = self.tracked_pr()
+        self.runtime.configure({"limits": {"retries": 3}}, self.project)
+        pr = {"state": "OPEN", "headRefOid": "head", "baseRefOid": "base", "baseRefName": "main",
+              "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "reviewDecision": "",
+              "statusCheckRollup": [{"name": "verify", "conclusion": "FAILURE"}]}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.checked", return_value="") as remote:
+            tick(self.runtime, 1000)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "superseded")
+        self.assertEqual(json.loads(row["result"])["delivery_status"], "feedback_replan")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "queued")
+        self.assertEqual(len([call for call in remote.call_args_list
+                              if call.args and call.args[0][:3] == ["gh", "pr", "close"]]), 1)
+
+    def test_stuck_inconclusive_checks_report_once_without_closing(self):
+        run = self.tracked_pr()
+        self.runtime.configure({"limits": {"retries": 3}}, self.project)
+        pr = {"state": "OPEN", "headRefOid": "head", "baseRefOid": "base", "baseRefName": "main",
+              "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "reviewDecision": "",
+              "statusCheckRollup": [{"name": "verify", "conclusion": "CANCELLED"}]}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.checked", return_value="") as remote:
+            for step in range(11):
+                tick(self.runtime, 1000 + step * 61)
+        self.assertEqual(self.store.one(
+            "SELECT COUNT(*) AS n FROM events WHERE kind='delivery_ci_inconclusive'")["n"], 1)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        saved = json.loads(row["result"])
+        self.assertEqual(row["state"], "pr_open")
+        self.assertEqual(saved["ci_inconclusive_ticks"], 10)
+        self.assertTrue(saved["ci_inconclusive_reported"])
+        self.assertFalse([call for call in remote.call_args_list
+                          if call.args and call.args[0][:3] == ["gh", "pr", "close"]])
+
+    def test_inconclusive_check_conclusions_are_context_not_replan_evidence(self):
+        from adaptive_rsi.delivery import pr_feedback_context, record_pr_feedback
+        run = self.tracked_pr()
+        for conclusion in ("CANCELLED", "STALE", "STARTUP_FAILURE"):
+            self.assertEqual(record_pr_feedback(self.store, run, "pr", {
+                "statusCheckRollup": [{"name": "verify-" + conclusion.lower(), "conclusion": conclusion}]}), [])
+        context = pr_feedback_context(self.store, self.project, run["task"])
+        self.assertEqual(sorted(item["state"] for item in context),
+                         ["CANCELLED", "STALE", "STARTUP_FAILURE"])
+        self.assertTrue(all(item["kind"] == "ci" for item in context))
 
     def test_merged_tasks_still_trigger_strategy_evolution_and_reverts_reach_planning(self):
         self.runtime.pause(self.project, False)

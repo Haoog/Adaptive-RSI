@@ -174,7 +174,7 @@ def record_pr_feedback(store, run, url, pr):
                                      "state": row.get("state"), "url": row.get("url"),
                                      "author": row.get("author"), "updated_at": row.get("updatedAt")})
     for row in pr.get("statusCheckRollup") or []:
-        if not isinstance(row, dict) or (row.get("conclusion") or row.get("state")) not in ("FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED", "CANCELLED", "STALE"):
+        if not isinstance(row, dict) or (row.get("conclusion") or row.get("state")) not in CHECK_TERMINAL_STATES:
             continue
         if not (row.get("name") or row.get("context")):
             continue
@@ -198,11 +198,12 @@ def record_pr_feedback(store, run, url, pr):
         payload = encode(item)
         key = prefix + hashlib.sha256(payload.encode("utf-8")).hexdigest()
         store.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (key, payload))
-        # 只有客观信号才重排：失败检查，或仍未被后续批准覆盖的修改请求。
-        # 普通评论（包括「LGTM」这类赞许）只作为后续规划的上下文。
-        if item["kind"] == "ci" or (item["kind"] == "review" and
-                                    item.get("state") == "CHANGES_REQUESTED" and
-                                    pr.get("reviewDecision") != "APPROVED"):
+        # 只有客观信号才重排：可归因的失败检查，或仍未被后续批准覆盖的修改请求。
+        # 未决结论（取消/作废/启动失败）只作为后续规划的上下文，绝不触发重排与关 PR。
+        # 普通评论（包括「LGTM」这类赞许）同样只作为上下文。
+        if ((item["kind"] == "ci" and item["state"] in CHECK_FAILURE_STATES) or
+                (item["kind"] == "review" and item.get("state") == "CHANGES_REQUESTED" and
+                 pr.get("reviewDecision") != "APPROVED")):
             actionable.append(identity)
     return actionable
 
@@ -280,8 +281,15 @@ def merge_protection(config):
     return result
 
 
-CHECK_FAILURE_STATES = frozenset({"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT",
-                                  "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"})
+# 只有真正裁决了候选代码的检查结论才构成交付证据。`CANCELLED`/`STALE`/
+# `STARTUP_FAILURE` 描述的是这次检查有没有跑起来（runner 回收、被新提交作废、
+# 启动即失败），与候选对错无关：既不能据此关闭 PR 重排任务，也不能让 PR 永远
+# 停在 ci_failed。两个使用点共用这份定义，避免再各自维护一份结论列表。
+CHECK_FAILURE_STATES = frozenset({"FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED"})
+CHECK_INCONCLUSIVE_STATES = frozenset({"CANCELLED", "STALE", "STARTUP_FAILURE"})
+CHECK_TERMINAL_STATES = CHECK_FAILURE_STATES | CHECK_INCONCLUSIVE_STATES
+# 只有未决结论连续这么多轮时记一次事件交人工重跑；不关闭 PR、不重排任务。
+CI_INCONCLUSIVE_TICKS = 10
 CHECK_DETAIL_LIMIT = 20
 
 
@@ -292,7 +300,9 @@ def delivery_checks(pr):
     failure, so they are omitted and a fully green PR leaves no detail. Both
     check-run (`name`/`conclusion`/`detailsUrl`) and status-context
     (`context`/`state`/`targetUrl`) shapes are normalized; the cap keeps a large
-    matrix from growing run results without bound.
+    matrix from growing run results without bound. Inconclusive conclusions
+    (cancelled/stale/startup_failure) are not attributable failures but stay in
+    the detail so the panel can name the check that never ran.
     """
     failed, pending = [], []
     for row in pr.get("statusCheckRollup") or []:
@@ -317,6 +327,9 @@ def merge_gate(pr, head, base):
     statuses = {check.get("conclusion") or check.get("state") or check.get("status") for check in checks}
     if statuses & CHECK_FAILURE_STATES:
         return "ci_failed"
+    if statuses & CHECK_INCONCLUSIVE_STATES:
+        # 未决结论不是候选证据：不合并也不判失败，留在 waiting_ci 等人工重跑。
+        return "waiting_ci"
     if statuses - {"SUCCESS", "NEUTRAL", "SKIPPED"}:
         return "waiting_ci"
     if not any((c.get("conclusion") or c.get("state")) == "SUCCESS" for c in checks):
@@ -1233,6 +1246,27 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                             continue
                         outcome = previous
                     outcome["delivery_status"] = gate
+                    # 基础设施没让检查裁决（runner 回收、被新提交作废、启动即失败）不构成
+                    # 候选证据：停在 waiting_ci，连续多轮只有未决结论时只记一次事件交人工
+                    # 重跑；不关闭 PR、不重排任务。结论一旦前进或退化为真实失败即清零。
+                    statuses = {check.get("conclusion") or check.get("state") or check.get("status")
+                                for check in pr.get("statusCheckRollup") or [] if isinstance(check, dict)}
+                    blockers = statuses - {"SUCCESS", "NEUTRAL", "SKIPPED"}
+                    if (gate == "waiting_ci" and statuses & CHECK_INCONCLUSIVE_STATES and
+                            not statuses & CHECK_FAILURE_STATES and blockers <= CHECK_INCONCLUSIVE_STATES):
+                        if not outcome.get("ci_inconclusive_reported"):
+                            ticks = outcome.get("ci_inconclusive_ticks")
+                            ticks = (ticks if isinstance(ticks, int) else 0) + 1
+                            outcome["ci_inconclusive_ticks"] = ticks
+                            if ticks >= CI_INCONCLUSIVE_TICKS:
+                                outcome["ci_inconclusive_reported"] = True
+                                store.event("delivery_ci_inconclusive",
+                                            "CI checks stayed inconclusive for %s ticks: %s" %
+                                            (ticks, ", ".join(sorted(statuses & CHECK_INCONCLUSIVE_STATES))),
+                                            project["id"], run["id"])
+                    else:
+                        outcome.pop("ci_inconclusive_ticks", None)
+                        outcome.pop("ci_inconclusive_reported", None)
                     # 同时要求运行时及当前项目授权，撤销授权立即阻止合并。
                     try:
                         run_config = json.loads(run["config"] or "{}")
