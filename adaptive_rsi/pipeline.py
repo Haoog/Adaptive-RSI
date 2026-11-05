@@ -604,9 +604,24 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             "scope": plan.get("scope", []), "decision_source": "planning", "wake_condition": "inputs_policy_or_relevant_baseline_change",
             "triage_input": fingerprint({"body": task["body"], "evidence": task["evidence"], "policy": config["triage"]["policy"]})}, True)
         return {"decision": "insufficient_evidence", "reason": plan["reason"]} if experiment else None
+    # 模型给出的计划能通过 schema 却缺少可执行内容（空 scope/acceptance，或把整个
+    # 仓库当范围）时，这是需要重新评估的业务契约问题，不能升级成未处理异常：
+    # 否则运行会以 blocked/execution 收尾且不自动重试。保留原始计划作为证据，
+    # 并与相邻分支一样停在 insufficient_evidence。
+    reason = None
     if not plan["scope"] or not plan["acceptance"]:
-        raise RuntimeError("Plan lacks scope or acceptance criteria")
-    plan["scope"] = _planned_scope(plan["scope"])
+        reason = ("Rollback task has no recorded files to revert" if task["source"] == "rollback"
+                  else "Plan lacks scope or acceptance criteria")
+    else:
+        try:
+            plan["scope"] = _planned_scope(plan["scope"])
+        except (RuntimeError, ValueError) as exc:
+            reason = str(exc)
+    if reason:
+        (directory / "plan.json").write_text(encode(plan), encoding="utf-8")
+        transition("insufficient_evidence", {"reason": reason, "plan_decision": plan["decision"],
+                   "failure": {"code": "improvement", "action": "inspect_evidence"}}, True)
+        return {"decision": "insufficient_evidence", "reason": reason} if experiment else None
     original_scope = list(plan["scope"])
     change_type = "preservation" if task["source"] == "rollback" else change_kind(task, plan)
     test_first_requested = _uses_test_first(change_type, plan["risk"])
