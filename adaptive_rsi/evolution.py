@@ -951,7 +951,32 @@ class Evolution:
                 if error:
                     malformed_checks.append(f"Case {case_id}: checks[{i}] {error}")
 
+        # argv[0] 含路径分隔符且不是绝对路径时，subprocess 按检查 cwd（一次性副本
+        # 内）解析，不是宿主 PATH 查询：必须到用例 repository/overlay 里定位。否则
+        # 包内自带的 ./run.sh 会被 which() 按宿主进程当前目录判成缺工具，整包检查
+        # 随之全部跳过，失败原因还会指向宿主环境。绝对路径仍指宿主文件，照旧处理。
+        def bundle_executable(case_entry, check, cmd):
+            relative = Path(check.get("cwd", ".")) / cmd
+            for base in ("overlay", "repository"):
+                try:
+                    root_dir = (case_entry / base).resolve()
+                    target = (root_dir / relative).resolve()
+                except (OSError, RuntimeError):
+                    continue
+                if root_dir not in target.parents:
+                    continue
+                # overlay 叠在 repository 之上：同名文件以 overlay 为准，存在但不是
+                # 可执行文件时不能再回退到 repository 的旧版本。
+                if target.is_file():
+                    return target if os.access(target, os.X_OK) else None
+            return None
+
+        def bundle_command(cmd):
+            return (not os.path.isabs(cmd)
+                    and (os.sep in cmd or (os.altsep is not None and os.altsep in cmd)))
+
         seen_tools = {}
+        seen_bundle = {}
         for case_id, case_entry, spec in case_items:
             checks = spec.get("checks")
             if not isinstance(checks, list):
@@ -965,24 +990,48 @@ class Evolution:
                 argv = check.get("argv")
                 cmd = argv[0]
                 check_name = check.get("name", "check")
-                if cmd not in seen_tools:
-                    found = lookup(cmd, path=path_env) if path_env else lookup(cmd)
-                    if found:
-                        info = {"name": cmd, "type": "executable", "path": str(found),
-                                "cases": [case_id], "checks": [check_name]}
-                        seen_tools[cmd] = ("available", info)
+                # 同一个相对命令在不同用例（或同一用例的不同 cwd）里指向不同文件，
+                # 按「用例 + cwd + 命令」分别记录；宿主工具仍按命令名合并。
+                bundled = bundle_command(cmd)
+                key = (case_id, check.get("cwd", "."), cmd) if bundled else cmd
+                table = seen_bundle if bundled else seen_tools
+                if key not in table:
+                    if bundled:
+                        found = bundle_executable(case_entry, check, cmd)
+                        if found:
+                            info = {"name": cmd, "type": "bundle",
+                                    "path": found.relative_to(root).as_posix(),
+                                    "cases": [case_id], "checks": [check_name]}
+                            table[key] = ("available", info)
+                        else:
+                            info = {"name": cmd, "type": "bundle",
+                                    "reason": f"Command '{cmd}' is not an executable file in the case bundle",
+                                    "cases": [case_id], "checks": [check_name]}
+                            table[key] = ("missing", info)
                     else:
-                        info = {"name": cmd, "type": "executable",
-                                "reason": f"Command '{cmd}' not found in PATH",
-                                "cases": [case_id], "checks": [check_name]}
-                        seen_tools[cmd] = ("missing", info)
+                        found = lookup(cmd, path=path_env) if path_env else lookup(cmd)
+                        if found:
+                            info = {"name": cmd, "type": "executable", "path": str(found),
+                                    "cases": [case_id], "checks": [check_name]}
+                            table[key] = ("available", info)
+                        else:
+                            info = {"name": cmd, "type": "executable",
+                                    "reason": f"Command '{cmd}' not found in PATH",
+                                    "cases": [case_id], "checks": [check_name]}
+                            table[key] = ("missing", info)
                 else:
-                    status, info = seen_tools[cmd]
+                    status, info = table[key]
                     if case_id not in info["cases"]:
                         info["cases"].append(case_id)
                     if check_name not in info["checks"]:
                         info["checks"].append(check_name)
 
+        missing_bundle = []
+        for status, info in seen_bundle.values():
+            if status == "available":
+                available_tools.append(info)
+            else:
+                missing_bundle.append(info)
         for status, info in seen_tools.values():
             if status == "available":
                 available_tools.append(info)
@@ -1032,6 +1081,11 @@ class Evolution:
             msg = f"Missing host tools: {len(missing_tools)} required executable(s) missing ({', '.join(t['name'] for t in missing_tools)})"
             if msg not in repro_limitations:
                 repro_limitations.append(msg)
+        if missing_bundle:
+            msg = (f"Missing bundle executables: {len(missing_bundle)} declared command(s) "
+                   f"not executable in the case bundle ({', '.join(t['name'] for t in missing_bundle)})")
+            if msg not in repro_limitations:
+                repro_limitations.append(msg)
         offline_note = "Isolated offline environment: external model APIs cannot be contacted without network egress and valid credentials"
         if offline_note not in repro_limitations:
             repro_limitations.append(offline_note)
@@ -1045,7 +1099,7 @@ class Evolution:
         # 检查命令在一次性临时副本上执行：先复制 repository，再把封存 overlay
         # 叠上去（与 evaluator 同一套 scrub + 符号链接拒绝语义），bundle 原文件保持不变。
         executed_checks = []
-        if run_checks and integrity.get("valid") and not missing_tools:
+        if run_checks and integrity.get("valid") and not missing_tools and not missing_bundle:
             import tempfile
             for case_id, case_entry, spec in case_items:
                 repo_dir = case_entry / "repository"
@@ -1167,6 +1221,7 @@ class Evolution:
         is_reproducible = (
             bool(integrity.get("valid")) and
             len(missing_tools) == 0 and
+            len(missing_bundle) == 0 and
             len(missing_creds) == 0 and
             credential_limitation is None and
             len(malformed_checks) == 0 and
@@ -1178,7 +1233,7 @@ class Evolution:
             "integrity": integrity,
             "dependencies": {
                 "available": available_tools,
-                "missing": missing_tools,
+                "missing": missing_tools + missing_bundle,
             },
             "credentials": {
                 "available": available_creds,
