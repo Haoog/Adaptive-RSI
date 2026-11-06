@@ -4,6 +4,14 @@ window.RSINativeUpdate=(()=>{
  const errors={update_target_changed:'更新目标已变化或撤回，请重新检查并确认。',update_window_closed:'安装窗口已结束，下一次允许的空闲窗口会重新尝试。',updater_key_missing:'当前安装包尚未配置更新签名，请手动安装支持自动更新的版本。',update_disk_space:'磁盘可用空间不足，请清理后重试。',update_download_or_signature_failed:'下载或签名验证失败，当前版本继续可用。',update_wait_cancelled:'已取消等待更新，当前任务继续运行。',update_install_failed:'安装未完成，请重试或手动安装。',update_incompatible_platform:'此更新包与当前系统或架构不兼容，当前版本继续可用。',update_connect_timeout:'连接更新服务器超时，当前版本继续可用。请检查网络后重试。',update_response_timeout:'更新服务器响应超时，当前版本继续可用。',update_download_timeout:'下载新版本超过总时限，已停止。当前版本继续可用。',update_transfer_stalled:'下载长时间没有数据，已停止。当前版本继续可用。',update_connection_failed:'无法连接更新服务器，当前版本继续可用。',update_download_incomplete:'更新包下载不完整，已重新开始；请重试。',update_range_rejected:'服务器拒绝续传分段，已删除分段；请重试重新下载。',update_cache_unavailable:'更新缓存不可用，请检查磁盘权限或空间后重试。',update_size_limit:'更新包超过允许的大小上限，已停止。当前版本继续可用。',update_unsupported_platform:'当前平台不支持应用内更新，请手动安装。',update_authorization_changed:'更新授权已变化，本次安装已撤销；请按当前设置重新确认。',update_authorization_invalid:'更新设置无效，请重新选择更新策略、版本范围与安装时间。',update_authorization_failed:'更新设置未能同步到本机，请重试。',update_cancel_failed:'未能确认本机已撤销安装，请查看更新状态后再操作。',update_receipt_missing:'本机还没有已持久化的升级回执。',update_receipt_unavailable:'升级回执无法写入本机，安装未开始。',update_version_mismatch:'重启后的版本与升级目标不一致，已记录为未生效。',update_health_failed:'升级后的本机服务未通过健康检查，已记录为升级失败。'};
  let snapshot={},busy=false,checking=false,nodes=null,failures=0,retryAt=0,storageError=false,polling=false,installRetryAt=0;
  let runtimeInfo=null,lastSample=null,currentSpeed=0;
+ // A running download needs per-second progress; a settled client does not. The
+ // panel used to run a 1s interval for the life of the page even when nothing
+ // was happening, so idle machines paid 86k IPC round-trips and full DOM
+ // rewrites per day. Cadence is now derived from the native state, and a
+ // background window is capped at one status read per minute.
+ const POLL_ACTIVE=1000,POLL_VISIBLE=5000,POLL_HIDDEN=60000,POLL_IDLE=300000;
+ const ACTIVE_PHASES=['downloading','verifying','replacing','waiting_idle'];
+ let pollTimer=null;
  const failureCounts={};
  let policy=localRead('rsi-native-update-policy')||'download';
  let versionScope=localRead('rsi-native-update-scope')||'patch',installWindow=localRead('rsi-native-update-window')||'any';
@@ -170,6 +178,9 @@ window.RSINativeUpdate=(()=>{
   lastSample=next&&next.state==='downloading'?{version:next.version,bytes,time:now}:null;
   return currentSpeed;
  }
+ function setText(node,value){value=value==null?'':String(value);if(node.textContent!==value)node.textContent=value;}
+ function setHidden(node,value){value=!!value;if(node.hidden!==value)node.hidden=value;}
+ function setDisabled(node,value){value=!!value;if(node.disabled!==value)node.disabled=value;}
  function render(){
   if(!enabled())return;
   ensurePanel();
@@ -178,26 +189,28 @@ window.RSINativeUpdate=(()=>{
   // Every native snapshot reports the revision it holds; adopt it so an install
   // binds to the stored authorization instead of a number this document guessed.
   adoptRevision(snapshot);
-  n.status.textContent=statusText(snapshot)+(snapshot.version?' · '+snapshot.version:'');
-  n.progress.hidden=phase!=='downloading';
-  n.progress.textContent=progressText(Object.assign({},snapshot,{speed:Number(snapshot.bytes_per_second)>0?snapshot.bytes_per_second:currentSpeed}));
-  const code=errorCode();n.error.hidden=!code;n.error.textContent=code?errorText(code):'';
-  n.details.hidden=!snapshot.notes;n.summary.textContent=t('这个版本更新了什么');
-  if(n.notes.textContent!==(snapshot.notes||''))n.notes.textContent=snapshot.notes||'';
-  n.labelText.textContent=t('桌面更新策略');n.select.setAttribute('aria-label',t('桌面更新策略'));
-  for(const [option,text] of n.options)option.textContent=t(text);
-  n.scopeText.textContent=t('自动更新版本范围');n.scopeSelect.setAttribute('aria-label',t('自动更新版本范围'));
-  n.windowText.textContent=t('自动安装时间');n.windowSelect.setAttribute('aria-label',t('自动安装时间'));
-  for(const [option,text] of [...n.scopeOptions,...n.windowOptions])option.textContent=t(text);
+  // Polling can call this every second; only changed text is written, so an
+  // unchanged snapshot costs comparisons instead of a full panel rewrite.
+  setText(n.status,statusText(snapshot)+(snapshot.version?' · '+snapshot.version:''));
+  setHidden(n.progress,phase!=='downloading');
+  setText(n.progress,progressText(Object.assign({},snapshot,{speed:Number(snapshot.bytes_per_second)>0?snapshot.bytes_per_second:currentSpeed})));
+  const code=errorCode();setHidden(n.error,!code);setText(n.error,code?errorText(code):'');
+  setHidden(n.details,!snapshot.notes);setText(n.summary,t('这个版本更新了什么'));
+  setText(n.notes,snapshot.notes||'');
+  setText(n.labelText,t('桌面更新策略'));n.select.setAttribute('aria-label',t('桌面更新策略'));
+  for(const [option,text] of n.options)setText(option,t(text));
+  setText(n.scopeText,t('自动更新版本范围'));n.scopeSelect.setAttribute('aria-label',t('自动更新版本范围'));
+  setText(n.windowText,t('自动安装时间'));n.windowSelect.setAttribute('aria-label',t('自动安装时间'));
+  for(const [option,text] of [...n.scopeOptions,...n.windowOptions])setText(option,t(text));
   if(document.activeElement!==n.select)n.select.value=policy;
-  n.scope.textContent=t(scopeText(runtimeInfo));
+  setText(n.scope,t(scopeText(runtimeInfo)));
   for(const [action,[button,text]] of Object.entries(n.buttons)){
-   button.textContent=t(text);button.disabled=action!=='cancel'&&busy;
-   button.hidden=action==='download'?snapshot.state!=='available':action==='install'?snapshot.state!=='ready':action==='cancel'?!['downloading','waiting_idle'].includes(snapshot.state):false;
+   setText(button,t(text));setDisabled(button,action!=='cancel'&&busy);
+   setHidden(button,action==='download'?snapshot.state!=='available':action==='install'?snapshot.state!=='ready':action==='cancel'?!['downloading','waiting_idle'].includes(snapshot.state):false);
   }
-  n.manual.textContent=t('手动下载安装包');
-  n.receipt.textContent=t('导出升级回执');
-  n.saved.hidden=!storageError;n.saved.textContent=t('偏好未保存到磁盘，本次会话已生效。');
+  setText(n.manual,t('手动下载安装包'));
+  setText(n.receipt,t('导出升级回执'));
+  setHidden(n.saved,!storageError);setText(n.saved,t('偏好未保存到磁盘，本次会话已生效。'));
  }
  async function exportReceipt(){
   // The transaction comes from the persisted record written before replacement,
@@ -271,6 +284,38 @@ window.RSINativeUpdate=(()=>{
   }finally{checking=false;}
  }
 
- document.addEventListener('DOMContentLoaded',()=>{if(!enabled())return;render();setTimeout(()=>safe(async()=>{await syncAuthorization();await tick();}),5000);setInterval(()=>safe(tick),1000);});
- return {render,run,tick,eligible,withinWindow,phaseOf,statusText,progressText,formatBytes,speedText,sampleSpeed,scopeText,errorText,errorCode,exportReceipt,syncAuthorization,settingsChanged,revision:()=>revision};
+ function pollDelay(){
+  // A background window never polls faster than once a minute, even mid-download:
+  // the immediate refresh when it becomes visible closes the gap, and nothing in
+  // the panel is being read while hidden.
+  if(document.visibilityState==='hidden')return POLL_HIDDEN;
+  const phase=phaseOf(snapshot);
+  if(ACTIVE_PHASES.includes(phase))return POLL_ACTIVE;
+  // Settled clients have nothing to show that changes faster than the six-hourly
+  // feed check; the five-minute read is only a safety net.
+  if(!snapshot.state||snapshot.state==='latest'||snapshot.state==='idle')return POLL_IDLE;
+  return POLL_VISIBLE;
+ }
+ function stopPoll(){if(pollTimer!==null){clearTimeout(pollTimer);pollTimer=null;}}
+ function schedulePoll(){
+  if(!enabled()){stopPoll();return;}
+  stopPoll();
+  pollTimer=setTimeout(()=>{pollTimer=null;safe(poll);},pollDelay());
+ }
+ async function poll(){try{await tick();}finally{schedulePoll();}}
+ function visibilityChanged(){
+  if(!enabled())return;
+  stopPoll();
+  if(document.visibilityState==='hidden'){schedulePoll();return;}
+  // A single catch-up read replaces the timer instead of adding one.
+  safe(poll);
+ }
+
+ document.addEventListener('DOMContentLoaded',()=>{
+  if(!enabled())return;
+  render();
+  document.addEventListener('visibilitychange',visibilityChanged);
+  setTimeout(()=>safe(async()=>{await syncAuthorization();await poll();}),5000);
+ });
+ return {render,run,tick,pollDelay,poll,eligible,withinWindow,phaseOf,statusText,progressText,formatBytes,speedText,sampleSpeed,scopeText,errorText,errorCode,exportReceipt,syncAuthorization,settingsChanged,revision:()=>revision};
 })();
