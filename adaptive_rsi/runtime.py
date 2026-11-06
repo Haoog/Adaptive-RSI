@@ -41,6 +41,9 @@ BUDGET_WAIT_RETRIES = 3
 ADMISSION_BACKOFF_SECONDS = 30
 # 阶段预算跨尝试累计时，崩溃最多丢失一个检查点间隔的已耗时间。
 STAGE_BUDGET_CHECKPOINT_SECONDS = 15
+# 检查点写库只争取这么久的写锁：DB 忙时放弃本轮检查点（下个间隔重试），
+# 不把取消轮询和阶段切换拖到 store 的 15 秒 busy timeout。
+STAGE_BUDGET_CHECKPOINT_BUSY_MS = 50
 
 # 失败退避的时长上限：指数退避只表达「越失败越谨慎」，不无限拉长。
 FAILURE_BACKOFF_MAX_SECONDS = 21600
@@ -147,6 +150,12 @@ def _diff_touches(changed, path):
     """路径本身或其目录前缀出现在变更集里，等价于 git pathspec 命中。"""
     path = path.rstrip("/")
     return any(name == path or name.startswith(path + "/") for name in changed)
+
+
+# 同一任务的检查点落盘是「读旧账取最大值 → 写新账」的读-改-写：跨 run 对象的
+# 时钟锁不通用（owner 与 trial 各持一把），用进程级锁把这段串起来。它只在时钟锁
+# 之外获取，因此写库阻塞不会回流到 begin_phase/invoke 与取消轮询。
+_stage_budget_write_lock = threading.Lock()
 
 
 class IssueSyncCorruptPending(ValueError):
@@ -1796,38 +1805,95 @@ class Runtime(Maintenance):
                 return stage, started
         return run.get('_deadline_stage'), run.get('_deadline_started')
 
-    def _save_stage_budget(self, run, now, keep):
-        """落盘或清除任务已耗的阶段时间：只有中断把额度交接给下一次尝试。"""
+    def _stage_budget_snapshot(self, run, now, keep):
+        """在时钟锁内生成检查点快照：只读内存字段，不做任何存储访问。
+
+        写库（含 DB busy 等待）必须在锁外完成，否则一次慢写会占住整把时钟锁，
+        把同一 run 的 begin_phase/invoke 与取消轮询一起拖住。
+        """
         used, task = run.get('_stage_used'), run.get('task')
         if not task or not isinstance(used, dict):
+            return None
+        values = dict(used)
+        stage, started = self._billable_stage(run)
+        if keep and stage in ('preparation', 'evaluation') and started is not None:
+            values[stage] = self._stage_seconds(values.get(stage)) + max(0.0, now - started)
+        values = {name: self._stage_seconds(values.get(name))
+                  for name in ('preparation', 'evaluation')}
+        return self._stage_budget_key(task), values, run.get('id')
+
+    def _persist_stage_budget(self, key, values, run_id, keep):
+        """落盘或清除任务已耗的阶段时间：只有中断把额度交接给下一次尝试。
+
+        必须在时钟锁外调用，但仍在取消轮询链上（is_cancelled → _deadline_expired），
+        因此这里不能用任何「排队等待」：写锁只做非阻塞抢占，抢不到就丢掉本轮检查点
+        （下个间隔重试），慢库不会让别的 run 的轮询排在这把进程级锁后面。
+
+        同一任务的账本按阶段取最大值合并：两轮轮询的写可能乱序完成，晚到的旧快照
+        不得回退已经记录的额度。读旧账与写新账共用一条连接，连接借出后先把
+        busy_timeout 压到检查点预算内，避免一次慢写等满默认的 15 秒。
+
+        终态那次写（process 的 finally）抢锁失败时同样丢弃：账本保留上一个检查点，
+        最多丢一个间隔的偏差，与硬崩溃的损失同量级，不会让收尾线程无限等待。
+        """
+        if not _stage_budget_write_lock.acquire(blocking=False):
+            # 另一个线程正在写检查点，它可能卡在慢库上：本线程不排队，丢本轮。
+            logging.getLogger(__name__).info(
+                'Dropped stage budget checkpoint for %s: another checkpoint write is in flight', run_id)
             return
-        key = self._stage_budget_key(task)
         try:
-            values = dict(used)
-            stage, started = self._billable_stage(run)
-            if keep and stage in ('preparation', 'evaluation') and started is not None:
-                values[stage] = self._stage_seconds(values.get(stage)) + max(0.0, now - started)
-            values = {name: self._stage_seconds(values.get(name))
-                      for name in ('preparation', 'evaluation')}
-            if not keep or not any(values.values()):
-                self.store.execute('DELETE FROM settings WHERE key=?', (key,))
+            with self.store.connect() as db:
+                previous_timeout = db.execute('PRAGMA busy_timeout').fetchone()[0]
+                db.execute('PRAGMA busy_timeout=%d' % STAGE_BUDGET_CHECKPOINT_BUSY_MS)
+                try:
+                    if not keep or not any(values.values()):
+                        db.execute('DELETE FROM settings WHERE key=?', (key,))
+                        return
+                    row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+                    try:
+                        stored = json.loads(row['value']) if row else {}
+                    except (TypeError, ValueError):
+                        stored = {}
+                    if isinstance(stored, dict):
+                        previous = {name: self._stage_seconds(stored.get(name)) for name in values}
+                        # 账本只增不减：旧值更大说明那一笔更晚完成，归属尝试也以它为准。
+                        if all(previous[name] >= values[name] for name in values):
+                            run_id = stored.get('run') or run_id
+                        values = {name: max(values[name], previous[name]) for name in values}
+                    # 记录归属尝试：终态提交后、finally 之前崩溃会留下键，载入时据此判定它是否还有效。
+                    db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',
+                               (key, encode({**values, 'run': run_id})))
+                finally:
+                    try:
+                        db.execute('PRAGMA busy_timeout=%d' % previous_timeout)
+                    except Exception:
+                        pass
+        except Exception as error:
+            # 预算是尽力而为的护栏：写入失败不能反过来中断正在收尾的 run，也不能把
+            # 取消轮询拖到 busy timeout。DB 忙只丢本轮检查点（下个间隔重试），
+            # 其他异常保留完整调用栈便于排查。
+            logger = logging.getLogger(__name__)
+            if 'locked' in str(error) or 'busy' in str(error).lower():
+                logger.info('Dropped stage budget checkpoint for %s: %s', run_id, error)
             else:
-                # 记录归属尝试：终态提交后、finally 之前崩溃会留下键，载入时据此判定它是否还有效。
-                self.store.put_setting(key, {**values, 'run': run.get('id')})
-        except Exception:
-            # 预算是尽力而为的护栏：写入失败不能反过来中断正在收尾的 run。
-            logging.getLogger(__name__).warning('Could not persist stage budget for %s', run.get('id'), exc_info=True)
+                logger.warning('Could not persist stage budget for %s', run_id, exc_info=True)
+        finally:
+            _stage_budget_write_lock.release()
 
     def _checkpoint_owner_budget(self, owner, now):
-        """trial 轮询顺带为所属 run 落盘：时钟各自独立，账本仍按 owner 的阶段计。"""
+        """trial 轮询顺带为所属 run 取快照：时钟各自独立，账本仍按 owner 的阶段计。
+
+        返回待落盘快照，由调用方在释放时钟锁后写入。
+        """
         if owner is None:
-            return
+            return None
         with _clock_lock(owner):
             checkpoint = owner.get('_deadline_checkpoint')
             if checkpoint is not None and now - checkpoint < STAGE_BUDGET_CHECKPOINT_SECONDS:
-                return
-            self._save_stage_budget(owner, now, keep=True)
+                return None
+            snapshot = self._stage_budget_snapshot(owner, now, keep=True)
             owner['_deadline_checkpoint'] = now
+            return snapshot
 
     def _load_stage_budget(self, run):
         """载入同一任务上一尝试的额度；不属于未结尝试的残留直接丢弃。"""
@@ -1883,22 +1949,34 @@ class Runtime(Maintenance):
     def _deadline_expired(self, run):
         """Judge the stage clock and record the timeout stage under the per-run lock.
 
-        相位推导、时钟重置、预算检查点与超时判定是同一组跨字段的读-改-写：
-        worker 的 begin_phase/invoke 会并发改同一 dict，acceptance 基线等取消
-        轮询线程也会在这里判定。整段持锁串行化；锁内只做阶段推断所需的存储读取，
-        以及一份很小的预算检查点写入（与时钟字段同锁才能保持一致快照）。
+        相位推导、时钟重置与超时判定是同一组跨字段的读-改-写：worker 的
+        begin_phase/invoke 会并发改同一 dict，acceptance 基线等取消轮询线程也会
+        在这里判定。整段持锁串行化；锁内只碰内存字段，runs.state 查询与检查点
+        写库都在锁外完成，慢 DB 不会把阶段切换或取消响应拖住。
         """
+        # 相位推断所需的 runs.state 预取到锁外；_explicit_phase 一旦写入不会被
+        # 清除，因此只有它缺席、且没有模型调用在途时才需要这次查询（与锁内原先的
+        # 惰性求值同条件）。
+        state_row, state_checked = None, False
+        if ('_deadline_started' in run and not run.get('_explicit_phase')
+                and run.get('_model_started') is None):
+            state_row = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
+            state_checked = True
+        pending = None
         with _clock_lock(run):
             if '_deadline_started' in run:
                 if run.get('_model_started') is not None:
                     stage = 'model'
                 elif run.get('_explicit_phase'):
                     stage = run['_explicit_phase']
+                elif state_checked:
+                    stage = 'evaluation' if state_row and state_row['state'] == 'evaluating' else 'preparation'
                 else:
-                    # 仅当 _model_started 与 _explicit_phase 都缺席时才需要 runs.state 推断阶段；
-                    # 该谓词是高频取消轮询路径，惰性求值避免每次白查一次 runs 表。
-                    state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
-                    stage = 'evaluation' if state and state['state'] == 'evaluating' else 'preparation'
+                    # 预取时模型调用仍在途、取锁时已结束：沿用当前阶段，不无依据地
+                    # 重新推断（否则会把评估时钟错锚到准备阶段）。
+                    stage = run.get('_deadline_stage')
+                    if stage not in ('preparation', 'evaluation'):
+                        stage = 'preparation'
                 now = time.monotonic()
                 if run.get('_deadline_stage') != stage:
                     # 模型调用的进出由 invoke 恢复外层锚点，在此累计会重复计时；
@@ -1929,13 +2007,16 @@ class Runtime(Maintenance):
                 checkpoint = run.get('_deadline_checkpoint')
                 if '_stage_used' in run and (checkpoint is None or now - checkpoint >= STAGE_BUDGET_CHECKPOINT_SECONDS):
                     # 硬崩溃时 finally 不会执行；按间隔落盘，重启后最多损失一个间隔。
-                    self._save_stage_budget(run, now, keep=True)
+                    # 锁内只取快照并占用这一轮窗口，写库在锁外完成。
+                    pending = self._stage_budget_snapshot(run, now, keep=True)
                     run['_deadline_checkpoint'] = now
                 elif run.get('_budget_owner') is not None:
                     # trial 自身不记账，但它运行期间父 run 仍在消耗阶段预算：
                     # 模型调用/评估循环的长轮询要按 owner 的检查点继续落盘，
                     # 否则硬崩溃会把整段试验耗时丢掉。计费阶段取 owner 的。
-                    self._checkpoint_owner_budget(run['_budget_owner'], now)
+                    pending = self._checkpoint_owner_budget(run['_budget_owner'], now)
+        if pending is not None:
+            self._persist_stage_budget(*pending, keep=True)
         return False
 
     def active_strategies(self, project, config=None):
@@ -2038,8 +2119,10 @@ class Runtime(Maintenance):
         # 该阶段时钟从此刻起算，不继承旧阶段的已耗时间。
         # 推导与四个字段的写入必须原子：取消轮询线程会并发重算同一时钟。
         self.store.phase(run["id"], role)
+        # runs.state 在锁外读取：锁内只做时钟字段的读-改-写，DB 往返（可能等
+        # busy timeout / 连接池）不占用时钟锁，否则取消轮询和阶段切换会跟着排队。
+        state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
         with _clock_lock(run):
-            state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
             outer_stage = (run.get('_explicit_phase') or
                            ('evaluation' if state and state['state'] == 'evaluating' else 'preparation'))
             if run.get('_deadline_stage') != outer_stage or run.get('_deadline_started') is None:
@@ -2098,7 +2181,9 @@ class Runtime(Maintenance):
             # 只有中断会交接给下一次尝试；其他终态（含 deadline 阻塞）视为本轮已结案。
             keep = bool(row) and (row['ended'] is None or row['state'] == 'interrupted')
             with _clock_lock(run):
-                self._save_stage_budget(run, time.monotonic(), keep)
+                pending = self._stage_budget_snapshot(run, time.monotonic(), keep)
+            if pending is not None:
+                self._persist_stage_budget(*pending, keep)
 
     def _process(self, run):
         try:
