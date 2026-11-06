@@ -31,6 +31,12 @@ HARNESS_CONFIG_PREFIXES = ("jest.config.", "vitest.config.", "playwright.config.
                            "test.config.", "karma.conf.", "wdio.conf.", "ava.config.")
 HARNESS_CONFIGS = {".mocharc.js", ".mocharc.cjs", ".mocharc.mjs", ".mocharc.json", ".mocharc.yaml",
                    ".mocharc.yml", ".mocharc.toml"}
+# Fixture/golden data read by baseline tests is part of the frozen comparison
+# surface even though it is not harness configuration. `testdata` is the Go
+# convention; `fixtures` only counts beneath a test directory so ordinary
+# `src/fixtures/` application data is left to the candidate.
+TEST_DATA_DIRECTORIES = {"testdata", "__fixtures__", "snapshots", "__snapshots__"}
+TEST_DIRECTORIES = {"test", "tests", "spec", "specs", "__tests__"}
 BASELINE_CACHE_LIMIT = 4
 HOST_TOOL_DIGEST_CHUNK = 1024 * 1024
 HOST_TOOL_DIGEST_CACHE_LIMIT = 32
@@ -613,8 +619,8 @@ def freeze_harness(baseline, target, checks=()):
         for name in files:
             src = Path(parent) / name
             relative = src.relative_to(baseline)
-            if not (test_path(relative) or relative in explicit_checks or _harness_path(relative) or
-                    name.endswith((".csproj", ".fsproj", ".sln"))):
+            if not (test_path(relative) or _test_data_path(relative) or relative in explicit_checks or
+                    _harness_path(relative) or name.endswith((".csproj", ".fsproj", ".sln"))):
                 continue
             dst = target / relative
             # Reject directory/symlink tricks before the host copies protected files.
@@ -848,6 +854,19 @@ def _harness_differs(baseline, candidate, checks):
     return False
 
 
+def _test_data_path(path):
+    """True for baseline fixture/golden data that tests read as expectations.
+
+    Unlike `_harness_path`, these files are only restored, never deleted: new
+    fixture files can belong to new candidate tests and must survive the freeze.
+    """
+    directories = [part.lower() for part in Path(path).parts[:-1]]
+    if any(part in TEST_DATA_DIRECTORIES for part in directories):
+        return True
+    return any(part == "fixtures" and any(parent in TEST_DIRECTORIES for parent in directories[:index])
+               for index, part in enumerate(directories))
+
+
 def _harness_path(path):
     name = Path(path).name.lower()
     parts = Path(path).parts
@@ -861,7 +880,8 @@ def _changed_harness(files, checks, baseline, added_tests=()):
     explicit_checks = configured_check_files(baseline, checks)
     additions = set(added_tests)
     return any(path not in additions and
-               (test_path(path) or _harness_path(path) or Path(path) in explicit_checks)
+               (test_path(path) or _harness_path(path) or Path(path) in explicit_checks or
+                (_test_data_path(path) and (Path(baseline) / path).is_file()))
                for path in files)
 
 
