@@ -1829,8 +1829,10 @@ class Runtime(Maintenance):
         因此这里不能用任何「排队等待」：写锁只做非阻塞抢占，抢不到就丢掉本轮检查点
         （下个间隔重试），慢库不会让别的 run 的轮询排在这把进程级锁后面。
 
-        同一任务的账本按阶段取最大值合并：两轮轮询的写可能乱序完成，晚到的旧快照
-        不得回退已经记录的额度。读旧账与写新账共用一条连接，连接借出后先把
+        同一尝试的账本按阶段取最大值合并：两轮轮询的写可能乱序完成，晚到的旧快照
+        不得回退已经记录的额度。账本已归属别的尝试时只有更新的尝试能改写，上一次
+        尝试迟到的检查点（含收尾删除）一律丢弃，不能把旧消耗记到新一轮账上。
+        读旧账与写新账共用一条连接，连接借出后先把
         busy_timeout 压到检查点预算内，避免一次慢写等满默认的 15 秒。
 
         终态那次写（process 的 finally）抢锁失败时同样丢弃：账本保留上一个检查点，
@@ -1846,19 +1848,32 @@ class Runtime(Maintenance):
                 previous_timeout = db.execute('PRAGMA busy_timeout').fetchone()[0]
                 db.execute('PRAGMA busy_timeout=%d' % STAGE_BUDGET_CHECKPOINT_BUSY_MS)
                 try:
-                    if not keep or not any(values.values()):
-                        db.execute('DELETE FROM settings WHERE key=?', (key,))
-                        return
                     row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
                     try:
                         stored = json.loads(row['value']) if row else {}
                     except (TypeError, ValueError):
                         stored = {}
-                    if isinstance(stored, dict):
+                    if not isinstance(stored, dict):
+                        stored = {}
+                    owner = stored.get('run')
+                    if owner and owner != run_id and not self._stage_budget_newer_attempt(db, run_id, owner):
+                        # 账本属于更晚的尝试：本线程是上一次尝试的迟到检查点，它的终态
+                        # 已经结案。放它进来会把旧消耗记到新一轮账本上（下一轮提前超时），
+                        # 也会用旧值覆盖新一轮已经写下的额度。
+                        logging.getLogger(__name__).info(
+                            'Dropped stale stage budget checkpoint for %s: ledger belongs to %s',
+                            run_id, owner)
+                        return
+                    if not keep or not any(values.values()):
+                        db.execute('DELETE FROM settings WHERE key=?', (key,))
+                        return
+                    if owner and owner != run_id:
+                        # 新尝试接手旧账本：载入时已把交接额度并进 _stage_used，快照本身
+                        # 就是权威值，不取上一次尝试的最大值（那是它的消耗，不属于本轮）。
+                        values = {name: self._stage_seconds(values.get(name)) for name in values}
+                    else:
                         previous = {name: self._stage_seconds(stored.get(name)) for name in values}
-                        # 账本只增不减：旧值更大说明那一笔更晚完成，归属尝试也以它为准。
-                        if all(previous[name] >= values[name] for name in values):
-                            run_id = stored.get('run') or run_id
+                        # 账本只增不减：同一尝试的旧快照算得更早、写得更晚，不得回退额度。
                         values = {name: max(values[name], previous[name]) for name in values}
                     # 记录归属尝试：终态提交后、finally 之前崩溃会留下键，载入时据此判定它是否还有效。
                     db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',
@@ -1879,6 +1894,19 @@ class Runtime(Maintenance):
                 logger.warning('Could not persist stage budget for %s', run_id, exc_info=True)
         finally:
             _stage_budget_write_lock.release()
+
+    @staticmethod
+    def _stage_budget_newer_attempt(db, run_id, owner):
+        """本次快照所属尝试是否比账本当前归属的尝试更新（按 runs.started 判定）。
+
+        只有更新的尝试才有权改写账本：上一次尝试若已结案，它迟到的检查点（含收尾
+        删除）不得影响新一轮的额度；反之新一轮接手旧账本时以自身快照为准。仍在
+        写库的旧快照无法在时钟锁内围栏，因此归属校验放在事务里做最后一道判断。
+        """
+        rows = {row['id']: row['started'] for row in db.execute(
+            'SELECT id,started FROM runs WHERE id IN (?,?)', (run_id, owner))}
+        started, previous = rows.get(run_id), rows.get(owner)
+        return started is not None and (previous is None or started > previous)
 
     def _checkpoint_owner_budget(self, owner, now):
         """trial 轮询顺带为所属 run 取快照：时钟各自独立，账本仍按 owner 的阶段计。

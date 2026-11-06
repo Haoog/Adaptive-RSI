@@ -554,6 +554,31 @@ class RuntimeHandoffTest(unittest.TestCase):
         # 失败后的新尝试从满额度起算，残留键在载入时已被丢弃。
         self.assertEqual(observed, [{'preparation': 0.0, 'evaluation': 0.0}, None])
 
+    def test_stale_checkpoint_from_completed_attempt_cannot_charge_the_retry(self):
+        """已完成尝试的迟到检查点既不能把旧消耗并入新账本，也不能覆盖新账本。"""
+        task, stale = self.claim()
+        # 上一尝试已写终态（非 interrupted）：它的 finally 因写锁被占而丢了收尾写，
+        # 迟到的检查点随后才落地——此时新一轮已经载入并开始记账。
+        self.store.execute("UPDATE runs SET state='failed',ended=? WHERE id=?", (time.time(), stale['id']))
+        self.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (task,))
+        self.runtime.retry(task)
+        retried = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertNotEqual(retried['id'], stale['id'])
+        key = 'stage-budget:' + task
+        self.assertIsNone(self.store.setting(key))
+        self.runtime._persist_stage_budget(key, {'preparation': 60.0, 'evaluation': 0.0}, stale['id'], True)
+        # 新一轮自己的快照不得继承旧尝试的 60 秒（否则剩余预算被凭空吃掉）。
+        self.runtime._persist_stage_budget(key, {'preparation': 20.0, 'evaluation': 1.0}, retried['id'], True)
+        self.assertEqual(self.store.setting(key),
+                         {'preparation': 20.0, 'evaluation': 1.0, 'run': retried['id']})
+        # 反向：旧尝试再迟到一次（含收尾删除）也不得改写新账本。
+        self.runtime._persist_stage_budget(key, {'preparation': 60.0, 'evaluation': 0.0}, stale['id'], True)
+        self.assertEqual(self.store.setting(key),
+                         {'preparation': 20.0, 'evaluation': 1.0, 'run': retried['id']})
+        self.runtime._persist_stage_budget(key, {'preparation': 0.0, 'evaluation': 0.0}, stale['id'], False)
+        self.assertEqual(self.store.setting(key),
+                         {'preparation': 20.0, 'evaluation': 1.0, 'run': retried['id']})
+
     def test_trial_phase_clock_ignores_parent_planning_and_propagates_timeout(self):
         _, parent = self.claim()
         parent['_deadline_started'] = time.monotonic() - 5000
