@@ -24,6 +24,23 @@ const {chromium} = require('playwright');
       await page.locator('#goal-form button[type=submit]').click();
       await page.getByRole('button', {name:title, exact:true}).waitFor();
     }
+    const pageCount = await page.getByRole('checkbox', {name: /^选择任务 · /}).count();
+    const toolbarCount = () => page.locator('#batch-actions span').first().textContent();
+    await page.getByRole('checkbox', {name:'选择任务 · 批量目标一'}).click();
+    await page.getByRole('checkbox', {name:'选择任务 · 批量目标二'}).click({modifiers:['Shift']});
+    assert.match(await toolbarCount(), new RegExp('· 2 / ' + pageCount), 'shift-click selects the whole visible range');
+    assert.equal(await page.getByRole('checkbox', {name:'选择任务 · 批量目标一'}).isChecked(), true);
+    assert.equal(await page.getByRole('checkbox', {name:'选择任务 · 批量目标二'}).isChecked(), true);
+    await page.getByRole('button', {name:'清除选择'}).click();
+    assert.match(await toolbarCount(), /· 0 \//, 'clearing resets the count');
+    assert.equal(await page.getByRole('checkbox', {name:'选择任务 · 批量目标一'}).isChecked(), false);
+    assert.equal(await page.locator('dialog.confirm-dialog[open]').count(), 0, 'clearing the selection sends no request');
+    await page.getByRole('checkbox', {name:'选择任务 · 批量目标一'}).check();
+    await page.locator('[data-task-filter="history"]').click();
+    // 筛选切换会先异步刷新列表；等渲染完成后再核对计数。
+    await page.waitForFunction(()=>/· 0 \/ 0/.test(document.querySelector('#batch-actions span')?.textContent||''));
+    assert.match(await toolbarCount(), /· 0 \/ 0/, 'switching the filter drops selections that left the page');
+    await page.locator('[data-task-filter="active"]').click();
     await page.getByRole('checkbox', {name:'选择任务 · 批量目标一'}).check();
     await page.getByRole('checkbox', {name:'选择任务 · 批量目标二'}).check();
     await page.getByRole('button', {name:'合并任务'}).click();
