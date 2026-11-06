@@ -26,6 +26,13 @@ const {chromium} = require('playwright');
     }
     const pageCount = await page.getByRole('checkbox', {name: /^选择任务 · /}).count();
     const toolbarCount = () => page.locator('#batch-actions span').first().textContent();
+    // 空选择时全选按钮仍须可见，否则用户必须先逐行勾选才能批量选择整页。
+    const selectAll = page.getByRole('button', {name:'全选当前页'});
+    assert.equal(await selectAll.isVisible(), true, 'select all stays visible before any task is selected');
+    await selectAll.click();
+    assert.match(await toolbarCount(), new RegExp('· ' + pageCount + ' / ' + pageCount), 'select all covers the visible page');
+    await page.getByRole('button', {name:'清除选择'}).click();
+    assert.match(await toolbarCount(), /· 0 \//, 'clearing after select all resets the count');
     await page.getByRole('checkbox', {name:'选择任务 · 批量目标一'}).click();
     await page.getByRole('checkbox', {name:'选择任务 · 批量目标二'}).click({modifiers:['Shift']});
     assert.match(await toolbarCount(), new RegExp('· 2 / ' + pageCount), 'shift-click selects the whole visible range');
