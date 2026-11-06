@@ -1969,6 +1969,87 @@ test('schedule form omits fold for a single-occurrence time and rejects empty in
   assert.match(page.node('toast').textContent, /请填写本地时间和时区/);
 });
 
+test('reason and schedule drafts survive detail rebuilds, clear on save, and stay per task', async () => {
+  const page = experiencePage(), posts = [];
+  const task = fixtureTask('draft-task', 'queued');
+  let metadata = {...task, dependency: null, revisions: []};
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') {
+      posts.push({url, body: JSON.parse(options.body)});
+      if (url.endsWith('/task/revise')) metadata = {...metadata, state: 'deferred'};
+      return response({saved: true});
+    }
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({tasks: []});
+    return response(url.includes('id=other&') ? fixtureTask('other', 'queued') : metadata);
+  };
+  const fields = () => {
+    const body = page.node('detail-body'), all = [body, ...descendants(body)];
+    const form = supplementForm(body), box = all.find(node => node.className === 'task-schedule-editor');
+    const inputs = descendants(box);
+    return {form, box, reason: form.children[1].children[0],
+      time: inputs.find(node => node.type === 'datetime-local'),
+      zone: inputs.find(node => node.type === 'text'),
+      repeat: inputs.find(node => node.tagName === 'SELECT')};
+  };
+  await openExperienceTask(page, task);
+  let current = fields();
+  current.reason.value = '保留这条审计原文'; current.reason.handlers.input();
+  current.time.value = '2027-11-07T01:30'; current.time.handlers.input();
+  current.zone.value = 'Asia/Shanghai'; current.zone.handlers.input();
+  current.repeat.value = '1'; current.repeat.handlers.change();
+  // 同步 Issue 的标题/正文会改变快照并整块重建详情。
+  metadata = {...metadata, title: '同步后的标题', body: '同步后的正文', updated: 2};
+  page.fireTimer(5000);
+  await waitFor(() => page.node('detail-title').textContent === '同步后的标题');
+  await new Promise(setImmediate);
+  current = fields();
+  assert.equal(current.reason.value, '保留这条审计原文');
+  assert.equal(current.time.value, '2027-11-07T01:30');
+  assert.equal(current.zone.value, 'Asia/Shanghai');
+  assert.equal(current.repeat.value, '1');
+  assert.equal(descendants(page.node('detail-body')).filter(node => node.className === 'task-schedule-editor').length, 1,
+    'rebuild leaves exactly one schedule editor');
+  assert.equal(descendants(page.node('detail-body')).filter(node => node.className === 'task-supplement-editor').length, 1,
+    'rebuild leaves exactly one supplement editor');
+  // 语言切换同样重建详情，草稿仍需保留。
+  await changeDetailLanguage(page); await new Promise(setImmediate);
+  current = fields();
+  assert.equal(current.reason.value, '保留这条审计原文');
+  assert.equal(current.time.value, '2027-11-07T01:30');
+  assert.equal(current.zone.value, 'Asia/Shanghai');
+  assert.equal(current.repeat.value, '1');
+  assert.equal(descendants(page.node('detail-body')).filter(node => node.className === 'task-schedule-editor').length, 1,
+    'language rebuild does not duplicate the schedule editor');
+  assert.equal(descendants(page.node('detail-body')).filter(node => node.className === 'task-supplement-editor').length, 1,
+    'language rebuild does not duplicate the supplement editor');
+  // 预约成功只清预约草稿，未提交的审计原文继续保留。
+  descendants(current.box).find(node => node.tagName === 'BUTTON' && node.textContent === '预约').handlers.click();
+  await page.context.lastAction;
+  assert.deepEqual(posts.at(-1).body, {task: 'draft-task', local_time: '2027-11-07T01:30',
+    timezone: 'Asia/Shanghai', fold: 1});
+  assert.equal(vm.runInContext("draftStore.get('task-schedule','draft-task')", page.context), null);
+  assert.equal(vm.runInContext("draftStore.get('task-reason','draft-task')", page.context), '保留这条审计原文');
+  // 重新打开不沿用已提交的预约值，但恢复未提交的审计原文。
+  await openExperienceTask(page, task);
+  current = fields();
+  assert.equal(current.reason.value, '保留这条审计原文');
+  assert.notEqual(current.time.value, '2027-11-07T01:30');
+  assert.equal(current.repeat.value, '');
+  // 成功提交补充需求后清除原因草稿，避免下次打开沿用旧原文。
+  current.form.children[0].children[0].value = '补充正文';
+  current.form.onsubmit({preventDefault() {}});
+  await page.context.lastAction;
+  assert.deepEqual(posts.at(-1).body, {task: 'draft-task', supplement: '补充正文', reason: '保留这条审计原文'});
+  assert.equal(vm.runInContext("draftStore.get('task-reason','draft-task')", page.context), null);
+  // 另一个任务不继承前一个任务的未提交内容。
+  await openExperienceTask(page, fixtureTask('other', 'queued'));
+  current = fields();
+  assert.equal(current.reason.value, '');
+  assert.equal(current.time.value, '');
+  assert.equal(current.repeat.value, '');
+});
+
 test('server schedule rejections reach the console with localized guidance', async () => {
   const page = browser();
   page.context.fetch = async () => ({...response({error: 'Scheduled local time is nonexistent',
