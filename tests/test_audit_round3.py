@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from adaptive_rsi.evaluator import empty_test_run, freeze_harness
+from adaptive_rsi.evaluator import _changed_harness, empty_test_run, freeze_harness
 from adaptive_rsi.native import Conversation, tools_for
 from adaptive_rsi.process import scrub_tree
 from adaptive_rsi.release import compatible_workflow
@@ -65,6 +65,35 @@ class AuditRound3Test(unittest.TestCase):
         freeze_harness(baseline, target)
         self.assertTrue((target / "test_example.py").is_file())
         self.assertFalse((target / "test_broken.py").exists())
+
+    def test_freeze_harness_restores_baseline_test_data_without_dropping_new_fixtures(self):
+        baseline = self.root / "baseline-data"
+        candidate = self.root / "candidate-data"
+        target = self.root / "target-data"
+        for root in (baseline, candidate):
+            (root / "pkg" / "testdata").mkdir(parents=True)
+            (root / "pkg" / "testdata" / "golden.json").write_text('{"v": 1}')
+            (root / "pkg" / "x_test.go").write_text("func TestX(t *testing.T) {}\n")
+            (root / "src" / "__snapshots__").mkdir(parents=True)
+            (root / "src" / "__snapshots__" / "ui.snap").write_text("expected\n")
+        (candidate / "pkg" / "testdata" / "golden.json").write_text('{"v": 2}')
+        (candidate / "pkg" / "testdata" / "new.json").write_text('{"new": true}')
+        (candidate / "src" / "__snapshots__" / "ui.snap").write_text("approximate\n")
+        shutil.copytree(candidate, target)
+
+        freeze_harness(baseline, target)
+
+        self.assertEqual((target / "pkg" / "testdata" / "golden.json").read_text(), '{"v": 1}')
+        self.assertEqual((target / "src" / "__snapshots__" / "ui.snap").read_text(), "expected\n")
+        self.assertEqual((target / "pkg" / "testdata" / "new.json").read_text(), '{"new": true}')
+        self.assertTrue(_changed_harness(["pkg/testdata/golden.json"], [], baseline))
+        self.assertTrue(_changed_harness(["src/__snapshots__/ui.snap"], [], baseline))
+        # A fixture added for a new candidate test is not drift in the baseline.
+        self.assertFalse(_changed_harness(["pkg/testdata/new.json"], [], baseline))
+        # Application data under src/fixtures stays candidate-owned.
+        (baseline / "src" / "fixtures").mkdir(parents=True)
+        (baseline / "src" / "fixtures" / "data.json").write_text("{}")
+        self.assertFalse(_changed_harness(["src/fixtures/data.json"], [], baseline))
 
     def test_conversation_trim_history_bounds_memory(self):
         conv = Conversation("chat_completions", "test-model", "initial instructions", tools_for("planning"), "default")
