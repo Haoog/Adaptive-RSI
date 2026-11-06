@@ -9,12 +9,12 @@
 通过策略演化（Evolution）导出的封存实验包包含了复现评估所需的本地封闭输入：
 - 候选策略/技能定义 (`candidate.json`)
 - 历史实验记录与配对证据 (`evidence.json`)
-- 抽中执行用例的评测配置、代码仓库基线快照与受保护覆盖层 (`cases/`)；未抽中用例只在 `bundle.json` 的 `cases` 索引中登记身份（`case`、`split`、`tree`），不封存工作树
+- 抽中执行用例的评测配置与受保护覆盖层 (`cases/`)，以及按 tree 哈希共享的仓库基线快照 (`repositories/<tree>/`，同 `(repository, base)` 的多个用例只存一份)；未抽中用例只在 `bundle.json` 的 `cases` 索引中登记身份（`case`、`split`、`tree`），不封存工作树
 - 全量输入 SHA-256 哈希清单与限制说明 (`bundle.json`)
 
 封存实验包设计遵循确定性输入与凭据脱敏原则：
 1. **脱敏保护**：包内绝不包含任何第三方 API Key、认证凭据或私有环境变量；`evidence.json` 仅记录非机密的 provider 需求（provider id 与所需环境变量名），不含密钥值。
-2. **输入冻结**：封存清单覆盖 eligible 全集的身份、提交哈希与测试检查命令指纹，但只有实际抽中执行的用例封存完整工作树：未抽中用例从未运行，逐项复制同一 `(repository, base)` 只会让包体按候选集线性膨胀。它们在 `bundle.json` 中 `exported` 为 `false`，执行期校验仍按库里实时 `git rev-parse` 的 tree 哈希核对全部条目。
+2. **输入冻结**：封存清单覆盖 eligible 全集的身份、提交哈希与测试检查命令指纹，但只有实际抽中执行的用例封存完整工作树：未抽中用例从未运行，逐项复制同一 `(repository, base)` 只会让包体按候选集线性膨胀。它们在 `bundle.json` 中 `exported` 为 `false`，执行期校验仍按库里实时 `git rev-parse` 的 tree 哈希核对全部条目。抽中用例之间同样按 tree 哈希去重：同一棵树只落 `repositories/<tree>/` 一份，各用例的 `case.json` 以相对路径指向它，包体、清单与逐文件校验不再随样本数放大。
 3. **隔离边界**：输入完整性验证不等于真实环境推理，离线无凭据环境仅可核查输入完整性及离线可运行的本地用例，无法直接调用远端模型。
 
 ## 离线复现操作清单

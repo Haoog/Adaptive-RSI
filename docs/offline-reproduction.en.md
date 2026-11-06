@@ -9,12 +9,12 @@ This checklist is for operators and auditors performing integrity verification a
 Sealed experiment bundles exported through the strategy evolution subsystem (`Evolution.export_bundle`) bundle all hermetic local inputs required for reproduction:
 - Candidate strategy or skill definitions (`candidate.json`)
 - Historical experiment evidence and paired evaluation logs (`evidence.json`)
-- Evaluation case specifications, repository baseline snapshots, and protected test overlays for sampled (executed) cases (`cases/`); unsampled cases are recorded by identity only (`case`, `split`, `tree`) in the `bundle.json` `cases` index, without sealing a working tree
+- Evaluation case specifications and protected test overlays for sampled (executed) cases (`cases/`), plus repository baseline snapshots shared by tree hash (`repositories/<tree>/`, one copy per distinct tree); unsampled cases are recorded by identity only (`case`, `split`, `tree`) in the `bundle.json` `cases` index, without sealing a working tree
 - Whole-input SHA-256 manifest and declared limitations (`bundle.json`)
 
 Sealed bundles adhere to deterministic input and credential exclusion principles:
 1. **Credential exclusion**: Bundles never include third-party API keys, private tokens, or environment credentials. `evidence.json` records only non-secret provider requirements (provider id and required environment variable name), never key values.
-2. **Frozen inputs**: The sealed manifest covers the identity, base commit SHA, and check-command fingerprints of the whole eligible set, but only cases actually sampled for execution seal a full working tree: unsampled cases never ran, and copying the same `(repository, base)` once per entry would inflate the bundle linearly with candidate-set size. They carry `exported: false` in `bundle.json`, while verification still compares every entry against the live `git rev-parse` tree hash from the store.
+2. **Frozen inputs**: The sealed manifest covers the identity, base commit SHA, and check-command fingerprints of the whole eligible set, but only cases actually sampled for execution seal a full working tree: unsampled cases never ran, and copying the same `(repository, base)` once per entry would inflate the bundle linearly with candidate-set size. They carry `exported: false` in `bundle.json`, while verification still compares every entry against the live `git rev-parse` tree hash from the store. Sampled cases are deduplicated the same way: one snapshot per tree lives at `repositories/<tree>/`, each `case.json` points at it by relative path, and bundle size, manifest entries, and per-file hashing no longer scale with sample count.
 3. **Isolation boundaries**: Input integrity verification establishes that files are untampered; it is not proof of standalone autonomous model execution in an air-gapped environment without external providers.
 
 ## Offline reproduction checklist
