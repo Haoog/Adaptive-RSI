@@ -1104,28 +1104,29 @@ def health_check(target, sha, timeout=15):
     JSON array so one child interpreter answers all endpoints concurrently,
     instead of one interpreter (~29 MiB, ~0.16 s startup) per endpoint. The
     parent still owns the absolute deadline and cancellation through
-    ``checked``; a transport failure leaves every endpoint unknown.
+    ``checked``, and the transport flushes each finished endpoint immediately:
+    when a stalled probe is killed at that deadline only the endpoints that
+    never answered stay unknown, instead of every conclusion being discarded.
     """
-    from .process import checked
+    from .process import checked, ProcessError
     argv = ([sys.executable, "internal-health-check"] if getattr(sys, "frozen", False)
             else [sys.executable, "-m", "adaptive_rsi.health_transport"])
     urls = list(target) if isinstance(target, (list, tuple)) else [target]
     payload = json.dumps(urls) if isinstance(target, (list, tuple)) else target
     try:
-        result = json.loads(checked([*argv, payload, sha, str(timeout)],
-                                    cwd=Path(__file__).resolve().parents[1], timeout=timeout))
-        if not isinstance(result, dict) or result.get("sha") != sha:
-            raise ValueError("Invalid health transport result")
-        return result
+        output = checked([*argv, payload, sha, str(timeout)],
+                         cwd=Path(__file__).resolve().parents[1], timeout=timeout)
     except Cancelled:
         raise
+    except ProcessError as exc:
+        # 总时限（或输出上限）终止了传输进程：已刷出的端点结论仍然有效。
+        output = (exc.result or {}).get("stdout") or ""
     except (OSError, RuntimeError, ValueError):
-        error = "Health transport failed or exceeded its total deadline"
-        if len(urls) == 1:
-            return {"url": urls[0], "sha": sha, "checked_at": time.time(), "healthy": None,
-                    "error": error}
-        return _health_report(urls, sha, [{"url": url, "sha": sha, "checked_at": time.time(),
-                                           "healthy": None, "error": error} for url in urls])
+        output = ""
+    reports = _health_transport_reports(output, urls, sha)
+    if isinstance(target, (list, tuple)):
+        return _health_report(urls, sha, reports)
+    return reports[0]
 
 
 def _health_report(urls, sha, reports):
@@ -1136,27 +1137,57 @@ def _health_report(urls, sha, reports):
                         all(report.get("healthy") is True for report in reports))}
 
 
+def _health_transport_reports(output, urls, sha):
+    """Merge the per-endpoint reports the transport flushed before it stopped.
+
+    The transport writes one JSON object per finished endpoint and flushes it
+    at once, so a probe still blocked at the deadline cannot erase conclusions
+    the other endpoints already reached. Unreadable, missing or foreign-SHA
+    reports leave that endpoint unknown instead of turning it into a failure.
+    """
+    known = {}
+    for line in str(output or "").splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        # 也接受一次性输出整份聚合结果的传输（旧版本或冻结版命令）。
+        for report in (item["checks"] if isinstance(item.get("checks"), list) else [item]):
+            if isinstance(report, dict) and report.get("url") in urls and report.get("sha") == sha:
+                known[report["url"]] = report
+    return [known.get(url) or {"url": url, "sha": sha, "checked_at": time.time(), "healthy": None,
+                               "error": "Health transport failed or exceeded its total deadline"}
+            for url in urls]
+
+
 class _HealthDeadlineExceeded(ValueError):
     """The endpoint did not finish answering within the total deadline; its health stays unknown."""
 
 
-def direct_health_check(target, sha, timeout=15):
+def direct_health_check(target, sha, timeout=15, emit=None):
     """Probe one endpoint — or every endpoint of a list/JSON array — in this process.
 
     ``health_transport`` passes its target argument through unchanged, so one
     child interpreter answers all declared endpoints concurrently here, instead
-    of the parent spawning one interpreter per endpoint.
+    of the parent spawning one interpreter per endpoint. ``emit`` receives each
+    report as soon as it is conclusive so the transport can flush it before the
+    parent's deadline kills a probe that is still blocked.
     """
     if isinstance(target, str) and target.lstrip().startswith("["):
         target = json.loads(target)
     if isinstance(target, (list, tuple)):
-        return _direct_health_check_all(list(target), sha, timeout)
-    return _direct_health_check_one(target, sha, timeout)
+        return _direct_health_check_all(list(target), sha, timeout, emit)
+    report = _direct_health_check_one(target, sha, timeout)
+    if emit is not None:
+        emit(report)
+    return report
 
 
-def _direct_health_check_all(urls, sha, timeout):
+def _direct_health_check_all(urls, sha, timeout, emit=None):
     """Probe every endpoint concurrently under one shared deadline, preserving input order."""
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     deadline = time.monotonic() + timeout
 
     def probe(url):
@@ -1166,9 +1197,15 @@ def _direct_health_check_all(urls, sha, timeout):
                     "error": "Shared health deadline exhausted"}
         return _direct_health_check_one(url, sha, timeout=min(10, remaining))
 
+    reports = {}
     with ThreadPoolExecutor(max_workers=min(8, len(urls))) as executor:
-        reports = list(executor.map(probe, urls))
-    return _health_report(urls, sha, reports)
+        pending = {executor.submit(probe, url): url for url in urls}
+        for future in as_completed(pending):
+            url = pending[future]
+            reports[url] = future.result()
+            if emit is not None:
+                emit(reports[url])
+    return _health_report(urls, sha, [reports[url] for url in urls])
 
 
 def _direct_health_check_one(url, sha, timeout=15):

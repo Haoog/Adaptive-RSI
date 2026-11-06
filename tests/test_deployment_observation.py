@@ -185,6 +185,57 @@ class DeploymentObservationTest(unittest.TestCase):
         self.assertEqual(state, 'health_unconfirmed')
         self.assertLessEqual(len(data['health_observations']), 10)
 
+    def test_conclusive_failure_survives_a_stalled_endpoint_at_the_transport_deadline(self):
+        from adaptive_rsi.process import ProcessError
+        from adaptive_rsi.release import health_check
+        urls = ['https://app.example/health', 'https://eu.example/health']
+        landed = json.dumps({'url': urls[0], 'sha': self.data['sha'], 'checked_at': 1, 'healthy': False,
+                             'error': 'Health response must confirm the exact deployment SHA'})
+        # 传输进程被总时限杀掉时，已刷出的端点结论必须保留；只有未完成的端点记 unknown。
+        killed = ProcessError({'argv': [], 'exit_code': -9, 'stdout': landed + '\n', 'stderr': '',
+                               'seconds': 15, 'error': 'Command timed out', 'error_kind': 'timeout'})
+        with patch('adaptive_rsi.process.checked', side_effect=killed):
+            report = health_check(urls, self.data['sha'])
+        self.assertIs(report['healthy'], False)
+        self.assertEqual([check['url'] for check in report['checks']], urls)
+        self.assertIs(report['checks'][0]['healthy'], False)
+        self.assertIsNone(report['checks'][1]['healthy'])
+
+    def test_stalled_endpoint_does_not_discard_another_endpoints_failure(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from adaptive_rsi.release import health_check
+        payload = json.dumps({'sha': self.data['sha'], 'healthy': False}).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                if self.path == '/stalled':
+                    # 卡在响应阶段：socket 超时之外的挂起只能由父进程的总时限终止。
+                    time.sleep(30)
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01})
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = 'http://127.0.0.1:%d' % server.server_port
+        began = time.monotonic()
+        report = health_check([base + '/health', base + '/stalled'], self.data['sha'], timeout=3)
+        self.assertLess(time.monotonic() - began, 10)
+        self.assertIs(report['healthy'], False)
+        self.assertIs(report['checks'][0]['healthy'], False)
+        self.assertIsNone(report['checks'][1]['healthy'])
+
     def test_health_transport_failure_is_unknown_and_can_be_retried(self):
         from adaptive_rsi.release import health_check
         with patch('adaptive_rsi.process.checked', side_effect=OSError('fixture unavailable')):
