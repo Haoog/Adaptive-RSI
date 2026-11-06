@@ -21,6 +21,11 @@ ABLATION_CONFIGURATIONS = ("baseline", "strategy_only", "skill_only", "combined"
 # 配对试验只有 pass/fail 是结论性结果。insufficient_evidence / error / interrupted /
 # 缺失都表示那一臂没有跑成：既不是改进，也不是回归。
 CONCLUSIVE_DECISIONS = ("pass", "fail")
+# 输入签名只收录影响试验执行的 limits：retention_days 等清理参数、旧额度键改动的是
+# 运维策略而非实验内容，不应让同一份证据重新付费演化。新增会改变试验结果的 limits
+# 键时须同步扩充这里，避免执行参数变化被去重逻辑放过。
+EXPERIMENT_LIMITS = ("command_seconds", "max_output_mb", "concurrency", "retries",
+                     "min_free_disk_mb", "min_available_memory_mb")
 
 
 def arm_decision(arm):
@@ -1540,7 +1545,8 @@ class Evolution:
                           "overlay": self.overlay_digest(overlay) if spec and overlay_available(overlay) else None,
                           "active": spec.get("active", True) if spec else None,
                           "available": spec.get("available", True) if spec else None})
-        return fingerprint({"build": BUILD_ID, "limits": config["limits"],
+        limits = {key: config["limits"].get(key) for key in EXPERIMENT_LIMITS}
+        return fingerprint({"build": BUILD_ID, "limits": limits,
             "observations": inputs["observations"], "failures": inputs["failures"],
             "development": inputs["development"],
             "strategies": [{"id": c["id"], "kind": c["kind"], "content": c["content"]} for c in inputs["current"]],
