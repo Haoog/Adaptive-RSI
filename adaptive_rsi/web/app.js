@@ -785,7 +785,13 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
  window.RSIExperience?.taskOpened(task,queueDraft);
  const requirements=el('section',undefined,'task-requirements'),copy=el('p',task.body);copy.id='task-requirements';requirements.append(el('h3',t('任务要求')),copy);body.append(requirements);
  const evidence=lazyEvidence('来源与证据',()=>task.evidence||'');evidence.className='detail-section';body.append(evidence);
- const firstPage=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');if(ticket!==detailSequence||projectId!==project)return;
+ // 首屏请求失败时运行记录区块还没创建，不能让详情永久空白：在正文内给出错误与重试，重试重新走一次完整渲染。
+ let firstPage;try{firstPage=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');}catch(error){if(ticket!==detailSequence||projectId!==project)return;
+  // 登录失效要重新进入控制台，保留原有提示，不在详情里诱导反复重试。
+  if(error.code==='session_required')throw error;
+  const failed=el('section',undefined,'detail-section'),retry=action(t('重试'),()=>showTask(task,restoreView,queueDraft),'text-button');
+  failed.append(el('h3',t('检查过程与运行记录')),el('p',t('运行记录加载失败。'),'form-error'),retry);body.append(failed);return;}
+ if(ticket!==detailSequence||projectId!==project)return;
  // 响应为分页信封；同时接受旧服务端的裸数组，避免升级期间把历史区显示为空。
  const history=runPageRows(firstPage);
  let historyBefore=!Array.isArray(firstPage)&&firstPage?.has_more&&firstPage.next_before?firstPage.next_before:null;
