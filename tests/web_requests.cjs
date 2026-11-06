@@ -79,7 +79,7 @@ const snapshot = (version = '0.2.0', csrf = 'original-csrf') => ({
   projects: [{id: 'a', name: 'A', paused: true}, {id: 'b', name: 'B', paused: true}]
 });
 
-function browser(savedSession = new Map()) {
+function browser(savedSession = new Map(), beforeLoad = null) {
   const nodes = new Map(), listeners = new Map(), windowListeners = new Map(), timers = [], local = new Map(), session = savedSession;
   let created = 0, nextTimer = 0;
   const node = id => {
@@ -138,6 +138,7 @@ function browser(savedSession = new Map()) {
     location: {reload() { throw new Error('A version change must retain pending forms'); }},
     lastAction: null
   });
+  if (beforeLoad) beforeLoad(context);
   vm.runInContext(source, context);
   // The app starts a boot refresh; abort its isolated request so each test owns its fetches.
   vm.runInContext('refreshController?.abort();refreshSequence++;refreshPromise=null;refreshController=null;refreshProject=null;refreshKey=null;refreshQueued=false;refreshWaiters.splice(0);clearTimeout(refreshPollTimer);', context);
@@ -3554,6 +3555,70 @@ test('an available desktop update starts polling only after its download begins'
   assert.equal(page.desktop.downloads.length, 1, 'the download is requested once');
   assert.ok(vm.runInContext('desktopUpdateTimer', page.context), 'polling starts once the download begins');
   assert.equal(page.node('desktop-update').disabled, true);
+});
+
+function desktopBootPage({lastChecked = Date.now() - 60000, failCheck = false} = {}) {
+  const calls = [], ready = [];
+  const page = browser(new Map(), context => {
+    const listen = context.document.addEventListener.bind(context.document);
+    context.document.addEventListener = (type, handler) => {
+      if (type === 'DOMContentLoaded') ready.push(handler);
+      else listen(type, handler);
+    };
+    context.window.RSIDesktop = {
+      ready: new Promise(() => {}),
+      invoke: async (command, args = {}) => {
+        if (command !== 'native_update') { calls.push(command); throw Error('unexpected desktop command ' + command); }
+        calls.push(args.action);
+        if (args.action === 'check' && failCheck) throw Error('offline');
+        return {state: 'latest', current_version: '1.2.3'};
+      }
+    };
+  });
+  page.context.fetch = async () => response(snapshot());
+  page.context.localStorage.setItem('rsi-native-update-checked', String(lastChecked));
+  Object.assign(page.node('update-status'), {after(...children) { this.children.push(...children); }});
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/native-update.js'), 'utf8'), page.context);
+  page.calls = calls;
+  page.checkCalls = () => calls.filter(action => action === 'check').length;
+  page.fireReady = async () => {
+    for (const handler of ready) await handler();
+    await new Promise(setImmediate);
+  };
+  return page;
+}
+
+test('opening the desktop console keeps the six-hour update-check window', async () => {
+  const page = desktopBootPage();
+  const recorded = page.context.localStorage.getItem('rsi-native-update-checked');
+  await page.fireReady();
+  assert.equal(page.checkCalls(), 0, 'a reload one minute after the last check must not reach the feed');
+  assert.equal(page.calls.includes('check_desktop_update'), false, 'boot must not use the unthrottled legacy command');
+  assert.ok(page.calls.includes('status'), 'the local native status is still refreshed');
+  assert.equal(page.context.localStorage.getItem('rsi-native-update-checked'), recorded, 'a skipped check cannot restart the six-hour window');
+});
+
+test('opening the desktop console checks the feed once the window expired', async () => {
+  const page = desktopBootPage({lastChecked: Date.now() - 7 * 3600000});
+  await page.fireReady();
+  assert.equal(page.checkCalls(), 1, 'the boot check runs once after seven hours');
+  assert.ok(Number(page.context.localStorage.getItem('rsi-native-update-checked')) > Date.now() - 60000, 'the completed check records its time');
+});
+
+test('opening the desktop console respects an active check backoff', async () => {
+  const page = desktopBootPage({lastChecked: 0, failCheck: true});
+  await page.fireReady();
+  assert.equal(page.checkCalls(), 1);
+  await page.context.window.RSINativeUpdate.tick();
+  assert.equal(page.checkCalls(), 1, 'the retry waits for the existing backoff');
+});
+
+test('the check-update button still forces an immediate check', async () => {
+  const page = desktopBootPage();
+  await page.fireReady();
+  assert.equal(page.checkCalls(), 0);
+  await page.node('check-update').handlers.click();
+  assert.equal(page.checkCalls(), 1, 'an explicit click bypasses the six-hour window');
 });
 
 test('multiple predecessors survive language rebuild and save as one dependency set', async () => {
