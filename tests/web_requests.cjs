@@ -987,6 +987,43 @@ test('task run history loads and appends earlier pages with a visible count', as
   assert.equal(more.hidden, true, 'the entry disappears when no further page remains');
 });
 
+test('a failed first task-runs request keeps a retry entry and renders one outcome after retry', async () => {
+  const page = browser(), requests = [];
+  let fail = true;
+  page.context.fetch = async url => {
+    if (url.includes('task-runs?')) {
+      requests.push(url);
+      if (fail) { fail = false; return response({error: 'temporary outage'}, 500); }
+      return response({runs: [{id: 'r1', task: 'a', project: 'a'}], has_more: false, next_before: null});
+    }
+    if (url.includes('run?id=')) return response({state: 'failed', ended: 1, config: {models: {}},
+      result: {reason: 'fixture', summary: '重试后的结果'}});
+    return response({});
+  };
+  const task = {id: 'a', project: 'a', title: 'Task a', body: '', evidence: '[]', state: 'failed'};
+  await page.context.showTask(task);
+  const body = page.node('detail-body');
+  const has = text => descendants(body).some(node => node.tagName === 'P' && node.textContent === text);
+  assert.ok(has('运行记录加载失败。'), 'the dialog shows the failure instead of staying blank');
+  const retry = descendants(body).find(node => node.tagName === 'BUTTON' && node.textContent === '重试');
+  assert.ok(retry, 'the failure exposes a retry entry');
+  assert.equal(descendants(body).filter(node => node.id === 'live-task-outcome').length, 0,
+    'a failed first page must not fabricate an outcome');
+  await retry.handlers.click();
+  assert.equal(requests.length, 2, 'the retry issues exactly one more history request');
+  const outcomes = descendants(body).filter(node => node.id === 'live-task-outcome');
+  assert.equal(outcomes.length, 1, 'the retry inserts a single outcome');
+  assert.ok(outcomes[0].children.some(node => node.tagName === 'P' && node.textContent === '重试后的结果'));
+  assert.deepEqual(body.children.filter(node => node.className === 'detail-section' && node.dataset.run)
+    .map(node => node.dataset.run), ['r1'], 'the retry renders the run history');
+  assert.equal(has('运行记录加载失败。'), false, 'the error entry disappears after a successful retry');
+  page.context.closeTaskDetail();
+  await page.context.showTask(task);
+  assert.equal(requests.length, 3);
+  assert.equal(descendants(body).filter(node => node.id === 'live-task-outcome').length, 1,
+    'reopening the detail still renders a single outcome');
+});
+
 test('closing task details while a response waits keeps the dialog closed', async () => {
   const page = browser();
   page.context.initialState.runs = [{id: 'ra', task: 'a', project: 'a'}];
