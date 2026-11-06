@@ -340,20 +340,21 @@ def case_allocation(population, selected):
             for stratum in sorted(sizes, key=lambda value: fingerprint({"stratum": value}))]
 
 
-def select_cases(cases, count, seed):
+def select_cases(cases, count, seed, stratum=case_stratum):
     """Pick up to `count` cases with traffic-weighted allocation across strata.
 
     每层按其在候选总体中的占比获得样本，样本数允许时每层至少 1 个；同一
     `seed` 结果稳定，不同 `seed` 只改变层内挑选顺序，不改变各层配额。
+    `stratum` 允许审计复算直接使用封存记录的分层，而不必重建用例 spec。
     """
     strata = {}
     for case in cases:
-        strata.setdefault(case_stratum(case), []).append(case)
-    quotas = stratum_quotas({stratum: len(rows) for stratum, rows in strata.items()}, count)
+        strata.setdefault(stratum(case), []).append(case)
+    quotas = stratum_quotas({key: len(rows) for key, rows in strata.items()}, count)
     selected = []
-    for stratum in sorted(quotas, key=lambda value: fingerprint({"stratum": value})):
-        rows = sorted(strata.get(stratum, []), key=lambda case: (case["uses"], fingerprint({"id": case["id"], "seed": seed})))
-        selected.extend(rows[:quotas[stratum]])
+    for key in sorted(quotas, key=lambda value: fingerprint({"stratum": value})):
+        rows = sorted(strata.get(key, []), key=lambda case: (case["uses"], fingerprint({"id": case["id"], "seed": seed})))
+        selected.extend(rows[:quotas[key]])
     return selected
 
 
@@ -421,6 +422,52 @@ class Evolution:
         valid = bool(expected) and set(actual) == expected and len(actual) == len(expected) == len(trials)
         return {"valid": valid, "reason": "complete_preregistered_analysis" if valid else "incomplete_or_unplanned_trials",
                 "analysis": "preregistered" if valid else "exploratory", "expected": len(expected), "observed": len(actual)}
+
+    @staticmethod
+    def verify_selection(plan):
+        """Recompute the sealed sample from the recorded population and seed.
+
+        计划记录 ``selection_seed`` 与每个 split 的 eligible 全集 (id, stratum, uses)，
+        审计方可用同一 ``select_cases`` 复算，区分策略抽样与人工挑选。
+        """
+        data = plan if isinstance(plan, dict) else {}
+        seed, population, samples = data.get("selection_seed"), data.get("selection_population"), data.get("samples")
+        if not isinstance(seed, str) or not seed:
+            return {"valid": False, "reason": "selection_seed_missing"}
+        if not isinstance(population, dict) or not isinstance(samples, list):
+            return {"valid": False, "reason": "selection_population_missing"}
+        allocation = data.get("allocation") if isinstance(data.get("allocation"), dict) else {}
+        expected, observed, uses, considered = [], [], [], {}
+        for split in ("validation", "holdout"):
+            target, rows = allocation.get(split), population.get(split)
+            requested = target.get("requested") if isinstance(target, dict) else None
+            if not isinstance(rows, list) or type(requested) is not int or requested < 0:
+                return {"valid": False, "reason": "selection_population_incomplete", "split": split}
+            cases = []
+            for row in rows:
+                if (not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]
+                        or type(row.get("uses")) is not int or row["uses"] < 0
+                        or not isinstance(row.get("stratum"), list) or len(row["stratum"]) != 2
+                        or not all(isinstance(part, str) for part in row["stratum"])):
+                    return {"valid": False, "reason": "selection_population_malformed", "split": split}
+                cases.append({"id": row["id"], "uses": row["uses"], "stratum": tuple(row["stratum"])})
+                considered[(split, row["id"])] = row["uses"]
+            picked = select_cases(cases, requested, seed, stratum=lambda case: case["stratum"])
+            expected.extend(split + ":" + case["id"] for case in picked)
+        for sample in samples:
+            if (not isinstance(sample, dict) or sample.get("split") not in ("validation", "holdout")
+                    or not isinstance(sample.get("id"), str)):
+                return {"valid": False, "reason": "samples_malformed"}
+            key = (sample["split"], sample["id"])
+            observed.append(sample["split"] + ":" + sample["id"])
+            if key in considered and (type(sample.get("prior_uses")) is not int
+                                      or sample["prior_uses"] != considered[key]):
+                uses.append(sample["split"] + ":" + sample["id"])
+        valid = (expected == observed and len(set(observed)) == len(observed) and not uses)
+        return {"valid": valid,
+                "reason": "recomputed_from_recorded_population" if valid else
+                          "sample_prior_uses_mismatch" if uses else "sample_not_rederivable",
+                "expected": expected, "observed": observed}
 
     def update_case(self, project, case, *, active, split=None, source):
         """Retire instead of deleting; exposure identities and all prior uses survive."""
@@ -1705,8 +1752,14 @@ class Evolution:
         # 新鲜 holdout 已经在上面单独筛出，分层抽样只作用于这组未曝光样本。抽样先于封存：
         # 封存清单仍记录 eligible 全集供导出与审计，但逐项标记是否实际执行，执行期校验
         # 只约束抽中样本，未抽中项的漂移只计入 unsampled_mismatches 与晋升评审限制。
-        selection = {"validation": select_cases(validation_cases, minimum, run["id"]),
-                     "holdout": select_cases(fresh_holdout, minimum, run["id"])}
+        selection_seed = run["id"]
+        selection = {"validation": select_cases(validation_cases, minimum, selection_seed),
+                     "holdout": select_cases(fresh_holdout, minimum, selection_seed)}
+        # `uses` 是层内排序主键：只记录抽中样本会让「按策略抽样」与「人工挑选」在封存
+        # 证据里无法区分；同时记录 seed 与 eligible 全集的 (id, stratum, uses) 供复算。
+        selection_population = {split: [{"id": case["id"], "stratum": list(case_stratum(case)),
+                                         "uses": case["uses"]} for case in rows]
+                                for split, rows in (("validation", validation_cases), ("holdout", fresh_holdout))}
         sampled_ids = {case["id"] for rows in selection.values() for case in rows}
         manifest = []
         for case in cases:
@@ -1785,10 +1838,11 @@ class Evolution:
             "SELECT count(*) AS n FROM candidates WHERE project=? AND kind=? AND "
             "json_valid(evidence) AND json_extract(evidence,'$.compatibility')=?",
             (project["id"], proposal["kind"], evidence["compatibility"]))["n"] + 1
-        plan = {"version": 2, "created": time.time(), "repeats": config["evolution"]["repeats"],
+        plan = {"version": 3, "created": time.time(), "repeats": config["evolution"]["repeats"],
                 "metric": "independent_case_family_paired_pass", "max_cost_ratio": config["evolution"]["max_cost_ratio"],
                 "stop_rules": ["validation_failure", "cancelled", "resource_budget", "complete_planned_trials"],
                 "selection_policy": "traffic_weighted_min_one_per_stratum",
+                "selection_seed": selection_seed, "selection_population": selection_population,
                 "allocation": {split: {"requested": minimum, "population": len(rows),
                                        "strata": case_allocation(rows, selection[split])}
                                for split, rows in (("validation", validation_cases), ("holdout", fresh_holdout))},
@@ -1806,6 +1860,7 @@ class Evolution:
                                 "sampling": "validation inputs with a demonstrated joint gain",
                                 "limit": config["evolution"].get("ablation_cases", 0)}
         evidence["preregistered_plan"] = {"data": plan, "sha256": fingerprint(plan)}
+        evidence["selection_verification"] = self.verify_selection(plan)
         evidence["promotion_review"] = {
             "baseline": current, "proposal": proposal, "experiment": candidate,
             "changed_kind": proposal["kind"], "plan_hash": fingerprint(plan),
@@ -1872,11 +1927,21 @@ class Evolution:
             evidence["plan_verification"] = self.verify_plan(evidence["preregistered_plan"], evidence["trials"])
             if not evidence["plan_verification"]["valid"]:
                 evidence.update(decision="insufficient_evidence", reason="Preregistered trial plan is incomplete or changed")
+            evidence["selection_verification"] = self.verify_selection(evidence["preregistered_plan"]["data"])
+            if not evidence["selection_verification"]["valid"]:
+                evidence.update(decision="insufficient_evidence",
+                                reason="Sealed sample cannot be reproduced from the recorded selection population")
             evidence["input_verification"] = self.verify_inputs(project["id"], manifest)
             if not evidence["input_verification"]["valid"]:
                 evidence.update(decision="insufficient_evidence", reason="Sealed experiment inputs changed during execution")
             drifted = evidence["input_verification"].get("unsampled_mismatches") or []
             review = evidence.get("promotion_review")
+            if isinstance(review, dict):
+                review["selection_verification"] = evidence["selection_verification"]
+                if not evidence["selection_verification"]["valid"]:
+                    review.setdefault("limitations", []).append(
+                        "The sealed sample cannot be reproduced from the recorded population; "
+                        "whether it followed the selection policy is unverifiable")
             if drifted and isinstance(review, dict):
                 review.setdefault("limitations", []).append(
                     "Sealed cases not selected for execution changed during the experiment; "
@@ -1993,9 +2058,16 @@ class Evolution:
             if not isinstance(sealed_evidence, dict):
                 sealed_evidence = {}
             if sealed_evidence.get("preregistered_plan"):
-                verification = self.verify_plan(sealed_evidence["preregistered_plan"], sealed_evidence.get("trials", []))
+                plan = sealed_evidence["preregistered_plan"]
+                verification = self.verify_plan(plan, sealed_evidence.get("trials", []))
                 if not verification["valid"] or not sealed_evidence.get("final_review", {}).get("fresh"):
                     raise ValueError("Candidate lacks complete sealed trials and fresh final review")
+                # 新版计划必须能从记录的总体复算抽样；旧证据没有 population 时保持可晋升，
+                # 由 selection_verification 如实记录无法复算的原因。
+                selection = self.verify_selection(plan.get("data", {}) if isinstance(plan, dict) else {})
+                sealed = plan.get("data", {}) if isinstance(plan, dict) else {}
+                if isinstance(sealed, dict) and sealed.get("selection_seed") and not selection["valid"]:
+                    raise ValueError("Candidate selection cannot be reproduced from the sealed population")
             expected = sealed_evidence.get("compatibility")
             if expected and expected != compatibility(config):
                 raise ValueError("Candidate evidence is incompatible with current configuration")
@@ -2102,6 +2174,7 @@ class Evolution:
         if is_terminal or plan_changed or "win_rate" not in evidence:
             if plan:
                 evidence["plan_verification"] = self.verify_plan(plan, trials)
+                evidence["selection_verification"] = self.verify_selection(plan.get("data", {}) if isinstance(plan, dict) else {})
                 if status == "evaluating" and not evidence["plan_verification"]["valid"]:
                     evidence["plan_verification"]["analysis"] = "planned_in_progress"
             evidence["win_rate"] = paired_summary(trials)
