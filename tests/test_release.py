@@ -169,6 +169,35 @@ class ReleaseAutomationTest(unittest.TestCase):
             closed = abandon(self.runtime, self.project, self.run["id"], "release", "GitHub access permanently revoked")
         self.assertEqual(closed["state"], "failed")
 
+    def test_abandoned_rerun_unknown_receipt_cannot_be_revived_by_retry(self):
+        from adaptive_rsi.release import abandon
+        data = {"state": "rerun_unknown", "operation_id": "fixture-operation", "sha": MERGED,
+                "repository": "example/project", "workflow": self.policy["workflow"], "ref": self.policy["ref"],
+                "workflow_sha": TRUSTED, "workflow_run_id": 17, "attempt": 1, "previous_attempt": 1,
+                "rerun_pending": True, "rerun_requested_at": time.time() - 600, "dispatch_receipt": "accepted"}
+        self.runtime.store.put_setting(key(self.run["id"], "release"), data)
+        with patch("adaptive_rsi.release.api", side_effect=ApiRejected("gh: Not Found (HTTP 404)", 404)):
+            closed = abandon(self.runtime, self.project, self.run["id"], "release", "operator confirmed no run")
+        self.assertEqual(closed["state"], "failed")
+        saved = self.runtime.store.setting(key(self.run["id"], "release"))
+        self.assertEqual(saved["state"], "failed")
+        self.assertEqual(saved["operator_abandon"]["reason"], "operator confirmed no run")
+        # 放弃同时作废未确认的重跑请求；残留字段会让下一次 retry 回到 rerun 分支。
+        self.assertNotIn("rerun_pending", saved)
+        self.assertNotIn("rerun_requested_at", saved)
+        self.assertEqual(saved["rerun_receipt"], "abandoned")
+        self.assertIn("rerun_abandoned_at", saved)
+        self.assertFalse(pending(self.runtime, self.run))
+        # 终态不可重试：不读取 GitHub、不提交重跑，也不覆盖已关闭的回执。
+        with patch("adaptive_rsi.release.api", side_effect=self.api) as api:
+            with self.assertRaisesRegex(ValueError, "abandoned"):
+                retry(self.runtime, self.project, self.run["id"], "release")
+        api.assert_not_called()
+        saved = self.runtime.store.setting(key(self.run["id"], "release"))
+        self.assertEqual(saved["state"], "failed")
+        self.assertEqual(saved["rerun_receipt"], "abandoned")
+        self.assertFalse(pending(self.runtime, self.run))
+
     def test_corrupt_automation_receipt_is_preserved_and_blocks_dispatch(self):
         from adaptive_rsi.release import status
         for raw in ('{broken', '[]', 'null', '{}', '{"state":3}', '{"state":"submitted"}'):
