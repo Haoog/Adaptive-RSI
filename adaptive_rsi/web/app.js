@@ -123,6 +123,7 @@ const apiErrors={
  "Health response must confirm the exact deployment SHA and healthy status": "健康检查未确认本次部署版本正常，请检查服务返回的版本和状态。",
  "Restore the original authorization and let tracking retry the pending operation": "请恢复原工作流授权，系统会继续跟踪待执行操作。",
  "Only a confirmed failed workflow run can be retried; uncertain dispatches require reconciliation": "请先到 GitHub 确认工作流结果。只有已确认失败的执行才能重试。",
+ "This operation was abandoned; open a new operation instead of retrying": "这次操作已被人工放弃，请新建一次操作，不能重试。",
  "Multiple workflow runs match this operation ID. Compare repository, workflow, ref, exact target SHA and operation ID before selecting one.": "有多个工作流执行记录都匹配本次操作编号。请先核对仓库、工作流、引用、目标提交和操作编号，再选择其中一条。",
  "One matching workflow run is visible. Reading its status never starts another run.": "已看到一条匹配的工作流执行记录。读取状态不会再次启动工作流。",
  "GitHub has not published a matching workflow run yet. Wait and query again; manual run IDs are not accepted.": "GitHub 尚未发布与本次操作匹配的工作流记录。请等待后重新查询；这里不接受手动填写运行编号。",

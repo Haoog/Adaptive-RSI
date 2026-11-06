@@ -809,6 +809,7 @@ const english = {
   "健康检查未确认本次部署版本正常，请检查服务返回的版本和状态。": "The health check did not confirm this deployment. Check the returned version and status.",
   "请恢复原工作流授权，系统会继续跟踪待执行操作。": "Restore the original workflow authorization. Tracking will continue the pending operation.",
   "请先到 GitHub 确认工作流结果。只有已确认失败的执行才能重试。": "Confirm the workflow result on GitHub first. Only confirmed failed runs can be retried.",
+  "这次操作已被人工放弃，请新建一次操作，不能重试。": "This operation was abandoned; open a new operation instead of retrying.",
   "发布工作流失败，请先重试发布再部署。": "Release workflow failed; retry release before deployment.",
   "发布授权已受阻，请先恢复授权再部署。": "Release authorization is blocked; restore it before deployment.",
   "回滚健康状态未确认": "Rollback health status unconfirmed",
