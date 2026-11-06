@@ -460,8 +460,36 @@ class AuditEvolutionTest(unittest.TestCase):
         self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)', ('late', 'p', encode([{'id': 'c'}]), encode({})))
         self.evolution.monitor('p', False, {'id': 'late'}, attributable=True)
         row = self.store.one('SELECT status,evidence FROM candidates WHERE id=?', ('c',))
+        evidence = json.loads(row['evidence'])
         self.assertEqual(row['status'], 'rolled_back')
-        self.assertEqual(json.loads(row['evidence'])['drift']['phase'], 'sentinel')
+        self.assertEqual(evidence['drift']['phase'], 'sentinel')
+        # 单候选失败可归因，drift 与计数必须显式标记 single。
+        self.assertEqual(evidence['drift']['attribution'], 'single')
+        self.assertEqual(evidence['monitor']['attribution'], 'single')
+        self.assertNotIn('shared_failed', evidence['monitor'])
+
+    def test_shared_failures_are_counted_without_rollback(self):
+        # strategy 与 adapter 各自晋升后，同一 run 覆盖两个生效候选：失败仍需计数并进入
+        # drift，但无法归因到单个策略，因此标记 shared 并跳过自动回滚。
+        self.candidate({'monitor': {'passed': 0, 'failed': 0}})
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                           ('a', 'p', 'adapter', 'stable', encode({'guidance': 'adapter', 'triggers': []}),
+                            encode({'monitor': {'passed': 0, 'failed': 0}}), 2))
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('shared-run', 'p', encode([{'id': 'c'}, {'id': 'a'}]), encode({})))
+        self.evolution.monitor('p', False, {'id': 'shared-run'}, attributable=True)
+        for cid in ('c', 'a'):
+            row = self.store.one('SELECT status,evidence FROM candidates WHERE id=?', (cid,))
+            evidence = json.loads(row['evidence'])
+            self.assertEqual(row['status'], 'stable')
+            self.assertEqual(evidence['monitor']['failed'], 1)
+            self.assertEqual(evidence['monitor']['shared_failed'], 1)
+            self.assertEqual(evidence['monitor']['attribution'], 'shared')
+            self.assertEqual(evidence['drift']['state'], 'watch')
+            self.assertEqual(evidence['drift']['attribution'], 'shared')
+            self.assertIn('no automatic rollback', evidence['drift']['reason'])
+        event = self.store.one("SELECT data FROM events WHERE kind='strategy_inconclusive'")
+        self.assertEqual(json.loads(event['data'])['attribution'], 'shared')
 
     def feed_passing_runs(self, ids):
         for run_id in ids:
