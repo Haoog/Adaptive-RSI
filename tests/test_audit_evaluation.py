@@ -214,6 +214,65 @@ class AuditEvaluationTest(unittest.TestCase):
             self.assertEqual(saved, big.encode())
             self.assertEqual(result['checks']['candidate'][0]['stdout'], big)
 
+    def test_early_refusal_paths_write_the_report(self):
+        # 未配置 checks 的早退以前不落盘：整轮运行连 report.json 都没有。
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SimpleNamespace(root=root / 'state', query=lambda *args, **kwargs: [])
+            outcome = evaluator.Evaluator(store).evaluate(
+                str(root), str(root), [], root / 'evaluation', _config())
+            report = json.loads((root / 'evaluation' / 'report.json').read_text())
+            self.assertEqual((report['decision'], report['reason'], report['checks'], report['interrupted']),
+                             (outcome['decision'], outcome['reason'], {}, False))
+
+    def test_cancelled_stage_keeps_completed_rows_and_reraises(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from adaptive_rsi.process import Cancelled
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'source').mkdir()
+            (root / 'source' / 'value.py').write_text('VALUE = 1\n')
+            checks = [{'name': 'unit', 'argv': ['python3', 'value.py']}]
+            report_path = root / 'evaluation' / 'report.json'
+
+            def stage(_evaluator, label, *args, **kwargs):
+                if label == 'baseline':
+                    return {'rows': [{'name': 'unit', 'argv': checks[0]['argv'], 'exit_code': 0,
+                                      'stdout': 'Ran 1 test\n', 'stderr': '', 'passed': True}]}
+                # 基线完成时 interim 报告已落盘；取消不能再把它丢掉。
+                interim = json.loads(report_path.read_text())
+                self.assertEqual(interim['checks']['baseline'][0]['name'], 'unit')
+                self.assertFalse(interim['interrupted'])
+                raise Cancelled('Cancelled')
+
+            store = SimpleNamespace(root=root / 'state', query=lambda *args, **kwargs: [])
+            with patch.object(evaluator.Evaluator, '_standard_stage', autospec=True, side_effect=stage), \
+                    patch('adaptive_rsi.evaluator.detect', return_value={'checks': []}):
+                with self.assertRaises(Cancelled):
+                    evaluator.Evaluator(store).evaluate(
+                        str(root / 'source'), str(root / 'source'), checks, root / 'evaluation',
+                        _config(), changed_files=[])
+            report = json.loads(report_path.read_text())
+            self.assertEqual((report['interrupted'], report['reason'], report['checks']['baseline'][0]['name']),
+                             (True, 'Evaluation cancelled', 'unit'))
+
+    def test_report_write_survives_a_failed_swap(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evaluator.write_evaluation_report(root, {'decision': 'pass', 'checks': {}})
+            previous = (root / 'report.json').read_text()
+            with patch('adaptive_rsi.evaluator.os.replace', side_effect=OSError(28, 'No space left')):
+                for target in [root, root / 'fresh']:
+                    with self.assertRaises(OSError):
+                        evaluator.write_evaluation_report(target, {'decision': 'fail', 'checks': {}})
+            # 交换失败保留上一份完整报告，也不留半截文件或临时文件。
+            self.assertEqual((root / 'report.json').read_text(), previous)
+            self.assertFalse((root / 'fresh' / 'report.json').exists())
+            self.assertEqual(list(root.rglob('report.json.*')), [])
+
     def test_stage_reuse_requires_explicit_opt_in(self):
         from adaptive_rsi.evaluator import checkpoint_reuse_enabled
         self.assertFalse(checkpoint_reuse_enabled(_config()))
