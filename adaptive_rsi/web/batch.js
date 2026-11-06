@@ -98,7 +98,7 @@ function paint(){for(const [id,box] of boxes)box.checked=ids().has(id);}
   const count=ids().size,page=visible.length,countLabel=el('span',t('当前页已选')+' · '+count+' / '+page,'muted');countLabel.setAttribute('role','status');
   panel.dataset.selection=count?'selected':'empty';
   panel.replaceChildren(countLabel);
-  const selectAll=el('button',t('全选当前页'),'text-button');selectAll.type='button';selectAll.disabled=!page||count===page||pending.has(projectId);
+  const selectAll=el('button',t('全选当前页'),'text-button');selectAll.id='batch-select-all';selectAll.type='button';selectAll.disabled=!page||count===page||pending.has(projectId);
   selectAll.addEventListener('click',()=>{for(const id of visible)ids().add(id);anchor=-1;toolbar();});panel.append(selectAll);
   const clear=el('button',t('清除选择'),'text-button');clear.type='button';clear.disabled=!count||pending.has(projectId);
   clear.addEventListener('click',()=>{ids().clear();anchor=-1;toolbar();});panel.append(clear);
