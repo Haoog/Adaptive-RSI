@@ -905,5 +905,62 @@ class MigrationLedgerHealTest(unittest.TestCase):
                     Store(root)
 
 
+class MigrationLedgerConcurrencyTest(unittest.TestCase):
+    """并发 opener：预检与写锁之间提交的迁移不得被重放。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "state"
+
+    def test_migration_applied_between_precheck_and_lock_runs_once(self):
+        from adaptive_rsi import schema_migrations
+        Store(self.root).close()
+        # v10 迁移体照问题报告写成幂等形式（DDL 幂等 + 计数行）：重放不再报建表冲突，
+        # 只能靠行数发现；同时复现报告的 IntegrityError 判据（仅当修复不完整时）。
+        pending = schema_migrations.scripts() + [
+            (10, b"CREATE TABLE IF NOT EXISTS race_probe(x INTEGER);\n"
+                 b"INSERT INTO race_probe VALUES (1);\n")]
+        barrier = threading.Barrier(2, timeout=15)
+        aligned = threading.local()
+        real_ledger_has = schema_migrations._ledger_has
+
+        def gated(db, version):
+            # 每个线程只在 v10 的锁外预检上对齐一次，把「预检之后、BEGIN IMMEDIATE
+            # 之前」的窗口固定成必然发生，而不是靠 sleep 撞时序。
+            if version == 10 and not getattr(aligned, "done", False):
+                aligned.done = True
+                barrier.wait()
+            return real_ledger_has(db, version)
+
+        stores, failures = [], []
+
+        def opener():
+            try:
+                stores.append(Store(self.root))
+            except BaseException as exc:  # 线程内异常不会让主线程失败，必须显式收集
+                failures.append(exc)
+
+        with patch("adaptive_rsi.schema_migrations.scripts", return_value=pending), \
+                patch("adaptive_rsi.schema_migrations._ledger_has", side_effect=gated):
+            threads = [threading.Thread(target=opener) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+        self.addCleanup(lambda: [store.close() for store in stores])
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(failures, [])
+        self.assertEqual(len(stores), 2)
+        self.assertEqual(stores[0].one("SELECT count(*) AS n FROM race_probe")["n"], 1)
+        with sqlite3.connect(str(self.root / "state.sqlite3")) as db:
+            self.assertEqual(db.execute(
+                "SELECT version FROM schema_migrations GROUP BY version HAVING count(*) > 1").fetchall(), [])
+            self.assertEqual([row[0] for row in db.execute(
+                "SELECT version FROM schema_migrations ORDER BY version")],
+                list(range(1, 11)))
+
+
 if __name__ == "__main__":
     unittest.main()
