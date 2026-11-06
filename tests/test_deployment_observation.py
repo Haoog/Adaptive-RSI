@@ -167,20 +167,18 @@ class DeploymentObservationTest(unittest.TestCase):
         self.assertTrue(result['health']['healthy'])
         self.assertIsNone(self.store.setting(stable_key('p', 'example/project', self.policy['health_url'])))
 
-    def test_parallel_probes_inherit_context_and_unknown_is_bounded(self):
-        from contextvars import ContextVar
+    def test_all_endpoints_probe_in_one_transport_process(self):
         from adaptive_rsi.release import observe_health
-        context = ContextVar('fixture_health_context', default=None)
-        token = context.set('operation')
-        try:
-            self.policy['health_urls'] = ['https://eu.example/health']
-            def probe(url, sha, timeout):
-                self.assertEqual(context.get(), 'operation')
-                return {'healthy': True}
-            with patch('adaptive_rsi.release.health_check', side_effect=probe):
-                self.assertTrue(health_sample(self.policy, 'b' * 40)['healthy'])
-        finally:
-            context.reset(token)
+        self.policy['health_urls'] = ['https://node%d.example/health' % index for index in range(7)]
+        urls = [self.policy['health_url'], *self.policy['health_urls']]
+        self.assertEqual(len(urls), 8)
+        checks = [{'url': url, 'sha': 'b' * 40, 'healthy': True} for url in urls]
+        output = json.dumps({'url': urls[0], 'sha': 'b' * 40, 'healthy': True, 'checks': checks})
+        with patch('adaptive_rsi.process.checked', return_value=output) as checked:
+            report = health_sample(self.policy, 'b' * 40)
+        self.assertEqual(checked.call_count, 1)
+        self.assertEqual(json.loads(checked.call_args[0][0][-3]), urls)
+        self.assertEqual([check['url'] for check in report['checks']], urls)
         data = {}
         for now in (100, 1000):
             state = observe_health(data, {'healthy': None}, self.policy, now)
@@ -223,24 +221,29 @@ class DeploymentObservationTest(unittest.TestCase):
                 save.assert_not_called()
 
     def test_all_endpoints_must_agree_with_shared_deadline(self):
-        self.policy['health_urls'] = ['https://eu.example/health', 'https://us.example/health']
+        from adaptive_rsi.release import _direct_health_check_all
+        urls = [self.policy['health_url'], 'https://eu.example/health', 'https://us.example/health']
+
         def probe(url, sha, timeout):
-            self.assertLessEqual(timeout, 15)
+            self.assertLessEqual(timeout, 10)
             return {'url': url, 'sha': sha, 'healthy': 'eu.' not in url}
-        with patch('adaptive_rsi.release.health_check', side_effect=probe) as check:
-            report = health_sample(self.policy, 'b' * 40)
+
+        with patch('adaptive_rsi.release._direct_health_check_one', side_effect=probe) as check:
+            report = _direct_health_check_all(urls, 'b' * 40, 15)
         self.assertFalse(report['healthy'])
-        self.assertEqual(len(report['checks']), 3)
+        self.assertEqual([item['url'] for item in report['checks']], urls)
         self.assertEqual(check.call_count, 3)
+
         barrier = threading.Barrier(3)
+
         def simultaneous(url, sha, timeout):
-            barrier.wait(timeout=1)
+            barrier.wait(timeout=5)
             return {'url': url, 'healthy': True}
-        with patch('adaptive_rsi.release.health_check', side_effect=simultaneous) as check:
-            report = health_sample(self.policy, 'b' * 40)
-        self.assertEqual(check.call_count, 3)
+
+        with patch('adaptive_rsi.release._direct_health_check_one', side_effect=simultaneous):
+            report = _direct_health_check_all(urls, 'b' * 40, 15)
         self.assertTrue(report['healthy'])
-        self.assertEqual(len(report['checks']), 3)
+        self.assertEqual([item['url'] for item in report['checks']], urls)
 
     def test_rollback_requires_same_consecutive_observation(self):
         self.data.update(state='rolling_back', rollback={'state': 'workflow_succeeded', 'sha': 'c' * 40})
