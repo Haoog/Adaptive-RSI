@@ -65,6 +65,7 @@ function fixture({visibility='visible',policy,respond}={}){
   statusCalls:()=>calls.filter(call=>call.action==='status'),
   statusCount:()=>calls.filter(call=>call.action==='status').length,
   setVisibility(state){document.visibilityState=state;for(const handler of listeners.visibilitychange||[])handler();},
+  button(label){return all(panel).find(node=>node.tag==='button'&&node.textContent===label);},
   resetWrites(){writes.total=0;writes.option=0;},
   text:()=>all(panel).map(node=>node.textContent).join(' '),
  };
@@ -160,4 +161,48 @@ test('an unchanged snapshot does not rewrite option or status text',async()=>{
  f.api.render();
  await f.flush();
  assert.equal(f.writes.total,0,'a language-neutral re-render of the same data is also free');
+});
+
+test('a long automatic download keeps status reads, progress and cancel live',async()=>{
+ // The native download call stays pending for the whole transfer; status must
+ // still be read while it runs, exactly like the real IPC channel.
+ const gate=new Promise(()=>{});
+ let started=false,bytes=0;
+ const f=fixture({respond:args=>{
+  if(args.action==='download'){started=true;return gate;}
+  return started?{state:'downloading',bytes:bytes+=1000,total:100000}:{state:'available',version:'1.2.4',current_version:'1.2.3'};
+ }});
+ f.boot();
+ await f.advance(5000);
+ assert.ok(started,'the available package starts downloading automatically');
+ const before=f.statusCount();
+ await f.advance(15000);
+ const calls=f.statusCalls().slice(before);
+ assert.ok(calls.length>=10,`${calls.length} status reads while the download invoke is pending`);
+ for(let i=1;i<calls.length;i++)assert.ok(calls[i].at-calls[i-1].at<=1000,`gap ${calls[i].at-calls[i-1].at}ms during the download`);
+ assert.match(f.text(),/\d+%/,'progress keeps rendering while the download runs');
+ assert.equal(f.button('取消').hidden,false,'the cancel button appears during the download');
+ assert.equal(f.pendingTimers(),1,'a single poll timer stays armed');
+});
+
+test('a user-started download replaces the pending idle timer',async()=>{
+ // A manual download leaves its IPC call pending, like the automatic one, so the
+ // timer must move to the active cadence while that call is still running.
+ const gate=new Promise(()=>{});
+ let started=false;
+ const f=fixture({respond:args=>{
+  if(args.action==='download'){started=true;return gate;}
+  return started?{state:'downloading',bytes:25000,total:100000}:{state:'latest',version:'1.2.3'};
+ }});
+ f.boot();
+ await f.advance(5000);
+ assert.equal(f.api.pollDelay(),300000,'a settled client waits five minutes');
+ const before=f.statusCount();
+ f.api.run('download');
+ await f.flush();
+ assert.equal(f.api.pollDelay(),1000,'the pending action switches the cadence to active');
+ await f.advance(3000);
+ assert.ok(f.statusCount()-before>=3,`${f.statusCount()-before} progress reads in three seconds`);
+ assert.match(f.text(),/25%/,'progress replaces the stale settled view');
+ assert.equal(f.button('取消').hidden,false,'the download is cancellable right away');
 });

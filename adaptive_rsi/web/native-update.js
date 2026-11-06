@@ -11,7 +11,7 @@ window.RSINativeUpdate=(()=>{
  // background window is capped at one status read per minute.
  const POLL_ACTIVE=1000,POLL_VISIBLE=5000,POLL_HIDDEN=60000,POLL_IDLE=300000;
  const ACTIVE_PHASES=['downloading','verifying','replacing','waiting_idle'];
- let pollTimer=null;
+ let pollTimer=null,pollActive=false;
  const failureCounts={};
  let policy=localRead('rsi-native-update-policy')||'download';
  let versionScope=localRead('rsi-native-update-scope')||'patch',installWindow=localRead('rsi-native-update-window')||'any';
@@ -251,6 +251,9 @@ window.RSINativeUpdate=(()=>{
   if(busy)return;busy=true;installPending=action==='install';
   if(action==='install')authorizationError='';
   render();
+  // The call stays pending for the whole operation, so the timer has to switch
+  // to the active cadence now instead of when run() finally settles.
+  schedulePoll();
   try{
    snapshot=await window.RSIDesktop.invoke('native_update',{action,automatic,installationWindow:action==='install'?(automatic?installWindow:'any'):null,revision:action==='install'?revision:null});
    if(snapshot.state==='error')throw Error(snapshot.error_code||'update_check_failed');
@@ -261,14 +264,19 @@ window.RSINativeUpdate=(()=>{
   }catch(error){
    snapshot={state:'error',error_code:String(error)};
    failureCounts[action]=(failureCounts[action]||0)+1;failures=failureCounts[action];const next=Date.now()+Math.min(300000,5000*2**Math.min(failures-1,6));if(action==='install')installRetryAt=next;else retryAt=next;
-  }finally{busy=false;installPending=false;render();}
+  }finally{busy=false;installPending=false;render();schedulePoll();}
  }
- async function tick(){
-  if(polling||!enabled())return;polling=true;
-  try{snapshot=await window.RSIDesktop.invoke('native_update',{action:'status'});render();}
-  catch(error){failures++;retryAt=Date.now()+Math.min(300000,5000*2**Math.min(failures-1,6));return;}
+ async function readStatus(){
+  if(polling||!enabled())return false;polling=true;
+  try{snapshot=await window.RSIDesktop.invoke('native_update',{action:'status'});render();return true;}
+  catch(error){failures++;retryAt=Date.now()+Math.min(300000,5000*2**Math.min(failures-1,6));return false;}
   finally{polling=false;}
-  if(checking||busy||Date.now()<retryAt)return;checking=true;
+ }
+ // An automatic download or install keeps its IPC call pending for as long as the
+ // operation runs. Status reads must not wait behind it, or the panel shows no
+ // progress and keeps the Cancel button hidden, so only the action half is long.
+ async function act(){
+  if(checking||busy||!enabled()||Date.now()<retryAt)return;checking=true;
   try{
    const last=Number(localRead('rsi-native-update-checked')||0);
    if(preference()!=='manual'&&((failureCounts.check||0)+(failureCounts.download||0)>0||Date.now()-last>6*3600000)){
@@ -283,6 +291,7 @@ window.RSINativeUpdate=(()=>{
    if(!busy&&!authorizationError&&Date.now()>=installRetryAt&&snapshot.state==='ready'&&preference()==='automatic'&&(!snapshot.error_code||snapshot.error_code==='update_window_closed'||snapshot.error_code==='update_authorization_changed')&&eligible(snapshot.current_version,snapshot.version)&&withinWindow())await run('install',true);
   }finally{checking=false;}
  }
+ async function tick(){if(await readStatus())await act();}
 
  function pollDelay(){
   // A background window never polls faster than once a minute, even mid-download:
@@ -290,7 +299,9 @@ window.RSINativeUpdate=(()=>{
   // the panel is being read while hidden.
   if(document.visibilityState==='hidden')return POLL_HIDDEN;
   const phase=phaseOf(snapshot);
-  if(ACTIVE_PHASES.includes(phase))return POLL_ACTIVE;
+  // A user or automatic action keeps its IPC call pending for the whole
+  // operation, before the snapshot reports the new phase.
+  if(busy||ACTIVE_PHASES.includes(phase))return POLL_ACTIVE;
   // Settled clients have nothing to show that changes faster than the six-hourly
   // feed check; the five-minute read is only a safety net.
   if(!snapshot.state||snapshot.state==='latest'||snapshot.state==='idle')return POLL_IDLE;
@@ -298,13 +309,25 @@ window.RSINativeUpdate=(()=>{
  }
  function stopPoll(){if(pollTimer!==null){clearTimeout(pollTimer);pollTimer=null;}}
  function schedulePoll(){
-  if(!enabled()){stopPoll();return;}
+  if(!enabled()){pollActive=false;stopPoll();return;}
+  // run() calls this after every user action as well; before the panel starts
+  // polling there is no cadence to recompute.
+  if(!pollActive)return;
   stopPoll();
   pollTimer=setTimeout(()=>{pollTimer=null;safe(poll);},pollDelay());
  }
- async function poll(){try{await tick();}finally{schedulePoll();}}
+ async function poll(){
+  if(!enabled()){pollActive=false;stopPoll();return;}
+  pollActive=true;
+  const fresh=await readStatus();
+  // Arm the next read from the state just fetched instead of waiting for a
+  // multi-minute automatic download or install in act() to finish.
+  schedulePoll();
+  if(fresh)await act();
+ }
  function visibilityChanged(){
   if(!enabled())return;
+  pollActive=true;
   stopPoll();
   if(document.visibilityState==='hidden'){schedulePoll();return;}
   // A single catch-up read replaces the timer instead of adding one.
@@ -315,6 +338,7 @@ window.RSINativeUpdate=(()=>{
   if(!enabled())return;
   render();
   document.addEventListener('visibilitychange',visibilityChanged);
+  pollActive=true;
   setTimeout(()=>safe(async()=>{await syncAuthorization();await poll();}),5000);
  });
  return {render,run,tick,pollDelay,poll,eligible,withinWindow,phaseOf,statusText,progressText,formatBytes,speedText,sampleSpeed,scopeText,errorText,errorCode,exportReceipt,syncAuthorization,settingsChanged,revision:()=>revision};
