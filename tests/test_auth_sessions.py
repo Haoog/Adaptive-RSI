@@ -1447,6 +1447,34 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "cancelled")
         self.assertEqual(manager.snapshot()["sessions"][-1]["id"], session["id"])
 
+    def test_status_expiry_sweep_tolerates_persist_failure(self):
+        # 状态目录只读/磁盘满时，status() 的懒回收写盘失败不能让只读接口 500：
+        # 内存已回滚为 ACTIVE，status/busy/snapshot 继续可用；恢复可写后再落盘。
+        now = [1000.0]
+        manager = AuthSessions(self.root / "status-state", factory=lambda backend: None,
+                               ttl=60, now=lambda: now[0])
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        now[0] = 2000.0  # 已过 expires_at，但还没有人扫描
+        with self.state_write_error(manager):
+            # 确认状态文件写入真的失败、且该行确实满足回收条件，
+            # 否则下面的读路径断言可能因为没走到回收而假通过。
+            with self.assertRaises(OSError):
+                manager._update(session["id"], state="expired", error="auth_expired")
+            self.assertGreaterEqual(manager.now(), manager.sessions[session["id"]]["expires_at"])
+            self.assertEqual(manager.status(session["id"])["state"], "starting")
+            self.assertEqual(manager.busy, 0)
+            self.assertEqual([row["id"] for row in manager.snapshot()["sessions"]], [session["id"]])
+            # 读路径吞掉写盘失败，写路径仍把 OSError 交给调用方。
+            with self.assertRaises(OSError):
+                manager.cancel(session["id"])
+            with self.assertRaises(OSError):
+                manager.complete(session["id"], code="1234")
+        self.assertEqual(manager.sessions[session["id"]]["state"], "starting")
+        # 恢复可写后下一次 status() 把同一会话收成 expired 并落盘。
+        self.assertEqual(manager.status(session["id"])["state"], "expired")
+        self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "expired")
+
     def test_failed_terminal_write_preserves_old_session_beyond_history_limit(self):
         manager = AuthSessions(self.root / 'old-state', factory=self.factory, ttl=600)
         self.addCleanup(manager.close)

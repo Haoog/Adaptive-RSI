@@ -1675,13 +1675,20 @@ class AuthSessions:
             if item is None:
                 raise AuthError("unknown_session")
             if item["state"] in ACTIVE and self.now() >= item["expires_at"]:
-                self._update(session_id, state="expired", error="auth_expired")
-                # 锁内只做状态判定并摘除 workers 引用；close() 含 docker rm、killpg、
-                # wait 及目录清理等慢操作，放到锁外执行。close() 自身幂等，
-                # 与 cancel()/_run()/close() 的并发路径一致，不会双重关闭。
-                expired_worker = self.workers.pop(session_id, None)
-                if expired_worker:
-                    expired_worker[1].set()
+                try:
+                    self._update(session_id, state="expired", error="auth_expired")
+                except OSError:
+                    # 状态目录只读/磁盘满时，懒回收写盘失败不该把「查询状态」变成 500：
+                    # _update 已把内存回滚为 ACTIVE，这里按锁竞争语义返回回滚后的快照，
+                    # 等目录恢复可写后由下一次 status() 真正收成 expired 并落盘。
+                    pass
+                else:
+                    # 锁内只做状态判定并摘除 workers 引用；close() 含 docker rm、killpg、
+                    # wait 及目录清理等慢操作，放到锁外执行。close() 自身幂等，
+                    # 与 cancel()/_run()/close() 的并发路径一致，不会双重关闭。
+                    expired_worker = self.workers.pop(session_id, None)
+                    if expired_worker:
+                        expired_worker[1].set()
             result = self._public(item)
         finally:
             self.lock.release()
