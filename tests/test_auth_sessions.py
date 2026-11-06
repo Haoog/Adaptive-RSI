@@ -1303,6 +1303,30 @@ class AuthSessionTests(unittest.TestCase):
         finally:
             state.chmod(0o700)
 
+    @unittest.skipIf(getattr(os, "geteuid", lambda: -1)() == 0, "root 不受目录权限限制")
+    def test_read_only_state_directory_logs_storage_error(self):
+        # 启动成功但状态文件写失败只留在私有属性里时，journal 没有任何线索：
+        # 构造必须留下恰好一条 warning，且只含类型与 errno，不带路径或会话内容。
+        state = self.root / "readonly-log"
+        state.mkdir()
+        session_id = "restored-log-session"
+        payload = {session_id: {"id": session_id, "backend": "codex", "state": "completed",
+                                "expires_at": time.time() + 600, "error": ""}}
+        (state / "auth-sessions.json").write_text(json.dumps(payload))
+        state.chmod(0o500)
+        try:
+            with self.assertLogs("adaptive_rsi.auth_sessions", level="WARNING") as logs:
+                manager = AuthSessions(state, factory=self.factory, ttl=600)
+            self.addCleanup(manager.close)
+            self.assertIsInstance(manager._persist_error, OSError)
+        finally:
+            state.chmod(0o700)
+        self.assertEqual(len(logs.records), 1)
+        message = logs.records[0].getMessage()
+        self.assertRegex(message, r"%s(:\d+)?$" % type(manager._persist_error).__name__)
+        self.assertNotIn("/", message)
+        self.assertNotIn(session_id, message)
+
     def test_codex_login_merges_with_existing_auth_fields(self):
         # 用户在目标文件里手放的 OPENAI_API_KEY 或新版本未知字段不能被登录写回抹掉。
         path = self.root / "codex/auth.json"
@@ -1493,6 +1517,69 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual(manager.threads, set())
         self.assertIsInstance(manager._close_error, OSError)
         self.assertEqual(manager.status(session["id"])["state"], "interrupted")
+
+    def test_close_state_write_failure_logs_storage_error(self):
+        manager = AuthSessions(self.root / "state-close-log", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        with self.state_write_error(manager):
+            with self.assertLogs("adaptive_rsi.auth_sessions", level="WARNING") as logs:
+                manager.close()
+        # close() 不抛错，写盘失败必须留下一条只含类型与 errno 的 warning。
+        self.assertIsInstance(manager._close_error, OSError)
+        self.assertEqual(len(logs.records), 1)
+        message = logs.records[0].getMessage()
+        self.assertIn("OSError:28", message)
+        self.assertNotIn("/", message)
+        self.assertNotIn(session["id"], message)
+
+    def test_worker_close_failure_is_logged_without_aborting_close(self):
+        # worker 的临时 HOME 删除失败只记类型与 errno：路径不能进日志，关闭不能中断。
+        class Broken(FakeAuth):
+            def close(worker):
+                raise OSError(39, "Directory not empty: /tmp/rsi-auth-private-home")
+
+        manager = AuthSessions(self.root / "state-worker-close", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        manager.workers["broken"] = (Broken("codex"), threading.Event())
+        healthy = FakeAuth("opencode")
+        self.created.append(healthy)
+        manager.discoveries.add(healthy)
+        with self.assertLogs("adaptive_rsi.auth_sessions", level="WARNING") as logs:
+            manager.close()
+        manager.workers.clear()
+        manager.discoveries.clear()
+        self.assertTrue(manager.closed)
+        # 首个 worker 抛错不能跳过后续发现任务的关闭。
+        self.assertTrue(healthy.closed)
+        self.assertIsInstance(manager._close_error, OSError)
+        self.assertEqual(len(logs.records), 1)
+        message = logs.records[0].getMessage()
+        self.assertIn("OSError:39", message)
+        self.assertNotIn("/tmp", message)
+        self.assertNotIn("rsi-auth-private-home", message)
+
+    def test_worker_retained_cleanup_errors_are_logged(self):
+        # 与 #399 同向：worker 就地收进 close_errors 的清理失败也必须浮到日志，
+        # 否则临时目录删除失败仍然只能靠复现。
+        class Retained(FakeAuth):
+            def __init__(worker, backend):
+                super(Retained, worker).__init__(backend)
+                worker.close_errors = [OSError(5, "Input/output error: /tmp/rsi-auth-private-home")]
+
+        manager = AuthSessions(self.root / "state-worker-retained", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        retained = Retained("codex")
+        self.created.append(retained)
+        manager.discoveries.add(retained)
+        with self.assertLogs("adaptive_rsi.auth_sessions", level="WARNING") as logs:
+            manager.close()
+        manager.discoveries.clear()
+        self.assertIsInstance(manager._close_error, OSError)
+        self.assertEqual(len(logs.records), 1)
+        message = logs.records[0].getMessage()
+        self.assertIn("OSError:5", message)
+        self.assertNotIn("/tmp", message)
 
     def test_reserve_registers_busy_session_before_any_worker_launch(self):
         session = self.manager.reserve("codex")

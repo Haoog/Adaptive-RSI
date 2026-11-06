@@ -201,6 +201,23 @@ def _read_json_for_write(path):
         return {}
 
 
+def _error_code(exc):
+    """关停/写盘失败的日志只写异常类型与 errno：异常文本可能带路径、凭据或用户标识。"""
+    number = getattr(exc, "errno", None)
+    return "%s:%s" % (type(exc).__name__, number) if isinstance(number, int) else type(exc).__name__
+
+
+def _close_worker(worker):
+    """关闭 worker 并返回首个清理失败；失败不能中断关停，只留类型与 errno 供日志。"""
+    try:
+        worker.close()
+    except Exception as exc:
+        return exc
+    # worker 内部的清理失败可能已就地收进 close_errors；同样要浮到这条日志。
+    retained = getattr(worker, "close_errors", None) or ()
+    return retained[0] if retained else None
+
+
 def _codex_path():
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json"
 
@@ -1005,6 +1022,10 @@ class AuthSessions:
                 # 状态目录只读/磁盘满时原文件仍完好：保留已加载会话继续启动，
                 # 等目录恢复可写后由下一次 reserve/_update 正常落盘。
                 self._persist_error = exc
+                # 启动照常完成，调用方看不到这次失败；日志是运维唯一的线索，
+                # 且只写类型与 errno，不带路径或会话内容。
+                logging.getLogger(__name__).warning(
+                    "Auth session state is not writable at startup: %s", _error_code(exc))
                 self._publish_sessions()
         else:
             self._publish_sessions()
@@ -1862,7 +1883,6 @@ class AuthSessions:
                         first_error = first_error or exc
                         self._terminate(item, state="interrupted", error="process_interrupted")
                         self._publish_sessions()
-            self._close_error = first_error
             # closed 已在上面置位；此后 _thread() 不再启动新线程，这里只需在
             # threads_lock 下取快照，避免漏掉刚登记、尚未 start 的线程。
             with self.threads_lock:
@@ -1870,8 +1890,17 @@ class AuthSessions:
         for worker, stop in workers:
             stop.set()
             if worker:
-                worker.close()
+                # worker 的临时 HOME/容器清理失败会残留目录；单个失败不能中断
+                # 关停，其余 worker、发现任务与线程回收仍必须执行。
+                error = _close_worker(worker)
+                first_error = first_error or error
         for worker in discoveries:
-            worker.close()
+            error = _close_worker(worker)
+            first_error = first_error or error
         for thread in threads:
             thread.join(timeout=2)
+        self._close_error = first_error
+        if first_error is not None:
+            # close() 不向调用方抛错，类型与 errno 是日志里唯一可查的线索。
+            logging.getLogger(__name__).warning(
+                "Auth sessions closed with cleanup errors: %s", _error_code(first_error))
