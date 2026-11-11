@@ -2827,6 +2827,7 @@ function modelScopePage(savedDrafts = new Map()) {
       return {saved:true,models:effective(body.project)};
     }
     if(path==='model-center/probe'){
+      if(signal?.aborted)throw Object.assign(new Error('Aborted'),{name:'AbortError'});
       if(probeHang)return new Promise((_resolve,reject)=>signal?.addEventListener('abort',()=>{probeAborts++;reject(Object.assign(new Error('Aborted'),{name:'AbortError'}));},{once:true}));
       if(probeFailure)throw Object.assign(new Error('Probe failed'),{code:'probe_failed'});return {calls:[{tokens:1}]};
     }
@@ -3036,9 +3037,19 @@ for(const failure of [false,true])test(`delayed probe ${failure?'failure':'succe
   await page.show('b');assert.equal(page.node('mc-probe-result').textContent,'');
   page.release();await probing;
   assert.equal(page.node('mc-probe-result').textContent,'');assert.equal(page.node('mc-probe-dialog').open,false);
-  await page.show('a');page.openProbe();assert.equal(page.node('mc-probe-result').textContent,'上一次测试已取消');
+  await page.show('a');page.openProbe();assert.equal(page.node('mc-probe-result').textContent,'已停止等待；测试可能仍在服务端继续、产生费用并记录结果。');
   page.node('mc-probe-dialog').close();
   await page.click('mc-probe-start');assert.equal(page.posts.length,1);
+});
+
+test('a cancelled probe finishing late cannot unlock a newer probe',async()=>{
+  const page=modelScopePage();await page.show('a');page.openProbe();page.hold();
+  const old=page.click('mc-probe-start');await new Promise(setImmediate);
+  page.node('mc-probe-dialog').close();page.openProbe();page.holdProbe();
+  const newer=page.click('mc-probe-start');assert.equal(page.node('mc-probe-start').disabled,true);
+  page.release();await old;
+  assert.equal(page.node('mc-probe-start').disabled,true,'the current probe must remain locked');
+  page.node('mc-probe-dialog').close();await newer;
 });
 
 test('closing a probe dialog aborts the request and lets another model be tested',async()=>{
@@ -3052,9 +3063,9 @@ test('closing a probe dialog aborts the request and lets another model be tested
   assert.equal(page.probeAborts(),1,'closing the dialog must abort the in-flight probe');
   page.openProbe(1);
   assert.equal(page.node('mc-probe-dialog').open,true,'a cancelled probe must not block the next one');
-  assert.equal(page.node('mc-probe-result').textContent,'上一次测试已取消');
+  assert.equal(page.node('mc-probe-result').textContent,'已停止等待；测试可能仍在服务端继续、产生费用并记录结果。');
   await probing;
-  assert.equal(page.node('mc-probe-result').textContent,'上一次测试已取消');
+  assert.equal(page.node('mc-probe-result').textContent,'已停止等待；测试可能仍在服务端继续、产生费用并记录结果。');
   page.node('mc-probe-dialog').close();
   page.openProbe();
   const again=page.click('mc-probe-start');

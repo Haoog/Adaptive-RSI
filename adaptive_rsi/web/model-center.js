@@ -478,7 +478,7 @@ window.RSIModelCenter = (() => {
     $('mc-probe-target').textContent=provider.name+' / '+model.id;
     $('mc-probe-dialog').dataset.provider=provider.id;$('mc-probe-dialog').dataset.model=model.id;
     const route=Object.values(routes()).find(r=>r.provider===provider.id&&r.model===model.id)||{provider:provider.id,model:model.id,effort:'default'};
-    $('mc-probe-effort').replaceChildren(effortControl({...route},t('测试模型'),()=>{},true));$('mc-probe-result').textContent=probeCancelled?t('上一次测试已取消'):'';probeCancelled=false;$('mc-probe-start').disabled=false;$('mc-probe-dialog').showModal();
+    $('mc-probe-effort').replaceChildren(effortControl({...route},t('测试模型'),()=>{},true));$('mc-probe-result').textContent=probeCancelled?t('已停止等待；测试可能仍在服务端继续、产生费用并记录结果。'):'';probeCancelled=false;$('mc-probe-start').disabled=false;$('mc-probe-dialog').showModal();
   }
   function init(){
     const tabs=[...document.querySelectorAll('[data-mc-tab]')];
@@ -569,8 +569,8 @@ window.RSIModelCenter = (() => {
     }));
     $('mc-reset-inheritance').addEventListener('click',()=>{if(!scope)return;inheritanceResets.set(scopeKey(),{models:safeRoutes(data.global_models)});drafts.set(scopeKey(),structuredClone(data.global_models));renderRoles();setStatus(t('已选择跟随通用设置，保存后生效。'));});
     $('mc-advanced-form').addEventListener('submit',event=>{event.preventDefault();try{const provider=$('mc-fallback-provider').value,model=$('mc-fallback-model').value;const fallback=provider?{provider,model,effort:$('mc-fallback-effort').querySelector('select').value}:null,route=routes()[$('mc-advanced-dialog').dataset.role];if(provider&&!model)throw Error(t('请先获取并启用备用模型。'));if(fallback&&provider===route.provider&&model===route.model)throw Error(t('备用模型应与主模型不同。'));route.fallback=fallback;route.effort=$('mc-advanced-effort').querySelector('select').value;$('mc-advanced-dialog').close();renderRoles();}catch(error){$('mc-advanced-error').textContent=error.message;}});
-    probeCancelButton=el('button',t('取消测试'),'text-button');probeCancelButton.type='button';$('mc-probe-dialog').append(probeCancelButton);setProbeCancelVisible(false);
-    probeCancelButton.addEventListener('click',()=>{if(!probeAbort)return;cancelProbe();$('mc-probe-result').textContent=t('上一次测试已取消');probeCancelled=false;$('mc-probe-start').disabled=false;});
+    probeCancelButton=el('button',t('停止等待'),'text-button');probeCancelButton.type='button';$('mc-probe-dialog').append(probeCancelButton);setProbeCancelVisible(false);
+    probeCancelButton.addEventListener('click',()=>{if(!probeAbort)return;cancelProbe();$('mc-probe-result').textContent=t('已停止等待；测试可能仍在服务端继续、产生费用并记录结果。');probeCancelled=false;$('mc-probe-start').disabled=false;});
     $('mc-probe-dialog').addEventListener('close',()=>{if(!$('mc-probe-dialog').open){cancelProbe();probeSession=null;}});
     $('mc-probe-start').addEventListener('click',()=>safe(async()=>{
       const button=$('mc-probe-start'),session=probeSession;
@@ -583,7 +583,7 @@ window.RSIModelCenter = (() => {
         if(controller.signal.aborted)return;
         if(current()){$('mc-probe-result').textContent=t('基础能力测试通过')+' · '+result.calls.length+' '+t('次调用')+' · '+result.calls.reduce((n,c)=>n+c.tokens,0)+' tokens';await load();}
       }catch(error){if(controller.signal.aborted)return;if(current()){$('mc-probe-result').textContent=message(error);await load();}}
-      finally{if(probeAbort===controller){probeAbort=null;busy=false;setProbeCancelVisible(false);}if(current())button.disabled=false;}
+      finally{if(probeAbort===controller){probeAbort=null;busy=false;setProbeCancelVisible(false);if(current())button.disabled=false;}}
     }));
     document.querySelectorAll('[data-open-model-center]').forEach(button=>button.addEventListener('click',()=>showView('models')));
     window.addEventListener('beforeunload',event=>{if(modified()){event.preventDefault();event.returnValue='';}});
@@ -595,7 +595,7 @@ window.RSIModelCenter = (() => {
     if($('mc-provider-dialog').open){$('mc-provider-dialog-title').textContent=t(editing?'连接设置':'添加模型服务');$('mc-input-key').placeholder=t(editing&&['stored','configured'].includes(editing.credential_status)?'留空保留当前密钥':'填写 API Key');}
     if($('mc-advanced-dialog').open){const provider=$('mc-fallback-provider').value,model=$('mc-fallback-model').value,effort=$('mc-fallback-effort').querySelector('select').value;renderFallback(provider?{provider,model,effort}:null);const role=$('mc-advanced-dialog').dataset.role;$('mc-advanced-title').textContent=t(roleNames[role])+' · '+t('高级参数');}
     if($('mc-probe-dialog').open){const dialog=$('mc-probe-dialog'),model=data.providers.find(p=>p.id===dialog.dataset.provider)?.catalog.models.find(m=>m.id===dialog.dataset.model);$('mc-probe-title').textContent=t('测试模型')+' · '+(model?.name||dialog.dataset.model);}
-    if(probeCancelButton)probeCancelButton.textContent=t('取消测试');
+    if(probeCancelButton)probeCancelButton.textContent=t('停止等待');
   }
   function rememberTab(){
     if(!location.href||location.pathname===undefined)return;
