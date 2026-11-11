@@ -369,11 +369,12 @@ class Evolution:
         self.store = runtime.store
         self._plan_keys = {}
 
-    def verify_inputs(self, project, manifest):
+    def verify_inputs(self, project, manifest, case_rows=None):
         mismatches = []
         unsampled_mismatches = []
         for item in manifest:
-            row = self.store.one("SELECT spec FROM cases WHERE id=? AND project=?", (item["case"], project))
+            row = (case_rows.get(item["case"]) if case_rows is not None else
+                   self.store.one("SELECT spec,split,family FROM cases WHERE id=? AND project=?", (item["case"], project)))
             try:
                 try:
                     spec = json.loads(row["spec"]) if row else {}
@@ -386,6 +387,8 @@ class Evolution:
                           "tree": git(spec["repository"], "rev-parse", spec["base"] + "^{tree}"),
                           "overlay": self.overlay_digest(spec.get("overlay"))}
                 changed = [key for key, value in actual.items() if item.get(key) != value]
+                changed.extend(key for key in ("split", "family")
+                               if key in item and row and item[key] != row[key])
                 # 配置了 overlay 却已不可用时，封存值与当前值都可能取不到（同为 None）；
                 # 相等不代表输入未变，这类用例必须在封存校验里失败，不能支持晋升。
                 if spec.get("overlay") and actual["overlay"] is None:
@@ -1975,8 +1978,12 @@ class Evolution:
         # 写事务之前完成，避免持锁执行外部命令；老证据没有 manifest 时保持原有行为。
         dataset = preflight.get("dataset")
         manifest = dataset.get("manifest") if isinstance(dataset, dict) else None
-        input_verification = (self.verify_inputs(row["project"], manifest)
-                              if isinstance(manifest, list) and manifest else None)
+        preflight_project, preflight_evidence = row["project"], row["evidence"]
+        case_rows = ({item["case"]: self.store.one(
+            "SELECT spec,split,family FROM cases WHERE id=? AND project=?", (item["case"], preflight_project))
+                      for item in manifest} if isinstance(manifest, list) and manifest else {})
+        input_verification = (self.verify_inputs(preflight_project, manifest, case_rows)
+                              if case_rows else None)
         if input_verification and input_verification["mismatches"]:
             raise ValueError("Sealed experiment inputs changed since evaluation: " + ", ".join(
                 item["case"] + " (" + ", ".join(item["fields"]) + ")"
@@ -1986,6 +1993,15 @@ class Evolution:
             row = db.execute("SELECT * FROM candidates WHERE id=?", (candidate,)).fetchone()
             if not row:
                 raise ValueError("Candidate not found")
+            if row["project"] != preflight_project or row["evidence"] != preflight_evidence:
+                raise ValueError("Candidate evidence changed during input verification; retry promotion")
+            # 只在事务内比较数据库快照，不在写锁内执行 git 或扫描 overlay。
+            for case, before in case_rows.items():
+                current = db.execute("SELECT spec,split,family FROM cases WHERE id=? AND project=?",
+                                     (case, preflight_project)).fetchone()
+                if (tuple(current) if current else None) != (
+                        tuple(before[key] for key in ("spec", "split", "family")) if before else None):
+                    raise ValueError("Sealed experiment inputs changed during verification; retry promotion")
             if row["status"] != "ready":
                 raise ValueError("Only a verified ready candidate can be promoted")
             if not db.execute("SELECT id FROM projects WHERE id=?", (row["project"],)).fetchone():

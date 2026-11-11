@@ -785,6 +785,38 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='previous'")['status'], 'stable')
         self.assertEqual(self.store.query('SELECT * FROM skills'), [])
 
+    def assert_promotion_rejects_post_verification_change(self, target):
+        self.ready_candidate()
+        verify = self.evolution.verify_inputs
+
+        def change_after_verification(*args, **kwargs):
+            result = verify(*args, **kwargs)
+            if target == 'case':
+                self.store.execute("UPDATE cases SET spec=? WHERE id='case-1'", ('{}',))
+            else:
+                self.store.execute("UPDATE candidates SET evidence=? WHERE id='candidate'", ('{}',))
+            return result
+
+        with patch.object(self.evolution, 'verify_inputs', side_effect=change_after_verification):
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                self.evolution.promote('candidate')
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='candidate'")['status'], 'ready')
+        self.assertEqual(self.store.query('SELECT * FROM skills'), [])
+
+    def test_promote_rejects_case_change_after_input_verification(self):
+        self.assert_promotion_rejects_post_verification_change('case')
+
+    def test_promote_rejects_evidence_change_after_input_verification(self):
+        self.assert_promotion_rejects_post_verification_change('evidence')
+
+    def test_promote_rejects_reclassified_sealed_case(self):
+        self.ready_candidate()
+        self.store.execute("UPDATE cases SET split='development' WHERE id='case-1'")
+        with self.assertRaisesRegex(ValueError, 'split'):
+            self.evolution.promote('candidate')
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='candidate'")['status'], 'ready')
+        self.assertEqual(self.store.query('SELECT * FROM skills'), [])
+
     def test_promote_with_unchanged_sealed_inputs_still_promotes(self):
         self.ready_candidate()
         result = self.evolution.promote('candidate')
