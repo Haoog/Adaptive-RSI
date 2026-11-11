@@ -554,6 +554,22 @@ class RuntimeHandoffTest(unittest.TestCase):
         # 失败后的新尝试从满额度起算，残留键在载入时已被丢弃。
         self.assertEqual(observed, [{'preparation': 0.0, 'evaluation': 0.0}, None])
 
+    def test_late_finished_checkpoint_cannot_recreate_empty_ledger(self):
+        task, stale = self.claim()
+        self.store.execute("UPDATE runs SET state='failed',ended=? WHERE id=?", (time.time(), stale['id']))
+        self.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (task,))
+        self.runtime.retry(task)
+        retried = self.store.claim(self.project, self.runtime.config(self.project))
+        key = 'stage-budget:' + task
+        self.runtime._persist_stage_budget(key, {'preparation': 60.0, 'evaluation': 0.0}, stale['id'], True)
+        self.assertIsNone(self.store.setting(key))
+        self.assertEqual(self.runtime._load_stage_budget(retried),
+                         {'preparation': 0.0, 'evaluation': 0.0})
+        # A delayed interrupted attempt also cannot create a ledger after a newer claim.
+        self.store.execute("UPDATE runs SET state='interrupted' WHERE id=?", (stale['id'],))
+        self.runtime._persist_stage_budget(key, {'preparation': 60.0, 'evaluation': 0.0}, stale['id'], True)
+        self.assertIsNone(self.store.setting(key))
+
     def test_stale_checkpoint_from_completed_attempt_cannot_charge_the_retry(self):
         """已完成尝试的迟到检查点既不能把旧消耗并入新账本，也不能覆盖新账本。"""
         task, stale = self.claim()

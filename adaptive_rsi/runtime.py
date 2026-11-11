@@ -1848,6 +1848,16 @@ class Runtime(Maintenance):
                 previous_timeout = db.execute('PRAGMA busy_timeout').fetchone()[0]
                 db.execute('PRAGMA busy_timeout=%d' % STAGE_BUDGET_CHECKPOINT_BUSY_MS)
                 try:
+                    # 与 run 终态及下一次 claim 串行化；先取写锁再判断归属，
+                    # 避免检查之后、写入之前状态发生变化。
+                    db.execute('BEGIN IMMEDIATE')
+                    attempt = db.execute(
+                        'SELECT task,state,ended,rowid FROM runs WHERE id=?', (run_id,)).fetchone()
+                    if (not attempt or key != self._stage_budget_key(attempt['task'])
+                            or (keep and attempt['ended'] is not None and attempt['state'] != 'interrupted')
+                            or db.execute('SELECT 1 FROM runs WHERE task=? AND rowid>? LIMIT 1',
+                                          (attempt['task'], attempt['rowid'])).fetchone()):
+                        return
                     row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
                     try:
                         stored = json.loads(row['value']) if row else {}
@@ -1897,14 +1907,14 @@ class Runtime(Maintenance):
 
     @staticmethod
     def _stage_budget_newer_attempt(db, run_id, owner):
-        """本次快照所属尝试是否比账本当前归属的尝试更新（按 runs.started 判定）。
+        """本次快照所属尝试是否比账本当前归属的尝试更新（按插入顺序判定）。
 
         只有更新的尝试才有权改写账本：上一次尝试若已结案，它迟到的检查点（含收尾
         删除）不得影响新一轮的额度；反之新一轮接手旧账本时以自身快照为准。仍在
         写库的旧快照无法在时钟锁内围栏，因此归属校验放在事务里做最后一道判断。
         """
-        rows = {row['id']: row['started'] for row in db.execute(
-            'SELECT id,started FROM runs WHERE id IN (?,?)', (run_id, owner))}
+        rows = {row['id']: row['rowid'] for row in db.execute(
+            'SELECT id,rowid FROM runs WHERE id IN (?,?)', (run_id, owner))}
         started, previous = rows.get(run_id), rows.get(owner)
         return started is not None and (previous is None or started > previous)
 
