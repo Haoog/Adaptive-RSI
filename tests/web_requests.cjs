@@ -3044,7 +3044,7 @@ test('closing the probe dialog aborts the abandoned request and unblocks other m
   const page=modelScopePage();await page.show('a');page.openProbe();page.hold();
   const probing=page.click('mc-probe-start');await new Promise(setImmediate);
   assert.equal(page.probeSignals.length,1);assert.equal(page.probeSignals[0].aborted,false);
-  assert.equal(page.node('mc-probe-start').textContent,'取消测试');
+  assert.equal(page.node('mc-probe-start').textContent,'停止等待');
   page.node('mc-probe-dialog').close();
   assert.equal(page.node('mc-probe-dialog').open,false);
   assert.equal(page.probeSignals[0].aborted,true,'closing the dialog must abort the abandoned probe');
@@ -3052,7 +3052,7 @@ test('closing the probe dialog aborts the abandoned request and unblocks other m
   assert.equal(page.node('mc-probe-dialog').open,true,'a closed probe must not keep other models blocked');
   assert.equal(page.node('mc-probe-dialog').dataset.model,'other-coder');
   page.openProbe();
-  assert.equal(page.node('mc-probe-result').textContent,'上一次测试已取消');
+  assert.equal(page.node('mc-probe-result').textContent,'已停止等待；测试可能仍在服务端继续、产生费用并记录结果。');
   page.release();await probing;
   assert.equal(page.node('mc-probe-start').disabled,false);
   await page.click('mc-probe-start');
@@ -3064,7 +3064,7 @@ test('the probe button cancels a running test without closing the dialog',async(
   const probing=page.click('mc-probe-start');await new Promise(setImmediate);
   await page.click('mc-probe-start');
   assert.equal(page.probeSignals[0].aborted,true);
-  assert.equal(page.node('mc-probe-result').textContent,'上一次测试已取消');
+  assert.equal(page.node('mc-probe-result').textContent,'已停止等待；测试可能仍在服务端继续、产生费用并记录结果。');
   assert.equal(page.node('mc-probe-start').textContent,'运行基础能力测试');
   assert.equal(page.node('mc-probe-start').disabled,false);
   page.release();await probing;

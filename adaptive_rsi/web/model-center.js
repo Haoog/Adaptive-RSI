@@ -444,7 +444,7 @@ window.RSIModelCenter = (() => {
     catch(error){if(scope===requested){await load();if(scope===requested&&active===providerId)setStatus(message(error),true);}if(propagateError)throw error;}
     finally{jobs.delete(key);if(scope===requested&&data)renderProvider();}
   }
-  // 基础能力测试由对话框独占：关闭、切换范围或改测别的模型时立即中止，避免放弃的请求继续占用按钮和额度。
+  // 基础能力测试由对话框独占：关闭、切换范围或改测别的模型时中止浏览器请求，服务端调用仍可能继续。
   function abortProbe(notify=false){
     const run=probeRun;probeRun=null;
     if(!run)return null;
@@ -469,7 +469,7 @@ window.RSIModelCenter = (() => {
     const route=Object.values(routes()).find(r=>r.provider===provider.id&&r.model===model.id)||{provider:provider.id,model:model.id,effort:'default'};
     $('mc-probe-effort').replaceChildren(effortControl({...route},t('测试模型'),()=>{},true));
     const cancelled=probeCancelled?.project===scope&&probeCancelled.provider===provider.id&&probeCancelled.model===model.id;
-    $('mc-probe-result').textContent=cancelled?t('上一次测试已取消'):'';
+    $('mc-probe-result').textContent=cancelled?t('已停止等待；测试可能仍在服务端继续、产生费用并记录结果。'):'';
     $('mc-probe-start').textContent=t('运行基础能力测试');$('mc-probe-start').disabled=false;$('mc-probe-dialog').showModal();
   }
   function init(){
@@ -563,13 +563,13 @@ window.RSIModelCenter = (() => {
       const button=$('mc-probe-start'),session=probeSession;
       if(!session||session.project!==scope||!$('mc-probe-dialog').open)return;
       // 运行中同一按钮变为取消；双击的第二次点击不算取消，避免刚发起就停掉。
-      if(probeRun){if(!(event?.detail>1)){abortProbe(true);$('mc-probe-result').textContent=t('上一次测试已取消');}return;}
+      if(probeRun){if(!(event?.detail>1)){abortProbe(true);$('mc-probe-result').textContent=t('已停止等待；测试可能仍在服务端继续、产生费用并记录结果。');}return;}
       const current=()=>probeSession===session&&scope===session.project;
       // 传了 signal 后 api() 不再设置 16 分钟截止时间，这里显式保留同一上限。
       const controller=new AbortController(),run={controller,session,timedOut:false};
       run.timeout=setTimeout(()=>{run.timedOut=true;controller.abort();},960000);
       probeRun=run;probeCancelled=null;
-      button.disabled=false;button.textContent=t('取消测试');$('mc-probe-result').textContent=t('正在执行基础能力测试…');
+      button.disabled=false;button.textContent=t('停止等待');$('mc-probe-result').textContent=t('正在执行基础能力测试…');
       try{const result=await api('model-center/probe',{...session,effort:$('mc-probe-effort').querySelector('select').value},{signal:controller.signal});
         if(probeRun===run&&current()){$('mc-probe-result').textContent=t('基础能力测试通过')+' · '+result.calls.length+' '+t('次调用')+' · '+result.calls.reduce((n,c)=>n+c.tokens,0)+' tokens';await load();}
       }catch(error){
@@ -586,7 +586,7 @@ window.RSIModelCenter = (() => {
     if($('mc-picker-dialog').open){renderPickerProviders();$('mc-picker-title').textContent=t(roleNames[picking])+' · '+t('选择模型');renderPicker();}
     if($('mc-provider-dialog').open){$('mc-provider-dialog-title').textContent=t(editing?'连接设置':'添加模型服务');$('mc-input-key').placeholder=t(editing&&['stored','configured'].includes(editing.credential_status)?'留空保留当前密钥':'填写 API Key');}
     if($('mc-advanced-dialog').open){const provider=$('mc-fallback-provider').value,model=$('mc-fallback-model').value,effort=$('mc-fallback-effort').querySelector('select').value;renderFallback(provider?{provider,model,effort}:null);const role=$('mc-advanced-dialog').dataset.role;$('mc-advanced-title').textContent=t(roleNames[role])+' · '+t('高级参数');}
-    if($('mc-probe-dialog').open){const dialog=$('mc-probe-dialog'),model=data.providers.find(p=>p.id===dialog.dataset.provider)?.catalog.models.find(m=>m.id===dialog.dataset.model);$('mc-probe-title').textContent=t('测试模型')+' · '+(model?.name||dialog.dataset.model);$('mc-probe-start').textContent=t(probeRun?'取消测试':'运行基础能力测试');}
+    if($('mc-probe-dialog').open){const dialog=$('mc-probe-dialog'),model=data.providers.find(p=>p.id===dialog.dataset.provider)?.catalog.models.find(m=>m.id===dialog.dataset.model);$('mc-probe-title').textContent=t('测试模型')+' · '+(model?.name||dialog.dataset.model);$('mc-probe-start').textContent=t(probeRun?'停止等待':'运行基础能力测试');}
   }
   function rememberTab(){
     if(!location.href||location.pathname===undefined)return;
