@@ -168,6 +168,24 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.assertIn("created=", listing[0])
         self.assertNotIn("created=", listing[1])
 
+    def test_unfiltered_fallback_finds_target_when_filtered_page_has_other_runs(self):
+        from adaptive_rsi.release import _remote_runs
+        calls = []
+        target = {"id": 17, "display_title": "rsi-operation"}
+        other = {"id": 18, "display_title": "another-operation"}
+
+        def listing(repo, endpoint, method="GET", fields=None):
+            calls.append(endpoint)
+            return {"workflow_runs": [other] if "created=" in endpoint else [other, target]}
+
+        data = {"workflow": ".github/workflows/publish.yml", "operation_id": "rsi-operation",
+                "created_at": time.time()}
+        with patch("adaptive_rsi.release.api", side_effect=listing):
+            self.assertEqual(_remote_runs("example/project", data), [target])
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("created=", calls[1])
+        self.assertIn("created_window_missed_at", data)
+
     def test_unfiltered_fallback_is_throttled_and_skipped_when_the_window_matches(self):
         from adaptive_rsi.release import RECONCILIATION_RECHECK_SECONDS, _remote_runs
         clock = _ReleaseClock(time.time())

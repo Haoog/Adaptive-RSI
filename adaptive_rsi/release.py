@@ -626,8 +626,8 @@ def _unfiltered_fallback_ready(data, force):
     ``created`` is a lower bound evaluated against GitHub's clock, while the
     receipt timestamp comes from this host's clock. A host clock ahead of
     GitHub (or a GitHub clock behind it) by more than
-    ``RECONCILIATION_CREATED_MARGIN_SECONDS`` makes the filtered listing empty
-    even though the run exists, so a zero-row listing gets one unfiltered page.
+    ``RECONCILIATION_CREATED_MARGIN_SECONDS`` can exclude the target run even
+    when unrelated runs are visible, so a no-match listing gets one unfiltered page.
     The receipt throttles that page to the recheck cadence: an operation that
     truly has no run yet must not turn reconciliation into a full scan.
     """
@@ -668,12 +668,10 @@ def _remote_runs(repo, data, force=False):
             total = payload.get("total_count")
             if type(total) is int and 0 < total <= scanned:
                 break
-        if since and not scanned and _unfiltered_fallback_ready(data, force):
-            # A zero-row filtered page means GitHub saw no run at or after the
-            # lower bound. Because that bound is derived from this host's clock,
-            # re-read the newest page without it before declaring the run
-            # invisible; a matching run here proves the created window was
-            # missed rather than that the dispatch never started a run.
+        if since and not found and _unfiltered_fallback_ready(data, force):
+            # A no-match filtered page can still contain unrelated runs. Because
+            # the lower bound comes from this host's clock, re-read the newest
+            # page without it before declaring the target invisible.
             data["unfiltered_fallback_at"] = time.time()
             payload = api(repo, endpoint.split("&created=")[0] + "&page=1")
             runs = payload.get("workflow_runs", [])
