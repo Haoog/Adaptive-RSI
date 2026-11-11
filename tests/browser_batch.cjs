@@ -31,7 +31,14 @@ const {chromium} = require('playwright');
     await dialog.getByRole('button', {name:'确认', exact:true}).click();
     await page.locator('#toast').filter({hasText:'批量操作已完成'}).waitFor();
     const state = await page.evaluate(async () => (await fetch('/api/state?filter=all&sections=core')).json());
-    const grouped = state.tasks.find(task => task.fingerprint?.startsWith('batch:') && task.body?.includes('批量目标一') && task.body?.includes('批量目标二'));
+    // The list payload omits body/evidence; read the grouped task through the detail endpoint.
+    const grouped = await page.evaluate(async tasks => {
+      for (const task of tasks.filter(task => task.fingerprint?.startsWith('batch:'))) {
+        const detail = await (await fetch('/api/task?id=' + encodeURIComponent(task.id) + '&project=' + encodeURIComponent(projectId))).json();
+        if (detail.body?.includes('批量目标一') && detail.body?.includes('批量目标二')) return detail;
+      }
+      return null;
+    }, state.tasks);
     assert.ok(grouped, 'grouped task keeps both requirements regardless of ID order');
     await page.getByRole('checkbox', {name:'选择任务 · '+grouped.title}).check();
     await page.getByRole('button', {name:'拆分未开始的任务'}).click();

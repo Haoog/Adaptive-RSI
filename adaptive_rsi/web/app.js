@@ -15,7 +15,7 @@ const formRevisions=new WeakMap(), settingsDrafts=new Map(), settingsClean=new M
 let navigationSequence=0;
 let settingsContext='',settingsGeneration=0,goalDraftRestoredProject=null;
 let configurationRepairBusy=false;
-let refreshSequence=0,refreshPromise=null,refreshController=null,refreshProject=null,refreshKey=null,refreshQueued=false,refreshForce=false,refreshWaiters=[],refreshPollTimer=null,lastUpdateToast='';
+let refreshSequence=0,refreshPromise=null,refreshController=null,refreshProject=null,refreshKey=null,refreshQueued=false,refreshForce=false,refreshWaiters=[],refreshPollTimer=null,lastUpdateToast='',sessionExpired=false,lastRefreshAt=0;
 let capabilitySequence=0,scopeChosen=false,scopeInitialized=false,taskOffset=0;
 const readinessCache=new Map(),bootBuild=document.documentElement?.dataset?.build||'';
 let readinessSequence=0;
@@ -436,7 +436,18 @@ async function safe(fn,form){
  }finally{if(form)pendingForms.delete(form);if(submit){submit.disabled=false;submitLabel(t('添加到当前项目'));}}
 }
 function refreshDelay(){if(document.visibilityState==='hidden')return 60000;return state?.runs?.some(run=>!run.ended)?5000:15000;}
-function scheduleRefreshPoll(delay=refreshDelay()){clearTimeout(refreshPollTimer);refreshPollTimer=setTimeout(()=>{refreshPollTimer=null;refresh().catch(error=>{$('connection').textContent=t(error.code==='session_required'?'需要重新登录':'连接中断');});},delay);}
+function clockTime(value){const date=new Date(value);return String(date.getHours()).padStart(2,'0')+':'+String(date.getMinutes()).padStart(2,'0');}
+// 会话失效后没有自动恢复入口：停止轮询，标出最后一次成功刷新的时间，并把现有的刷新按钮变成重新登录入口。
+function expireSessionCopy(){
+ $('connection').textContent=lastRefreshAt?t('登录已失效 · 当前显示 {time} 的数据').replace('{time}',clockTime(lastRefreshAt)):t('登录已失效');
+ const reload=$('reload-ui');reload.hidden=false;reload.textContent=t('登录已失效，重新打开控制台');
+}
+function expireSession(){
+ if(sessionExpired)return;
+ sessionExpired=true;clearTimeout(refreshPollTimer);refreshPollTimer=null;
+ expireSessionCopy();
+}
+function scheduleRefreshPoll(delay=refreshDelay()){if(sessionExpired)return;clearTimeout(refreshPollTimer);refreshPollTimer=setTimeout(()=>{refreshPollTimer=null;refresh().catch(()=>{if(!sessionExpired)$('connection').textContent=t('连接中断');});},delay);}
 function requestedStateSections(force=false){
  const sections=['core'],project=projectId||null,stale=Date.now()-30000;
  // 用户刚完成回滚、导入或晋升时，旧数组仍在 TTL 内也不能沿用；其他轮询继续使用 TTL。
@@ -445,6 +456,8 @@ function requestedStateSections(force=false){
  return sections;
 }
 async function refresh(options={}){
+ // 会话失效后只保留现有画面，等待用户点击重新登录；任何新的轮询或页面请求都不再发出。
+ if(sessionExpired)return;
  const force=!!options.force,requestedProject=projectId,requestedView=view,sections=requestedStateSections(force),taskView=['overview','tasks'].includes(view),filter=taskView?$('task-filter').value:'all',system=taskView?String($('show-system-tasks').checked):'true',offset=taskView?taskOffset:0;
  const key=JSON.stringify([requestedProject,view,offset,filter,system,sections]);
  if(refreshPromise){if(refreshKey===key)return refreshPromise;refreshQueued=true;refreshForce=refreshForce||force;refreshSequence++;refreshController?.abort();return new Promise((resolve,reject)=>refreshWaiters.push({resolve,reject}));}
@@ -470,7 +483,7 @@ async function refresh(options={}){
    else state={...(state||{}),...next};
    if(returned.has('analytics')){loadedStateSections.analyticsProject=next.selected_project??null;loadedStateSections.analyticsAt=Date.now();}
    if(returned.has('candidates')){loadedStateSections.candidatesProject=next.selected_project??null;loadedStateSections.candidatesAt=Date.now();}
-   $('connection').textContent=t('已连接');$('version').textContent='Adaptive RSI '+state.version;
+   lastRefreshAt=Date.now();$('connection').textContent=t('已连接');$('version').textContent='Adaptive RSI '+state.version;
    const select=$('project-select'),old=projectId;if(!state.projects.some(p=>p.id===projectId)){stashGoalDraft();projectId=state.projects[0]?.id||'';restoreGoalDraft();goalDraftRestoredProject=projectId;}
    if(JSON.stringify([...select.options].map(x=>[x.value,x.text]))!==JSON.stringify(state.projects.map(p=>[p.id,projectLabel(p)]))){select.replaceChildren(...state.projects.map(p=>{const o=el('option',projectLabel(p));o.value=p.id;o.title=projectPath(p);return o;}));if(!state.projects.length){const o=el('option',t('尚未接入项目'));o.value='';select.append(o);}}
    if(projectId&&!scopeChosen&&!scopeInitialized){stashSettings();$('config-scope').value='project';settingsBaseline=null;scopeInitialized=true;}
@@ -479,7 +492,7 @@ async function refresh(options={}){
   }catch(error){if(controller.signal.aborted){if(timedOut&&requestedProject===projectId)$('connection').textContent=t('连接超时');return;}throw error;}
   finally{clearTimeout(timeout);}
  })();refreshPromise=operation;
- try{return await operation;}finally{if(refreshPromise===operation){refreshPromise=null;refreshController=null;refreshProject=null;refreshKey=null;}if(refreshQueued){refreshQueued=false;const waiters=refreshWaiters.splice(0),forceNext=refreshForce;refreshForce=false;let next;try{next=refresh({force:forceNext});}catch(error){for(const waiter of waiters)waiter.reject(error);scheduleRefreshPoll();}if(next)Promise.resolve(next).then(value=>waiters.forEach(waiter=>waiter.resolve(value)),error=>waiters.forEach(waiter=>waiter.reject(error)));}else scheduleRefreshPoll();}
+ try{return await operation;}catch(error){if(error.code==='session_required')expireSession();throw error;}finally{if(refreshPromise===operation){refreshPromise=null;refreshController=null;refreshProject=null;refreshKey=null;}if(refreshQueued){refreshQueued=false;const waiters=refreshWaiters.splice(0),forceNext=refreshForce;refreshForce=false;let next;try{next=refresh({force:forceNext});}catch(error){for(const waiter of waiters)waiter.reject(error);scheduleRefreshPoll();}if(next)Promise.resolve(next).then(value=>waiters.forEach(waiter=>waiter.resolve(value)),error=>waiters.forEach(waiter=>waiter.reject(error)));}else scheduleRefreshPoll();}
 }
 function parentView(name){return name==='tasks'?'overview':name;}
 function renderNavigation(){
@@ -783,8 +796,12 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
  const stillCurrent=()=>ticket===detailSequence&&projectId===project&&detailTask?.id===task.id;
  if(!$('detail-dialog').open)$('detail-dialog').showModal();
  window.RSIExperience?.taskOpened(task,queueDraft);
+ // 列表接口只下发渲染所需的列；正文与证据在打开详情时按任务补取一次。
+ // 语言切换与操作后重绘复用已补全的 detailTask，不再重复请求。
+ const partial=task.body===undefined||task.evidence===undefined;
  const requirements=el('section',undefined,'task-requirements'),copy=el('p',task.body);copy.id='task-requirements';requirements.append(el('h3',t('任务要求')),copy);body.append(requirements);
- const evidence=lazyEvidence('来源与证据',()=>task.evidence||'');evidence.className='detail-section';body.append(evidence);
+ const evidence=lazyEvidence('来源与证据',()=>task.evidence||'');evidence.className='detail-section';evidence.hidden=partial;body.append(evidence);
+ if(partial)safe(async()=>{const detail=await api('task?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));if(!stillCurrent())return;task=detail;detailTask=detail;copy.textContent=detail.body||'';evidence.hidden=false;});
  const firstPage=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');if(ticket!==detailSequence||projectId!==project)return;
  // 响应为分页信封；同时接受旧服务端的裸数组，避免升级期间把历史区显示为空。
  const history=runPageRows(firstPage);
@@ -1483,7 +1500,8 @@ $('language-select').addEventListener('change',()=>safe(async()=>{
  if(window.RSIDesktop?.invoke)window.RSIDesktop.invoke('set_native_language',{language}).catch(()=>{});
  translateStatic();
  const connectionStates=['已连接','连接中断','连接超时','需要重新登录'];
- $('connection').textContent=t(connectionStates.find(name=>[name,english[name]].includes($('connection').textContent))||'已连接');
+ if(sessionExpired)expireSessionCopy();
+ else $('connection').textContent=t(connectionStates.find(name=>[name,english[name]].includes($('connection').textContent))||'已连接');
  if(!projectId&&$('project-select').options.length)$('project-select').options[0].textContent=t('尚未接入项目');
  $('toast').hidden=true;
  if(!state)return;
