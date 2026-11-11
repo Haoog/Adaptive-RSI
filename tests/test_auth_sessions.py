@@ -164,6 +164,40 @@ class AuthSessionTests(unittest.TestCase):
             if 'reader' in locals():
                 reader.join(3)
 
+    def test_reserve_rejects_during_api_key_install(self):
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+        def factory(backend):
+            worker = FakeAuth(backend)
+            self.created.append(worker)
+            worker.capabilities = types.SimpleNamespace(modern=True)
+            worker.set_api_key = lambda *args: None
+            worker.export_credential = lambda *args: [{'fixture': True}]
+            def install(*args):
+                entered.set()
+                release.wait(5)
+            worker.install_credential = install
+            return worker
+        self.manager.factory = factory
+        def save():
+            try:
+                self.manager.set_api_key('opencode', 'openai', 'fixture')
+            except Exception as exc:
+                errors.append(exc)
+        writer = threading.Thread(target=save)
+        writer.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            with self.assertRaises(AuthError) as caught:
+                self.manager.reserve('opencode', 'openai')
+            self.assertEqual(caught.exception.code, 'auth_busy')
+        finally:
+            release.set()
+            writer.join(5)
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.manager.reserve('opencode', 'openai')['state'], 'starting')
+
     def test_reserve_does_not_wait_for_blocked_credential_install(self):
         entered, release = threading.Event(), threading.Event()
         session = self.manager.reserve("opencode", "openai")
@@ -201,6 +235,12 @@ class AuthSessionTests(unittest.TestCase):
             with self.assertRaises(AuthError) as cancelled:
                 self.manager.cancel(session["id"])
             self.assertEqual(cancelled.exception.code, "auth_credentials_busy")
+            with patch.object(self.manager, 'now', return_value=session['expires_at'] + 1):
+                self.assertEqual(self.manager.busy, 1)
+                with self.assertRaises(AuthError) as completed:
+                    self.manager.complete(session['id'], 'fixture')
+                self.assertEqual(completed.exception.code, 'invalid_auth_state')
+                self.assertEqual(self.manager.status(session['id'])['state'], 'starting')
         finally:
             release.set()
             writer.join(3)

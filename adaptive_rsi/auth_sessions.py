@@ -958,6 +958,7 @@ class AuthSessions:
         # 凭据写入（可能起子进程或 fsync）在 self.lock 外执行；此集合标记写入中的会话，
         # 供 cancel() 拒绝并发取消，并让状态扫描不要把写入中的会话提前过期。
         self.credential_writes = set()
+        self.api_key_writes = set()
         self.discoveries = set()
         self.threads = set()
         # 线程登记不占用 self.lock：后者在 logout 期间仍会被较长时间持有（凭据移除
@@ -1051,6 +1052,7 @@ class AuthSessions:
     def busy(self):
         with self.view_lock:
             ids = [key for key, item in self.public_sessions.items() if item["state"] in ACTIVE]
+            writing = self.credential_writes.copy()
         count = 0
         for key in ids:
             try:
@@ -1061,7 +1063,7 @@ class AuthSessions:
                 continue
             # status() 的非阻塞回收在锁竞争时可能返回陈旧 ACTIVE 快照；
             # busy 语义是「仍在进行」，过期行即便尚未被扫描也不再占用名额。
-            if result["state"] in ACTIVE and self.now() < result["expires_at"]:
+            if result["state"] in ACTIVE and (self.now() < result["expires_at"] or key in writing):
                 count += 1
         return count
 
@@ -1406,7 +1408,7 @@ class AuthSessions:
                         and self.now() >= item["expires_at"]
                         and session_key not in self.credential_writes):
                     self._update(session_key, state="expired", error="auth_expired")
-            if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
+            if backend in self.api_key_writes or any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
                 raise AuthError("auth_busy")
             session_id = secrets.token_urlsafe(24)
             self.sessions[session_id] = {"id": session_id, "backend": backend, "provider": provider,
@@ -1641,7 +1643,8 @@ class AuthSessions:
                 if self.now() >= current_session["expires_at"]:
                     self._update(session_id, state="expired", error="auth_expired")
                     return
-                self.credential_writes.add(session_id)
+                with self.view_lock:
+                    self.credential_writes.add(session_id)
             try:
                 if backend == "codex":
                     # 与 opencode 分支一致：合并写回，保留用户手放的 OPENAI_API_KEY
@@ -1668,7 +1671,8 @@ class AuthSessions:
                 # 写入中取消会被 cancel() 拒绝，因此这里结束前状态仍是同一 ACTIVE 会话；
                 # 仍在持锁时摘标记，避免「标记已摘、completed 未写」的窗口被取消穿过。
                 with self.lock:
-                    self.credential_writes.discard(session_id)
+                    with self.view_lock:
+                        self.credential_writes.discard(session_id)
         finally:
             credential_lock.release()
 
@@ -1712,7 +1716,8 @@ class AuthSessions:
             item = self.sessions.get(session_id)
             if item is None:
                 raise AuthError("unknown_session")
-            if item["state"] in ACTIVE and self.now() >= item["expires_at"]:
+            if (item["state"] in ACTIVE and self.now() >= item["expires_at"]
+                    and session_id not in self.credential_writes):
                 self._update(session_id, state="expired", error="auth_expired")
             if item["state"] != "awaiting_authorization" or item.get("method") != "code":
                 raise AuthError("invalid_auth_state")
@@ -1810,6 +1815,7 @@ class AuthSessions:
         if not AUTH_LOCK.acquire(blocking=False):
             raise AuthError("auth_credentials_busy")
         worker = None
+        write_reserved = False
         try:
             with self.lock:
                 if self.closed:
@@ -1828,6 +1834,8 @@ class AuthSessions:
                     raise AuthError("service_closed")
                 if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
                     raise AuthError("auth_busy")
+                self.api_key_writes.add(backend)
+                write_reserved = True
             modern = bool(getattr(getattr(worker, "capabilities", None), "modern", False))
             if modern and hasattr(worker, "set_api_key") and hasattr(worker, "export_credential"):
                 worker.set_api_key(provider, key.strip())
@@ -1854,6 +1862,9 @@ class AuthSessions:
                 self._invalidate_caches(backend)
         finally:
             try:
+                if write_reserved:
+                    with self.lock:
+                        self.api_key_writes.discard(backend)
                 if worker:
                     with self.lock:
                         self.discoveries.discard(worker)
