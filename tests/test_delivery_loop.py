@@ -1047,6 +1047,7 @@ print('BOUNDARIES_OK')
     def behind_fixture(self, conflict=False):
         base = git(self.repo, "rev-parse", "HEAD")
         run = self.tracked_pr()
+        self.runtime.configure({"delivery": {"base_branch": "main"}}, self.project)
         for key, sealed in (("delivery:", {"head": "head", "base": base, "branch": "main",
                                           "repository": "example/project"}),
                             ("run-baseline:", {"repository": "example/project", "branch": "main", "sha": base})):
@@ -1081,6 +1082,126 @@ print('BOUNDARIES_OK')
             record.append("merge")
             return git(root, *args)
         return remote
+
+    def test_update_rechecks_resolved_default_branch(self):
+        run, workspace, new_base = self.behind_fixture()
+        self.runtime.configure({"delivery": {"base_branch": ""}}, self.project)
+        pr = {**self.pr_row("https://github.com/example/project/pull/1", git(workspace, "rev-parse", "HEAD")),
+              "baseRefOid": new_base, "headRefName": "fix/rsi-candidate",
+              "headRepositoryOwner": {"login": "example"}, "headRepository": {"nameWithOwner": "example/project"}}
+        calls = []
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), new_base, "main")), \
+                patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.github_git", side_effect=self.behind_remote(calls)), \
+                patch("adaptive_rsi.delivery.checked", return_value="release"):
+            tick(self.runtime, 1000)
+        self.assertNotIn("push", calls)
+
+    def test_update_push_retry_is_bounded_and_backed_off(self):
+        run, workspace, new_base = self.behind_fixture()
+        self.runtime.configure({"delivery": {"base_branch": "main"}}, self.project)
+        pr = {**self.pr_row("https://github.com/example/project/pull/1", git(workspace, "rev-parse", "HEAD")),
+              "baseRefOid": new_base, "headRefName": "fix/rsi-candidate",
+              "headRepositoryOwner": {"login": "example"}, "headRepository": {"nameWithOwner": "example/project"}}
+        calls = []
+        remote = self.behind_remote(calls)
+        def fail(root, *args, timeout=60):
+            if "push" in args:
+                calls.append("push")
+                raise RuntimeError("unknown push outcome")
+            return remote(root, *args, timeout=timeout)
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), new_base, "main")), \
+                patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.github_git", side_effect=fail), \
+                patch("adaptive_rsi.delivery.checked"):
+            tick(self.runtime, 1000)
+            tick(self.runtime, 1001)
+            self.assertEqual(calls.count("push"), 1)
+            for i in range(1, 20):
+                tick(self.runtime, 1000 + 4000 * i)
+            self.assertEqual(calls.count("push"), 12)
+            intent = self.store.setting("delivery-update:" + run["id"])
+            self.assertIsNotNone(intent)
+            pr["headRefOid"] = intent["new_policy"]["head"]
+            tick(self.runtime, 90000)
+        self.assertIsNone(self.store.setting("delivery-update:" + run["id"]))
+        self.assertEqual(self.store.setting("delivery:" + run["id"])["head"], pr["headRefOid"])
+
+    def test_base_advances_again_before_push(self):
+        run, workspace, new_base = self.behind_fixture()
+        self.runtime.configure({"delivery": {"base_branch": "main"}}, self.project)
+        pr = {**self.pr_row("https://github.com/example/project/pull/1", git(workspace, "rev-parse", "HEAD")),
+              "baseRefOid": new_base, "headRefName": "fix/rsi-candidate",
+              "headRepositoryOwner": {"login": "example"}, "headRepository": {"nameWithOwner": "example/project"}}
+        calls = []
+        remote = self.behind_remote(calls)
+        def advancing(root, *args, timeout=60):
+            result = remote(root, *args, timeout=timeout)
+            if "merge" in args and pr["baseRefOid"] == new_base:
+                (self.repo / "later.txt").write_text("later\n")
+                git(self.repo, "add", "later.txt")
+                git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",
+                    "commit", "--quiet", "-m", "advance again")
+                pr["baseRefOid"] = git(self.repo, "rev-parse", "HEAD")
+            if "push" in args:
+                pr["headRefOid"] = git(workspace, "rev-parse", "HEAD")
+            return result
+        def read_baseline(*args):
+            return str(self.repo), git(self.repo, "rev-parse", "HEAD"), "main"
+        with patch("adaptive_rsi.delivery.baseline", side_effect=read_baseline), \
+                patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.github_git", side_effect=advancing), \
+                patch("adaptive_rsi.delivery.checked"):
+            tick(self.runtime, 1000)
+            self.assertEqual(self.store.setting("run-baseline:" + run["id"])["sha"], new_base)
+            tick(self.runtime, 1400)
+        self.assertEqual(calls.count("push"), 2)
+        self.assertEqual(self.store.setting("run-baseline:" + run["id"])["sha"], pr["baseRefOid"])
+
+    def check_real_remote_ref_race(self, race):
+        run, workspace, new_base = self.behind_fixture()
+        old = git(workspace, "rev-parse", "HEAD")
+        base = self.store.setting("delivery:" + run["id"])["base"]
+        bare = self.root / ("remote-" + race + ".git")
+        git(self.repo, "clone", "--bare", str(self.repo), str(bare))
+        ref = "refs/heads/fix/rsi-candidate"
+        git(workspace, "push", str(bare), old + ":" + ref)
+        pr = {**self.pr_row("https://github.com/example/project/pull/1", old),
+              "baseRefOid": new_base, "headRefName": "fix/rsi-candidate",
+              "headRepositoryOwner": {"login": "example"}, "headRepository": {"nameWithOwner": "example/project"}}
+        remote = self.behind_remote()
+        attempted = []
+        expected = {"delete": None, "rewind": base, "replace": new_base}[race]
+        def racing(root, *args, timeout=60):
+            if "push" not in args:
+                return remote(root, *args, timeout=timeout)
+            attempted.append(True)
+            if expected is None:
+                git(bare, "update-ref", "-d", ref, old)
+            else:
+                git(bare, "update-ref", ref, expected, old)
+            forwarded = list(args)
+            forwarded[-2] = str(bare)
+            return git(root, *forwarded, timeout=timeout)
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), new_base, "main")), \
+                patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.github_git", side_effect=racing), \
+                patch("adaptive_rsi.delivery.checked"):
+            tick(self.runtime, 1000)
+        self.assertTrue(attempted)
+        self.assertEqual(git(bare, "for-each-ref", "--format=%(objectname)", ref) or None, expected)
+        self.assertEqual(self.store.setting("delivery:" + run["id"])["head"], old)
+        self.assertIsNotNone(self.store.setting("delivery-update:" + run["id"]))
+
+
+    def test_real_remote_ref_deleted_during_push(self):
+        self.check_real_remote_ref_race("delete")
+
+    def test_real_remote_ref_rewound_during_push(self):
+        self.check_real_remote_ref_race("rewind")
+
+    def test_real_remote_ref_replaced_during_push(self):
+        self.check_real_remote_ref_race("replace")
 
     def test_advanced_base_updates_the_same_pr_instead_of_replanning(self):
         run, workspace, new_base = self.behind_fixture()

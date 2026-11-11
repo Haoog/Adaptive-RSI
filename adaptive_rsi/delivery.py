@@ -419,6 +419,15 @@ def update_behind(runtime, project, run, outcome, policy, repo, now, pr, cancell
         if (not isinstance(intent, dict) or intent.get("old_policy") != policy or
                 intent.get("head_branch") != head_branch):
             return "waiting"
+        attempts = intent.get("push_attempts", 0)
+        last = intent.get("push_retry_at")
+        if not isinstance(attempts, int) or attempts < 0:
+            return "waiting"
+        if attempts >= REBASE_ATTEMPT_LIMIT:
+            outcome["delivery_update_blocked"] = "push attempts exhausted; reconciliation remains active"
+            return "waiting"
+        if attempts and isinstance(last, (int, float)) and now - last < _write_retry_delay(attempts):
+            return "waiting"
         if isinstance(intent.get("new_policy"), dict):
             if git(workspace, "rev-parse", "HEAD") != intent["new_policy"].get("head"):
                 return "waiting"
@@ -502,6 +511,8 @@ def update_behind(runtime, project, run, outcome, policy, repo, now, pr, cancell
     with runtime.dispatch_lock:
         live_project = runtime.project(project["id"])
         live_config = runtime.config(project["id"])
+        live_branch = live_config["delivery"]["base_branch"] or checked(
+            ["gh", "repo", "view", repo, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"])
         live_run = store.one("SELECT * FROM runs WHERE id=? AND project=?", (run["id"], project["id"]))
         task = store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))
         newer = store.one("SELECT 1 FROM runs WHERE task=? AND (started>? OR (started=? AND id>?))",
@@ -512,7 +523,7 @@ def update_behind(runtime, project, run, outcome, policy, repo, now, pr, cancell
                 not _dict_field(_json_object(live_run["config"]), "delivery").get("auto_merge") or
                 live_config["delivery"]["mode"] != "pr" or not live_config["delivery"]["auto_merge"] or
                 live_config["github"]["repository"] != repo or
-                (live_config["delivery"]["base_branch"] and live_config["delivery"]["base_branch"] != policy["branch"]) or
+                live_branch != policy["branch"] or
                 live_project["paused"] or cancelled() or
                 origin_repository(live_project["path"]).lower() != repo.lower() or
                 store.setting("delivery:" + run["id"]) != policy or
@@ -523,11 +534,16 @@ def update_behind(runtime, project, run, outcome, policy, repo, now, pr, cancell
                 git(workspace, "rev-parse", "HEAD") != intent["new_policy"]["head"] or
                 git(workspace, "status", "--porcelain") or
                 not _update_pr_identity(fresh, repo, policy["branch"], head_branch, policy["head"]) or
-                fresh.get("baseRefOid") != current):
+                not fresh.get("baseRefOid")):
             return "waiting"
+        # A lease is allowed only for a verified fast-forward, never a history rewrite.
+        if git(workspace, "merge-base", policy["head"], intent["new_policy"]["head"]) != policy["head"]:
+            return "waiting"
+        intent = {**intent, "push_attempts": intent.get("push_attempts", 0) + 1, "push_retry_at": now}
         store.put_setting(intent_key, intent)
         try:
-            github_git(workspace, "push", "https://github.com/" + repo + ".git",
+            github_git(workspace, "push", "--force-with-lease=refs/heads/" + head_branch + ":" + policy["head"],
+                       "https://github.com/" + repo + ".git",
                        intent["new_policy"]["head"] + ":refs/heads/" + head_branch, timeout=180)
         except Exception:
             return "waiting"
@@ -536,6 +552,7 @@ def update_behind(runtime, project, run, outcome, policy, repo, now, pr, cancell
     _, pending = _reconcile_branch_update(store, run, policy, repo, fresh)
     if pending:
         return "waiting"
+    outcome.pop("delivery_update_blocked", None)
     outcome.pop("rebase_attempts", None)
     outcome.pop("rebase_retry_at", None)
     return "waiting_ci"
@@ -1333,6 +1350,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                 update_intent = store.setting("delivery-update:" + run["id"])
                 if isinstance(update_intent, dict):
                     policy, pending_update = _reconcile_branch_update(store, run, policy, repo, pr)
+                    if not pending_update:
+                        outcome.pop("delivery_update_blocked", None)
                     if pending_update and pr.get("state") == "OPEN" and not _update_pr_identity(
                             pr, repo, policy["branch"], update_intent.get("head_branch"), policy["head"]):
                         outcome["delivery_status"] = "waiting"
