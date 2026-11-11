@@ -636,6 +636,11 @@ window.RSIExperience = (() => {
             // Rebase even if this form was rebuilt. Its editor still owns newer edits.
             editor.baseline = {dependencies: parents, urgency: !!submitted.urgency};
             editor.version++;
+            // A closed and reopened view owns a different editor for the same task.
+            if (queueEditor && queueEditor !== editor && queueEditor.key === editor.key) {
+              queueEditor.baseline = {dependencies: parents, urgency: !!submitted.urgency};
+              queueEditor.version++;
+            }
             if (!queueEditorCurrent(editor)) return;
             await refresh();
             if (queueEditorCurrent(editor)) toast(t("排队设置已保存"));

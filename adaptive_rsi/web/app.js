@@ -784,7 +784,8 @@ function valueFeedback(data){
  form.append(heading,hint,label,noteLabel,button,status);
  form.addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
   button.disabled=true;status.textContent='';
-  try{await api('task/value-feedback',{project:data.project,task:data.task,run:data.id,rating:select.value||null,note:note.value});valueFeedbackDrafts.delete(key);if(form.isConnected)status.textContent=t('评价已保存');}
+  const submittedDraft=valueFeedbackDrafts.get(key),submitted={project:data.project,task:data.task,run:data.id,rating:select.value||null,note:note.value};
+  try{await api('task/value-feedback',submitted);if(valueFeedbackDrafts.get(key)===submittedDraft)valueFeedbackDrafts.delete(key);if(form.isConnected)status.textContent=t('评价已保存');}
   finally{button.disabled=false;}
  },form);});return form;
 }

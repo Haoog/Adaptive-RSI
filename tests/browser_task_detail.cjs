@@ -104,6 +104,33 @@ async function checkTaskDetail(browser, url, errors) {
     assert.equal(persisted.evidence_summary.value_feedback.rating, 'helpful');
     assert.equal(persisted.evidence_summary.value_feedback.note, '<script>original feedback</script>');
     assert.equal(await valueBox.locator('script').count(), 0);
+    // Hold a real save acknowledgement while the same form receives newer input.
+    let releaseFeedback, feedbackCommitted;
+    const feedbackGate = new Promise(resolve => { releaseFeedback = resolve; });
+    const feedbackArrived = new Promise(resolve => { feedbackCommitted = resolve; });
+    const holdFeedback = async route => {
+      const response = await route.fetch();
+      feedbackCommitted(); await feedbackGate; await route.fulfill({response});
+    };
+    await page.route('**/api/task/value-feedback', holdFeedback);
+    try {
+      await valueBox.getByLabel('评价说明（可选）').fill('提交的评价');
+      await valueBox.getByRole('button', {name: '保存评价', exact: true}).click();
+      await feedbackArrived;
+      await valueBox.getByLabel('价值评价').selectOption('false_positive');
+      await valueBox.getByLabel('评价说明（可选）').fill('回执前的新草稿');
+      releaseFeedback();
+      await valueBox.getByRole('status').filter({hasText: '评价已保存'}).waitFor();
+      await page.locator('#language-select').selectOption('en');
+      await page.locator('#live-task-outcome .value-feedback').waitFor();
+      assert.equal(await valueBox.locator('select').inputValue(), 'false_positive');
+      assert.equal(await valueBox.locator('textarea').inputValue(), '回执前的新草稿');
+      await page.locator('#language-select').selectOption('zh-CN');
+      await page.locator('#live-task-outcome .value-feedback').waitFor();
+    } finally {
+      releaseFeedback();
+      await page.unroute('**/api/task/value-feedback', holdFeedback);
+    }
     await closeDetail(page);
     await openDetail(page, '详情历史任务', 'attention');
     await page.locator('#live-task-outcome .value-feedback').waitFor();

@@ -2688,6 +2688,38 @@ for (const editTiming of ['after acknowledgement', 'during save']) {
   });
 }
 
+test('queue acknowledgement rebases a reopened editor before later undo and rebuild', async () => {
+  const page = experiencePage(), task = fixtureTask('runless', 'deferred');
+  let metadata = task, acknowledge;
+  page.context.fetch = async (url, options) => {
+    if (url.endsWith('/task/schedule')) {
+      const submitted = JSON.parse(options.body);
+      return new Promise(resolve => { acknowledge = () => {
+        metadata = {...metadata, dependency: {dependency: submitted.dependency}, urgency: submitted.urgency};
+        resolve(response({saved: true}));
+      }; });
+    }
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({tasks: [fixtureTask('parent')]});
+    return response(metadata);
+  };
+  const controls = await openExperienceTask(page, task);
+  const form = editorForm(controls, 'task-queue-editor');
+  form.children[0].children[0].value = 'parent'; form.children[1].children[0].checked = true;
+  form.onsubmit({preventDefault() {}}); const pending = page.context.lastAction;
+  await new Promise(setImmediate);
+  page.context.closeTaskDetail();
+  await openExperienceTask(page, task);
+  acknowledge(); await pending;
+  const reopened = queueForm(page);
+  reopened.children[0].children[0].value = ''; reopened.children[1].children[0].checked = false;
+  metadata = {...metadata, state: 'queued'};
+  page.fireTimer(5000); await new Promise(setImmediate); await page.context.lastAction;
+  const rebuilt = queueForm(page);
+  assert.equal(rebuilt.children[0].children[0].value, '');
+  assert.equal(rebuilt.children[1].children[0].checked, false);
+});
+
 for (const navigation of ['close', 'project', 'other-task']) {
   test(`a queue save acknowledgement cannot affect ${navigation} navigation`, async () => {
     const page = experiencePage(), task = fixtureTask('runless', 'deferred');
