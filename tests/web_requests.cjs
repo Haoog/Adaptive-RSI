@@ -3662,3 +3662,46 @@ test('returning to the page refreshes once via visibilitychange; focus no longer
   assert.equal(states.length, 2, 'hiding the page does not refresh');
   assert.equal(page.timers.filter(timer => timer.active && timer.delay === 60000).length, 1, 'hidden polling keeps the slow cadence');
 });
+
+test('hidden pages prefix the title with the attention count and keep the project context', () => {
+  const page = browser();
+  Object.assign(page.context.initialState, {
+    projects: [{id: 'a', name: 'Alpha', path: '/work/alpha', paused: true}],
+    selected_project: 'a', tasks: [], runs: [], task_counts: [{state: 'awaiting_approval', count: 2}],
+    schedules: [], events: [], usage: [],
+  });
+  page.node('config-scope').value = 'project';
+  page.document.visibilityState = 'hidden';
+  vm.runInContext('state=initialState;projectId="a";view="overview";language="zh-CN";renderNavigation()', page.context);
+  assert.equal(page.document.title, '● 2 · 需要处理的任务 · Alpha · /work/alpha · Adaptive RSI · 控制台');
+  assert.equal(page.context.window.RSIExperience, undefined, 'the title hint works without the optional notification module or permission');
+  vm.runInContext('state.task_counts=[];renderNavigation()', page.context);
+  assert.equal(page.document.title, 'Alpha · /work/alpha · Adaptive RSI · 控制台', 'zero attention restores the plain title');
+});
+
+test('visibility changes update the title without extra requests and translate its fragment', async () => {
+  const page = browser(), requests = [];
+  Object.assign(page.context.initialState, {
+    projects: [{id: 'a', name: 'Alpha', paused: true}],
+    selected_project: 'a', tasks: [], runs: [], task_counts: [{state: 'awaiting_approval', count: 3}],
+    schedules: [], events: [], usage: [],
+  });
+  page.node('config-scope').value = 'project';
+  page.context.fetch = async url => { requests.push(url); return response({tasks: [], runs: []}); };
+  page.document.visibilityState = 'visible';
+  vm.runInContext('state=initialState;projectId="a";view="overview";language="zh-CN";renderNavigation()', page.context);
+  assert.equal(page.document.title, 'Alpha · Adaptive RSI · 控制台');
+  page.document.visibilityState = 'hidden';
+  page.listeners.get('visibilitychange')();
+  assert.equal(requests.length, 0, 'hiding the page updates the title without a request');
+  assert.match(page.document.title, /^● 3/);
+  page.context.t = value => ({'需要处理的任务': 'Tasks needing attention', 'Adaptive RSI · 控制台': 'Adaptive RSI · Console'}[value] ?? value);
+  page.context.language = 'en';
+  vm.runInContext('renderNavigation()', page.context);
+  assert.equal(page.document.title, '● 3 · Tasks needing attention · Alpha · Adaptive RSI · Console', 'the fragment translates while the project name and suffix stay intact');
+  page.document.visibilityState = 'visible';
+  page.listeners.get('visibilitychange')();
+  assert.equal(requests.length, 1, 'becoming visible keeps the existing single refresh');
+  await page.context.lastAction;
+  assert.equal(page.document.title, 'Alpha · Adaptive RSI · Console');
+});
