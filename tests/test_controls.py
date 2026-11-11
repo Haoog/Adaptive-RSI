@@ -40,6 +40,12 @@ class ValueAndIsolationTest(unittest.TestCase):
         self.runtime.close()
         self.temp.cleanup()
 
+    def process_with_ready_sandbox(self, run):
+        # These cases exercise planning decisions; Docker daemon availability is
+        # unrelated and must not short-circuit them before planning.
+        with patch("adaptive_rsi.readiness.Sandbox.backend", return_value="docker"):
+            self.runtime.process(run)
+
     def process(self, decision="ready", **value):
         class Triage(FakeAgent):
             def invoke(self, role, *args, **kwargs):
@@ -52,7 +58,7 @@ class ValueAndIsolationTest(unittest.TestCase):
         task = self.runtime.goal(self.project, "Consider a proposed change")
         self.runtime.pause(self.project, False)
         run = self.store.claim(self.project, self.runtime.config(self.project))
-        self.runtime.process(run)
+        self.process_with_ready_sandbox(run)
         return task, self.store.one("SELECT * FROM runs WHERE id=?", (run["id"],))
 
     def test_deferred_and_rejected_never_execute_and_keep_value_evidence(self):
@@ -115,14 +121,14 @@ class ValueAndIsolationTest(unittest.TestCase):
         now = time.time()
         self.runtime.schedule(self.project, config, now)
         recheck = self.store.claim(self.project, config)
-        self.runtime.process(recheck)
+        self.process_with_ready_sandbox(recheck)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "deferred")
         (self.repo / "calculator.py").write_text("def add(a,b): return a+b\n")
         git(self.repo, "add", ".")
         git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "--quiet", "-m", "new evidence")
         self.runtime.schedule(self.project, config, now + config["schedule"]["light_minutes"] * 60 + 1)
         recheck = self.store.claim(self.project, config)
-        self.runtime.process(recheck)
+        self.process_with_ready_sandbox(recheck)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
         self.assertEqual([role for role, _ in self.runtime.agent.roles], ["planning"])
 
