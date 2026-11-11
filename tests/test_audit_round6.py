@@ -862,6 +862,7 @@ class AuditMaintenanceRetentionTest(unittest.TestCase):
                 fake = SimpleNamespace(store=store, dispatch_lock=threading.RLock(),
                     scheduler_scope=lambda *a, **k: contextlib.nullcontext(), config=lambda p: {'providers': []},
                     model_center=SimpleNamespace(cleanup_credentials=lambda: None, key=lambda *a: 'unused'))
+                fake._record_maintenance_degraded = lambda failures, now: Maintenance._record_maintenance_degraded(fake, failures, now)
                 Maintenance.maintenance(fake)
                 self.assertIsNone(store.setting('batch:p:finished'))
                 self.assertIsNone(store.setting('batch:p:finished:item'))
@@ -878,12 +879,15 @@ class AuditMaintenanceRetentionTest(unittest.TestCase):
     def archive_maintenance(self, store):
         """Minimal Maintenance surface used by the archive-verification tail."""
         from types import SimpleNamespace
-        return SimpleNamespace(
+        from adaptive_rsi.maintenance import Maintenance
+        runtime = SimpleNamespace(
             store=store, dispatch_lock=threading.RLock(),
             scheduler_scope=lambda *a, **k: contextlib.nullcontext(),
             config=lambda project: {'providers': []},
             model_center=SimpleNamespace(cleanup_credentials=lambda: None,
                                          key=lambda *a: 'unused'))
+        runtime._record_maintenance_degraded = lambda failures, now: Maintenance._record_maintenance_degraded(runtime, failures, now)
+        return runtime
 
     @staticmethod
     def repaired_events(store):
