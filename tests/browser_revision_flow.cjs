@@ -131,12 +131,22 @@ async function checkRevisionFlow(browser, url, errors) {
         assert.equal(await supplement.evaluate(node => node.open), true, 'unsaved supplement reopens automatically');
         assert.equal(await page.getByLabel('补充需求（保留在当前任务）', {exact: true}).inputValue(), '验证精确修订快照');
         await page.getByLabel('干预原因（可选，保留原文）', {exact: true}).fill('补充边界条件');
+        let revisionSubmitted = false;
+        page.on('request', request => {
+          if (new URL(request.url()).pathname === '/api/task/revise' && request.method() === 'POST') revisionSubmitted = true;
+        });
+        await page.route('**/api/task?*', async route => {
+          if (revisionSubmitted) await new Promise(resolve => setTimeout(resolve, 1500));
+          await route.continue();
+        });
         const saved = page.waitForResponse(response => new URL(response.url()).pathname === '/api/task/revise' && response.request().method() === 'POST');
         await page.getByRole('button', {name: '保存补充并重新评估', exact: true}).click();
         assert.equal((await saved).status(), 200);
         const history = page.locator('#detail-body .task-controls details').filter({has: page.locator('summary', {hasText: '需求修订记录'})}).first();
-        await history.locator(':scope > summary').click();
         const revision = history.locator('details').filter({has: page.locator('summary', {hasText: '验证精确修订快照'})}).first();
+        // The POST response precedes the detail refresh; wait for the new DOM before opening it.
+        await revision.waitFor({state: 'attached'});
+        await history.locator(':scope > summary').click();
         await revision.locator(':scope > summary').click();
         await revision.getByText('旧候选已失效，后续运行将重新验证。', {exact: true}).waitFor();
         assert.ok((await revision.locator('pre').first().textContent()).includes('+验证精确修订快照'));
