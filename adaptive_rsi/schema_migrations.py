@@ -216,9 +216,12 @@ def heal(db):
                     "recorded; restore a backup or repair the ledger manually"
                     % (version, EVIDENCE.get(version, ("the migration schema effect",))[0], highest))
             break
-        db.execute("INSERT INTO schema_migrations VALUES (?,?,?)",
-                   (version, expected[version], time.time()))
-        healed.append(version)
+        # 并发 opener 可能刚补过同一行：忽略主键冲突，且只把自己写入的版本计入返回值，
+        # 避免日志声称回填了别人已经补好的账。
+        cursor = db.execute("INSERT OR IGNORE INTO schema_migrations VALUES (?,?,?)",
+                            (version, expected[version], time.time()))
+        if cursor.rowcount:
+            healed.append(version)
     if healed:
         LOGGER.warning("Backfilled migration ledger rows for version(s) %s without replaying migrations",
                        ", ".join(str(version) for version in healed))
@@ -288,12 +291,23 @@ def _quarantine_unsafe_dependencies(db):
     return len(rows)
 
 
+def _ledger_has(db, version):
+    return db.execute("SELECT 1 FROM schema_migrations WHERE version=?", (version,)).fetchone() is not None
+
+
 def apply(db):
     for version, content in scripts():
-        if db.execute("SELECT 1 FROM schema_migrations WHERE version=?", (version,)).fetchone():
+        # 锁外的预检只用来跳过已应用版本；真正判定必须在写锁内复查：另一个进程可能在
+        # 预检与 BEGIN IMMEDIATE 之间提交同一迁移。缺少这次复查时会重放迁移体，非幂等
+        # DDL 直接报 table already exists，随后账本写入才报 UNIQUE，把并发伪装成坏库。
+        if _ledger_has(db, version):
             continue
         if not db.in_transaction:
             db.execute("BEGIN IMMEDIATE")
+        if _ledger_has(db, version):
+            LOGGER.info("Migration %d was applied by another opener while waiting for the write lock; "
+                        "skipping its body", version)
+            continue
         if version == 6:
             # 006 以文件 sha256 记账，不能在 SQL 里加过滤；预清理与迁移共用同一事务，
             # 006 失败时隔离记录一并回滚，坏库不会留下半个状态。
@@ -308,5 +322,16 @@ def apply(db):
                 statement = ""
         if statement.strip():
             raise RuntimeError("Incomplete database migration statement")
-        db.execute("INSERT INTO schema_migrations VALUES (?,?,?)",
-                   (version, hashlib.sha256(content).hexdigest(), time.time()))
+        try:
+            recorded = db.execute("INSERT OR IGNORE INTO schema_migrations VALUES (?,?,?)",
+                                  (version, hashlib.sha256(content).hexdigest(), time.time())).rowcount
+        except sqlite3.IntegrityError:
+            # OR IGNORE 之外的约束错误：仅当该版本已由并发路径记账时才视为成功。
+            if not _ledger_has(db, version):
+                raise
+            recorded = 0
+        if not recorded:
+            # 写锁内复查已排除普通并发；走到这里说明账本行由本事务之外的路径写入
+            # （例如另一进程的 heal 补账）。迁移体已执行，不回滚、不重放。
+            LOGGER.warning("Migration %d ledger row was written by another opener; keeping its checksum",
+                           version)
