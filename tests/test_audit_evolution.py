@@ -193,6 +193,14 @@ class AuditEvolutionTest(unittest.TestCase):
             self.assertEqual(evaluated['content'], promoted[5])
             self.assertEqual(len(promoted[5]), length)
 
+    def test_mixed_trigger_types_are_identical_in_evaluated_and_promoted_skill(self):
+        proposal = {'kind': 'strategy', 'guidance': 'g', 'triggers': ['secret', 123, None, '  ']}
+        evaluated = Evolution.candidate_skill('candidate', proposal)
+        promoted = Evolution.promoted_skill('p', 'candidate', proposal, {}, 0)
+        assert promoted is not None
+        self.assertEqual(json.loads(promoted[4]), evaluated['triggers'])
+        self.assertEqual(json.loads(promoted[4]), ['secret', '  '])
+
     def test_promotion_without_retrievable_triggers_writes_no_verified_skill(self):
         """triggers 全为空的候选晋升后不写 verified 技能行，避免不可审计的检索记录。"""
         args, observed = self.setup_ablation(triggers=(), auto_promote=True)

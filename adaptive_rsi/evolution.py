@@ -1964,6 +1964,7 @@ class Evolution:
         """
         triggers = content.get("triggers", []) if isinstance(content, dict) else []
         guidance = content.get("guidance", "") if isinstance(content, dict) else ""
+        triggers = [trigger for trigger in triggers if isinstance(trigger, str)] if isinstance(triggers, list) else []
         return (uid(), project, None, "verified", encode(triggers), str(guidance)[:SKILL_CONTENT_LIMIT],
                 encode({"candidate": candidate, "config_hash": fingerprint(config)}),
                 now + 30 * 86400, now)
@@ -1977,7 +1978,7 @@ class Evolution:
         记录并污染「已验证技能数」统计；策略晋升本身不受影响。
         """
         triggers = content.get("triggers", []) if isinstance(content, dict) else []
-        if not any(isinstance(trigger, str) and trigger.strip() for trigger in triggers):
+        if not isinstance(triggers, list) or not any(isinstance(trigger, str) and trigger.strip() for trigger in triggers):
             return None
         return cls.skill_values(project, candidate, content, config, now)
 
