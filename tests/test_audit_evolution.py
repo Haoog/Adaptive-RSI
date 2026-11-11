@@ -73,6 +73,28 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertIn('status', result)
         self.assertEqual(self.calls['proposal'], 1)
 
+    def test_non_string_sources_are_excluded_and_safe_to_stratify(self):
+        from adaptive_rsi.evolution import case_stratum, select_cases
+        args = self.setup_proposal()
+        for index, source in enumerate(({'legacy': 'object'}, ['legacy'], None, 7)):
+            with self.subTest(source_type=type(source).__name__):
+                for split in ('validation', 'holdout'):
+                    row = self.store.one('SELECT spec FROM cases WHERE id=?', (split,))
+                    spec = json.loads(row['spec'])
+                    spec['source'] = source
+                    self.store.execute('UPDATE cases SET spec=? WHERE id=?', (encode(spec), split))
+
+                cases = self.evolution.eligible_cases('p', self.config['evolution']['max_holdout_uses'])
+                self.assertEqual(cases, [])
+                result = self.evolution.propose_and_evaluate(*args, force=True)
+                self.assertEqual(result['status'], 'insufficient_evidence')
+                self.assertEqual(self.calls, {'proposal': 0, 'trial': 0})
+
+                legacy = {'id': 'legacy-' + str(index), 'uses': 0,
+                          'spec': encode({'task': 'legacy task', 'source': source})}
+                self.assertEqual(case_stratum(legacy), ('unknown', 'small'))
+                self.assertEqual(select_cases([legacy], 1, 'seed'), [legacy])
+
     def test_manifest_failure_leaves_no_holdout_reservation(self):
         args = self.setup_proposal()
         with patch('adaptive_rsi.evolution.git', side_effect=RuntimeError('repository unavailable')):

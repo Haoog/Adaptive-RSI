@@ -285,7 +285,10 @@ def case_stratum(case):
     if not isinstance(task, str):
         return ("unknown", "unknown")
     length = len(task)
-    return (spec.get("source", "unknown"), "small" if length < 1000 else "medium" if length < 10000 else "large")
+    source = spec.get("source", "unknown")
+    if not isinstance(source, str):
+        source = "unknown"
+    return (source, "small" if length < 1000 else "medium" if length < 10000 else "large")
 
 
 def stratum_quotas(sizes, count):
@@ -489,6 +492,7 @@ class Evolution:
         condition = ("CASE WHEN json_valid(spec) THEN (json_type(spec)='object' "
                      "AND json_type(spec,'$.task')='text' AND json_type(spec,'$.repository')='text' "
                      "AND json_type(spec,'$.base')='text' "
+                     "AND (json_type(spec,'$.source') IS NULL OR json_type(spec,'$.source')='text') "
                      "AND (json_type(spec,'$.available') IS NULL OR (EXISTS(SELECT 1 FROM json_each(spec,'$.available')) "
                      "AND json_extract(spec,'$.available') NOT IN (0,''))) "
                      "AND (json_type(spec,'$.active') IS NULL OR (EXISTS(SELECT 1 FROM json_each(spec,'$.active')) "
