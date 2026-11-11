@@ -18,7 +18,7 @@ window.RSINativeUpdate=(()=>{
  // Every settings change gets a new revision, and every install is bound to the
  // revision it was approved under. The native side rejects a stale binding, and
  // its counter survives a webview reload, so it is adopted instead of restarted.
- let revision=0,authorizationError='',installPending=false;
+ let revision=0,authorizationError='',installPending=false,initialAuthorization=null;
  const enabled=()=>!!window.RSIDesktop;
  const preference=()=>policy;
  function adoptRevision(source){
@@ -278,6 +278,9 @@ window.RSINativeUpdate=(()=>{
  async function act(){
   if(checking||busy||!enabled()||Date.now()<retryAt)return;checking=true;
   try{
+   // Status reads must continue during startup authorization, but automatic
+   // actions must still wait for the authorization reply.
+   if(initialAuthorization)await initialAuthorization;
    const last=Number(localRead('rsi-native-update-checked')||0);
    if(preference()!=='manual'&&((failureCounts.check||0)+(failureCounts.download||0)>0||Date.now()-last>6*3600000)){
     await run('check');
@@ -339,7 +342,7 @@ window.RSINativeUpdate=(()=>{
   render();
   document.addEventListener('visibilitychange',visibilityChanged);
   pollActive=true;
-  setTimeout(()=>safe(async()=>{await syncAuthorization();await poll();}),5000);
+  setTimeout(()=>{initialAuthorization=syncAuthorization();safe(poll);},5000);
  });
  return {render,run,tick,pollDelay,poll,eligible,withinWindow,phaseOf,statusText,progressText,formatBytes,speedText,sampleSpeed,scopeText,errorText,errorCode,exportReceipt,syncAuthorization,settingsChanged,revision:()=>revision};
 })();

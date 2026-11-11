@@ -71,6 +71,45 @@ function fixture({visibility='visible',policy,respond}={}){
  };
 }
 
+test('a pending initial authorization does not block status polling or start automatic actions',async()=>{
+ let authorize;
+ const gate=new Promise(resolve=>{authorize=resolve;});
+ let bytes=0;
+ const f=fixture({respond:args=>{
+  if(args.action==='authorize')return gate;
+  if(args.action==='status')return {state:'downloading',bytes:bytes+=1000,total:100000};
+  return {state:'latest'};
+ }});
+ f.boot();
+ await f.advance(5000);
+ assert.equal(f.statusCount(),1,'the first status read does not wait for authorization');
+ await f.advance(3000);
+ assert.equal(f.statusCount(),4,'status reads continue while authorization remains pending');
+ assert.match(f.text(),/4%/);
+ assert.equal(f.button('取消').hidden,false);
+ assert.equal(f.pendingTimers(),1);
+ assert.equal(f.calls.filter(call=>['check','download','install'].includes(call.action)).length,0);
+ authorize({authorization_revision:1});
+ await f.flush();
+ assert.equal(f.pendingTimers(),1,'authorization completion does not stack timers');
+});
+
+test('automatic actions wait for the initial authorization and resume after it completes',async()=>{
+ let authorize;
+ const gate=new Promise(resolve=>{authorize=resolve;});
+ const f=fixture({respond:args=>{
+  if(args.action==='authorize')return gate;
+  if(args.action==='status')return {state:'available',version:'1.2.4',current_version:'1.2.3'};
+  return {state:'ready'};
+ }});
+ f.boot();
+ await f.advance(15000);
+ assert.equal(f.calls.filter(call=>call.action==='download').length,0);
+ authorize({authorization_revision:1});
+ await f.flush();
+ assert.equal(f.calls.filter(call=>call.action==='download').length,1,'the pending action resumes without another timer');
+});
+
 test('a settled visible client reads status on a five-minute cadence, not every second',async()=>{
  const f=fixture();
  f.boot();
