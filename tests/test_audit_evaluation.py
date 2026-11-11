@@ -273,6 +273,47 @@ class AuditEvaluationTest(unittest.TestCase):
             self.assertFalse((root / 'fresh' / 'report.json').exists())
             self.assertEqual(list(root.rglob('report.json.*')), [])
 
+    def test_report_failed_swap_preserves_referenced_output(self):
+        from unittest.mock import patch
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = 'a' * (evaluator.REPORT_STREAM_LIMIT + 1)
+            new = 'b' * (evaluator.REPORT_STREAM_LIMIT + 1)
+            evaluator.write_evaluation_report(root, {'checks': {'candidate_full': [{'stdout': old}]}})
+            report = json.loads((root / 'report.json').read_text())
+            row = report['checks']['candidate_full'][0]
+            with patch('adaptive_rsi.evaluator.os.replace', side_effect=OSError('swap failed')):
+                with self.assertRaises(OSError):
+                    evaluator.write_evaluation_report(root, {'checks': {'candidate_full': [{'stdout': new}]}})
+            self.assertEqual(hashlib.sha256((root / row['stdout_path']).read_bytes()).hexdigest(), row['stdout_sha256'])
+
+    def test_cancelled_controls_keeps_completed_evidence(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from adaptive_rsi.process import Cancelled
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            checks = [{'name': 'unit', 'argv': ['python3', 'value.py']}]
+            row = {'name': 'unit', 'argv': checks[0]['argv'], 'exit_code': 0,
+                   'stdout': 'Ran 1 test', 'stderr': '', 'passed': True}
+            store = SimpleNamespace(root=root / 'state', query=lambda *args, **kwargs: [])
+            error = Cancelled('cancelled in controls')
+            with patch.object(evaluator.Evaluator, '_standard_stage', return_value={'rows': [row]}), \
+                    patch('adaptive_rsi.evaluator.detect', return_value={'checks': []}), \
+                    patch('adaptive_rsi.evaluator.validation_controls', return_value=[{'id': 'control'}]), \
+                    patch.object(evaluator.Evaluator, 'validate_controls', side_effect=error):
+                with self.assertRaises(Cancelled) as caught:
+                    evaluator.Evaluator(store).evaluate(source, source, checks, root / 'evaluation',
+                                                        _config(), changed_files=[])
+            self.assertIs(caught.exception, error)
+            report = json.loads((root / 'evaluation' / 'report.json').read_text())
+            self.assertTrue(report['interrupted'])
+            self.assertEqual(report['reason'], 'Evaluation cancelled')
+            self.assertEqual(report['checks']['candidate_full'][0]['name'], 'unit')
+
     def test_stage_reuse_requires_explicit_opt_in(self):
         from adaptive_rsi.evaluator import checkpoint_reuse_enabled
         self.assertFalse(checkpoint_reuse_enabled(_config()))

@@ -904,6 +904,7 @@ def _report_output_location(directory, trail):
 def _bounded_report_row(row, directory, trail):
     """Copy one result row, moving oversized streams to files next to the report."""
     import hashlib
+    import uuid
     location, name = _report_output_location(directory, trail)
     item = dict(row)
     for stream, suffix in (("stdout", "out"), ("stderr", "err")):
@@ -917,8 +918,21 @@ def _bounded_report_row(row, directory, trail):
         if len(raw) <= REPORT_STREAM_LIMIT:
             continue
         location.mkdir(parents=True, exist_ok=True)
-        path = location / (name + "." + suffix)
-        path.write_bytes(raw)
+        # Publish complete, content-addressed streams without ever replacing a
+        # file referenced by an earlier report; checkpoints can reuse them.
+        path = location / (name + "." + item[stream + "_sha256"] + "." + suffix)
+        temporary = location / ("." + uuid.uuid4().hex + ".tmp")
+        try:
+            with temporary.open("xb") as output:
+                output.write(raw)
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                if hashlib.sha256(path.read_bytes()).hexdigest() != item[stream + "_sha256"]:
+                    raise OSError("Existing report output does not match its digest")
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
         item[stream] = raw[-REPORT_STREAM_LIMIT:].decode("utf-8", "replace")
         item[stream + "_path"] = path.relative_to(directory).as_posix()
     return item
@@ -1407,9 +1421,22 @@ class Evaluator:
         Early refusals and stage-ledger failures used to return without writing
         anything; one write point keeps every return inspectable.
         """
-        data = self._evaluate_stages(baseline, candidate, checks, directory, config, cancel, overlay, seeds,
-                                     acceptance, acceptance_baseline, cache_scope, cache_base,
-                                     environment_digest, test_first, test_first_kind, changed_files)
+        report_state = {"checks": {}, "execution_environment": None}
+        try:
+            data = self._evaluate_stages(baseline, candidate, checks, directory, config, cancel, overlay, seeds,
+                                         acceptance, acceptance_baseline, cache_scope, cache_base,
+                                         environment_digest, test_first, test_first_kind, changed_files,
+                                         report_state=report_state)
+        except Exception as exc:
+            try:
+                write_evaluation_report(directory, {
+                    "decision": "insufficient_evidence",
+                    "reason": "Evaluation cancelled" if isinstance(exc, Cancelled)
+                    else "Evaluation interrupted: " + str(exc),
+                    "interrupted": True, **report_state})
+            except OSError:
+                pass
+            raise
         # 取消/中断路径自己在写盘前标 true；其余出口（含早退）一律标 false。
         data.setdefault("interrupted", False)
         write_evaluation_report(directory, data)
@@ -1417,17 +1444,20 @@ class Evaluator:
 
     def _evaluate_stages(self, baseline, candidate, checks, directory, config, cancel=None, overlay=None, seeds=None,
                          acceptance=None, acceptance_baseline=None, cache_scope=None, cache_base=None,
-                         environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None):
+                         environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None,
+                         report_state=None):
         stage_stop = threading.Event()
         original_cancel = cancel
         cancel = lambda: stage_stop.is_set() or bool(original_cancel and original_cancel())
         if not checks:
             return {"decision": "insufficient_evidence",
                     "reason": "No executable acceptance checks. Configure checks before delivery.", "checks": {}}
-        results = {}
+        results = report_state["checks"] if report_state is not None else {}
         hidden = [row["path"] for row in self.store.query("SELECT path FROM projects")]
         execution_config, execution_identity = (
             self._execution_environment(config) if cache_scope and cache_base else (config, None))
+        if report_state is not None:
+            report_state["execution_environment"] = execution_identity
         if changed_files is None:
             changed_files = _changed_files(candidate)
             if changed_files is None:
@@ -1594,24 +1624,9 @@ class Evaluator:
                 # 中间快照尽力而为：磁盘满不能中止仍在产出证据的阶段。
                 interim_failures.append(type(exc).__name__ + ": " + str(exc))
 
-        try:
-            outcomes = self._run_stages(stages, 1 if acceptance and acceptance.get("change_kind") == "performance"
-                                        else int(config.get("limits", {}).get("concurrency", 1)),
-                                        stop=stage_stop, on_result=checkpoint_stage)
-        except Exception as exc:
-            # Cancellation or a failed stage: persist the finished stages, then
-            # re-raise the same exception so caller cancel semantics are kept.
-            try:
-                write_evaluation_report(directory, {
-                    "decision": "insufficient_evidence",
-                    "reason": "Evaluation cancelled" if isinstance(exc, Cancelled)
-                    else "Evaluation interrupted: " + str(exc),
-                    "interrupted": True, "checks": results,
-                    "execution_environment": execution_identity})
-            except OSError:
-                # 写盘失败不能吞掉取消/失败语义；调用方按运行工件缺失处理。
-                pass
-            raise
+        outcomes = self._run_stages(stages, 1 if acceptance and acceptance.get("change_kind") == "performance"
+                                    else int(config.get("limits", {}).get("concurrency", 1)),
+                                    stop=stage_stop, on_result=checkpoint_stage)
         for label in ["baseline", "acceptance_baseline", "candidate", "candidate_full", "acceptance_candidate"]:
             if label not in outcomes:
                 continue
