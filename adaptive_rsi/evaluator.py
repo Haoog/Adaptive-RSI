@@ -623,12 +623,17 @@ def freeze_harness(baseline, target, checks=()):
                     _harness_path(relative) or name.endswith((".csproj", ".fsproj", ".sln"))):
                 continue
             dst = target / relative
-            # Reject directory/symlink tricks before the host copies protected files.
-            for item in [dst] + list(dst.parents):
+            # Only a leaf symlink identical to the baseline is baseline-owned.
+            # Check all ancestors before unlinking it; never follow candidate links.
+            for item in list(dst.parents):
                 if item == target.parent:
                     break
                 if item.is_symlink():
                     raise RuntimeError("Candidate symlink overlaps protected harness")
+            if dst.is_symlink():
+                if not src.is_symlink() or os.readlink(dst) != os.readlink(src):
+                    raise RuntimeError("Candidate symlink overlaps protected harness")
+                dst.unlink()
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.is_dir():
                 shutil.rmtree(dst)
