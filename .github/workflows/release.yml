@@ -61,7 +61,7 @@ jobs:
   reuse:
     if: needs.prepare.outputs.mode == 'publish' && needs.prepare.outputs.artifact_run_id != ''
     needs: prepare
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 20
     permissions:
       contents: read
