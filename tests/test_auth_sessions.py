@@ -1254,6 +1254,82 @@ class AuthSessionTests(unittest.TestCase):
         self.gate.set()
         self.assertFalse((self.root / "codex/auth.json").exists())
 
+    def test_launch_thread_failure_marks_session_failed_and_frees_backend(self):
+        # 低内存下 thread.start() 会抛 RuntimeError("can't start new thread")：worker
+        # 从未运行，会话不能留在 starting 把同后端锁到 TTL 到期。
+        self.manager.ttl = 600
+
+        def refuse(_thread):
+            raise RuntimeError("can't start new thread")
+        with patch.object(threading.Thread, "start", refuse):
+            with self.assertRaises(AuthError) as caught:
+                self.manager.start("codex")
+        # AuthError 继承 RuntimeError，这里要确认真实类型而不是裸 RuntimeError。
+        self.assertIs(type(caught.exception), AuthError)
+        self.assertEqual(caught.exception.code, "auth_protocol_error")
+        [session] = self.manager.public_sessions.values()
+        self.assertEqual((session["state"], session["error"]), ("failed", "process_interrupted"))
+        self.assertEqual(self.manager.busy, 0)
+        self.assertEqual(self.created, [])
+        rows = json.loads(self.manager.file.read_text())
+        self.assertEqual((rows[session["id"]]["state"], rows[session["id"]]["error"]),
+                         ("failed", "process_interrupted"))
+        # 终态行不占名额：同一后端可以立即重新登录，不必等 TTL。
+        retry = self.manager.reserve("codex")
+        self.assertEqual(retry["state"], "starting")
+        self.assertEqual(self.manager.busy, 1)
+
+    def test_close_waits_for_registered_thread_to_start(self):
+        session = self.manager.reserve("codex")
+        entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+        original_start = threading.Thread.start
+        def delayed_start(thread):
+            if threading.current_thread() is launcher:
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test timed out")
+            return original_start(thread)
+        def launch():
+            try:
+                self.manager.launch(session["id"])
+            except Exception as exc:
+                errors.append(exc)
+        def close():
+            try:
+                self.manager.close()
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                closed.set()
+        launcher = threading.Thread(target=launch)
+        closer = threading.Thread(target=close)
+        with patch.object(threading.Thread, "start", delayed_start):
+            original_start(launcher)
+            try:
+                self.assertTrue(entered.wait(2))
+                original_start(closer)
+                self.assertFalse(closed.wait(.1))
+            finally:
+                release.set()
+                launcher.join(5)
+                if closer.ident is not None:
+                    closer.join(5)
+        self.assertTrue(closed.is_set())
+        self.assertFalse(launcher.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_launch_after_close_reports_service_closed_instead_of_starting(self):
+        session = self.manager.reserve("codex")
+        # 模拟 close() 与 launch() 的竞争：closed 已置位，该行还没被 close() 收成终态。
+        self.manager.closed = True
+        with self.assertRaises(AuthError) as caught:
+            self.manager.launch(session["id"])
+        self.assertEqual(caught.exception.code, "service_closed")
+        state = self.manager.status(session["id"])
+        self.assertEqual((state["state"], state["error"]), ("interrupted", "process_interrupted"))
+        self.assertEqual(self.created, [])
+
     def test_restart_marks_active_session_interrupted_without_restarting_cli(self):
         session = self.manager.start("codex")
         self.wait_state(session, "awaiting_authorization")
