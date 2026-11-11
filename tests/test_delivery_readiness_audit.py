@@ -186,16 +186,23 @@ class BaselineReplayTest(unittest.TestCase):
     def write_acceptance(self):
         directory = self.root / "run"
         directory.mkdir()
-        acceptance = {"hash": "acceptance-hash", "criteria": ["2 + 3 equals 5"],
+        acceptance = {"criteria": ["2 + 3 equals 5"],
                       "checks": [{"name": "independent", "argv": ["python3", "-c", "assert True"], "cwd": "."}],
                       "spec": {"files": [{"path": ".rsi-acceptance/check.py", "content": "assert True\n"}],
                                "checks": [{"name": "independent", "argv": ["python3", "-c", "assert True"],
                                            "criteria": [0]}]}}
+        acceptance["hash"] = fingerprint(acceptance["spec"])
+        acceptance["change_kind"] = "behavior"
+        acceptance["contract"] = {"kind": "behavior"}
         (directory / "acceptance.json").write_text(json.dumps(acceptance), encoding="utf-8")
         outcome = json.loads(self.run["result"])
         outcome["files"] = ["calculator.py"]
         outcome["patch_hash"] = fingerprint(git(
             self.workspace, "diff", self.run["base"], "--binary", "--no-ext-diff", "--no-textconv"))
+        outcome["evaluation"]["acceptance_hash"] = acceptance["hash"]
+        outcome["evaluation"]["criteria"] = acceptance["criteria"]
+        outcome["evaluation"]["contract"] = acceptance["contract"]
+        outcome["evaluation"]["source"] = {"test_first": False, "change_kind": "behavior"}
         self.store.execute("UPDATE runs SET path=?,result=? WHERE id=?",
                            (str(directory), encode(outcome), self.run["id"]))
         self.run = self.store.one("SELECT * FROM runs WHERE id=?", (self.run["id"],))
@@ -288,6 +295,88 @@ class BaselineReplayTest(unittest.TestCase):
         self.assertEqual(self.store.setting("run-baseline:" + self.run["id"])["sha"], self.run["base"])
         event = self.store.one("SELECT data FROM events WHERE run=? AND kind='baseline_changed' ORDER BY seq DESC LIMIT 1", (self.run["id"],))
         self.assertEqual(json.loads(event["data"])["replay"], "fixed checks or acceptance did not pass on the new baseline")
+
+    def test_replay_preserves_test_first_mode(self):
+        self.write_acceptance()
+        outcome = json.loads(self.run["result"])
+        (Path(self.run["path"]) / "acceptance.json").unlink()
+        outcome["evaluation"].pop("acceptance_hash")
+        outcome["evaluation"]["source"] = {"test_first": True, "change_kind": "bugfix"}
+        base = self.advance()
+        with patch.object(self.runtime.evaluator, "evaluate", return_value={"decision": "pass"}) as evaluator:
+            delivery.replay_on_advanced_baseline(self.runtime, self.runtime.project(self.project), self.run, self.workspace,
+                                                 outcome, self.repo, base, json.loads(self.run["config"]))
+        self.assertIs(evaluator.call_args.kwargs["test_first"], True)
+        self.assertEqual(evaluator.call_args.kwargs["test_first_kind"], "bugfix")
+        self.assertIsNone(evaluator.call_args.kwargs["acceptance"])
+
+    def test_replay_rejects_modified_acceptance_spec_or_executable_checks(self):
+        original = self.write_acceptance()
+        path = Path(self.run["path"]) / "acceptance.json"
+        outcome = json.loads(self.run["result"])
+        for field in ("spec", "checks", "criteria", "contract", "change_kind"):
+            changed = copy.deepcopy(original)
+            if field == "spec":
+                changed["spec"]["files"][0]["content"] = "assert False\n"
+            elif field == "checks":
+                changed["checks"][0]["argv"] = ["python3", "-c", "assert False"]
+            elif field == "criteria":
+                changed["criteria"] = ["different criterion"]
+            elif field == "contract":
+                changed["contract"] = {"kind": "preservation"}
+            else:
+                changed["change_kind"] = "preservation"
+            path.write_text(json.dumps(changed), encoding="utf-8")
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                delivery._replay_acceptance(self.run, self.workspace, outcome)
+
+    def test_replay_persists_changed_patch_and_verdict_before_push(self):
+        # Give the file enough unchanged context for an independent later edit.
+        original = (self.repo / "calculator.py").read_text()
+        padding = "\n" + "# padding\n" * 12
+        (self.repo / "calculator.py").write_text(original + padding)
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=t@localhost", "commit", "-qm", "long base")
+        base0 = git(self.repo, "rev-parse", "HEAD")
+        git(self.workspace, "fetch", str(self.repo), base0)
+        git(self.workspace, "reset", "--hard", base0)
+        (self.workspace / "calculator.py").write_text("def add(a,b):\n    return a+b\n" + padding)
+        git(self.workspace, "add", ".")
+        git(self.workspace, "-c", "user.name=Test", "-c", "user.email=t@localhost", "commit", "-qm", "candidate")
+        self.store.execute("UPDATE runs SET base=? WHERE id=?", (base0, self.run["id"]))
+        self.store.put_setting("run-baseline:" + self.run["id"], {**self.identity, "sha": base0})
+        self.run = self.store.one("SELECT * FROM runs WHERE id=?", (self.run["id"],))
+        self.write_acceptance()
+        destination = Path(self.run["path"]) / "candidate"
+        self.workspace.rename(destination)
+        self.workspace = destination
+        old = json.loads(self.run["result"])["patch_hash"]
+        base = self.advance("calculator.py", original + padding + "# independent change\n")
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base, "main")), \
+                patch.object(self.runtime.evaluator, "evaluate", return_value={"decision": "pass", "checks": {}}), \
+                patch("adaptive_rsi.delivery.checked", return_value="[]"), \
+                patch("adaptive_rsi.delivery.github_git", side_effect=RuntimeError("offline")):
+            with self.assertRaisesRegex(RuntimeError, "offline"):
+                self.publish()
+        row = self.store.one("SELECT base,result FROM runs WHERE id=?", (self.run["id"],))
+        saved = json.loads(row["result"])
+        replay = Path(self.store.setting("delivery-replay:" + self.run["id"])["workspace"])
+        new = fingerprint(git(replay, "diff", base, "--binary", "--no-ext-diff", "--no-textconv"))
+        self.assertNotEqual(old, new)
+        self.assertEqual(row["base"], base)
+        self.assertEqual(saved["patch_hash"], new)
+        self.assertEqual(saved["evaluation"]["decision"], "pass")
+        self.store.execute("UPDATE tasks SET state='queued' WHERE id=?", (self.approval,))
+        job = self.store.claim(self.project, self.runtime.config(self.project))
+        def command(argv, **kwargs):
+            return "[]" if argv[1:3] == ["pr", "list"] else self.url
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base, "main")), \
+                patch("adaptive_rsi.delivery.checked", side_effect=command), \
+                patch("adaptive_rsi.delivery.github_git") as push:
+            self.runtime.process(job)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (job["id"],))["state"], "completed")
+        self.assertEqual(json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (self.run["id"],))["result"])["pr"], self.url)
+        push.assert_called_once()
 
 
 class AttributionTest(unittest.TestCase):

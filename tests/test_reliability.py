@@ -537,6 +537,42 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 1)
         self.assertIn("implementation", task_feedback.summary(self.store, second["id"])["reused_stages"])
 
+    def test_rejected_replayed_patch_invalidates_original_checkpoint(self):
+        padding = "\n" + "# padding\n" * 12
+        path = self.repo / "calculator.py"
+        path.write_text(path.read_text() + padding)
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=t@localhost", "commit", "-qm", "long base")
+        task, first = self.claim()
+        invoke = self.runtime.agent.invoke
+        def preserve_padding(role, prompt, workspace, *args, **kwargs):
+            result = invoke(role, prompt, workspace, *args, **kwargs)
+            if role == "implementation":
+                target = workspace / "calculator.py"
+                target.write_text(target.read_text() + padding)
+            return result
+        with ExitStack() as stack:
+            for scenario in self.evaluation_sandbox():
+                stack.enter_context(scenario)
+            stack.enter_context(patch.object(self.runtime.agent, "invoke", side_effect=preserve_padding))
+            self.runtime.process(first)
+        old = self.saved_implementation(first)["patch_hash"]
+        path.write_text(path.read_text() + "# independent change\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=t@localhost", "commit", "-qm", "advance")
+        self.store.execute("UPDATE tasks SET state='blocked' WHERE id=?", (task,))
+        self.runtime.retry(task)
+        second = self.store.claim(self.project, self.runtime.config(self.project))
+        with ExitStack() as stack:
+            for scenario in self.evaluation_sandbox():
+                stack.enter_context(scenario)
+            stack.enter_context(patch.object(self.runtime.evaluator, "evaluate", return_value={
+                "decision": "fail", "reason": "rejected", "checks": {}}))
+            self.runtime.process(second)
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 1)
+        rows = self.store.query("SELECT data FROM stages WHERE run=? AND stage IN ('implementation','validated_candidate')", (first["id"],))
+        self.assertFalse(any(json.loads(row["data"]).get("patch_hash") == old for row in rows))
+
     def test_conflicting_new_baseline_falls_back_to_reimplementation(self):
         task, run = self.claim()
         with ExitStack() as stack:

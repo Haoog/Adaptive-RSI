@@ -367,7 +367,8 @@ def _replay_acceptance(run, workspace, outcome):
     """Load the sealed acceptance spec that must be re-executed with the patch."""
     directory = Path(run.get("path") or Path(workspace).parent)
     path = directory / "acceptance.json"
-    expected = (outcome.get("evaluation") or {}).get("acceptance_hash")
+    original_evaluation = outcome.get("evaluation") or {}
+    expected = original_evaluation.get("acceptance_hash")
     if not path.exists():
         if expected:
             raise ValueError("sealed acceptance evidence is missing")
@@ -379,7 +380,19 @@ def _replay_acceptance(run, workspace, outcome):
     if (not isinstance(acceptance, dict) or not isinstance(acceptance.get("checks"), list)
             or not isinstance(acceptance.get("spec"), dict) or not isinstance(acceptance.get("hash"), str)):
         raise ValueError("sealed acceptance evidence is invalid")
-    if expected and acceptance["hash"] != expected:
+    spec = acceptance["spec"]
+    try:
+        from .agent import SCHEMAS, validate_output
+        validate_output(spec, SCHEMAS["acceptance"])
+        checks = [{"name": check["name"], "argv": check["argv"], "cwd": "."}
+                  for check in spec["checks"]]
+    except (KeyError, TypeError, ValueError, RuntimeError):
+        raise ValueError("sealed acceptance evidence is invalid") from None
+    if (not expected or acceptance["hash"] != expected or fingerprint(spec) != expected
+            or acceptance["checks"] != checks or acceptance.get("criteria") != original_evaluation.get("criteria")
+            or not isinstance(acceptance.get("contract"), dict)
+            or acceptance["contract"] != original_evaluation.get("contract")
+            or acceptance.get("change_kind") != acceptance["contract"].get("kind")):
         raise ValueError("sealed acceptance evidence changed")
     return acceptance
 
@@ -420,6 +433,11 @@ def replay_on_advanced_baseline(runtime, project, run, workspace, outcome, sourc
     try:
         checks = _replay_checks(outcome, baseline_tree, config)
         acceptance = _replay_acceptance(run, workspace, outcome)
+        evaluation_source = (outcome.get("evaluation") or {}).get("source")
+        if (not isinstance(evaluation_source, dict) or
+                not isinstance(evaluation_source.get("test_first"), bool) or
+                not isinstance(evaluation_source.get("change_kind"), str) or not evaluation_source["change_kind"]):
+            raise ValueError("sealed evaluation mode is missing")
     except ValueError as exc:
         refuse(str(exc))
     replay = _fresh_snapshot(source, Path(str(workspace) + ".rebase"), current)
@@ -436,7 +454,8 @@ def replay_on_advanced_baseline(runtime, project, run, workspace, outcome, sourc
         evaluation = runtime.evaluator.evaluate(
             baseline_tree, replay, checks, Path(str(workspace) + ".rebase-evaluation"), config,
             cancel=lambda: runtime.is_cancelled(run), seeds=seeds if seeds.is_dir() else None,
-            acceptance=acceptance, changed_files=files)
+            acceptance=acceptance, changed_files=files, test_first=evaluation_source["test_first"],
+            test_first_kind=evaluation_source["change_kind"])
     except Cancelled:
         raise
     except Exception as exc:
@@ -444,6 +463,8 @@ def replay_on_advanced_baseline(runtime, project, run, workspace, outcome, sourc
         refuse("verification on the new baseline is unavailable")
     if not isinstance(evaluation, dict) or evaluation.get("decision") != "pass":
         refuse("fixed checks or acceptance did not pass on the new baseline")
+    replay_patch = git(replay, "diff", current, "--binary", "--no-ext-diff", "--no-textconv")
+    evaluation["source"] = {**evaluation_source, "base": current, "patch_hash": fingerprint(replay_patch)}
     return replay, evaluation
 
 
@@ -684,22 +705,23 @@ def publish(runtime, project, task, run, workspace, config, outcome=None):
                 runtime, project, run, workspace, outcome, source, current, config)
             authorize_write()
             previous = run["base"]
+            replay_hash = fingerprint(git(replay, "diff", current, "--binary", "--no-ext-diff", "--no-textconv"))
+            updated_outcome = {**outcome, "base": current, "evaluation": revalidated, "patch_hash": replay_hash,
+                               "baseline_replay": {"previous": previous, "current": current,
+                                                   "patch_hash": replay_hash}}
             with store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 row = db.execute("SELECT state FROM runs WHERE id=? AND project=?",
                                  (run["id"], project["id"])).fetchone()
                 if not row or row["state"] != "awaiting_approval":
                     raise Cancelled("Approved candidate was superseded; publishing stopped")
-                db.execute("UPDATE runs SET base=? WHERE id=?", (current, run["id"]))
+                db.execute("UPDATE runs SET base=?,result=? WHERE id=?", (current, encode(updated_outcome), run["id"]))
                 db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("run-baseline:" + run["id"], encode(
                     {"repository": repo, "branch": base_branch, "sha": current})))
                 db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("delivery-replay:" + run["id"], encode(
                     {"workspace": str(replay), "base": current})))
             run["base"] = current
-            outcome["base"] = current
-            outcome["evaluation"] = revalidated
-            outcome["baseline_replay"] = {"previous": previous, "current": current,
-                                          "patch_hash": outcome.get("patch_hash")}
+            outcome.update(updated_outcome)
             workspace = replay
             sha = prepare_head(workspace)
             check_journal(sha)
