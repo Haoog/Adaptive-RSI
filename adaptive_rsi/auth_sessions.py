@@ -419,16 +419,22 @@ class CodexAuth(_Process):
             try:
                 message = self.messages.get_nowait()
             except queue.Empty:
-                # 读线程已结束就不会再有新消息；先取空队列再判定，避免丢掉
-                # 死亡前已入队的响应。
                 if self.reader_done.is_set():
-                    raise AuthError("process_interrupted", detail={"read_end": self.read_end}) from None
-                try:
-                    message = self.messages.get(timeout=min(0.25, max(0, deadline - time.monotonic())))
-                except queue.Empty:
-                    if time.monotonic() >= deadline:
-                        raise AuthError("auth_timeout") from None
-                    continue
+                    # Producer may have enqueued between the empty check and
+                    # setting reader_done. Once set, a second check is stable.
+                    try:
+                        message = self.messages.get_nowait()
+                    except queue.Empty:
+                        raise AuthError("process_interrupted", detail={"read_end": self.read_end}) from None
+                else:
+                    try:
+                        message = self.messages.get(timeout=min(0.25, max(0, deadline - time.monotonic())))
+                    except queue.Empty:
+                        if self.reader_done.is_set():
+                            continue
+                        if time.monotonic() >= deadline:
+                            raise AuthError("auth_timeout") from None
+                        continue
             if message.get("id") == request_id:
                 if "error" in message:
                     raise AuthError("device_auth_unavailable" if method == "account/login/start" else "auth_protocol_error")
@@ -462,11 +468,15 @@ class CodexAuth(_Process):
                     message = self.messages.get_nowait()
                 except queue.Empty:
                     if self.reader_done.is_set():
-                        raise AuthError("process_interrupted", detail={"read_end": self.read_end}) from None
-                    try:
-                        message = self.messages.get(timeout=min(0.25, max(0, deadline - time.time())))
-                    except queue.Empty:
-                        continue
+                        try:
+                            message = self.messages.get_nowait()
+                        except queue.Empty:
+                            raise AuthError("process_interrupted", detail={"read_end": self.read_end}) from None
+                    else:
+                        try:
+                            message = self.messages.get(timeout=min(0.25, max(0, deadline - time.time())))
+                        except queue.Empty:
+                            continue
             if message.get("method") == "account/login/completed":
                 params = message.get("params", {})
                 if params.get("loginId") == self.login_id:

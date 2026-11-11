@@ -2631,6 +2631,27 @@ class CodexReadThreadTests(unittest.TestCase):
     def run_reader(self, worker):
         threading.Thread(target=worker._read, daemon=True).start()
 
+    def test_message_queued_between_empty_check_and_reader_done_is_consumed(self):
+        for waiting in (False, True):
+            with self.subTest(waiting=waiting):
+                worker = self.make_worker(b"")
+                worker.login_id = "login"
+                message = ({"method": "account/login/completed", "params": {"loginId": "login", "success": True}}
+                           if waiting else {"id": 1, "result": {"ok": True}})
+                original = worker.messages.get_nowait
+                def race():
+                    worker.messages.get_nowait = original
+                    worker.messages.put_nowait(message)
+                    worker.read_end = "eof"
+                    worker.reader_done.set()
+                    raise queue.Empty
+                worker.messages.get_nowait = race
+                if waiting:
+                    worker.request = lambda *args, **kwargs: {"account": {"type": "chatgpt"}}
+                    self.assertTrue(worker.wait(threading.Event(), time.time() + 1))
+                else:
+                    self.assertEqual(worker.request("account/read", {}, timeout=1), {"ok": True})
+
     def test_full_queue_is_reported_and_request_fails_fast(self):
         worker = self.make_worker(json.dumps({"params": {}}).encode() + b"\n")
         for _ in range(worker.messages.maxsize):
