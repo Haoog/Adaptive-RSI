@@ -1155,25 +1155,28 @@ window.RSIExperience = (() => {
       link.download = "adaptive-rsi-" + saved.id + ".sqlite3";
       desktopDownload(link, saved.id);
       box.append(link);
-      let checking = false, status, timer;
+      let checking = false, status, timer, deadlineTimer;
       const checkButton = action(t("验证恢复点"), async () => {
         // 全库校验可能持续数十秒到数分钟：先禁用按钮，避免重复点击占满后台操作池。
         if (checking) return;
         checking = true;
         checkButton.disabled = true;
+        if (!status) {
+          status = el("p", undefined, "muted");
+          status.setAttribute("role", "status");
+          checkButton.after(status);
+        }
+        status.textContent = t("正在验证恢复点…");
+        const controller = new AbortController();
+        let timedOut = false;
         try {
           const operation = await api("operations", {kind:"restore-check", parameters:{id:saved.id}}),
             deadline = Date.now() + restoreCheckTimeout;
-          if (!status) {
-            status = el("p", undefined, "muted");
-            status.setAttribute("role", "status");
-            checkButton.after(status);
-          }
-          status.textContent = t("正在验证恢复点…");
+          deadlineTimer = setTimeout(() => { timedOut = true; controller.abort(); }, restoreCheckTimeout);
           let current;
           do {
             await new Promise(resolve => { timer = setTimeout(resolve, 300); });
-            current = await api("operation?id=" + encodeURIComponent(operation.id));
+            current = await api("operation?id=" + encodeURIComponent(operation.id), undefined, {signal:controller.signal});
           } while (!current.ended && Date.now() < deadline);
           if (!current.ended) {
             status.textContent = t("验证未完成，请重试。");
@@ -1185,9 +1188,14 @@ window.RSIExperience = (() => {
         } catch (error) {
           // 轮询中断时保留错误提示，同时把状态行改成可重试，避免停在“正在验证”。
           if (status) status.textContent = t("验证未完成，请重试。");
+          if (timedOut) {
+            toast(status.textContent, true);
+            return;
+          }
           throw error;
         } finally {
           clearTimeout(timer);
+          clearTimeout(deadlineTimer);
           checking = false;
           checkButton.disabled = false;
         }
