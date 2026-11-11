@@ -106,7 +106,7 @@ def baseline(runtime, project, config):
         return str(cache), sha, branch
 
 
-PR_FIELDS = ("url,state,headRefOid,headRefName,headRepositoryOwner,baseRefOid,baseRefName,"
+PR_FIELDS = ("url,state,headRefOid,headRefName,headRepository,headRepositoryOwner,baseRefOid,baseRefName,"
              "mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,mergeCommit,isDraft,comments,reviews")
 # 列表页最多返回 100 条；正好满页时无法证明第 101 个受跟踪 PR 不存在，只能回退逐条精确读。
 PR_LIST_LIMIT = 100
@@ -355,67 +355,189 @@ def baseline_change(source, previous, current):
 REBASE_ATTEMPT_LIMIT = 12  # 退避曲线与关闭失败共用；上限让无果更新收敛到重排。
 
 
-def update_behind(runtime, project, run, outcome, policy, repo, now):
+def _update_pr_identity(pr, repo, base_branch, head_branch, head):
+    return (pr.get("state") == "OPEN" and pr.get("baseRefName") == base_branch and
+            pr.get("headRefName") == head_branch and pr.get("headRefOid") == head and
+            str(_dict_field(pr, "headRepository").get("nameWithOwner", "")).lower() == repo.lower() and
+            str(_dict_field(pr, "headRepositoryOwner").get("login", "")).lower() == repo.split("/")[0].lower())
+
+
+def _reconcile_branch_update(store, run, policy, repo, pr):
+    key = "delivery-update:" + run["id"]
+    intent = store.setting(key)
+    if not isinstance(intent, dict):
+        return policy, False
+    branch = intent.get("head_branch")
+    old = intent.get("old_policy")
+    new = intent.get("new_policy")
+    if (old != policy or not isinstance(new, dict) or not isinstance(branch, str) or
+            new.get("repository") != repo or new.get("branch") != policy["branch"] or
+            pr.get("state") not in ("OPEN", "MERGED") or
+            not _update_pr_identity({**pr, "state": "OPEN"}, repo, policy["branch"], branch, new.get("head"))):
+        # An old or unexpected observation is ambiguous: preserve the journal and PR.
+        return policy, True
+    with store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        live = db.execute("SELECT state FROM runs WHERE id=?", (run["id"],)).fetchone()
+        rows = {row["key"]: _json_object(row["value"]) for row in db.execute(
+            "SELECT key,value FROM settings WHERE key IN (?,?,?)",
+            (key, "delivery:" + run["id"], "run-baseline:" + run["id"]))}
+        if (not live or live["state"] != "pr_open" or rows.get(key) != intent or
+                rows.get("delivery:" + run["id"]) != old or
+                rows.get("run-baseline:" + run["id"]) !=
+                {"repository": repo, "branch": policy["branch"], "sha": policy["base"]}):
+            return policy, True
+        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("delivery:" + run["id"], encode(new)))
+        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("run-baseline:" + run["id"], encode(
+            {"repository": repo, "branch": new["branch"], "sha": new["base"]})))
+        db.execute("DELETE FROM settings WHERE key=?", (key,))
+    return new, False
+
+
+def update_behind(runtime, project, run, outcome, policy, repo, now, pr, cancelled):
     """把前进的目标分支并入候选分支并重封，保留同一个 PR 而不是关闭重排。
 
     返回新的 gate：重封为 waiting_ci；暂不宜写远端为 waiting；工作区缺失、基线
     被改写、冲突或退避用尽为 stale，交回关闭重排路径。
     """
     store = runtime.store
-    attempts, last = outcome.get("rebase_attempts"), outcome.get("rebase_retry_at")
-    if isinstance(attempts, int) and (attempts >= REBASE_ATTEMPT_LIMIT or (
-            isinstance(last, (int, float)) and now - last < _write_retry_delay(attempts))):
-        return "stale" if attempts >= REBASE_ATTEMPT_LIMIT else "waiting"
     workspace = Path(store.root) / "runs" / run["id"] / "candidate"
     if not workspace.is_dir():
+        if store.setting("delivery-update:" + run["id"]):
+            return "waiting"  # A prior push may have succeeded; preserve the PR for reconciliation.
         store.event("delivery_rebase_unavailable", "Candidate workspace is missing", project["id"], run["id"])
         return "stale"
-    config = merge(runtime.config(project["id"]), {"delivery": {"base_branch": policy["branch"]}})
-    source, current, branch = baseline(runtime, project, config)
-    change = baseline_change(source, policy["base"], current)
-    if branch != policy["branch"] or change["relation"] == "identical":
-        return "waiting"  # PR 读数尚未追上真实基线：本轮不写，下轮重判。
-    if change["relation"] != "advanced":
-        # 基线被改写：候选基于的提交已不在主线，合并没有正确结果可分叉。
-        store.event("baseline_changed", "Remote baseline rewrite invalidates the candidate",
-                    project["id"], run["id"], change)
-        return "stale"
-    attempts = (attempts if isinstance(attempts, int) else 0) + 1
-    outcome.update(rebase_attempts=attempts, rebase_retry_at=now)
-    store.execute("UPDATE runs SET result=? WHERE id=? AND state='pr_open'", (encode(outcome), run["id"]))
-    try:
-        github_git(workspace, "fetch", "--quiet", "--no-tags", "https://github.com/" + repo + ".git",
-                   "+refs/heads/" + policy["branch"] + ":refs/remotes/origin/" + policy["branch"], timeout=180)
-        # 快照是浅克隆，只取基线分支尖端算不出合并基点，因此完整取该分支历史。
-        github_git(workspace, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
-                   "merge", "--no-edit", "origin/" + policy["branch"], timeout=180)
-    except Exception as exc:
-        conflicted = (workspace / ".git" / "MERGE_HEAD").exists()
-        try:
-            git(workspace, "merge", "--abort")
-        except Exception:
-            pass
-        store.event("delivery_rebase_conflict", str(exc), project["id"], run["id"], change)
-        return "stale" if conflicted else "waiting"
-    head = git(workspace, "rev-parse", "HEAD")
-    try:
-        github_git(workspace, "push", "https://github.com/" + repo + ".git",
-                   "HEAD:refs/heads/" + policy["branch"], timeout=180)
-    except Exception:
-        return "waiting"  # 本地已合并、远端未更新：下轮重试仍是 fast-forward。
-    sealed = {"repository": repo, "branch": policy["branch"], "sha": current}
-    resealed = {"head": head, "base": current, "branch": policy["branch"], "repository": repo}
-    with store.connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        live = db.execute("SELECT state FROM runs WHERE id=?", (run["id"],)).fetchone()
-        if not live or live["state"] != "pr_open":
+    push = store.setting("delivery-push:" + run["id"])
+    head_branch = push.get("branch") if isinstance(push, dict) else None
+    if (not isinstance(head_branch, str) or not head_branch or head_branch == policy["branch"] or
+            push.get("repository") != repo or
+            not _update_pr_identity(pr, repo, policy["branch"], head_branch, policy["head"])):
+        return "waiting"
+    intent_key = "delivery-update:" + run["id"]
+    intent = store.setting(intent_key)
+    if intent:
+        if (not isinstance(intent, dict) or intent.get("old_policy") != policy or
+                intent.get("head_branch") != head_branch):
             return "waiting"
-        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("delivery:" + run["id"], encode(resealed)))
-        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("run-baseline:" + run["id"], encode(sealed)))
+        if isinstance(intent.get("new_policy"), dict):
+            if git(workspace, "rev-parse", "HEAD") != intent["new_policy"].get("head"):
+                return "waiting"
+            current = intent["new_policy"].get("base")
+        else:
+            current = intent.get("target_base")
+            if not isinstance(current, str) or not current:
+                return "waiting"
+    else:
+        attempts, last = outcome.get("rebase_attempts"), outcome.get("rebase_retry_at")
+        if isinstance(attempts, int) and (attempts >= REBASE_ATTEMPT_LIMIT or (
+                isinstance(last, (int, float)) and now - last < _write_retry_delay(attempts))):
+            return "stale" if attempts >= REBASE_ATTEMPT_LIMIT else "waiting"
+        if git(workspace, "rev-parse", "HEAD") != policy["head"] or git(workspace, "status", "--porcelain"):
+            return "waiting"
+        config = merge(runtime.config(project["id"]), {"delivery": {"base_branch": policy["branch"]}})
+        source, current, branch = baseline(runtime, project, config)
+        change = baseline_change(source, policy["base"], current)
+        if branch != policy["branch"] or change["relation"] == "identical":
+            return "waiting"
+        if change["relation"] != "advanced":
+            store.event("baseline_changed", "Remote baseline rewrite invalidates the candidate",
+                        project["id"], run["id"], change)
+            return "stale"
+        attempts = (attempts if isinstance(attempts, int) else 0) + 1
+        outcome.update(rebase_attempts=attempts, rebase_retry_at=now)
+        store.execute("UPDATE runs SET result=? WHERE id=? AND state='pr_open'", (encode(outcome), run["id"]))
+        try:
+            github_git(workspace, "fetch", "--quiet", "--no-tags", "https://github.com/" + repo + ".git",
+                       "+refs/heads/" + policy["branch"] + ":refs/remotes/origin/" + policy["branch"], timeout=180)
+            if git(workspace, "rev-parse", "refs/remotes/origin/" + policy["branch"]) != current:
+                return "waiting"
+        except Exception as exc:
+            store.event("delivery_rebase_conflict", str(exc), project["id"], run["id"], change)
+            return "waiting"
+        intent = {"head_branch": head_branch, "old_policy": policy, "target_base": current}
+        # Record the operation before changing the candidate checkout.
+        store.put_setting(intent_key, intent)
+
+    if not isinstance(intent.get("new_policy"), dict):
+        head = git(workspace, "rev-parse", "HEAD")
+        merge_head = workspace / ".git" / "MERGE_HEAD"
+        # A partially completed merge may contain user edits. Leave it intact.
+        if git(workspace, "status", "--porcelain") or merge_head.exists():
+            return "waiting"
+        if head == policy["head"]:
+            try:
+                github_git(workspace, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
+                           "merge", "--no-edit", current, timeout=180)
+            except Exception as exc:
+                conflicted = merge_head.exists()
+                try:
+                    git(workspace, "merge", "--abort")
+                except Exception:
+                    pass
+                if conflicted:
+                    store.execute("DELETE FROM settings WHERE key=?", (intent_key,))
+                store.event("delivery_rebase_conflict", str(exc), project["id"], run["id"])
+                return "stale" if conflicted else "waiting"
+            head = git(workspace, "rev-parse", "HEAD")
+        else:
+            # Verify both the parents and independently reconstructed tree; never
+            # adopt an unrelated local commit merely because a journal exists.
+            try:
+                if head == current:
+                    if git(workspace, "merge-base", policy["head"], current) != policy["head"]:
+                        return "waiting"
+                else:
+                    parents = git(workspace, "show", "-s", "--format=%P", head).split()
+                    tree = git(workspace, "merge-tree", "--write-tree", policy["head"], current).splitlines()[0]
+                    if parents != [policy["head"], current] or git(workspace, "rev-parse", head + "^{tree}") != tree:
+                        return "waiting"
+            except (RuntimeError, OSError, IndexError):
+                return "waiting"
+        intent = {"head_branch": head_branch, "old_policy": policy,
+                  "new_policy": {"head": head, "base": current, "branch": policy["branch"], "repository": repo}}
+        store.put_setting(intent_key, intent)
+
+    # Fetch/merge can take minutes. Re-read the PR and all local authority immediately
+    # before the write, with configuration changes excluded until the push returns.
+    with runtime.dispatch_lock:
+        live_project = runtime.project(project["id"])
+        live_config = runtime.config(project["id"])
+        live_run = store.one("SELECT * FROM runs WHERE id=? AND project=?", (run["id"], project["id"]))
+        task = store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))
+        newer = store.one("SELECT 1 FROM runs WHERE task=? AND (started>? OR (started=? AND id>?))",
+                          (run["task"], run["started"], run["started"], run["id"]))
+        fresh = pr_view(repo, outcome["pr"])
+        if (not live_run or live_run["state"] != "pr_open" or not task or task["state"] != "pr_open" or newer or
+                _json_object(live_run["result"]).get("pr") != outcome["pr"] or
+                not _dict_field(_json_object(live_run["config"]), "delivery").get("auto_merge") or
+                live_config["delivery"]["mode"] != "pr" or not live_config["delivery"]["auto_merge"] or
+                live_config["github"]["repository"] != repo or
+                (live_config["delivery"]["base_branch"] and live_config["delivery"]["base_branch"] != policy["branch"]) or
+                live_project["paused"] or cancelled() or
+                origin_repository(live_project["path"]).lower() != repo.lower() or
+                store.setting("delivery:" + run["id"]) != policy or
+                store.setting("run-baseline:" + run["id"]) !=
+                {"repository": repo, "branch": policy["branch"], "sha": policy["base"]} or
+                store.setting("delivery-push:" + run["id"]) != push or
+                store.setting(intent_key) != intent or
+                git(workspace, "rev-parse", "HEAD") != intent["new_policy"]["head"] or
+                git(workspace, "status", "--porcelain") or
+                not _update_pr_identity(fresh, repo, policy["branch"], head_branch, policy["head"]) or
+                fresh.get("baseRefOid") != current):
+            return "waiting"
+        store.put_setting(intent_key, intent)
+        try:
+            github_git(workspace, "push", "https://github.com/" + repo + ".git",
+                       intent["new_policy"]["head"] + ":refs/heads/" + head_branch, timeout=180)
+        except Exception:
+            return "waiting"
+    # Do not assume a successful process exit or an exception reveals remote state.
+    fresh = pr_view(repo, outcome["pr"])
+    _, pending = _reconcile_branch_update(store, run, policy, repo, fresh)
+    if pending:
+        return "waiting"
     outcome.pop("rebase_attempts", None)
     outcome.pop("rebase_retry_at", None)
-    store.event("baseline_changed", "Target branch advanced; candidate branch re-sealed",
-                project["id"], run["id"], change)
     return "waiting_ci"
 
 
@@ -1208,6 +1330,16 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                   active_run, tracking_cancelled, tick_baselines)
                 continue
             if run["state"] == "pr_open":
+                update_intent = store.setting("delivery-update:" + run["id"])
+                if isinstance(update_intent, dict):
+                    policy, pending_update = _reconcile_branch_update(store, run, policy, repo, pr)
+                    if pending_update and pr.get("state") == "OPEN" and not _update_pr_identity(
+                            pr, repo, policy["branch"], update_intent.get("head_branch"), policy["head"]):
+                        outcome["delivery_status"] = "waiting"
+                        _persist_result(store, run, outcome)
+                        continue
+                    identity = store.setting("run-baseline:" + run["id"])
+                    sealed_target = identity == {"repository": repo, "branch": policy["branch"], "sha": policy["base"]}
                 gate = merge_gate(pr, policy["head"], policy["base"])
                 if pr.get("baseRefName", policy["branch"]) != policy["branch"] or (
                         config["delivery"]["base_branch"] and config["delivery"]["base_branch"] != policy["branch"]):
@@ -1315,7 +1447,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     authorized = authorized and sealed_target
                     if gate == "behind" and authorized and not tracking_cancelled():
                         # 基线前进：先更新同一 PR 的分支再重跑检查，不再关闭重排整轮。
-                        gate = update_behind(runtime, project, run, outcome, policy, repo, now)
+                        gate = update_behind(runtime, project, run, outcome, policy, repo, now, pr, tracking_cancelled)
                     outcome["delivery_status"] = "waiting" if gate == "behind" else gate
                     if gate == "ready" and authorized and not runtime.project(project["id"])["paused"]:
                         # 同一 tick 内的就绪 run 共享一次真实 fetch：首个准入复核
