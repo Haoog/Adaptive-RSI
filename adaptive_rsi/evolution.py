@@ -2268,6 +2268,26 @@ class Evolution:
                 monitor = evidence.setdefault("monitor", {"passed": 0, "failed": 0})
                 seen = monitor.setdefault("runs", [])
                 if run["id"] in seen:
+                    # Only repair the last recorded attributable failure, and never undo
+                    # a later deliberate restoration of a candidate already rolled back.
+                    drift = evidence.get("drift")
+                    checked = monitor.get("last_checked")
+                    if (not passed and not shared and monitor.get("last_run") == run["id"]
+                            and isinstance(checked, (int, float)) and isinstance(drift, dict)
+                            and drift.get("reason") == "Attributable operational regression"):
+                        events = db.execute("SELECT data FROM events WHERE project=? AND kind='rollback' AND created>=?",
+                                            (project, checked)).fetchall()
+                        already_rolled_back = False
+                        for event in events:
+                            try:
+                                data = json.loads(event["data"] or "{}")
+                            except (TypeError, ValueError):
+                                continue
+                            if isinstance(data, dict) and data.get("candidate") == row["id"]:
+                                already_rolled_back = True
+                                break
+                        if not already_rolled_back:
+                            self._rollback_in_transaction(db, row["id"])
                     continue
                 sentinel = monitor["passed"] >= config["evolution"]["monitor_tasks"]
                 # Continue observing attributable failures indefinitely. Successful
@@ -2324,33 +2344,40 @@ class Evolution:
                                       "sampled_passed": monitor.get("sampled_passed", 0),
                                       "unbiased_pass_ratio": round(pass_ratio, 4)})
                     evidence["drift"] = drift
+                elif isinstance(evidence.get("drift"), dict) and monitor["failed"]:
+                    # Preserve historical drift details while correcting its aggregate attribution.
+                    evidence["drift"]["attribution"] = attribution
                 db.execute("UPDATE candidates SET evidence=? WHERE id=? AND status='stable'", (encode(evidence), row["id"]))
-            if not passed and not shared:
-                self.rollback(row["id"])
+                if not passed and not shared:
+                    self._rollback_in_transaction(db, row["id"])
+
+    @staticmethod
+    def _rollback_in_transaction(db, candidate):
+        row = db.execute("SELECT * FROM candidates WHERE id=?", (candidate,)).fetchone()
+        if not row:
+            raise ValueError("Candidate not found")
+        if row["status"] == "rolled_back":
+            return
+        if row["status"] != "stable":
+            raise ValueError("Only an active strategy can be rolled back")
+        db.execute("UPDATE candidates SET status='rolled_back' WHERE id=?", (candidate,))
+        if row["parent"]:
+            db.execute("UPDATE candidates SET status='stable' WHERE id=?", (row["parent"],))
+        for skill in db.execute("SELECT id,evidence FROM skills WHERE project=? AND status='verified'", (row["project"],)).fetchall():
+            try:
+                skill_evidence = json.loads(skill["evidence"] or "{}")
+            except (TypeError, ValueError):
+                skill_evidence = {}
+            if isinstance(skill_evidence, dict) and skill_evidence.get("candidate") == candidate:
+                db.execute("UPDATE skills SET status='invalidated' WHERE id=?", (skill["id"],))
+        db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                   (row["project"], None, "rollback", "Restored previous stable strategy and invalidated its learned skill",
+                    encode({"candidate": candidate}), time.time()))
 
     def rollback(self, candidate):
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM candidates WHERE id=?", (candidate,)).fetchone()
-            if not row:
-                raise ValueError("Candidate not found")
-            if row["status"] == "rolled_back":
-                # 重复回滚是幂等操作；监控线程与用户操作并发时不产生误导性错误事件。
-                return
-            if row["status"] != "stable":
-                raise ValueError("Only an active strategy can be rolled back")
-            db.execute("UPDATE candidates SET status='rolled_back' WHERE id=?", (candidate,))
-            if row["parent"]:
-                db.execute("UPDATE candidates SET status='stable' WHERE id=?", (row["parent"],))
-            # Roll back learned instructions as well as the strategy pointer.
-            for skill in db.execute("SELECT id,evidence FROM skills WHERE project=? AND status='verified'", (row["project"],)).fetchall():
-                try:
-                    skill_evidence = json.loads(skill["evidence"] or "{}")
-                except (TypeError, ValueError):
-                    skill_evidence = {}
-                if isinstance(skill_evidence, dict) and skill_evidence.get("candidate") == candidate:
-                    db.execute("UPDATE skills SET status='invalidated' WHERE id=?", (skill["id"],))
-        self.store.event("rollback", "Restored previous stable strategy and invalidated its learned skill", row["project"], data={"candidate": candidate})
+            self._rollback_in_transaction(db, candidate)
 
 
 reproduce_bundle = Evolution.reproduce_bundle
