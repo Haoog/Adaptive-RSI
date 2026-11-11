@@ -801,7 +801,7 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
  let firstPage;try{firstPage=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');}catch(error){if(ticket!==detailSequence||projectId!==project)return;
   // 登录失效要重新进入控制台，保留原有提示，不在详情里诱导反复重试。
   if(error.code==='session_required')throw error;
-  const failed=el('section',undefined,'detail-section'),retry=action(t('重试'),()=>showTask(task,restoreView,queueDraft),'text-button');
+  const failed=el('section',undefined,'detail-section'),retry=action(t('重试'),()=>showTask(task,restoreView),'text-button');
   failed.append(el('h3',t('检查过程与运行记录')),el('p',t('运行记录加载失败。'),'form-error'),retry);body.append(failed);return;}
  if(ticket!==detailSequence||projectId!==project)return;
  // 响应为分页信封；同时接受旧服务端的裸数组，避免升级期间把历史区显示为空。
@@ -894,7 +894,7 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
       fold:submitted.repeat===''?undefined:Number(submitted.repeat)});
      const saved=draftStore.get('task-schedule',task.id);
      if(saved&&saved.time===submitted.time&&saved.zone===submitted.zone&&saved.repeat===submitted.repeat)draftStore.remove('task-schedule',task.id);
-     toast(t('预约已保存'));closeTaskDetail();await refresh();},'button primary'));
+     toast(t('预约已保存'));if(stillCurrent())closeTaskDetail();await refresh();},'button primary'));
    secondary.append(el('summary',t('安排检查')),scheduleBox);}
   body.append(secondary);}
  restoreView?.(body);

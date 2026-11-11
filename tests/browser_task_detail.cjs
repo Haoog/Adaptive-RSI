@@ -280,6 +280,31 @@ async function checkTaskDetail(browser, url, errors) {
     await budgetRetry.click();
     assert.equal((await budgetResponse).status(), 200);
     await page.locator('#detail-body .badge').filter({ hasText: '排队中' }).waitFor({ timeout: 10000 });
+    // Hold a real successful schedule acknowledgement while opening another task.
+    await page.locator('.task-secondary-actions > summary').first().click();
+    const schedule = page.locator('.task-schedule-editor');
+    await schedule.getByLabel('本地时间').fill('2035-01-01T12:00');
+    await schedule.getByLabel('时区').fill('UTC');
+    let release, committed;
+    const gate = new Promise(resolve => { release = resolve; });
+    const arrived = new Promise(resolve => { committed = resolve; });
+    const holdSchedule = async route => {
+      const response = await route.fetch();
+      assert.equal(response.status(), 200, await response.text());
+      committed(); await gate; await route.fulfill({response});
+    };
+    await page.route('**/api/task/schedule-time', holdSchedule);
+    try {
+      await schedule.getByRole('button', {name: '预约', exact: true}).click();
+      await arrived;
+      await openDetail(page, '过时详情任务', 'history');
+      const acknowledged = page.waitForResponse(response => new URL(response.url()).pathname === '/api/task/schedule-time');
+      release(); await acknowledged;
+      await page.locator('#toast').filter({hasText: '预约已保存'}).waitFor();
+      assert.equal(await page.locator('#detail-dialog').evaluate(dialog => dialog.open), true,
+        'an older schedule acknowledgement must not close another task');
+      assert.equal(await page.locator('#detail-title').textContent(), '过时详情任务');
+    } finally { release(); await page.unroute('**/api/task/schedule-time', holdSchedule); }
     await closeDetail(page);
 
     // ---------- 4) 过时任务详情内可重试 ----------
