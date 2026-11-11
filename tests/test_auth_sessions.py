@@ -1582,6 +1582,50 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual(len(self.manager.threads), 0)
         self.manager.close()  # 必须幂等通过，不因泄漏线程抛错
 
+    def test_close_does_not_join_registered_but_unstarted_thread(self):
+        # 固定「已登记、尚未 start」的窗口：阻塞 Thread.start，让 close() 在线程
+        # 真正启动前尝试取 threads 快照。join 未启动线程会抛 RuntimeError，
+        # 进而中断 Runtime._close() 的后续阶段，因此 close() 不能看到该窗口。
+        real_start = threading.Thread.start
+        entered, release, ran = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+
+        def blocked_start(thread):
+            if thread in self.manager.threads:
+                entered.set()
+                self.assertTrue(release.wait(5), "start() 未被放行")
+            real_start(thread)
+
+        def start_worker():
+            try:
+                self.manager._thread(ran.set)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def close_manager():
+            try:
+                self.manager.close()
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(threading.Thread, "start", blocked_start):
+            starter = threading.Thread(target=start_worker, daemon=True)
+            starter.start()
+            self.assertTrue(entered.wait(2), "登记后的线程未进入 start()")
+            closer = threading.Thread(target=close_manager, daemon=True)
+            closer.start()
+            deadline = time.monotonic() + 2
+            while not self.manager.closed and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertTrue(self.manager.closed, "close() 未置位 closed")
+            release.set()
+            starter.join(3)
+            closer.join(3)
+        # start() 已放行的线程可以执行一次，但不能让关闭流程抛错。
+        self.assertEqual(errors, [])
+        self.assertTrue(ran.wait(2))
+        self.assertEqual(self.manager.threads, set())
+
     def test_launch_rejects_unknown_or_terminal_sessions(self):
         with self.assertRaisesRegex(AuthError, "unknown_session"):
             self.manager.launch("missing")
