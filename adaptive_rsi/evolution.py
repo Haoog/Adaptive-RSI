@@ -2283,9 +2283,17 @@ class Evolution:
                 if sentinel:
                     monitor["success_sample_rate"] = success_rate
                 monitor["passed" if passed else "failed"] += 1
-                monitor["attribution"] = "shared" if shared else "single"
                 if not passed and shared:
                     monitor["shared_failed"] = monitor.get("shared_failed", 0) + 1
+                # Attribution describes the cumulative failures, not just the latest run.
+                shared_failed = monitor.get("shared_failed", 0)
+                if shared_failed:
+                    attribution = "shared" if shared_failed == monitor["failed"] else "mixed"
+                elif monitor["failed"]:
+                    attribution = "single"
+                else:
+                    attribution = "shared" if shared else "single"
+                monitor["attribution"] = attribution
                 if sentinel and passed:
                     monitor["sampled_passed"] = monitor.get("sampled_passed", 0) + 1
                 monitor["last_run"] = run["id"]
@@ -2310,7 +2318,7 @@ class Evolution:
                         reason = "Observed pass ratio below 0.8"
                     drift = {"state": "watch", "phase": monitor["phase"], "reason": reason,
                              "passed": monitor["passed"], "failed": monitor["failed"],
-                             "attribution": "shared" if shared else "single"}
+                             "attribution": attribution}
                     if sentinel:
                         drift.update({"sampled": True, "success_sample_rate": success_rate,
                                       "sampled_passed": monitor.get("sampled_passed", 0),

@@ -491,6 +491,41 @@ class AuditEvolutionTest(unittest.TestCase):
         event = self.store.one("SELECT data FROM events WHERE kind='strategy_inconclusive'")
         self.assertEqual(json.loads(event['data'])['attribution'], 'shared')
 
+    def test_shared_failure_attribution_survives_later_single_success(self):
+        self.candidate({'monitor': {'passed': 0, 'failed': 0}})
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                           ('a', 'p', 'adapter', 'stable', encode({'guidance': 'adapter', 'triggers': []}),
+                            encode({'monitor': {'passed': 0, 'failed': 0}}), 2))
+        for run_id, candidates in [('shared-failure', ['c', 'a']), ('single-success', ['c'])]:
+            self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                               (run_id, 'p', encode([{'id': cid} for cid in candidates]), encode({})))
+        self.evolution.monitor('p', False, {'id': 'shared-failure'}, attributable=True)
+        self.evolution.monitor('p', True, {'id': 'single-success'})
+        row = self.store.one('SELECT status,evidence FROM candidates WHERE id=?', ('c',))
+        evidence = json.loads(row['evidence'])
+        self.assertEqual(row['status'], 'stable')
+        self.assertEqual((evidence['monitor']['passed'], evidence['monitor']['failed']), (1, 1))
+        self.assertEqual(evidence['monitor']['shared_failed'], 1)
+        self.assertEqual(evidence['monitor']['attribution'], 'shared')
+        self.assertEqual(evidence['drift']['attribution'], 'shared')
+
+    def test_mixed_failures_keep_aggregate_attribution_and_single_rollback(self):
+        self.candidate({'monitor': {'passed': 0, 'failed': 0}})
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                           ('a', 'p', 'adapter', 'stable', encode({'guidance': 'adapter', 'triggers': []}),
+                            encode({'monitor': {'passed': 0, 'failed': 0}}), 2))
+        for run_id, candidates in [('shared-failure', ['c', 'a']), ('single-failure', ['c'])]:
+            self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                               (run_id, 'p', encode([{'id': cid} for cid in candidates]), encode({})))
+            self.evolution.monitor('p', False, {'id': run_id}, attributable=True)
+        row = self.store.one('SELECT status,evidence FROM candidates WHERE id=?', ('c',))
+        evidence = json.loads(row['evidence'])
+        self.assertEqual(row['status'], 'rolled_back')
+        self.assertEqual(evidence['monitor']['failed'], 2)
+        self.assertEqual(evidence['monitor']['shared_failed'], 1)
+        self.assertEqual(evidence['monitor']['attribution'], 'mixed')
+        self.assertEqual(evidence['drift']['attribution'], 'mixed')
+
     def feed_passing_runs(self, ids):
         for run_id in ids:
             self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
