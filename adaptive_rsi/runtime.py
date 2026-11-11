@@ -2116,14 +2116,13 @@ class Runtime(Maintenance):
         finally:
             try:
                 row = self.store.one('SELECT state,ended FROM runs WHERE id=?', (run['id'],))
+                # 只有中断会交接给下一次尝试；其他终态视为本轮已结案。
+                keep = bool(row) and (row['ended'] is None or row['state'] == 'interrupted')
             except Exception:
-                # 读不到 run 行就无法判定交接：按已结案结算，保证 _save_stage_budget
-                # 仍执行且 finally 不掩盖真正的失败原因。
+                # 状态未知时保留消耗；下次载入会按归属 run 的实际状态丢弃已结案残留。
                 logging.getLogger(__name__).warning(
                     'Could not read run state for stage budget %s', run.get('id'), exc_info=True)
-                row = None
-            # 只有中断会交接给下一次尝试；其他终态（含 deadline 阻塞）视为本轮已结案。
-            keep = bool(row) and (row['ended'] is None or row['state'] == 'interrupted')
+                keep = True
             with _clock_lock(run):
                 self._save_stage_budget(run, time.monotonic(), keep)
 

@@ -368,6 +368,40 @@ class RuntimeHandoffTest(unittest.TestCase):
         # 失败后的新尝试从满额度起算，残留键在载入时已被丢弃。
         self.assertEqual(observed, [{'preparation': 0.0, 'evaluation': 0.0}, None])
 
+    def test_unknown_final_state_preserves_budget_until_owner_can_be_checked(self):
+        for final_state in ('interrupted', 'failed'):
+            with self.subTest(final_state=final_state):
+                task, run = self.claim()
+                clock = [1000.0]
+                original_one = self.store.one
+                failed_reads = []
+
+                def finish(current):
+                    clock[0] += 60.0
+                    self.store.execute('UPDATE runs SET state=?,ended=? WHERE id=?',
+                                       (final_state, time.time(), current['id']))
+
+                def fail_final_read(sql, *args, **kwargs):
+                    if sql == 'SELECT state,ended FROM runs WHERE id=?' and args[0] == (run['id'],):
+                        failed_reads.append(sql)
+                        raise sqlite3.OperationalError('database is locked')
+                    return original_one(sql, *args, **kwargs)
+
+                with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]), \
+                     patch.object(self.runtime, '_process', side_effect=finish), \
+                     patch.object(self.store, 'one', side_effect=fail_final_read):
+                    self.runtime.process(run)
+                self.assertEqual(len(failed_reads), 1)
+                key = 'stage-budget:' + task
+                self.assertEqual(self.store.setting(key),
+                                 {'preparation': 60.0, 'evaluation': 0.0, 'run': run['id']})
+                loaded = self.runtime._load_stage_budget({'task': task, 'id': 'next-attempt'})
+                expected = 60.0 if final_state == 'interrupted' else 0.0
+                self.assertEqual(loaded, {'preparation': expected, 'evaluation': 0.0})
+                if final_state == 'failed':
+                    self.assertIsNone(self.store.setting(key))
+                self.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (task,))
+
     def test_unreadable_stage_budget_closes_run_and_releases_the_project(self):
         """预算读失败不能把 run 钉在 planning：该项目的普通任务否则全被冻到重启。"""
         task, run = self.claim()
