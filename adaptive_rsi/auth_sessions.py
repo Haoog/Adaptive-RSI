@@ -963,6 +963,8 @@ class AuthSessions:
         self.closed = False
         # close() 期间状态文件写失败时保留首个异常，供排查；不向调用方抛出。
         self._close_error = None
+        # 构造时整理旧文件的写盘失败（只读目录、磁盘满）只记录，不阻断服务启动。
+        self._persist_error = None
         self.shutdown = threading.Event()
         self.ttl = ttl
         self.config = config
@@ -997,7 +999,13 @@ class AuthSessions:
                     item.update(state="interrupted", error="process_interrupted")
                 self.sessions[session_id] = item
         if previous:
-            self._persist()
+            try:
+                self._persist()
+            except OSError as exc:
+                # 状态目录只读/磁盘满时原文件仍完好：保留已加载会话继续启动，
+                # 等目录恢复可写后由下一次 reserve/_update 正常落盘。
+                self._persist_error = exc
+                self._publish_sessions()
         else:
             self._publish_sessions()
 
@@ -1353,18 +1361,18 @@ class AuthSessions:
                     self.threads.discard(threading.current_thread())
         thread = threading.Thread(target=run, daemon=True)
         with self.threads_lock:
-            # 与 close() 的 closed 置位+快照同锁：先于 start() 登记，让 close() 能看到
-            # 即将启动的线程；已关闭时不再启动新线程。start 失败则摘除，否则 close()
-            # 会对一个从未启动的线程 join() 而抛 RuntimeError。
+            # 登记与 start() 必须同锁原子完成：只有已经启动的线程才会留在
+            # self.threads 里，close() 在 threads_lock 下取到的快照因此不会包含
+            # 未启动线程（对其 join() 会抛 RuntimeError 并中断整段关闭流程）。
+            # 已关闭时不再启动新线程；start 失败则摘除登记。
             if self.closed:
                 return
             self.threads.add(thread)
-        try:
-            thread.start()
-        except BaseException:
-            with self.threads_lock:
+            try:
+                thread.start()
+            except BaseException:
                 self.threads.discard(thread)
-            raise
+                raise
 
     def start(self, backend, provider=None, method=0, inputs=None):
         """reserve + launch 的便捷组合；更新准入场景在临界区内只调用 reserve。
@@ -1855,8 +1863,9 @@ class AuthSessions:
                         self._terminate(item, state="interrupted", error="process_interrupted")
                         self._publish_sessions()
             self._close_error = first_error
-            # closed 已在上面置位；此后 _thread() 不再启动新线程，这里只需在
-            # threads_lock 下取快照，避免漏掉刚登记、尚未 start 的线程。
+            # closed 已在上面置位；此后 _thread() 不再启动新线程。快照在
+            # threads_lock 下取，且 _thread() 的登记与 start() 同锁完成，
+            # 因此这里只会拿到已启动的线程，join() 不会抛 RuntimeError。
             with self.threads_lock:
                 threads = list(self.threads)
         for worker, stop in workers:
