@@ -534,6 +534,52 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='c'")['status'], 'rolled_back')
         self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='rollback'")), 1)
 
+    def test_historical_drift_converges_on_duplicate_monitor_run(self):
+        self.candidate({'monitor': {'passed': 4, 'failed': 1, 'shared_failed': 1,
+                                    'runs': ['success'], 'attribution': 'shared'},
+                        'drift': {'state': 'watch', 'attribution': 'single', 'reason': 'historic'}})
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('success', 'p', encode([{'id': 'c'}]), '{}'))
+        self.evolution.monitor('p', True, {'id': 'success'})
+        evidence = json.loads(self.store.one("SELECT evidence FROM candidates WHERE id='c'")['evidence'])
+        self.assertEqual(evidence['drift']['attribution'], 'shared')
+        self.assertEqual(evidence['monitor']['passed'], 4)
+
+    def test_duplicate_monitor_repairs_mixed_attribution_atomically(self):
+        import sqlite3
+        evidence = {'monitor': {'passed': 2, 'failed': 3, 'shared_failed': 1,
+                                'runs': ['success'], 'attribution': 'single'},
+                    'drift': {'state': 'watch', 'attribution': 'single', 'reason': 'historic'}}
+        self.candidate(evidence)
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('success', 'p', encode([{'id': 'c'}]), '{}'))
+        self.store.execute("CREATE TRIGGER reject_attribution BEFORE UPDATE OF evidence ON candidates "
+                           "BEGIN SELECT RAISE(ABORT,'injected'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'injected'):
+            self.evolution.monitor('p', True, {'id': 'success'})
+        row = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+        self.assertEqual(json.loads(row['evidence']), evidence)
+        self.store.execute('DROP TRIGGER reject_attribution')
+        self.evolution.monitor('p', True, {'id': 'success'})
+        self.evolution.monitor('p', True, {'id': 'success'})
+        row = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+        repaired = json.loads(row['evidence'])
+        self.assertEqual(repaired['monitor']['attribution'], 'mixed')
+        self.assertEqual(repaired['drift']['attribution'], 'mixed')
+        self.assertEqual((repaired['monitor']['passed'], repaired['monitor']['failed']), (2, 3))
+        self.assertEqual(repaired['drift']['reason'], 'historic')
+
+    def test_duplicate_monitor_does_not_infer_attribution_from_inconsistent_counts(self):
+        evidence = {'monitor': {'passed': 2, 'failed': 1, 'shared_failed': 2,
+                                'runs': ['success'], 'attribution': 'single'},
+                    'drift': {'state': 'watch', 'attribution': 'single', 'reason': 'historic'}}
+        self.candidate(evidence)
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('success', 'p', encode([{'id': 'c'}]), '{}'))
+        self.evolution.monitor('p', True, {'id': 'success'})
+        row = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+        self.assertEqual(json.loads(row['evidence']), evidence)
+
     def test_historical_drift_attribution_is_corrected_above_threshold(self):
         self.config['evolution']['monitor_tasks'] = 10
         self.candidate({'monitor': {'passed': 4, 'failed': 1, 'shared_failed': 1, 'runs': [], 'attribution': 'single'},

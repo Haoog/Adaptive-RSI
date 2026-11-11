@@ -12,7 +12,7 @@ LOGGER = logging.getLogger(__name__)
 SCRIPTS = ((3, "003_seal_bootstrap.sql"), (4, "004_revision_snapshots.sql"),
            (5, "005_task_group_lineage.sql"), (6, "006_dependency_dag.sql"),
            (7, "007_call_prices.sql"), (8, "008_intervention_history_index.sql"),
-           (9, "009_open_runs_index.sql"))
+           (9, "009_open_runs_index.sql"), (10, "010_failure_monitor_outbox.sql"))
 
 # _bootstrap() 的建表 DDL：executescript 会隐式提交，与后续补列/数据迁移事务分离，
 # 进程可能在两者之间中断。提取为常量供 Store 复用，也让回归测试能直接构造
@@ -137,6 +137,8 @@ EVIDENCE = {
         lambda db, tables, indexes: "events_intervention_task" in indexes),
     9: ("partial index open_runs on runs(project) where ended is null",
         lambda db, tables, indexes: "open_runs" in indexes),
+    10: ("table failure_monitor_outbox and its ordering index",
+         lambda db, tables, indexes: "failure_monitor_outbox" in tables and "failure_monitor_outbox_order" in indexes),
 }
 
 

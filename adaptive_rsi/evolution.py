@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import json
 import math
@@ -2226,28 +2227,30 @@ class Evolution:
             return None
         return digest.hexdigest()
 
-    def monitor(self, project, passed, run=None, attributable=False):
-        config = self.runtime.config(project)
+    def monitor(self, project, passed, run=None, attributable=False, db=None, config=None):
+        if config is None:
+            config = self.runtime.config(project)
         if not run or not (passed or attributable):
             return
-        recorded = self.store.one("SELECT strategy,config FROM runs WHERE id=? AND project=?", (run["id"], project))
-        if not recorded:
-            return
-        active = {c["id"] for c in json.loads(recorded["strategy"] or "[]") if c.get("id")}
-        # 一次运行可能同时覆盖多个 kind 各自晋升的候选（如 strategy 与 adapter）。
-        # 这类失败仍要计入监控与 drift，但无法归因到单个候选，因此只观察、不自动回滚。
-        shared = len(active) > 1
-        if not passed and len(active) != 1:
-            event = {"strategies": sorted(active)}
-            if shared:
-                event["attribution"] = "shared"
-            self.store.event("strategy_inconclusive", "Regression cannot be attributed to a single strategy; no automatic rollback",
-                             project, run["id"], event)
-        for row in self.store.query("SELECT * FROM candidates WHERE project=? AND status='stable'", (project,)):
-            if row["id"] not in active:
-                continue
-            with self.store.connect() as db:
+        with (contextlib.nullcontext(db) if db is not None else self.store.connect()) as db:
+            if not db.in_transaction:
                 db.execute("BEGIN IMMEDIATE")
+            recorded = db.execute("SELECT strategy,config FROM runs WHERE id=? AND project=?", (run["id"], project)).fetchone()
+            if not recorded:
+                return
+            active = {c["id"] for c in json.loads(recorded["strategy"] or "[]") if c.get("id")}
+            shared = len(active) > 1
+            if not passed and len(active) != 1:
+                event = {"strategies": sorted(active)}
+                if shared:
+                    event["attribution"] = "shared"
+                db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                           (project, run["id"], "strategy_inconclusive",
+                            "Regression cannot be attributed to a single strategy; no automatic rollback",
+                            encode(event), time.time()))
+            for row in db.execute("SELECT * FROM candidates WHERE project=? AND status='stable'", (project,)).fetchall():
+                if row["id"] not in active:
+                    continue
                 current = db.execute("SELECT evidence FROM candidates WHERE id=? AND status='stable'", (row["id"],)).fetchone()
                 if not current:
                     continue
@@ -2268,6 +2271,19 @@ class Evolution:
                 monitor = evidence.setdefault("monitor", {"passed": 0, "failed": 0})
                 seen = monitor.setdefault("runs", [])
                 if run["id"] in seen:
+                    # Aggregate counts prove the attribution even when this run was
+                    # already counted. Do not infer it from a truncated run list.
+                    failed = monitor.get("failed")
+                    shared_failed = monitor.get("shared_failed")
+                    drift = evidence.get("drift")
+                    if (type(failed) is int and type(shared_failed) is int
+                            and failed > 0 and 0 < shared_failed <= failed):
+                        attribution = "shared" if shared_failed == failed else "mixed"
+                        monitor["attribution"] = attribution
+                        if isinstance(drift, dict):
+                            drift["attribution"] = attribution
+                        db.execute("UPDATE candidates SET evidence=? WHERE id=? AND status='stable'",
+                                   (encode(evidence), row["id"]))
                     # Only repair the last recorded attributable failure, and never undo
                     # a later deliberate restoration of a candidate already rolled back.
                     drift = evidence.get("drift")

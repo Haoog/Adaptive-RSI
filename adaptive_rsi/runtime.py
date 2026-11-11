@@ -1394,6 +1394,7 @@ class Runtime(Maintenance):
                 self.maintenance_async()
                 with self.scheduler_scope('postprocess'):
                     self.drain_postprocess()
+                self.drain_failure_monitors()
                 for future in tuple(self.futures):
                     if future.done():
                         with self._futures_lock:
@@ -2345,8 +2346,8 @@ class Runtime(Maintenance):
             delay = min(FAILURE_BACKOFF_MAX_SECONDS, 60 * 2 ** attempts)
             # run 保留失败证据，任务与退避同事务回队，依赖清理看不到临时 failed。
             task_fields = {"state": "queued", "available": time.time() + delay}
-        transitioned = self.store.transition(run["id"], state, result, True, task_fields=task_fields)
-        if state == "failed" and transitioned and self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"] == "failed":
+        regression = False
+        if state == "failed":
             checks = (result.get("evaluation") or {}).get("checks") or {}
             candidate_rows = checks.get("candidate_full") or checks.get("candidate") or []
             candidate_by_id = {
@@ -2360,6 +2361,9 @@ class Runtime(Maintenance):
                 for old in baseline_rows
                 if isinstance(old, dict) and check_identity(old) in candidate_by_id
             )
+        transitioned = self.store.transition(run["id"], state, result, True, task_fields=task_fields,
+                                             failure_monitor=regression if state == "failed" else None)
+        if state == "failed" and transitioned and self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"] == "failed":
             self.monitor_strategy(run["project"], False, run, attributable=regression)
         if retry and transitioned and self.store.one("SELECT state FROM tasks WHERE id=?", (task["id"],))["state"] == "queued":
             self.store.event("retry", "Fresh run scheduled with bounded backoff", run["project"], run["id"])
@@ -2710,7 +2714,41 @@ class Runtime(Maintenance):
 
     def monitor_strategy(self, project, passed, run=None, attributable=False):
         from .evolution import Evolution
+        if not passed and run and self.store.one("SELECT 1 FROM runs WHERE id=? AND state='failed' AND ended IS NOT NULL", (run["id"],)):
+            self._consume_failure_monitor(run["id"])
+            return
         Evolution(self).monitor(project, passed, run, attributable)
+
+    def _consume_failure_monitor(self, run_id):
+        from .evolution import Evolution
+        pending = self.store.one("SELECT project FROM failure_monitor_outbox WHERE run=?", (run_id,))
+        if not pending:
+            return
+        config = self.config(pending["project"])
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            pending = db.execute("SELECT * FROM failure_monitor_outbox WHERE run=?", (run_id,)).fetchone()
+            if pending:
+                Evolution(self).monitor(pending["project"], False, {"id": run_id},
+                                        bool(pending["attributable"]), db=db, config=config)
+                db.execute("DELETE FROM failure_monitor_outbox WHERE run=?", (run_id,))
+
+    def drain_failure_monitors(self):
+        # Rotate past failed entries so a full batch of persistent errors cannot
+        # prevent later runs from being monitored. Restart begins at the oldest.
+        cursor = getattr(self, "_failure_monitor_cursor", None)
+        pending_rows = self.store.query(
+            "SELECT run,project,created FROM failure_monitor_outbox "
+            "WHERE (? IS NULL OR (created,run)>(?,?)) ORDER BY created,run LIMIT 100",
+            (cursor[0], cursor[0], cursor[1]) if cursor else (None, None, None))
+        if not pending_rows and cursor:
+            self._failure_monitor_cursor = None
+            pending_rows = self.store.query(
+                "SELECT run,project,created FROM failure_monitor_outbox ORDER BY created,run LIMIT 100")
+        for pending in pending_rows:
+            with self.scheduler_scope("failure_monitor", pending["project"], pending["run"]):
+                self._consume_failure_monitor(pending["run"])
+            self._failure_monitor_cursor = (pending["created"], pending["run"])
 
     def rollback_strategy(self, candidate):
         from .evolution import Evolution
