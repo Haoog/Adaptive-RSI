@@ -97,7 +97,8 @@ class BaselineAndCleanupTest(unittest.TestCase):
         first = [{'name': 'feature-%d' % i, 'commit': {'sha': 'b' * 40}} for i in range(100)]
         second = [{'name': 'fix/rsi-0123456789abcdef', 'commit': {'sha': 'a' * 40}}]
         second += [{'name': 'feature-b-%d' % i, 'commit': {'sha': 'c' * 40}} for i in range(19)]
-        pulls = [[{'state': 'closed', 'head': {'ref': 'fix/rsi-0123456789abcdef', 'sha': 'a' * 40}}]]
+        pulls = [[{'state': 'closed', 'head': {'ref': 'fix/rsi-0123456789abcdef', 'sha': 'a' * 40,
+                                                 'repo': {'full_name': 'example/project'}}}]]
         calls = {}
         with patch.object(release, 'api', side_effect=cleanup_api([first, second], pulls, calls)):
             result = delivery.branch_cleanup_preview('example/project', recovery_refs=set())
@@ -108,6 +109,16 @@ class BaselineAndCleanupTest(unittest.TestCase):
         self.assertFalse(result['deletion_performed'])
         self.assertEqual(calls['branches'], [1, 2])
         self.assertEqual(calls['pulls'], [1])
+
+    def test_cleanup_preview_does_not_accept_fork_or_unknown_repo_as_ownership(self):
+        branches = [{'name': 'fix/rsi-same', 'commit': {'sha': 'same'}}]
+        for repo in ({'full_name': 'fork/project'}, None, {}):
+            with self.subTest(repo=repo):
+                pulls = [{'state': 'closed', 'head': {'ref': 'fix/rsi-same', 'sha': 'same', 'repo': repo}}]
+                with patch.object(release, 'api', side_effect=cleanup_api([branches], [pulls], {})):
+                    result = delivery.branch_cleanup_preview('example/project', recovery_refs=set())
+                self.assertEqual(result['candidates'], [])
+                self.assertEqual(result['protected'][0]['reason'], 'unverified_ownership')
 
     def test_cleanup_preview_reports_truncated_inventory_at_page_limit(self):
         pages = []
@@ -159,7 +170,7 @@ class BaselineAndCleanupTest(unittest.TestCase):
                     {'name': 'fix/rsi-open', 'commit': {'sha': 'open'}},
                     {'name': 'feat/rsi-backup', 'commit': {'sha': 'backup'}},
                     {'name': 'main', 'commit': {'sha': 'main'}}]
-        prs = [{'state': 'CLOSED', 'head': {'ref': 'feat/rsi-old', 'sha': 'old'}},
+        prs = [{'state': 'CLOSED', 'head': {'ref': 'feat/rsi-old', 'sha': 'old', 'repo': {'full_name': 'example/project'}}},
                {'state': 'OPEN', 'head': {'ref': 'fix/rsi-open', 'sha': 'open'}}]
         with patch.object(release, 'api', side_effect=cleanup_api([branches], [prs], {})) as command:
             result = delivery.branch_cleanup_preview('example/project', recovery_refs=['backup'])

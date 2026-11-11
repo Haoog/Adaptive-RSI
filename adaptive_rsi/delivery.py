@@ -438,7 +438,9 @@ def branch_cleanup_preview(repo, recovery_refs=None, store=None):
         elif any(str(pr.get("state", "")).lower() == "open" for pr in matching):
             reason = "open_pr"
         elif not matching or not any(str(pr.get("state", "")).lower() == "closed" and
-                                     sha is not None and _dict_field(pr, "head").get("sha") == sha for pr in matching):
+                                     sha is not None and _dict_field(pr, "head").get("sha") == sha and
+                                     str(_dict_field(_dict_field(pr, "head"), "repo").get("full_name") or "").lower() == repo.lower()
+                                     for pr in matching):
             if not matching and any(head is not None and head == sha for head in pushed.get(name, ())):
                 reason = "pushed_no_pr"
             else:
