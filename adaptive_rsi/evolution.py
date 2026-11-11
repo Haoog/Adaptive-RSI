@@ -1087,6 +1087,13 @@ class Evolution:
                 return None
             return path if path.is_dir() else None
 
+        invalid_overlays = {}
+        for case_id, case_entry, spec in case_items:
+            declared = spec.get("overlay")
+            if declared is not None and (not isinstance(declared, str) or not declared
+                                         or sealed_dir(case_entry, declared, None) is None):
+                invalid_overlays[case_id] = "overlay is missing or escapes the bundle"
+
         # argv[0] 含路径分隔符且不是绝对路径时，subprocess 按检查 cwd（一次性副本
         # 内）解析，不是宿主 PATH 查询：必须到用例 repository/overlay 里定位。否则
         # 包内自带的 ./run.sh 会被 which() 按宿主进程当前目录判成缺工具，整包检查
@@ -1259,6 +1266,9 @@ class Evolution:
             if msg not in repro_limitations:
                 repro_limitations.append(msg)
 
+        for case_id, error in invalid_overlays.items():
+            repro_limitations.append(f"Case {case_id}: {error}")
+
         # 5. Optional check execution
         # 检查命令在一次性临时副本上执行：先复制 repository，再把封存 overlay
         # 叠上去（与 evaluator 同一套 scrub + 符号链接拒绝语义），bundle 原文件保持不变。
@@ -1268,6 +1278,12 @@ class Evolution:
             for case_id, case_entry, spec in case_items:
                 repo_dir = sealed_dir(case_entry, spec.get("repository"), "repository")
                 overlay_dir = sealed_dir(case_entry, spec.get("overlay"), "overlay")
+                if case_id in invalid_overlays:
+                    executed_checks.append({
+                        "case": case_id, "check": None, "argv": [],
+                        "exit_code": -1, "passed": False, "error": invalid_overlays[case_id],
+                    })
+                    continue
                 if repo_dir is None:
                     executed_checks.append({
                         "case": case_id, "check": None, "argv": [],
@@ -1398,6 +1414,7 @@ class Evolution:
             len(missing_creds) == 0 and
             credential_limitation is None and
             len(malformed_checks) == 0 and
+            len(invalid_overlays) == 0 and
             checks_passed is not False
         )
 

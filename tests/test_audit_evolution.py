@@ -1960,6 +1960,29 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertFalse(rows['case-second']['overlay_applied'])
         self.assertTrue(all(row['passed'] for row in result['executed_checks']))
 
+    def test_declared_unresolved_overlay_prevents_reproduction(self):
+        destination = self.sealed_bundle(repo_name='repo-bad-overlay')
+        case = destination / 'cases' / 'case-bad-overlay'
+        spec_path = case / 'case.json'
+        spec = json.loads(spec_path.read_text(encoding='utf-8'))
+        for declared in ('missing-overlay', '../../../protected-overlay', ''):
+            with self.subTest(overlay=declared):
+                spec['overlay'] = declared
+                spec_path.write_text(encode(spec), encoding='utf-8')
+                self.reseal_bundle(destination)
+                for run_checks in (False, True):
+                    result = Evolution.reproduce_bundle(
+                        destination, env={'PATH': '/usr/bin:/bin'}, run_checks=run_checks,
+                        which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+                    self.assertTrue(result['integrity']['valid'])
+                    self.assertFalse(result['reproducible'], result)
+                    self.assertTrue(any('overlay is missing or escapes the bundle' in msg
+                                        for msg in result['limitations']))
+                    if run_checks:
+                        self.assertFalse(result['checks_passed'])
+                        self.assertEqual(result['executed_checks'][0]['check'], None)
+                        self.assertIn('overlay', result['executed_checks'][0]['error'])
+
     def test_bundle_reproduction_supports_legacy_case_repository_layout(self):
         """旧包把树放在 cases/<id>/repository、case.json 记 "repository"：仍能复现。"""
         destination = self.sealed_bundle(repo_name='repo-legacy')
