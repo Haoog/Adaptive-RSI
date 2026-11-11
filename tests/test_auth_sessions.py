@@ -1486,6 +1486,36 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual(result["state"], "failed")
         self.assertEqual(result["error"], "auth_protocol_error")
 
+    def test_untrusted_exception_attributes_are_not_logged(self):
+        class UntrustedError(Exception):
+            code = "SECRET-CODE"
+            errno = "SECRET-ERRNO"
+        def factory(_backend):
+            raise UntrustedError("SECRET-MESSAGE")
+        manager = AuthSessions(self.root / "unsafe-exception", factory=factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        with self.assertLogs("adaptive_rsi.auth_sessions", level="WARNING") as captured:
+            manager._run(session["id"], 0, None)
+        self.assertNotIn("SECRET", " ".join(captured.output))
+        self.assertEqual(manager.status(session["id"])["error"], "auth_protocol_error")
+
+    def test_credential_install_oserror_stays_protocol_error(self):
+        def factory(backend):
+            worker = FakeAuth(backend, self.gate)
+            worker.capabilities = types.SimpleNamespace(modern=True)
+            worker.export_credential = lambda provider: [{"integrationID": provider}]
+            def install(provider, credentials):
+                raise OSError(2, "missing executable")
+            worker.install_credential = install
+            return worker
+        manager = AuthSessions(self.root / "install-oserror", factory=factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("opencode", "openai")
+        self.gate.set()
+        manager._run(session["id"], 0, None)
+        self.assertEqual(manager.status(session["id"])["error"], "auth_protocol_error")
+
     def test_failed_state_write_does_not_abort_close(self):
         manager = AuthSessions(self.root / "state", factory=self.factory, ttl=600)
         self.addCleanup(manager.close)
