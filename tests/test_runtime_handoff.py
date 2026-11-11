@@ -1170,6 +1170,22 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.store.setting('postprocess:' + run['id'])['state'], 'completed')
         self.assertEqual(self.store.one("SELECT value FROM settings WHERE key='postprocess:corrupt'")['value'], '{')
 
+    def test_orphan_receipt_event_failure_keeps_receipt_pending_for_retry(self):
+        identifier = 'missing-run'
+        key = 'postprocess:' + identifier
+        self.store.put_setting(key, {'state': 'pending', 'steps': [], 'created': time.time()})
+        self.store.put_setting('postprocess-pending:' + identifier, {'created': time.time()})
+        # Fail the event INSERT via a SQLite trigger, preserving the normal transaction path.
+        self.store.execute("CREATE TRIGGER fail_orphan_event BEFORE INSERT ON events "
+                           "WHEN NEW.kind='postprocess_orphaned' BEGIN SELECT RAISE(ABORT, 'event failed'); END")
+        self.runtime.drain_postprocess()
+        self.assertEqual(self.store.setting(key)['state'], 'pending')
+        self.assertIsNotNone(self.store.setting('postprocess-pending:' + identifier))
+        self.store.execute('DROP TRIGGER fail_orphan_event')
+        self.runtime.drain_postprocess()
+        self.assertEqual(self.store.setting(key)['state'], 'obsolete')
+        self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='postprocess_orphaned'")), 1)
+
     def test_postprocess_orphaned_receipt_reaches_terminal_state_and_leaves_index(self):
         identifier = 'missing-run'
         self.store.put_setting('postprocess:' + identifier,
