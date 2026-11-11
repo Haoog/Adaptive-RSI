@@ -877,9 +877,11 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
    const repeatLabel=el('label',t('重复小时'));repeatLabel.append(repeat);
    scheduleBox.append(el('p',t('安排检查：此任务将在指定时刻开始运行。')),localLabel,zoneLabel,repeatLabel,
     action(t('预约'),async()=>{if(!time.value||!zone.value.trim()){toast(t('请填写本地时间和时区。'),true);return;}
-     await api('task/schedule-time',{task:task.id,local_time:time.value,timezone:zone.value.trim(),
-      fold:repeat.value===''?undefined:Number(repeat.value)});
-     draftStore.remove('task-schedule',task.id);
+     const submitted={time:time.value,zone:zone.value,repeat:repeat.value};
+     await api('task/schedule-time',{task:task.id,local_time:submitted.time,timezone:submitted.zone.trim(),
+      fold:submitted.repeat===''?undefined:Number(submitted.repeat)});
+     const saved=draftStore.get('task-schedule',task.id);
+     if(saved&&saved.time===submitted.time&&saved.zone===submitted.zone&&saved.repeat===submitted.repeat)draftStore.remove('task-schedule',task.id);
      toast(t('预约已保存'));closeTaskDetail();await refresh();},'button primary'));
    secondary.append(el('summary',t('安排检查')),scheduleBox);}
   body.append(secondary);}

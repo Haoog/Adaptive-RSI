@@ -507,17 +507,17 @@ window.RSIExperience = (() => {
         event.preventDefault();
         safe(async () => {
           if (!current()) return;
-          const value = input.value;
+          const value = input.value, submittedReason = reason.value;
           if (!value.trim()) throw Error(t("补充需求不能为空，请输入需要保留或补充的要求。"));
           submit.disabled = true;
           try {
             const receipt = await api("task/revise", {
               task: task.id,
               supplement: value,
-              reason: reason.value,
+              reason: submittedReason,
             });
             if (draftStore.get('task-supplement', task.id) === value) draftStore.remove('task-supplement', task.id);
-            if (draftStore.get('task-reason', task.id) === reason.value) draftStore.remove('task-reason', task.id);
+            if (draftStore.get('task-reason', task.id) === submittedReason) draftStore.remove('task-reason', task.id);
             toast(t(receipt.pending ? "补充已收到，将在当前阶段结束后带入下一轮。" : "补充已保存，将重新评估。"));
             await refreshTaskDetail();
           } finally {
