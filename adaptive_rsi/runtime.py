@@ -1008,17 +1008,17 @@ class Runtime(Maintenance):
         self._shutdown['phase'] = 'scheduler'
         attempt('scheduler', 'scheduler_thread', scheduler_phase)
 
-        def workers_phase():
-            self._shutdown['workers_timed_out'] = False
-            try:
-                self._shutdown_workers()
-            finally:
-                # 即使线程池排空自身报错，也必须为已取消、从未启动的领取留下终态。
-                _, failed = self._reconcile_unstarted_workers()
-                self._shutdown['reconcile_failed'] = len(failed)
+        def reconcile_workers():
+            _, failed = self._reconcile_unstarted_workers()
+            self._shutdown['reconcile_failed'] = len(failed)
 
         self._shutdown['phase'] = 'workers'
-        attempt('workers', 'worker_pool', workers_phase)
+        self._shutdown['workers_timed_out'] = False
+        try:
+            attempt('workers', 'worker_pool', self._shutdown_workers)
+        finally:
+            # 独立记录两个失败，也在中断时仍尝试协调未启动的领取。
+            attempt('workers', 'reconcile', reconcile_workers)
 
         def maintenance_phase():
             self._shutdown['maintenance_timed_out'] = False
