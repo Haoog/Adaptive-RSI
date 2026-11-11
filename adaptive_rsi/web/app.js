@@ -482,11 +482,23 @@ async function refresh(options={}){
  try{return await operation;}finally{if(refreshPromise===operation){refreshPromise=null;refreshController=null;refreshProject=null;refreshKey=null;}if(refreshQueued){refreshQueued=false;const waiters=refreshWaiters.splice(0),forceNext=refreshForce;refreshForce=false;let next;try{next=refresh({force:forceNext});}catch(error){for(const waiter of waiters)waiter.reject(error);scheduleRefreshPoll();}if(next)Promise.resolve(next).then(value=>waiters.forEach(waiter=>waiter.resolve(value)),error=>waiters.forEach(waiter=>waiter.reject(error)));}else scheduleRefreshPoll();}
 }
 function parentView(name){return name==='tasks'?'overview':name;}
+let attentionCount=0;
+function attentionTotal(){
+ const counts=state.selected_project&&state.selected_project!==projectId?null:state.task_counts;
+ return counts?counts.filter(r=>attentionStates.includes(r.state)).reduce((n,r)=>n+r.count,0):visibleTasks(scoped(state.tasks),'attention',true).length;
+}
+// 标题是页面切走后唯一无需权限的待处理提示；项目名与固定后缀始终保留。
+function renderTitle(){
+ if(!state)return;
+ const project=currentProject(),path=projectPath(project);
+ const base=(project?projectName(project)+(path?' · '+path:'')+' · ':'')+t('Adaptive RSI · 控制台');
+ document.title=attentionCount>0&&document.visibilityState==='hidden'?'● '+attentionCount+' · '+t('需要处理的任务')+' · '+base:base;
+}
 function renderNavigation(){
  localWrite('rsi-navigation',JSON.stringify({view,filter:$('task-filter').value,system:$('show-system-tasks').checked}));
  const parent=parentView(view),configScope=$('config-scope').value,project=currentProject();
  document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+parent);
- const path=projectPath(project);document.title=(project?projectName(project)+(path?' · '+path:'')+' · ':'')+t('Adaptive RSI · 控制台');
+ attentionCount=attentionTotal();renderTitle();
  document.querySelectorAll('.nav').forEach(node=>node.classList.toggle('active',node.dataset.view===parent));
  document.querySelectorAll('.nav').forEach(node=>{const selected=node.dataset.view===parent;if(selected)node.setAttribute('aria-current','page');else node.removeAttribute('aria-current');});
  document.querySelector('#tasks-list')?.setAttribute('aria-live','off');
@@ -556,7 +568,7 @@ function render(){
  const next=state.schedules.filter(row=>row.project===projectId&&((row.kind==='issues'&&config.sources.issues&&config.github.repository)||(row.kind==='light'&&config.sources.inspection))).sort((a,b)=>scheduleTime(a)-scheduleTime(b))[0];
  const scheduleTimezone=config.schedule?.timezone||'UTC';
  $('next-check').textContent=t(project?.paused?'启动后开始':!next?'未安排自动检查':'下次 ')+(project&&!project.paused&&next?scheduleStamp(scheduleTime(next),scheduleTimezone)+' · '+t('项目时区')+' '+scheduleTimezone:'');
- const attention=counts?counts.filter(r=>attentionStates.includes(r.state)).reduce((n,r)=>n+r.count,0):visibleTasks(tasks,'attention',true).length;$('attention-banner').hidden=!attention;$('attention-text').textContent=t('需要处理的任务')+' · '+attention;
+ const attention=attentionTotal();$('attention-banner').hidden=!attention;$('attention-text').textContent=t('需要处理的任务')+' · '+attention;
  for(const kind of ['light','issues']){
   const mins=config.schedule[kind+'_minutes'],factor=mins%1440===0?1440:mins%60===0?60:1;
   $(kind+'-interval').textContent=(mins/factor)+' '+t(factor===1440?'天':factor===60?'小时':'分钟');
@@ -1502,6 +1514,8 @@ $('language-select').addEventListener('change',()=>safe(async()=>{
 }));
 // 回到页面只由重新可见补一次刷新：可见窗口重复获得焦点不再额外全量拉取 state，常规轮询已覆盖。
 typeof document.addEventListener==='function'&&document.addEventListener('visibilitychange',()=>{
+ // 仅重算标题，不因可见性变化额外请求；可见时仍沿用原有的一次刷新。
+ renderTitle();
  if(document.visibilityState==='visible'&&state)safe(refresh);
  else scheduleRefreshPoll();
 });
