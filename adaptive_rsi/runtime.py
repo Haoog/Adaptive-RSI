@@ -1035,9 +1035,11 @@ class Runtime(Maintenance):
         with self._futures_lock:
             pending = {future for future in (self.futures | self._stuck_futures)
                        if not future.done()}
-            unregistered = pending - self._stuck_futures
             self._stuck_futures.update(pending)
-        for future in unregistered:
+            registered = set(self._stuck_futures)
+        # Register only after storage cleanup: a finished future invokes its
+        # callback synchronously and must not release ownership during close().
+        for future in registered:
             future.add_done_callback(self._stuck_worker_done)
         if not pending:
             self._release_state_dir_lock()
@@ -1106,8 +1108,6 @@ class Runtime(Maintenance):
         # 状态与锁交接使用；最后一个退出时才释放状态目录锁。
         with self._futures_lock:
             self._stuck_futures.update(running)
-        for future in running:
-            future.add_done_callback(self._stuck_worker_done)
         runs = sorted(unfinished_runs[future] for future in running if future in unfinished_runs)
         logging.getLogger(__name__).warning(
             "Worker threads did not stop within %ss; proceeding with shutdown (runs: %s)",
