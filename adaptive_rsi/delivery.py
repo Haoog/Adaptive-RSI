@@ -156,7 +156,7 @@ BOT_LOGINS = {"github-actions", "dependabot", "renovate", "copilot-pull-request-
               "copilot", "codex", "chatgpt-codex-connector"}
 
 
-def record_pr_feedback(store, run, url, pr):
+def record_pr_feedback(store, run, url, pr, actionable_ci=True):
     """Append distinct observations without changing task state or run evidence."""
     observations = []
     for field, kind in (("comments", "comment"), ("reviews", "review")):
@@ -200,7 +200,7 @@ def record_pr_feedback(store, run, url, pr):
         store.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (key, payload))
         # 只有客观信号才重排：失败检查，或仍未被后续批准覆盖的修改请求。
         # 普通评论（包括「LGTM」这类赞许）只作为后续规划的上下文。
-        if item["kind"] == "ci" or (item["kind"] == "review" and
+        if (item["kind"] == "ci" and actionable_ci) or (item["kind"] == "review" and
                                     item.get("state") == "CHANGES_REQUESTED" and
                                     pr.get("reviewDecision") != "APPROVED"):
             actionable.append(identity)
@@ -352,7 +352,7 @@ def baseline_change(source, previous, current):
     return result
 
 
-REBASE_ATTEMPT_LIMIT = 12  # 退避曲线与关闭失败共用；上限让无果更新收敛到重排。
+REBASE_ATTEMPT_LIMIT = 12  # 本地准备失败的上限；不限制结果不确定的远端推送重试。
 
 
 def _update_pr_identity(pr, repo, base_branch, head_branch, head):
@@ -372,7 +372,7 @@ def _reconcile_branch_update(store, run, policy, repo, pr):
     new = intent.get("new_policy")
     if (old != policy or not isinstance(new, dict) or not isinstance(branch, str) or
             new.get("repository") != repo or new.get("branch") != policy["branch"] or
-            pr.get("state") not in ("OPEN", "MERGED") or
+            pr.get("state") not in ("OPEN", "MERGED", "CLOSED") or
             not _update_pr_identity({**pr, "state": "OPEN"}, repo, policy["branch"], branch, new.get("head"))):
         # An old or unexpected observation is ambiguous: preserve the journal and PR.
         return policy, True
@@ -380,16 +380,25 @@ def _reconcile_branch_update(store, run, policy, repo, pr):
         db.execute("BEGIN IMMEDIATE")
         live = db.execute("SELECT state FROM runs WHERE id=?", (run["id"],)).fetchone()
         rows = {row["key"]: _json_object(row["value"]) for row in db.execute(
-            "SELECT key,value FROM settings WHERE key IN (?,?,?)",
-            (key, "delivery:" + run["id"], "run-baseline:" + run["id"]))}
+            "SELECT key,value FROM settings WHERE key IN (?,?,?,?)",
+            (key, "delivery:" + run["id"], "run-baseline:" + run["id"], "delivery-push:" + run["id"]))}
+        push = rows.get("delivery-push:" + run["id"])
         if (not live or live["state"] != "pr_open" or rows.get(key) != intent or
                 rows.get("delivery:" + run["id"]) != old or
+                not isinstance(push, dict) or push.get("repository") != repo or
+                push.get("branch") != branch or push.get("head") != policy["head"] or
                 rows.get("run-baseline:" + run["id"]) !=
                 {"repository": repo, "branch": policy["branch"], "sha": policy["base"]}):
             return policy, True
         db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("delivery:" + run["id"], encode(new)))
         db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("run-baseline:" + run["id"], encode(
             {"repository": repo, "branch": new["branch"], "sha": new["base"]})))
+        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("delivery-push:" + run["id"], encode(
+            {**push, "head": new["head"], "base": new["base"]})))
+        db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                   (run["project"], run["id"], "delivery_update_reconciled", "Branch update reconciled",
+                    encode({"old_policy": old, "new_policy": new, "head_branch": branch,
+                            "pr_state": pr["state"], "push_attempts": intent.get("push_attempts", 0)}), time.time()))
         db.execute("DELETE FROM settings WHERE key=?", (key,))
     return new, False
 
@@ -422,9 +431,6 @@ def update_behind(runtime, project, run, outcome, policy, repo, now, pr, cancell
         attempts = intent.get("push_attempts", 0)
         last = intent.get("push_retry_at")
         if not isinstance(attempts, int) or attempts < 0:
-            return "waiting"
-        if attempts >= REBASE_ATTEMPT_LIMIT:
-            outcome["delivery_update_blocked"] = "push attempts exhausted; reconciliation remains active"
             return "waiting"
         if attempts and isinstance(last, (int, float)) and now - last < _write_retry_delay(attempts):
             return "waiting"
@@ -545,7 +551,10 @@ def update_behind(runtime, project, run, outcome, policy, repo, now, pr, cancell
             github_git(workspace, "push", "--force-with-lease=refs/heads/" + head_branch + ":" + policy["head"],
                        "https://github.com/" + repo + ".git",
                        intent["new_policy"]["head"] + ":refs/heads/" + head_branch, timeout=180)
-        except Exception:
+        except Exception as exc:
+            store.event("delivery_update_push_error", str(exc), project["id"], run["id"],
+                        {"head_branch": head_branch, "old_head": policy["head"],
+                         "new_head": intent["new_policy"]["head"], "attempt": intent["push_attempts"]})
             return "waiting"
     # Do not assume a successful process exit or an exception reveals remote state.
     fresh = pr_view(repo, outcome["pr"])
@@ -1315,7 +1324,12 @@ def tick(runtime, now=None, project_id=None, active_run=None):
             feedback_keys = []
             if run["state"] == "pr_open":
                 try:
-                    feedback_keys = record_pr_feedback(store, run, pr_url, pr)
+                    # Preserve old CI observations as context, but do not replan on
+                    # checks that will be rerun after updating a behind branch.
+                    feedback_keys = record_pr_feedback(store, run, pr_url, pr,
+                        actionable_ci=not (pr.get("headRefOid") == policy["head"] and
+                                           pr.get("baseRefOid") is not None and
+                                           pr["baseRefOid"] != policy["base"]))
                 except Exception as exc:
                     store.event("pr_feedback_error", str(exc), project["id"], run["id"])
                 task = store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))
