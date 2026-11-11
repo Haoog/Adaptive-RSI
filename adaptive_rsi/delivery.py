@@ -284,8 +284,9 @@ def merge_protection(config):
                                  for rule in rules if rule.get("type") == "required_status_checks")
         except Cancelled:
             raise
-        except (ProcessError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
-            cacheable = cacheable and _protection_definitive(exc)
+        except (ProcessError, OSError, ValueError, KeyError, TypeError, AttributeError):
+            # A rules endpoint 404 does not establish that no rules apply.
+            cacheable = False
         result["complete"] = all(value == "observed" for value in result["sources"].values())
         if any(strict_values):
             result.update(state="strict", strict_checks=True)

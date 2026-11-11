@@ -229,6 +229,17 @@ class ProtectionRulesTest(unittest.TestCase):
         self.assertEqual(command.call_count, 2)
         self.assertEqual((recovered['state'], recovered['complete']), ('strict', True))
 
+    def test_ruleset_404_is_retried_instead_of_cached(self):
+        classic = json.dumps({'required_status_checks': {'strict': False}})
+        with patch.object(delivery, 'checked', side_effect=[
+                classic, ProcessError({'error': 'gh: Not Found (HTTP 404)'})]):
+            failed = delivery.merge_protection(self.config)
+        self.assertFalse(failed['complete'])
+        with patch.object(delivery, 'checked', side_effect=[classic, json.dumps([])]) as command:
+            recovered = delivery.merge_protection(self.config)
+        self.assertEqual(command.call_count, 2)
+        self.assertTrue(recovered['complete'])
+
     def test_not_found_answer_is_cached_for_the_advisory_ttl(self):
         # classic 404 是「未保护」的确定答案，保持 300 秒缓存：未保护仓库的
         # 就绪页加载不再每次打两次 API。
