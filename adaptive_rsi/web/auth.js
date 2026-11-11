@@ -49,7 +49,7 @@ window.RSIAuth = (() => {
     try{
       if(session.refreshStage==='status'){
         readinessCache.clear();await status(true);if(sessions.get(id)!==session)return;
-        await refreshProviders();
+        await refreshProviders();if(sessions.get(id)!==session)return;
         session.refreshStage='catalog';
       }
       await session.refresh();if(sessions.get(id)!==session)return;

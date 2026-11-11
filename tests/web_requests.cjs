@@ -3083,8 +3083,8 @@ for(const fails of [false,true])test(`catalog callback ${fails?'failure':'succes
   assert.equal(page.node('mc-feedback').textContent,'Provider B feedback');
 });
 
-async function authCompletionPage({failure='',direct=false,hold=''}={}) {
-  const page=browser(),calls={status:0,session:0,catalog:0,start:0,complete:0},walk=node=>[node,...(node.children||[]).flatMap(walk)];
+async function authCompletionPage({failure='',direct=false,hold='',preloadProviders=false}={}) {
+  const page=browser(),calls={status:0,session:0,catalog:0,start:0,complete:0,providers:0},walk=node=>[node,...(node.children||[]).flatMap(walk)];
   const tick=()=>new Promise(setImmediate),session={id:'completion-A',backend:'codex',provider:null,state:'awaiting_authorization',method:direct?'code':'auto'};
   let release,held=false;
   const waitHeld=async stage=>{if(hold===stage&&!held){held=true;await new Promise(resolve=>{release=resolve;});}};
@@ -3098,6 +3098,7 @@ async function authCompletionPage({failure='',direct=false,hold=''}={}) {
     if(url.endsWith('/api/auth/cancel'))return response({...session,state:'cancelled'});
     if(url.endsWith('/api/auth/start')){calls.start++;return response({...session,id:'completion-B',state:'starting'});}
     if(url.endsWith('/api/auth/logout'))return response({ok:true});
+    if(url.includes('/api/auth/providers?')){calls.providers++;if(calls.providers>1)await waitHeld('providers');return response({providers:[]});}
     throw new Error('Unexpected request '+url);
   };
   vm.runInContext(authSource,page.context);
@@ -3108,6 +3109,7 @@ async function authCompletionPage({failure='',direct=false,hold=''}={}) {
     if(failure==='catalog400')throw Object.assign(new Error('Catalog rejected'),{status:400});
   });
   await tick();await tick();
+  if(preloadProviders){page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();page.context.window.RSIAuth.show('openai',async()=>{});await tick();}
   return {page,calls,tick,walk,release:()=>release(),text:()=>walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),
     activeTimers:()=>page.timers.filter(timer=>timer.active&&timer.delay===1500).length,
     async finish(){
@@ -3170,6 +3172,16 @@ for(const hold of ['status','catalog'])for(const restart of [false,true]){
     else assert.equal(run.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
   });
 }
+
+test('completion provider refresh cannot invoke catalog after logout',async()=>{
+  const run=await authCompletionPage({hold:'providers',preloadProviders:true});await run.finish();
+  const completing=run.page.context.lastAction;
+  assert.equal(run.calls.providers,2);
+  const logout=run.walk(run.page.node('mc-auth')).find(node=>node.textContent==='退出账号');
+  assert.ok(logout);logout.handlers.click();await run.page.context.lastAction;
+  run.release();await completing;
+  assert.equal(run.calls.catalog,0);
+});
 
 test('pending completion catalog refresh cannot invoke duplicate callbacks',async()=>{
   const run=await authCompletionPage({hold:'catalog'});await run.finish();
