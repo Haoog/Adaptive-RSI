@@ -14,7 +14,7 @@ from .adapters import detect, test_path
 from .build import BUILD_ID
 from .config import fingerprint
 from .gitops import copy_source, git
-from .process import Sandbox, run_process
+from .process import Cancelled, Sandbox, run_process
 from .store import encode
 from .workflow import (_go_test_options, environment_failure, node_test_options, npm_test_runner,
                        unittest_discovery_options, pytest_options)
@@ -1003,6 +1003,7 @@ def _report_output_location(directory, trail):
 def _bounded_report_row(row, directory, trail):
     """Copy one result row, moving oversized streams to files next to the report."""
     import hashlib
+    import uuid
     location, name = _report_output_location(directory, trail)
     item = dict(row)
     for stream, suffix in (("stdout", "out"), ("stderr", "err")):
@@ -1016,8 +1017,21 @@ def _bounded_report_row(row, directory, trail):
         if len(raw) <= REPORT_STREAM_LIMIT:
             continue
         location.mkdir(parents=True, exist_ok=True)
-        path = location / (name + "." + suffix)
-        path.write_bytes(raw)
+        # Publish complete, content-addressed streams without ever replacing a
+        # file referenced by an earlier report; checkpoints can reuse them.
+        path = location / (name + "." + item[stream + "_sha256"] + "." + suffix)
+        temporary = location / ("." + uuid.uuid4().hex + ".tmp")
+        try:
+            with temporary.open("xb") as output:
+                output.write(raw)
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                if hashlib.sha256(path.read_bytes()).hexdigest() != item[stream + "_sha256"]:
+                    raise OSError("Existing report output does not match its digest")
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
         item[stream] = raw[-REPORT_STREAM_LIMIT:].decode("utf-8", "replace")
         item[stream + "_path"] = path.relative_to(directory).as_posix()
     return item
@@ -1047,12 +1061,24 @@ def _bounded_report_node(node, directory, trail=(), memo=None):
 
 
 def write_evaluation_report(directory, data):
-    """Persist the evaluation report without inlining multi-megabyte logs."""
+    """Persist the evaluation report without inlining multi-megabyte logs.
+
+    The payload is written to a sibling temporary file and swapped in with
+    ``os.replace``: a crash, a full disk or a failed write can no longer leave a
+    truncated ``report.json`` standing in for evidence, and a failed write keeps
+    the previous complete report before re-raising ``OSError``.
+    """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     document = _bounded_report_node(data, directory)
-    (directory / "report.json").write_text(json.dumps(document, ensure_ascii=False, indent=2),
-                                           encoding="utf-8")
+    temporary = directory / ("report.json." + str(os.getpid()) + "." + str(time.time_ns()) + ".tmp")
+    try:
+        temporary.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, directory / "report.json")
+    except OSError:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise
 
 
 class Evaluator:
@@ -1419,19 +1445,32 @@ class Evaluator:
         return {"rows": rows}
 
     @staticmethod
-    def _run_stages(stages, limit, stop=None):
+    def _run_stages(stages, limit, stop=None, on_result=None):
+        """Run stages, handing each finished outcome to ``on_result`` at once.
+
+        The callback runs in the calling thread, so callers persist partial
+        evidence before a later stage fails or is cancelled.
+        """
         if not stages:
             return {}
         workers = min(3, max(1, limit), len(stages))
         if workers == 1 or len(stages) == 1:
-            return {label: task() for label, task in stages.items()}
+            results = {}
+            for label, task in stages.items():
+                results[label] = task()
+                if on_result:
+                    on_result(label, results[label])
+            return results
         results = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
                                                    thread_name_prefix="rsi-eval") as pool:
             futures = {pool.submit(task): label for label, task in stages.items()}
             try:
                 for future in concurrent.futures.as_completed(futures):
-                    results[futures[future]] = future.result()
+                    label = futures[future]
+                    results[label] = future.result()
+                    if on_result:
+                        on_result(label, results[label])
             except Exception:
                 if stop:
                     stop.set()
@@ -1476,16 +1515,48 @@ class Evaluator:
     def _evaluate(self, baseline, candidate, checks, directory, config, cancel=None, overlay=None, seeds=None,
                   acceptance=None, acceptance_baseline=None, cache_scope=None, cache_base=None,
                   environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None):
+        """Persist one report for every exit path, then hand the decision back.
+
+        Early refusals and stage-ledger failures used to return without writing
+        anything; one write point keeps every return inspectable.
+        """
+        report_state = {"checks": {}, "execution_environment": None}
+        try:
+            data = self._evaluate_stages(baseline, candidate, checks, directory, config, cancel, overlay, seeds,
+                                         acceptance, acceptance_baseline, cache_scope, cache_base,
+                                         environment_digest, test_first, test_first_kind, changed_files,
+                                         report_state=report_state)
+        except Exception as exc:
+            try:
+                write_evaluation_report(directory, {
+                    "decision": "insufficient_evidence",
+                    "reason": "Evaluation cancelled" if isinstance(exc, Cancelled)
+                    else "Evaluation interrupted: " + str(exc),
+                    "interrupted": True, **report_state})
+            except OSError:
+                pass
+            raise
+        # 取消/中断路径自己在写盘前标 true；其余出口（含早退）一律标 false。
+        data.setdefault("interrupted", False)
+        write_evaluation_report(directory, data)
+        return data
+
+    def _evaluate_stages(self, baseline, candidate, checks, directory, config, cancel=None, overlay=None, seeds=None,
+                         acceptance=None, acceptance_baseline=None, cache_scope=None, cache_base=None,
+                         environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None,
+                         report_state=None):
         stage_stop = threading.Event()
         original_cancel = cancel
         cancel = lambda: stage_stop.is_set() or bool(original_cancel and original_cancel())
         if not checks:
             return {"decision": "insufficient_evidence",
                     "reason": "No executable acceptance checks. Configure checks before delivery.", "checks": {}}
-        results = {}
+        results = report_state["checks"] if report_state is not None else {}
         hidden = [row["path"] for row in self.store.query("SELECT path FROM projects")]
         execution_config, execution_identity = (
             self._execution_environment(config) if cache_scope and cache_base else (config, None))
+        if report_state is not None:
+            report_state["execution_environment"] = execution_identity
         if changed_files is None:
             changed_files = _changed_files(candidate)
             if changed_files is None:
@@ -1603,11 +1674,9 @@ class Evaluator:
                 results["acceptance_baseline"] = cached_acceptance
         if (acceptance and acceptance_identity_matches and
                 acceptance_baseline.get("decision") == "insufficient_evidence"):
-            data = {"decision": "insufficient_evidence", "reason": acceptance_baseline["reason"],
+            return {"decision": "insufficient_evidence", "reason": acceptance_baseline["reason"],
                     "setup": acceptance_baseline.get("setup"), "checks": results,
                     "execution_environment": execution_identity}
-            write_evaluation_report(directory, data)
-            return data
         stages = {}
         if "baseline" not in results:
             stages["baseline"] = lambda: self._standard_stage(
@@ -1635,20 +1704,38 @@ class Evaluator:
                 seeds, hidden)
         # Benchmarks have exclusive process-wide access; ordinary checks share
         # the global execution capacity while retaining stage concurrency.
+        interim_failures = []
+
+        def checkpoint_stage(label, stage_outcome):
+            # 每个阶段一完成就刷新报告：后续阶段被取消或崩溃时，已完成的证据
+            # 仍在磁盘上；最终的完整报告会覆盖这份 interim 文档。
+            if "setup" in stage_outcome:
+                return
+            results[label] = stage_outcome["rows"]
+            if "test_first_rows" in stage_outcome:
+                results["test_first_" + label] = stage_outcome["test_first_rows"]
+            try:
+                write_evaluation_report(directory, {
+                    "decision": "insufficient_evidence", "reason": "Evaluation in progress",
+                    "interrupted": False, "checks": results,
+                    "execution_environment": execution_identity})
+            except OSError as exc:
+                # 中间快照尽力而为：磁盘满不能中止仍在产出证据的阶段。
+                interim_failures.append(type(exc).__name__ + ": " + str(exc))
+
         outcomes = self._run_stages(stages, 1 if acceptance and acceptance.get("change_kind") == "performance"
-                                    else int(config.get("limits", {}).get("concurrency", 1)), stop=stage_stop)
+                                    else int(config.get("limits", {}).get("concurrency", 1)),
+                                    stop=stage_stop, on_result=checkpoint_stage)
         for label in ["baseline", "acceptance_baseline", "candidate", "candidate_full", "acceptance_candidate"]:
             if label not in outcomes:
                 continue
             outcome = outcomes[label]
             if "setup" in outcome:
-                data = {"decision": "insufficient_evidence",
+                return {"decision": "insufficient_evidence",
                         "reason": "Independent acceptance environment preparation failed"
                         if label.startswith("acceptance") else "Isolated dependency preparation failed",
                         "setup": outcome["setup"], "checks": results,
                         "execution_environment": execution_identity}
-                write_evaluation_report(directory, data)
-                return data
             results[label] = outcome["rows"]
             if "test_first_rows" in outcome:
                 results["test_first_" + label] = outcome["test_first_rows"]
@@ -1680,6 +1767,10 @@ class Evaluator:
                 "harness_hash": fingerprint(checks), "candidate_full_reused": reuse_full, "checks": results,
                 "execution_environment": execution_identity,
                 "host_tools": host_tool_versions(checks, execution_identity)}
+        if interim_failures:
+            # Interim snapshots are best effort; keep the failed writes visible
+            # on the complete report instead of only in the process log.
+            data["report_write"] = {"state": "failed", "reason": "; ".join(interim_failures)}
         if cache_failures:
             # The baseline cache only accelerates later runs; record the failed
             # write so it stays observable without changing the decision.
@@ -1745,5 +1836,4 @@ class Evaluator:
             else:
                 data["controls"] = {"decision": "not_run", "reason": "Candidate checks did not pass",
                                     "controls": []}
-        write_evaluation_report(directory, data)
         return data
