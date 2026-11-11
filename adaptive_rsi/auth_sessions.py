@@ -1359,12 +1359,12 @@ class AuthSessions:
             if self.closed:
                 return
             self.threads.add(thread)
-        try:
-            thread.start()
-        except BaseException:
-            with self.threads_lock:
+            try:
+                # close() must not snapshot a thread before start() succeeds.
+                thread.start()
+            except BaseException:
                 self.threads.discard(thread)
-            raise
+                raise
         # 返回是否真的启动了线程：close() 竞争时调用方需要据此把会话落成终态。
         return True
 

@@ -1279,6 +1279,46 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual(retry["state"], "starting")
         self.assertEqual(self.manager.busy, 1)
 
+    def test_close_waits_for_registered_thread_to_start(self):
+        session = self.manager.reserve("codex")
+        entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+        original_start = threading.Thread.start
+        def delayed_start(thread):
+            if threading.current_thread() is launcher:
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test timed out")
+            return original_start(thread)
+        def launch():
+            try:
+                self.manager.launch(session["id"])
+            except Exception as exc:
+                errors.append(exc)
+        def close():
+            try:
+                self.manager.close()
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                closed.set()
+        launcher = threading.Thread(target=launch)
+        closer = threading.Thread(target=close)
+        with patch.object(threading.Thread, "start", delayed_start):
+            original_start(launcher)
+            try:
+                self.assertTrue(entered.wait(2))
+                original_start(closer)
+                self.assertFalse(closed.wait(.1))
+            finally:
+                release.set()
+                launcher.join(5)
+                if closer.ident is not None:
+                    closer.join(5)
+        self.assertTrue(closed.is_set())
+        self.assertFalse(launcher.is_alive())
+        self.assertEqual(errors, [])
+
     def test_launch_after_close_reports_service_closed_instead_of_starting(self):
         session = self.manager.reserve("codex")
         # 模拟 close() 与 launch() 的竞争：closed 已置位，该行还没被 close() 收成终态。
