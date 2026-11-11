@@ -928,10 +928,11 @@ class MigrationLedgerConcurrencyTest(unittest.TestCase):
         def gated(db, version):
             # 每个线程只在 v10 的锁外预检上对齐一次，把「预检之后、BEGIN IMMEDIATE
             # 之前」的窗口固定成必然发生，而不是靠 sleep 撞时序。
+            result = real_ledger_has(db, version)
             if version == 10 and not getattr(aligned, "done", False):
                 aligned.done = True
                 barrier.wait()
-            return real_ledger_has(db, version)
+            return result
 
         stores, failures = [], []
 
