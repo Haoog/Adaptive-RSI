@@ -228,13 +228,14 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
                 delivery.tick(self.runtime, now=10000000000 + step * 3600, project_id=self.project)
             result = json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])
             self.assertEqual(result['delivery_recovery_attempts'], 3)
-            self.assertIn('exhausted', result['delivery_recovery_abandoned'])
-            # 第 3 次尝试在远端读取前就达到上限：只查询 2 次后落终态。
-            self.assertEqual(command.call_count, 2)
-            # 终态后退出恢复候选：不再发起远端查询。
+            self.assertNotIn('delivery_recovery_abandoned', result)
+            self.assertEqual(command.call_count, 3)
+            # 最后一次查询也完成后，下一轮才宣布次数耗尽。
             for step in range(3, 5):
                 delivery.tick(self.runtime, now=10000000000 + step * 3600, project_id=self.project)
-            self.assertEqual(command.call_count, 2)
+            result = json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])
+            self.assertIn('exhausted', result['delivery_recovery_abandoned'])
+            self.assertEqual(command.call_count, 3)
             delivery.schedule(self.runtime, now=10000018000)
             self.assertIsNone(self.store.one("SELECT 1 FROM tasks WHERE source='system_delivery' AND project=? "
                                              "AND state IN ('queued','planning','executing','evaluating','waiting_budget')",
@@ -247,6 +248,20 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
         self.assertIsNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
                                          ('delivery-push:' + self.run['id'],)))
 
+    def test_last_permitted_query_can_recover_pr(self):
+        self.prepare()
+        pr = {'url': self.url, 'state': 'OPEN', 'headRefOid': self.head,
+              'headRefName': 'feat/rsi-' + self.run['id'], 'baseRefName': 'main',
+              'headRepositoryOwner': {'login': 'example'}}
+        with patch.object(delivery, 'RECOVERY_ATTEMPT_LIMIT', 2), \
+                patch.object(delivery, 'checked', side_effect=['[]', json.dumps([pr])]) as command:
+            delivery.tick(self.runtime, now=10000000000, project_id=self.project)
+            delivery.tick(self.runtime, now=10000003600, project_id=self.project)
+        result = json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])
+        self.assertEqual(command.call_count, 2)
+        self.assertEqual(result['pr'], self.url)
+        self.assertNotIn('delivery_recovery_abandoned', result)
+
     def test_corrupt_push_journal_is_terminal_after_one_event(self):
         self.prepare()
         self.store.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
@@ -256,7 +271,7 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
                 delivery.tick(self.runtime, now=10000000000 + step * 3600, project_id=self.project)
         command.assert_not_called()
         result = json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])
-        self.assertIn('journal', result['delivery_recovery_abandoned'])
+        self.assertIn('journal', result['delivery_recovery_blocked'])
         self.assertNotIn('delivery_recovery_attempts', result)
         events = self.store.query("SELECT kind FROM events WHERE kind='recovery_blocked' AND run=?",
                                   (self.run['id'],))
@@ -272,10 +287,28 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
         result = json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])
         # 未发出任何查询：既不计次，也不能留下「查了 72 次都没找到」的假终态。
         self.assertNotIn('delivery_recovery_attempts', result)
-        self.assertIn('baseline identity', result['delivery_recovery_abandoned'])
+        self.assertIn('baseline identity', result['delivery_recovery_blocked'])
         events = self.store.query("SELECT kind FROM events WHERE kind='recovery_blocked' AND run=?",
                                   (self.run['id'],))
         self.assertEqual(len(events), 1)
+
+    def test_missing_baseline_can_be_repaired_without_losing_journal(self):
+        self.prepare()
+        key = 'run-baseline:' + self.run['id']
+        identity = self.store.setting(key)
+        self.store.execute('DELETE FROM settings WHERE key=?', (key,))
+        with patch.object(delivery, 'checked', return_value='[]') as command:
+            delivery.tick(self.runtime, now=10000000000, project_id=self.project)
+            self.store.execute('UPDATE runs SET ended=? WHERE id=?', (time.time() - 91 * 86400, self.run['id']))
+            self.runtime.maintenance()
+            self.assertIsNotNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
+                                                ('delivery-push:' + self.run['id'],)))
+            self.store.put_setting(key, identity)
+            delivery.tick(self.runtime, now=10000003600, project_id=self.project)
+        self.assertEqual(command.call_count, 1)
+        result = json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])
+        self.assertEqual(result['delivery_recovery_attempts'], 1)
+        self.assertNotIn('delivery_recovery_blocked', result)
 
     def test_query_attempt_is_counted_only_when_remote_is_read(self):
         self.prepare()

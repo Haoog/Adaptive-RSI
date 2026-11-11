@@ -808,12 +808,7 @@ def _recovery_due(outcome, now):
 
 
 def _block_recovery(store, run, now, reason):
-    """Stop recovery that can never issue a query.
-
-    This is not an exhausted attempt count: nothing was read from the remote, so
-    the run must not be recorded as having searched and failed. A distinct event
-    kind keeps it apart from the "queried but no PR matched" terminal state.
-    """
+    """Back off while preserving evidence until preconditions can be repaired."""
     detail = 'recovery preconditions unavailable: ' + reason
     with store.connect() as db:
         db.execute('BEGIN IMMEDIATE')
@@ -823,11 +818,14 @@ def _block_recovery(store, run, now, reason):
         outcome = parsed_result(row)
         if outcome.get('pr') or outcome.get('delivery_recovery_abandoned'):
             return
-        outcome['delivery_recovery_abandoned'] = detail
+        changed = outcome.get('delivery_recovery_blocked') != detail
+        outcome['delivery_recovery_blocked'] = detail
         outcome['delivery_recovery_at'] = now
+        outcome['delivery_recovery_retry'] = 3600
         db.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run['id']))
-    store.event('recovery_blocked', 'Superseded delivery reconciliation blocked: ' + detail,
-                run['project'], run['id'])
+    if changed:
+        store.event('recovery_blocked', 'Superseded delivery reconciliation blocked: ' + detail,
+                    run['project'], run['id'])
 
 
 def _stamp_recovery(store, run_id, now, wait):
@@ -840,13 +838,18 @@ def _stamp_recovery(store, run_id, now, wait):
         outcome = parsed_result(row)
         if outcome.get('pr') or outcome.get('delivery_recovery_abandoned'):
             return
-        outcome['delivery_recovery_at'] = now
-        outcome['delivery_recovery_retry'] = wait
+        outcome.pop('delivery_recovery_blocked', None)
         attempts = outcome.get('delivery_recovery_attempts', 0)
-        outcome['delivery_recovery_attempts'] = (attempts if isinstance(attempts, int) else 0) + 1
-        abandoned = outcome['delivery_recovery_attempts'] >= RECOVERY_ATTEMPT_LIMIT
+        attempts = attempts if isinstance(attempts, int) and attempts >= 0 else 0
+        abandoned = attempts >= RECOVERY_ATTEMPT_LIMIT
         if abandoned:
-            outcome['delivery_recovery_abandoned'] = 'exhausted %s attempts without a matching PR' % RECOVERY_ATTEMPT_LIMIT
+            # The previous attempt may have failed to read GitHub; do not claim
+            # that a matching PR was absent. Allow the last attempt to run first.
+            outcome['delivery_recovery_abandoned'] = 'exhausted %s attempts; matching PR not confirmed' % RECOVERY_ATTEMPT_LIMIT
+        else:
+            outcome['delivery_recovery_at'] = now
+            outcome['delivery_recovery_retry'] = wait
+            outcome['delivery_recovery_attempts'] = attempts + 1
         db.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run_id))
         return outcome, abandoned
 
@@ -859,8 +862,7 @@ def _recover_superseded_receipt(runtime, project, run, config, now):
     if not isinstance(intent, dict):
         row = store.one('SELECT value FROM settings WHERE key=?', (intent_key,))
         if row is not None:
-            # 日志存在但不可解析：损坏的意图永远匹配不到回执，重试只会按退避
-            # 无限刷写；落终态并停止查询远端。
+            # 损坏的意图暂时匹配不到回执；保留日志并退避，允许修复后恢复。
             _block_recovery(store, run, now, 'push journal unreadable')
         return
     identity = store.setting('run-baseline:' + run['id'])
