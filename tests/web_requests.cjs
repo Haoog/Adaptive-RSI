@@ -3102,6 +3102,40 @@ for(const direct of [false,true])for(const failure of ['status','catalog']){
   });
 }
 
+test('OpenCode key changes reload provider connection counts',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);
+  let connected=false,providerCalls=0;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['example']:[]}});
+    if(url.includes('/api/auth/providers?')){providerCalls++;return response([{id:'example',name:'Example',connected,connection_count:connected?2:0,methods:[{index:0,type:'api',supported:true}]}]);}
+    if(url.endsWith('/api/auth/key')){connected=true;return response({ok:true});}
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});
+  await tick();await tick();
+  const select=walk(page.node('mc-auth')).find(node=>node.tagName==='SELECT');select.value='example';select.handlers.change();
+  const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});
+  await tick();await tick();
+  const content=walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' ');
+  assert.equal(providerCalls,2);assert.match(content,/账号已连接 · 2 个账号/);assert.match(content,/Example · 已连接 · 2 个账号/);
+});
+
+test('OpenCode OAuth completion refreshes provider metadata',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);
+  let providerCalls=0,sessionCalls=0,statusCalls=0;
+  const session={id:'oauth-1',backend:'opencode',provider:'example',state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){statusCalls++;return response({sessions:statusCalls===1?[session]:[],opencode:{available:true,authenticated_providers:statusCalls>1?['example']:[]}});}
+    if(url.includes('/api/auth/providers?')){providerCalls++;return response([{id:'example',name:'Example',connected:providerCalls>1,connection_count:providerCalls>1?1:0,methods:[]}]);}
+    if(url.includes('/api/auth/session?id=')){sessionCalls++;return response({...session,state:sessionCalls>1?'completed':'awaiting_authorization'});}
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});
+  await tick();await tick();page.fireTimer(1500);await tick();await tick();
+  const content=walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' ');
+  assert.equal(providerCalls,2);assert.match(content,/账号已连接 · 1 个账号/);assert.match(content,/Example · 已连接 · 1 个账号/);
+});
+
 test('completed auth console expiry stays actionable and stops refresh retries',async()=>{
   const run=await authCompletionPage({failure:'session_required'});await run.finish();
   assert.match(run.text(),/控制台登录已失效/);assert.equal(run.calls.catalog,0);
