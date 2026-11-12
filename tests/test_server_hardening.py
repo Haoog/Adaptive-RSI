@@ -8,6 +8,7 @@ import io
 import json
 import os
 import sqlite3
+import socket
 import tempfile
 import threading
 import time
@@ -160,6 +161,82 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertNotIn(b"/private/path", payload)
         self.assertEqual(before, (self.server.token, self.server.csrf, self.server.url))
         self.assertEqual(self.request()[0], 200)
+
+    def test_post_response_does_not_hold_dispatch_lock_during_slow_socket_write(self):
+        lock = self.runtime.dispatch_lock
+        admission_lock_states, write_lock_states = [], []
+        response_entered, response_finished = threading.Event(), threading.Event()
+        self.runtime.updates.require_ready = lambda: admission_lock_states.append(lock._is_owned())
+
+        def archive(project, confirmation):
+            write_lock_states.append(lock._is_owned())
+            return {"payload": "x" * (8 * 1024 * 1024)}
+
+        self.runtime.archive_project = archive
+        original_setup, original_respond = Handler.setup, Handler.respond
+
+        class ObservedWriter:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def write(self, data):
+                if len(data) > 1024 * 1024:
+                    response_entered.set()
+                return self.stream.write(data)
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+        def small_socket_buffer(handler):
+            original_setup(handler)
+            handler.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            handler.connection.settimeout(5)
+            handler.wfile = ObservedWriter(handler.wfile)
+
+        def observe_response(handler, *args, **kwargs):
+            try:
+                return original_respond(handler, *args, **kwargs)
+            finally:
+                if handler.path == "/api/project/archive":
+                    response_finished.set()
+
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.settimeout(5)
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        client.connect(("127.0.0.1", self.server.server_port))
+        body = b'{"project":"p"}'
+        request = (b"POST /api/project/archive HTTP/1.1\r\n"
+                   + f"Host: 127.0.0.1:{self.server.server_port}\r\n".encode()
+                   + f"Cookie: {self.server.cookie}={self.server.token}\r\n".encode()
+                   + f"Origin: {self.server.local_origin}\r\n".encode()
+                   + f"X-RSI-CSRF: {self.server.csrf}\r\n".encode()
+                   + b"Content-Type: application/json\r\nConnection: close\r\n"
+                   + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        try:
+            with patch.object(Handler, "setup", small_socket_buffer), \
+                    patch.object(Handler, "respond", observe_response):
+                client.sendall(request)
+                self.assertTrue(response_entered.wait(5), "POST 响应未开始")
+                self.assertFalse(response_finished.wait(.1), "大响应没有形成慢客户端背压")
+                acquired = lock.acquire(timeout=.5)
+                if acquired:
+                    lock.release()
+                self.assertTrue(acquired, "响应传输期间 dispatch_lock 仍被占用")
+        finally:
+            client.close()
+            self.assertTrue(response_finished.wait(5), "断开客户端后响应处理线程未结束")
+
+        self.assertEqual(admission_lock_states, [True])
+        self.assertEqual(write_lock_states, [True])
+        rows = []
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            rows = self.store.query("SELECT status,error_code FROM request_log WHERE path='/api/project/archive'")
+            if rows:
+                break
+            time.sleep(.01)
+        self.assertEqual([(row["status"], row["error_code"]) for row in rows],
+                         [(500, "response_interrupted")])
 
     def test_concurrent_rotation_has_complete_private_final_file(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
