@@ -85,6 +85,8 @@ Deployment health URL requires HTTPS without credentials, query or fragment
 Automatic deployment rollback requires an explicit health URL
 Workflow repository must match the selected project's origin
 Workflow must be an existing repository file
+Select a compatible existing workflow from this project
+Unable to inspect this workflow right now; retry after the GitHub request succeeds
 Feedback interval must be at least 5 minutes
 Invalid base branch
 No GitHub repository configured
