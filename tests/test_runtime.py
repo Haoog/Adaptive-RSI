@@ -1503,6 +1503,31 @@ Path(%r).write_text('allowed output')
         self.assertEqual(self.runtime.active_strategies(self.project), [])
         self.assertEqual(self.runtime.memories(self.project, "add"), [])
 
+    def test_duplicate_check_identity_does_not_hide_regression(self):
+        config = self.runtime.config(self.project)
+        candidate = "duplicate-check-identity"
+        evidence = {"monitor": {"passed": 0, "failed": 0, "runs": []}}
+        self.store.execute(
+            "INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+            (candidate, self.project, "strategy", "stable", "{}", encode(evidence), time.time()),
+        )
+        task_id, run = self.claim("duplicate check identity")
+        self.store.execute("UPDATE runs SET strategy=?,config=? WHERE id=?",
+                           (encode([{"id": candidate}]), encode(config), run["id"]))
+        task = self.store.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        duplicate = {"name": "same", "argv": ["true"], "cwd": "."}
+        result = {"decision": "fail", "evaluation": {"checks": {
+            "baseline": [{**duplicate, "passed": True}],
+            "candidate": [{**duplicate, "passed": False}, {**duplicate, "passed": True}],
+        }}}
+
+        self.runtime.finish_failure(run, task, result, config)
+
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id=?", (candidate,))
+        self.assertEqual(row["status"], "rolled_back")
+        self.assertEqual(json.loads(row["evidence"])["monitor"]["failed"], 1)
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='rollback'")), 1)
+
     def test_finish_failure_aligns_regression_attribution_by_check_identity(self):
         config = self.runtime.config(self.project)
         check_a = {"name": "check_a", "argv": ["python3", "-c", "print(1)"], "cwd": "."}
