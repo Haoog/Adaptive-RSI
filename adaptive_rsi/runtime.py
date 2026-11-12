@@ -1939,10 +1939,15 @@ class Runtime(Maintenance):
         return False
 
     def active_strategies(self, project, config=None):
+        return self._active_strategy_snapshot(project, config)[0]
+
+    def _active_strategy_snapshot(self, project, config=None):
         # evidence 随首查一并取出，避免对每个 candidate 追加一条查询；输出保持原有字段。
-        rows = self.store.query("SELECT id,kind,content,evidence FROM candidates WHERE project=? AND status='stable'", (project,))
+        rows = self.store.query("SELECT id,kind,content,evidence,created FROM candidates "
+                                "WHERE project=? AND status='stable'", (project,))
         key = compatibility(config or self.config(project))
         result = []
+        generations = {}
         for row in rows:
             evidence, content = decode_object(row["evidence"]), decode_object(row["content"])
             if evidence.get("evidence_error") or content.get("evidence_error"):
@@ -1951,7 +1956,8 @@ class Runtime(Maintenance):
             if expected and expected != key:
                 continue
             result.append({"id": row["id"], "kind": row["kind"], "content": content})
-        return result
+            generations[row["id"]] = row["created"]
+        return result, generations
 
     def memories(self, project, text, extra=None):
         """Retrieve verified skills for active strategies matching text, plus optional extra candidate skills.
@@ -2189,8 +2195,11 @@ class Runtime(Maintenance):
             if task["source"] == "system_reassess":
                 self.store.transition(run["id"], "completed", {"reason": "Deferred tasks compared against current execution baseline"}, True)
                 return
-            strategies = self.active_strategies(project["id"], config)
-            self.store.execute("UPDATE runs SET strategy=? WHERE id=?", (encode(strategies), run["id"]))
+            strategies, strategy_generations = self._active_strategy_snapshot(project["id"], config)
+            recorded_strategies = [{**strategy, "_candidate_created": strategy_generations[strategy["id"]]}
+                                   for strategy in strategies]
+            self.store.execute("UPDATE runs SET strategy=? WHERE id=?",
+                               (encode(recorded_strategies), run["id"]))
             workspace = snapshot(source, directory / "workspace", base)
             if task["source"] in ["system_light", "system_deep"]:
                 self.inspect(project, workspace, task["source"].split("_")[1], run, strategies)

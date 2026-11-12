@@ -8,6 +8,7 @@ const test=require('node:test');
 // (or attribute value) is a key in the english dictionary, so anything else is
 // left in Chinese for English users. These pages rely on that dictionary.
 const WEB=path.join(__dirname,'../adaptive_rsi/web');
+const DELIVERY=path.join(__dirname,'../adaptive_rsi/delivery.py');
 const PAGES=['index.html','install.html'];
 const CJK=/[\u4e00-\u9fff]/;
 // The language names stay in their own language; the label is intentionally bilingual.
@@ -68,4 +69,38 @@ for(const page of PAGES){
 test('scanner reports untranslated text nodes and translated attributes',()=>{
   const html='<p>已有翻译</p><p>新的文本漏译</p><button aria-label="也漏译">中文</button><input placeholder="占位漏译" title=\'标题漏译\'><script>const sample="脚本内的中文";</script>';
   assert.deepEqual(missingStaticTranslations(html,new Set(['已有翻译'])),['新的文本漏译','也漏译','占位漏译','标题漏译']);
+});
+
+// delivery.py writes the status shown on the task detail page. Every status it
+// can record needs a Chinese label in app.js plus both the code key and the
+// label in the English dictionary; otherwise the UI leaks the internal code.
+function deliveryStatuses(){
+  const source=fs.readFileSync(DELIVERY,'utf8');
+  const pattern=/\[\s*["']delivery_status["']\s*\]\s*=\s*["']([a-z][a-z0-9_]*)["']/g;
+  return [...new Set([...source.matchAll(pattern)].map(match=>match[1]))];
+}
+
+function deliveryLabels(){
+  const source=fs.readFileSync(path.join(WEB,'app.js'),'utf8');
+  const marker=/const\s+deliveryNames\s*=\s*\{/.exec(source);
+  assert.ok(marker,'app.js: deliveryNames dictionary not found');
+  const start=marker.index+marker[0].length;
+  const end=source.indexOf('};',start);
+  assert.ok(end>start,'app.js: deliveryNames dictionary is not closed');
+  return new Map([...source.slice(start,end).matchAll(/([A-Za-z_][A-Za-z0-9_]*)\s*:\s*'([^']*)'/g)].map(match=>[match[1],match[2]]));
+}
+
+test('delivery statuses written by delivery.py have Chinese and English labels',()=>{
+  const statuses=deliveryStatuses();
+  // A sentinel guards against a silent regex/refactor drift that finds nothing.
+  assert.ok(statuses.includes('merged'),'delivery.py: no known delivery status found');
+  const labels=deliveryLabels();
+  const keys=englishKeys();
+  for(const status of statuses){
+    assert.ok(labels.has(status),`app.js: deliveryNames is missing ${status}`);
+    const label=labels.get(status);
+    assert.ok(CJK.test(label),`app.js: deliveryNames.${status} has no Chinese label`);
+    assert.ok(keys.has(label),`i18n.js: English dictionary is missing the label for ${status}: ${label}`);
+    assert.ok(keys.has(status),`i18n.js: English dictionary is missing the code key ${status}`);
+  }
 });

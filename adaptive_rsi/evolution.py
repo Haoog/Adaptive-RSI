@@ -2154,7 +2154,9 @@ class Evolution:
         recorded = self.store.one("SELECT strategy,config FROM runs WHERE id=? AND project=?", (run["id"], project))
         if not recorded:
             return
-        active = {c["id"] for c in json.loads(recorded["strategy"] or "[]") if c.get("id")}
+        active = {c["id"]: c.get("_candidate_created")
+                  for c in json.loads(recorded["strategy"] or "[]")
+                  if isinstance(c, dict) and c.get("id")}
         if not passed and len(active) != 1:
             self.store.event("strategy_inconclusive", "Regression cannot be attributed to a single strategy; no automatic rollback",
                              project, run["id"], {"strategies": sorted(active)})
@@ -2164,8 +2166,12 @@ class Evolution:
                 continue
             with self.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                current = db.execute("SELECT evidence FROM candidates WHERE id=? AND status='stable'", (row["id"],)).fetchone()
+                current = db.execute("SELECT evidence,created FROM candidates WHERE id=? AND status='stable'",
+                                     (row["id"],)).fetchone()
                 if not current:
+                    continue
+                expected_created = active[row["id"]]
+                if expected_created is not None and current["created"] != expected_created:
                     continue
                 try:
                     evidence = json.loads(current["evidence"] or "{}")
@@ -2226,14 +2232,16 @@ class Evolution:
                     evidence["drift"] = drift
                 db.execute("UPDATE candidates SET evidence=? WHERE id=? AND status='stable'", (encode(evidence), row["id"]))
             if not passed:
-                self.rollback(row["id"])
+                self.rollback(row["id"], expected_created=expected_created)
 
-    def rollback(self, candidate):
+    def rollback(self, candidate, expected_created=None):
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM candidates WHERE id=?", (candidate,)).fetchone()
             if not row:
                 raise ValueError("Candidate not found")
+            if expected_created is not None and row["created"] != expected_created:
+                return
             if row["status"] == "rolled_back":
                 # 重复回滚是幂等操作；监控线程与用户操作并发时不产生误导性错误事件。
                 return
