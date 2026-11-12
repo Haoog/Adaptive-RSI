@@ -27,6 +27,7 @@ RETENTION_REJECT_REVALIDATE_SECONDS = 6 * 3600
 
 # 归档校验报告的有效期：过期后才重新解压验证，每轮最多验证一个归档。
 ARCHIVE_VERIFICATION_SECONDS = 7 * 86400
+ARCHIVE_VERIFICATION_READ_BATCH_SIZE = 128
 
 # 保留删除只把页移入 freelist；库以 auto_vacuum=0 创建，不 VACUUM 文件永不缩小。
 # 空闲页达到四分之一且磁盘留足重写整库的余量（VACUUM 峰值约需一份库文件）时
@@ -787,33 +788,38 @@ class Maintenance:
         # Passive checkpoint yields to readers; archive checks are capped per cycle.
         self.store.wal_diagnostics(checkpoint=True)
         from .storage_tools import verify_archive
-        archive_paths = sorted(
-            path for path in (self.store.root / "archives").glob("*.sqlite3.gz")
-            if not path.is_symlink())
         prefix = "archive-verification:"
-        verification_rows = self.store.query(
-            "SELECT key,value FROM settings WHERE key GLOB ?",
-            (prefix + "*",)) if archive_paths else []
-        verification_status = {row["key"]: row["value"] for row in verification_rows}
-        for path in archive_paths:
-            key = prefix + path.name
-            due, previous_type = _archive_verification_due(
-                verification_status.get(key), now)
-            if not due:
-                continue
-            if previous_type is not None:
-                # 只报形状，不回显原值：损坏内容可能是任意手工写入的文本。
+        archive_paths = [path for path in sorted((self.store.root / "archives").glob("*.sqlite3.gz"))
+                         if not path.is_symlink()]
+        for offset in range(0, len(archive_paths), ARCHIVE_VERIFICATION_READ_BATCH_SIZE):
+            batch = archive_paths[offset:offset + ARCHIVE_VERIFICATION_READ_BATCH_SIZE]
+            keys = [prefix + path.name for path in batch]
+            placeholders = ",".join("?" for _ in keys)
+            rows = self.store.query(
+                "SELECT key,value FROM settings WHERE key IN (%s)" % placeholders,
+                tuple(keys))
+            verification_status = {row["key"]: row["value"] for row in rows}
+            for path, key in zip(batch, keys):
+                due, previous_type = _archive_verification_due(
+                    verification_status.get(key), now)
+                if not due:
+                    continue
+                if previous_type is not None:
+                    # 只报形状，不回显原值：损坏内容可能是任意手工写入的文本。
+                    try:
+                        self.store.event("archive_verification_repaired",
+                                         "Replaced unusable archive verification record: %s" % key,
+                                         data={"key": key, "previous_type": previous_type})
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "Archive verification repair event persistence failed: %s", key)
                 try:
-                    self.store.event("archive_verification_repaired",
-                                     "Replaced unusable archive verification record: %s" % key,
-                                     data={"key": key, "previous_type": previous_type})
-                except Exception:
-                    logging.getLogger(__name__).exception(
-                        "Archive verification repair event persistence failed: %s", key)
-            try:
-                report = verify_archive(path, timeout=5)
-            except (OSError, ValueError, TimeoutError, sqlite3.Error, EOFError, zlib.error) as exc:
-                report = {"valid": False, "checked_at": now, "error_type": type(exc).__name__}
-            self.store.put_setting(key, report)
+                    report = verify_archive(path, timeout=5)
+                except (OSError, ValueError, TimeoutError, sqlite3.Error, EOFError, zlib.error) as exc:
+                    report = {"valid": False, "checked_at": now, "error_type": type(exc).__name__}
+                self.store.put_setting(key, report)
+                break
+            else:
+                continue
             break
         self.store.put_setting("maintenance-last", now)

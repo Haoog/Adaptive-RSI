@@ -974,49 +974,101 @@ class AuditMaintenanceRetentionTest(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_archive_verification_statuses_are_loaded_in_one_batch(self):
+    def test_archive_verification_status_reads_only_current_keys_in_order(self):
         from adaptive_rsi.maintenance import Maintenance
         with tempfile.TemporaryDirectory() as directory:
             store = Store(directory)
             try:
                 archives = store.root / 'archives'
                 archives.mkdir()
-                names = [f'{index:03}.sqlite3.gz' for index in range(40)]
+                names = [f'{index:03}.sqlite3.gz' for index in range(300)]
+                names[150] = "150-[?]*'归档.sqlite3.gz"
+                names.sort()
                 fresh = time.time() - 60
                 for name in names:
                     (archives / name).write_bytes(b'fixture')
                     store.put_setting('archive-verification:' + name,
                                       {'valid': True, 'checked_at': fresh})
-                due_key = 'archive-verification:' + names[20]
+                orphan_value = json.dumps('x' * 8192)
+                with store.connect() as db:
+                    db.executemany(
+                        'INSERT INTO settings VALUES (?,?)',
+                        [('archive-verification:retired-%04d.sqlite3.gz' % index,
+                          orphan_value) for index in range(512)])
+                due_key = 'archive-verification:' + names[150]
                 store.put_setting(due_key, {'valid': True, 'checked_at': 1.0})
-                corrupt_key = 'archive-verification:' + names[30]
+                corrupt_key = 'archive-verification:' + names[200]
                 store.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',
                               (corrupt_key, '{broken'))
+                missing_key = 'archive-verification:' + names[280]
+                store.execute('DELETE FROM settings WHERE key=?', (missing_key,))
                 runtime = self.archive_maintenance(store)
                 original_query = store.query
-                with patch.object(store, 'query', wraps=original_query) as queries:
+                status_reads = []
+
+                def capture_status_reads(sql, args=()):
+                    result = original_query(sql, args)
+                    if (sql.startswith('SELECT key,value FROM settings WHERE key IN (') and args and
+                            isinstance(args[0], str) and args[0].startswith('archive-verification:')):
+                        status_reads.append((sql, args, result))
+                    return result
+
+                with patch.object(store, 'query', side_effect=capture_status_reads):
                     with patch('adaptive_rsi.storage_tools.verify_archive',
                                return_value={'valid': True, 'checked_at': time.time()}) as checked:
                         Maintenance.maintenance(runtime)
-                        self.assertEqual(Path(checked.call_args.args[0]).name, names[20])
+                        self.assertEqual(Path(checked.call_args.args[0]).name, names[150])
+                        self.assertEqual(checked.call_count, 1)
                         store.execute("DELETE FROM settings WHERE key='maintenance-last'")
                         Maintenance.maintenance(runtime)
-                status_reads = [call for call in queries.call_args_list
-                                if 'settings' in call.args[0] and
-                                any(isinstance(value, str) and
-                                    value.startswith('archive-verification:')
-                                    for value in (call.args[1] if len(call.args) > 1 else ()))]
-                self.assertEqual(len(status_reads), 2)
-                self.assertTrue(all('SELECT key,value FROM settings' in call.args[0]
-                                    for call in status_reads))
-                self.assertTrue(all(call.args[1] == ('archive-verification:*',)
-                                    for call in status_reads))
-                self.assertEqual(checked.call_count, 2)
+                        self.assertEqual(checked.call_count, 2)
+                        store.execute("DELETE FROM settings WHERE key='maintenance-last'")
+                        Maintenance.maintenance(runtime)
+                        self.assertEqual(checked.call_count, 3)
+                expected_batches = [(start, min(start + 128, len(names)))
+                                    for _ in range(2) for start in (0, 128)]
+                expected_batches += [(0, 128), (128, 256), (256, 300)]
+                self.assertEqual(len(status_reads), len(expected_batches))
+                for (sql, args, rows), (start, stop) in zip(status_reads, expected_batches):
+                    self.assertEqual(sql, 'SELECT key,value FROM settings WHERE key IN (' +
+                                     ','.join('?' for _ in args) + ')')
+                    self.assertEqual(args, tuple('archive-verification:' + name
+                                                 for name in names[start:stop]))
+                    self.assertLessEqual(len(rows), 128)
+                    self.assertTrue(all(row['key'] in args for row in rows))
+                    self.assertNotIn('archive-verification:retired-0000.sqlite3.gz', args)
+                self.assertEqual(checked.call_count, 3)
                 self.assertEqual([Path(call.args[0]).name for call in checked.call_args_list],
-                                 [names[20], names[30]])
+                                 [names[150], names[200], names[280]])
                 self.assertEqual(store.setting(due_key)['valid'], True)
                 self.assertEqual(store.setting(corrupt_key)['valid'], True)
                 self.assertEqual(self.repaired_events(store), 1)
+                self.assertEqual(store.setting(missing_key)['valid'], True)
+                self.assertEqual(store.setting('archive-verification:retired-0000.sqlite3.gz'),
+                                 'x' * 8192)
+            finally:
+                store.close()
+
+    def test_archive_verification_status_read_errors_propagate(self):
+        from adaptive_rsi.maintenance import Maintenance
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory)
+            try:
+                archives = store.root / 'archives'
+                archives.mkdir()
+                (archives / 'current.sqlite3.gz').write_bytes(b'fixture')
+                runtime = self.archive_maintenance(store)
+                original_query = store.query
+
+                def fail_status_read(sql, args=()):
+                    if args and isinstance(args[0], str) and args[0].startswith('archive-verification:'):
+                        raise sqlite3.OperationalError('injected archive status read failure')
+                    return original_query(sql, args)
+
+                with patch.object(store, 'query', side_effect=fail_status_read):
+                    with self.assertRaisesRegex(sqlite3.OperationalError,
+                                                'injected archive status read failure'):
+                        Maintenance.maintenance(runtime)
             finally:
                 store.close()
 
