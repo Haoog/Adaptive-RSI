@@ -2230,7 +2230,7 @@ class Evolution:
     def monitor(self, project, passed, run=None, attributable=False, db=None, config=None):
         if config is None:
             config = self.runtime.config(project)
-        if not run or not (passed or attributable):
+        if not run:
             return
         with (contextlib.nullcontext(db) if db is not None else self.store.connect()) as db:
             if not db.in_transaction:
@@ -2240,6 +2240,8 @@ class Evolution:
                 return
             active = {c["id"] for c in json.loads(recorded["strategy"] or "[]") if c.get("id")}
             shared = len(active) > 1
+            if not passed and not attributable and not shared:
+                return
             if not passed and len(active) != 1:
                 event = {"strategies": sorted(active)}
                 if shared:
