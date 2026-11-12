@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from adaptive_rsi.evaluator import _changed_harness, empty_test_run, freeze_harness
+from adaptive_rsi.evaluator import Evaluator, _changed_harness, empty_test_run, freeze_harness
 from adaptive_rsi.native import Conversation, tools_for
 from adaptive_rsi.process import scrub_tree
 from adaptive_rsi.release import compatible_workflow
@@ -114,6 +114,116 @@ class AuditRound3Test(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'Candidate symlink'):
             freeze_harness(baseline, target)
         self.assertEqual((target / 'shared' / 'expected.json').read_text(), 'candidate')
+
+    def test_candidate_stage_freezes_fixture_directory_symlink_target(self):
+        baseline = self.root / "baseline-dir-link"
+        candidate = self.root / "candidate-dir-link"
+        fixture = Path("shared/fixtures/expected.json")
+        (baseline / fixture).parent.mkdir(parents=True)
+        (baseline / fixture).write_text("baseline")
+        (baseline / "pkg").mkdir()
+        (baseline / "pkg" / "testdata").symlink_to("../shared/fixtures", target_is_directory=True)
+        shutil.copytree(baseline, candidate, symlinks=True)
+        (candidate / fixture).write_text("candidate")
+        store = Store(self.root / "state-dir-link")
+        self.addCleanup(store.close)
+        evaluator = Evaluator(store)
+        observed = []
+
+        def check(_spec, target, *_args):
+            observed.append({
+                "fixture": (Path(target) / "pkg" / "testdata" / "expected.json").read_text(),
+                "protected": [Path(path) for path in _args[1]],
+            })
+            return {"exit_code": 0, "error": None, "stdout": "1 passed in 0.01s", "stderr": ""}
+
+        config = {"environment": {"seed_paths": [], "setup": []}, "limits": {"concurrency": 1}}
+        with patch("adaptive_rsi.evaluator.Sandbox.check", side_effect=check):
+            evaluator._standard_stage(
+                "candidate", candidate, baseline, candidate,
+                [{"name": "unit", "argv": ["python3", "-c", "pass"]}],
+                self.root / "dir-link-stage", config, None, None, None, [])
+
+        self.assertEqual(observed[0]["fixture"], "baseline")
+        self.assertFalse((self.root / "dir-link-stage" / "candidate" / "pkg" / "testdata").is_symlink())
+        self.assertIn(self.root / "dir-link-stage" / "candidate" / "pkg" / "testdata",
+                      observed[0]["protected"])
+        self.assertTrue(_changed_harness([fixture.as_posix()], [], baseline))
+
+    def test_candidate_stage_rejects_fixture_symlink_into_protected_state(self):
+        project = self.root / "state-link-project"
+        state = self.root / "protected-state"
+        (project / "pkg" / "testdata").mkdir(parents=True)
+        state.mkdir()
+        (state / "state.json").write_text("protected")
+        (project / "pkg" / "testdata" / "expected.json").symlink_to(state / "state.json")
+        evaluator = Evaluator(Store(state))
+        self.addCleanup(evaluator.store.close)
+        config = {"environment": {"seed_paths": [], "setup": []}, "limits": {"concurrency": 1}}
+
+        with patch("adaptive_rsi.evaluator.Sandbox.check") as check:
+            with self.assertRaisesRegex(RuntimeError, "External symlink cannot enter protected host state"):
+                evaluator._standard_stage(
+                    "candidate", project, project, project,
+                    [{"name": "unit", "argv": ["python3", "-c", "pass"]}],
+                    self.root / "state-link-stage", config, None, None, None, [])
+
+        check.assert_not_called()
+        self.assertFalse((self.root / "state-link-stage" / "candidate").exists())
+
+    def test_candidate_stage_rejects_nested_state_link_in_fixture_directory_symlink(self):
+        project = self.root / "nested-state-link-project"
+        fixture_root = project / "shared" / "fixtures"
+        (fixture_root / "nested").mkdir(parents=True)
+        (project / "pkg").mkdir()
+        state = self.root / "nested-protected-state"
+        state.mkdir()
+        (state / "secret.json").write_text("protected")
+        (fixture_root / "nested" / "expected.json").symlink_to(state / "secret.json")
+        (project / "pkg" / "testdata").symlink_to("../shared/fixtures", target_is_directory=True)
+        evaluator = Evaluator(Store(state))
+        self.addCleanup(evaluator.store.close)
+        config = {"environment": {"seed_paths": [], "setup": []}, "limits": {"concurrency": 1}}
+
+        with patch("adaptive_rsi.evaluator.Sandbox.check") as check:
+            with self.assertRaisesRegex(RuntimeError, "External symlink cannot enter protected host state"):
+                evaluator._standard_stage(
+                    "candidate", project, project, project,
+                    [{"name": "unit", "argv": ["python3", "-c", "pass"]}],
+                    self.root / "nested-state-link-stage", config, None, None, None, [])
+
+        check.assert_not_called()
+        self.assertFalse((self.root / "nested-state-link-stage" / "candidate").exists())
+
+    def test_candidate_stage_materializes_safe_fixture_links_inside_fixture_directory_link(self):
+        baseline = self.root / "nested-fixture-link-baseline"
+        candidate = self.root / "nested-fixture-link-candidate"
+        fixture_root = baseline / "shared" / "fixtures"
+        (fixture_root / "nested").mkdir(parents=True)
+        (fixture_root / "value.json").write_text("baseline")
+        (fixture_root / "nested" / "alias.json").symlink_to("../value.json")
+        (baseline / "pkg").mkdir()
+        (baseline / "pkg" / "testdata").symlink_to("../shared/fixtures", target_is_directory=True)
+        shutil.copytree(baseline, candidate, symlinks=True)
+        (candidate / "shared" / "fixtures" / "value.json").write_text("candidate")
+        evaluator = Evaluator(Store(self.root / "nested-fixture-link-state"))
+        self.addCleanup(evaluator.store.close)
+        observed = []
+
+        def check(_spec, target, *_args):
+            expected = Path(target) / "pkg" / "testdata" / "nested" / "alias.json"
+            observed.append((expected.read_text(), expected.is_symlink(),
+                             (Path(target) / "pkg" / "testdata").is_symlink()))
+            return {"exit_code": 0, "error": None, "stdout": "1 passed in 0.01s", "stderr": ""}
+
+        config = {"environment": {"seed_paths": [], "setup": []}, "limits": {"concurrency": 1}}
+        with patch("adaptive_rsi.evaluator.Sandbox.check", side_effect=check):
+            evaluator._standard_stage(
+                "candidate", candidate, baseline, candidate,
+                [{"name": "unit", "argv": ["python3", "-c", "pass"]}],
+                self.root / "nested-fixture-link-stage", config, None, None, None, [])
+
+        self.assertEqual(observed[0], ("baseline", False, False))
 
     def test_conversation_trim_history_bounds_memory(self):
         conv = Conversation("chat_completions", "test-model", "initial instructions", tools_for("planning"), "default")

@@ -683,13 +683,86 @@ def configured_check_files(baseline, checks):
     return files
 
 
-def freeze_harness(baseline, target, checks=()):
+def _copy_frozen_fixture(source, destination, baseline, state=None, ancestors=()):
+    """Copy fixture data while materializing only project-owned symlink targets."""
+    source = Path(source)
+    destination = Path(destination)
+    baseline = Path(baseline).resolve()
+    resolved = source.resolve(strict=True)
+    try:
+        resolved.relative_to(baseline)
+    except ValueError:
+        raise RuntimeError("Baseline fixture symlink escapes project") from None
+    if state is not None:
+        try:
+            resolved.relative_to(Path(state).resolve())
+        except ValueError:
+            pass
+        else:
+            raise RuntimeError("Baseline fixture overlaps protected host state")
+    if resolved in ancestors:
+        raise RuntimeError("Baseline fixture symlink cycle")
+    if resolved.is_dir():
+        destination.mkdir(parents=True, exist_ok=True)
+        chain = (*ancestors, resolved)
+        for child in resolved.iterdir():
+            if child.name in {".git", ".rsi-agent", ".rsi-home", ".rsi-build", "__pycache__"}:
+                continue
+            _copy_frozen_fixture(child, destination / child.name, baseline, state, chain)
+        shutil.copystat(resolved, destination)
+        return
+    if not resolved.is_file():
+        raise RuntimeError("Baseline fixture is not a regular file")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(resolved, destination)
+
+
+def freeze_harness(baseline, target, checks=(), state=None):
     """Host-owned baseline tests/build entrypoints overwrite candidate-authored gate changes."""
+    baseline = Path(baseline).resolve()
+    target = Path(target)
+    from .process import scrub_tree
+    scrub_tree(baseline, state=state)
     protected = set()
     baseline_harness = set()
     explicit_checks = configured_check_files(baseline, checks)
     for parent, dirs, files in os.walk(baseline, followlinks=False):
         dirs[:] = [d for d in dirs if d not in {".git", ".rsi-agent", ".rsi-home"}]
+        for name in list(dirs):
+            src = Path(parent) / name
+            if not src.is_symlink():
+                continue
+            relative = src.relative_to(baseline)
+            if not _test_data_path(relative / ".fixture"):
+                continue
+            try:
+                resolved = src.resolve(strict=True)
+                resolved.relative_to(baseline)
+            except (OSError, RuntimeError, ValueError):
+                raise RuntimeError("Baseline fixture symlink escapes project") from None
+            if not resolved.is_dir():
+                raise RuntimeError("Baseline fixture symlink is not a directory")
+            dst = target / relative
+            for item in dst.parents:
+                if item == target.parent:
+                    break
+                if item.is_symlink():
+                    raise RuntimeError("Candidate symlink overlaps protected harness")
+            if dst.is_symlink():
+                if os.readlink(dst) != os.readlink(src):
+                    raise RuntimeError("Candidate symlink overlaps protected harness")
+                dst.unlink()
+            if dst.is_dir():
+                shutil.rmtree(dst)
+            elif dst.exists():
+                dst.unlink()
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            _copy_frozen_fixture(resolved, dst, baseline, state)
+            for child_parent, _, child_files in os.walk(dst, followlinks=False):
+                baseline_harness.update((Path(child_parent) / name).relative_to(target)
+                                        for name in child_files)
+            protected.add(dst)
+            dirs.remove(name)
         for name in files:
             src = Path(parent) / name
             relative = src.relative_to(baseline)
@@ -713,10 +786,17 @@ def freeze_harness(baseline, target, checks=()):
                 shutil.rmtree(dst)
             if src.is_symlink():
                 try:
-                    if not src.resolve().exists():
+                    resolved = src.resolve(strict=True)
+                    if _test_data_path(relative):
+                        resolved.relative_to(baseline)
+                    if not resolved.exists():
                         continue
-                except OSError:
+                except (OSError, RuntimeError, ValueError):
+                    if _test_data_path(relative):
+                        raise RuntimeError("Baseline fixture symlink escapes project") from None
                     continue
+                if _test_data_path(relative):
+                    resolved.relative_to(baseline)
             shutil.copy2(src, dst)
             baseline_harness.add(relative)
             parts = relative.parts
@@ -958,10 +1038,44 @@ def _harness_path(path):
 def _changed_harness(files, checks, baseline, added_tests=()):
     explicit_checks = configured_check_files(baseline, checks)
     additions = set(added_tests)
-    return any(path not in additions and
-               (test_path(path) or _harness_path(path) or Path(path) in explicit_checks or
-                (_test_data_path(path) and (Path(baseline) / path).is_file()))
-               for path in files)
+    root = Path(baseline).resolve()
+    fixture_links = []
+    for parent, dirs, _ in os.walk(root, followlinks=False):
+        for name in dirs:
+            link = Path(parent) / name
+            relative = link.relative_to(root)
+            if not link.is_symlink() or not _test_data_path(relative / ".fixture"):
+                continue
+            try:
+                resolved = link.resolve(strict=True)
+                resolved.relative_to(root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if resolved.is_dir():
+                fixture_links.append(resolved)
+    for path in files:
+        if path in additions:
+            continue
+        candidate = Path(path)
+        baseline_path = root / candidate
+        if test_path(path) or _harness_path(path) or candidate in explicit_checks:
+            return True
+        if _test_data_path(path) and (baseline_path.exists() or baseline_path.is_symlink()):
+            return True
+        # A changed file may be reached through a baseline fixture directory
+        # symlink whose virtual path has no matching entry in the baseline tree.
+        try:
+            resolved_candidate = baseline_path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            resolved_candidate = None
+        if resolved_candidate is not None:
+            for fixture_root in fixture_links:
+                try:
+                    resolved_candidate.relative_to(fixture_root)
+                    return True
+                except ValueError:
+                    continue
+    return False
 
 
 def _overlay_added_tests(candidate, target, paths):
@@ -1109,7 +1223,7 @@ class Evaluator:
         def freeze(target):
             if baseline is None:
                 return []
-            protected = freeze_harness(baseline, target, checks)
+            protected = freeze_harness(baseline, target, checks, state=self.store.root)
             # Detection must come from the host-owned harness alone: test files
             # the candidate added (absent from the baseline) never run inside a
             # control, so they cannot decide whether a fixture was caught.
@@ -1136,7 +1250,7 @@ class Evaluator:
                 result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty_test_run(result["stdout"] + result["stderr"])
                 rows.append(result)
             return rows, True
-        positive_target = copy_source(source, root / "positive")
+        positive_target = copy_source(source, root / "positive", state=self.store.root)
         positive, ready = execute(positive_target, freeze(positive_target))
         outcomes = []
         seen = set()
@@ -1145,7 +1259,7 @@ class Evaluator:
                     or not control.get("source") or not control.get("criterion") or not control.get("files")):
                 raise ValueError("Controls require unique IDs, source, criterion and bounded fixture files")
             seen.add(control["id"])
-            target = copy_source(source, root / str(index))
+            target = copy_source(source, root / str(index), state=self.store.root)
             protected = freeze(target)
             total = 0
             for item in control["files"]:
@@ -1353,10 +1467,10 @@ class Evaluator:
 
     def _standard_stage(self, label, source, baseline, candidate, checks, directory, config, cancel,
                         overlay, seeds, hidden, test_first_files=(), test_first_check=None, run_checks=None):
-        target = copy_source(source, Path(directory) / label)
+        target = copy_source(source, Path(directory) / label, state=self.store.root)
         self._seed_target(target, seeds, config, clear=True)
         harness = candidate if label == "candidate_full" else baseline
-        protected = freeze_harness(harness, target, checks)
+        protected = freeze_harness(harness, target, checks, state=self.store.root)
         if label == "baseline" and test_first_files:
             protected.extend(_overlay_added_tests(candidate, target, test_first_files))
         elif label in {"candidate", "candidate_full"} and test_first_files:
@@ -1418,10 +1532,10 @@ class Evaluator:
 
     def _acceptance_stage(self, label, source, baseline, acceptance, directory, config, cancel, seeds, hidden):
         from .config import relative_path
-        target = copy_source(source, Path(directory) / label)
+        target = copy_source(source, Path(directory) / label, state=self.store.root)
         if (target / ".rsi-acceptance").exists():
             raise RuntimeError("Candidate overlaps independent acceptance namespace")
-        protected = freeze_harness(baseline, target, acceptance["checks"])
+        protected = freeze_harness(baseline, target, acceptance["checks"], state=self.store.root)
         for item in acceptance["spec"]["files"]:
             dst = target / relative_path(item["path"])
             dst.parent.mkdir(parents=True, exist_ok=True)
