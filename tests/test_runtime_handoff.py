@@ -369,18 +369,30 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(observed, [{'preparation': 0.0, 'evaluation': 0.0}, None])
 
     def test_unavailable_stage_budget_ledger_does_not_pin_the_run_in_planning(self):
-        """状态库读不出阶段预算时，run 不能停在 planning 把项目普通任务一起冻住。"""
+        """读不出阶段预算时结案、保留账本并退避，不能耗光重试次数或冻结项目。"""
         task, run = self.claim()
         other = self.runtime.goal(self.project, 'Second boundary')
+        previous_budget = {'preparation': 60.0, 'evaluation': 5.0, 'run': run['id']}
+        self.store.put_setting('stage-budget:' + task, previous_budget)
         real_setting = self.store.setting
+        real_transition = self.store.transition
+        transitions = []
 
         def locked(key, default=None):
             if key.startswith('stage-budget:'):
                 raise sqlite3.OperationalError('database is locked')
             return real_setting(key, default)
 
-        # 只坏预算键：其余读写正常，复现「一次瞬时读失败」的最小条件。
-        with patch.object(self.store, 'setting', side_effect=locked):
+        def flaky_transition(*args, **kwargs):
+            transitions.append(args[1])
+            if len(transitions) == 1:
+                raise sqlite3.OperationalError('database is locked')
+            return real_transition(*args, **kwargs)
+
+        started = time.time()
+        # 只坏预算读取并注入一次状态写瞬时失败，验证有限重试能完成收尾。
+        with patch.object(self.store, 'setting', side_effect=locked), \
+             patch.object(self.store, 'transition', side_effect=flaky_transition):
             self.runtime.process(run)
         row = self.store.one('SELECT state,ended,result FROM runs WHERE id=?', (run['id'],))
         self.assertEqual(row['state'], 'interrupted')
@@ -389,40 +401,52 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(result['reason'], 'Stage budget unavailable')
         self.assertEqual(result['failure']['code'], 'environment')
         self.assertIn('database is locked', result['failure']['detail'])
-        self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (task,))['state'], 'queued')
+        task_row = self.store.one('SELECT state,attempts,available FROM tasks WHERE id=?', (task,))
+        self.assertEqual((task_row['state'], task_row['attempts']), ('queued', 0))
+        self.assertGreaterEqual(task_row['available'], started + 29)
         event = self.store.one("SELECT message,data FROM events WHERE run=? AND kind='stage_budget_unavailable'",
                                (run['id'],))
         self.assertIsNotNone(event)
         self.assertEqual(json.loads(event['data']), {'run': run['id'], 'error': 'database is locked'})
-        # 未结 run 一旦落终态，同项目下一条普通任务就能立刻领到，不再等进程重启。
+        # 预算读取失败时不能用默认零值覆盖此前累计的真实耗时。
+        self.assertEqual(self.store.setting('stage-budget:' + task), previous_budget)
+        self.assertEqual(transitions, ['interrupted', 'interrupted'])
+        # 故障任务退避期间，同项目下一条普通任务仍能领取。
         second = self.store.claim(self.project, self.runtime.config(self.project))
         self.assertIsNotNone(second)
-        self.assertIn(second['task'], (task, other))
+        self.assertEqual(second['task'], other)
 
     def test_run_state_read_failure_still_settles_the_stage_budget(self):
-        """收尾读不到 run 终态时按不交接结算：预算落盘不能被连带跳过。"""
-        from adaptive_rsi.process import Cancelled
-        from adaptive_rsi.gitops import git
-        task, run = self.claim()
-        project = self.runtime.project(self.project)
-        base = git(project['path'], 'rev-parse', 'HEAD')
-        self.store.put_setting('stage-budget:' + task,
-                               {'preparation': 60.0, 'evaluation': 0.0, 'run': run['id']})
-        real_one = self.store.one
+        """终态查询失败时保留预算，再按 owner 的最终状态决定是否交接。"""
+        for final_state in ('interrupted', 'failed'):
+            with self.subTest(final_state=final_state):
+                task, run = self.claim()
+                clock = [1000.0]
+                original_one = self.store.one
 
-        def flaky(sql, args=()):
-            if sql == 'SELECT state,ended FROM runs WHERE id=?' and tuple(args) == (run['id'],):
-                raise sqlite3.OperationalError('database is locked')
-            return real_one(sql, args)
+                def finish(current):
+                    clock[0] += 60.0
+                    self.store.execute('UPDATE runs SET state=?,ended=? WHERE id=?',
+                                       (final_state, time.time(), current['id']))
 
-        with patch.object(self.store, 'one', side_effect=flaky), \
-             patch('adaptive_rsi.delivery.baseline', return_value=(project['path'], base, 'main')), \
-             patch.object(self.runtime, 'execute_candidate', side_effect=Cancelled('stopped')):
-            self.runtime.process(run)
-        self.assertEqual(self.store.one('SELECT state,ended FROM runs WHERE id=?', (run['id'],))['state'],
-                         'interrupted')
-        # keep=True 会留下 60 秒额度；读不到终态只能按已结案处理，键必须被清掉。
-        self.assertIsNone(self.store.setting('stage-budget:' + task))
+                def fail_final_read(sql, args=()):
+                    if sql == 'SELECT state,ended FROM runs WHERE id=?' and tuple(args) == (run['id'],):
+                        raise sqlite3.OperationalError('database is locked')
+                    return original_one(sql, args)
+
+                with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]), \
+                     patch.object(self.runtime, '_process', side_effect=finish), \
+                     patch.object(self.store, 'one', side_effect=fail_final_read):
+                    self.runtime.process(run)
+                key = 'stage-budget:' + task
+                self.assertEqual(self.store.setting(key),
+                                 {'preparation': 60.0, 'evaluation': 0.0, 'run': run['id']})
+                loaded = self.runtime._load_stage_budget({'task': task, 'id': 'next-attempt'})
+                expected = 60.0 if final_state == 'interrupted' else 0.0
+                self.assertEqual(loaded, {'preparation': expected, 'evaluation': 0.0})
+                if final_state == 'failed':
+                    self.assertIsNone(self.store.setting(key))
+                self.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (task,))
 
     def test_trial_phase_clock_ignores_parent_planning_and_propagates_timeout(self):
         _, parent = self.claim()

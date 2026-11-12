@@ -39,6 +39,8 @@ BUDGET_WAIT_RETRIES = 3
 # 线程池准入失败的退避：claim 之后提交被拒（线程/内存耗尽）不构成一次任务尝试，
 # 归还额度并把任务延后重排；否则每个调度节拍（~5s）都会新建一条 interrupted run。
 ADMISSION_BACKOFF_SECONDS = 30
+# 阶段预算账本不可读时，交还 claim 次数并延迟重排，避免调度节拍反复创建 run。
+STAGE_BUDGET_BACKOFF_SECONDS = 30
 # 阶段预算跨尝试累计时，崩溃最多丢失一个检查点间隔的已耗时间。
 STAGE_BUDGET_CHECKPOINT_SECONDS = 15
 
@@ -2124,10 +2126,12 @@ class Runtime(Maintenance):
                     'Could not read run state while settling stage budget for %s',
                     run.get('id'), exc_info=True)
                 row = None
-            # 只有中断会交接给下一次尝试；其他终态（含 deadline 阻塞）视为本轮已结案。
-            keep = bool(row) and (row['ended'] is None or row['state'] == 'interrupted')
-            with _clock_lock(run):
-                self._save_stage_budget(run, time.monotonic(), keep)
+            # 状态读取失败时保留账本，下一次载入会按 owner 的真实状态裁决；
+            # 若预算本身读失败，_stage_used 是默认零值，不能覆盖原账本。
+            keep = row is None or row['ended'] is None or row['state'] == 'interrupted'
+            if unavailable is None:
+                with _clock_lock(run):
+                    self._save_stage_budget(run, time.monotonic(), keep)
 
     def _interrupt_unavailable_stage_budget(self, run, detail):
         """预算账本不可读时收尾本次尝试：留下结构化回执并把任务名额交还队列。
@@ -2138,6 +2142,19 @@ class Runtime(Maintenance):
         仍能在 events 里看到失败原因。
         """
         detail = str(detail or '')[:300] or 'Stage budget ledger is unreadable'
+        retry_at = time.time() + STAGE_BUDGET_BACKOFF_SECONDS
+
+        def retry_database(operation):
+            error = None
+            for attempt in range(3):
+                try:
+                    return operation()
+                except Exception as exc:
+                    error = exc
+                    if attempt < 2:
+                        time.sleep(0.05 * (attempt + 1))
+            raise error
+
         try:
             self.store.event('stage_budget_unavailable',
                              'Stage budget ledger unavailable; run interrupted and task requeued',
@@ -2147,11 +2164,16 @@ class Runtime(Maintenance):
             logging.getLogger(__name__).exception(
                 'Could not record stage budget failure for %s', run.get('id'))
         try:
-            self.store.transition(run['id'], 'interrupted',
-                                  {'reason': 'Stage budget unavailable',
-                                   'failure': {'code': 'environment', 'action': 'check_environment',
-                                               'detail': detail}},
-                                  True, task_fields={'state': 'queued'})
+            task = retry_database(lambda: self.store.one(
+                'SELECT attempts FROM tasks WHERE id=?', (run['task'],)))
+            attempts = max(0, (task['attempts'] or 0) - 1) if task else 0
+            retry_database(lambda: self.store.transition(
+                run['id'], 'interrupted',
+                {'reason': 'Stage budget unavailable',
+                 'failure': {'code': 'environment', 'action': 'check_environment',
+                             'detail': detail}},
+                True, task_fields={'state': 'queued', 'available': retry_at,
+                                   'attempts': attempts}))
         except Exception:
             logging.getLogger(__name__).exception(
                 'Could not interrupt run %s after stage budget failure', run.get('id'))
