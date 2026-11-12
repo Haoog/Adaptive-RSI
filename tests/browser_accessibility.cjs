@@ -19,6 +19,14 @@ async function audit(page) {
     for (const node of document.querySelectorAll('button,a[href],input:not([type=hidden]),select,textarea')) {
       if (visible(node) && !named(node)) errors.push('Unnamed control: ' + node.tagName + '#' + node.id);
     }
+    for (const node of document.querySelectorAll('dialog')) {
+      if (!visible(node)) continue;
+      const labelledby = (node.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+        .map(id => document.getElementById(id)?.textContent.trim()).filter(Boolean).join(' ');
+      if (!node.getAttribute('aria-label')?.trim() && !labelledby) {
+        errors.push('Unnamed dialog: ' + (node.id || node.className));
+      }
+    }
     for (const node of document.querySelectorAll('[aria-labelledby],[aria-describedby]')) {
       for (const attr of ['aria-labelledby', 'aria-describedby']) {
         for (const id of (node.getAttribute(attr) || '').split(/\s+/).filter(Boolean)) {
@@ -30,6 +38,33 @@ async function audit(page) {
     return errors;
   });
   assert.deepEqual(problems, []);
+}
+
+// <dialog> 的可访问名称只来自 aria-labelledby / aria-label，不从后代文本取名。
+// 这里直接读取 Chromium 无障碍树，避免再用 textContent 兜底掩盖缺失的名称。
+async function assertModelDialogNames(page, locale) {
+  const ids = ['mc-provider-dialog', 'mc-picker-dialog', 'mc-advanced-dialog', 'mc-price-dialog', 'mc-probe-dialog'];
+  const client = await page.context().newCDPSession(page);
+  try {
+    await client.send('Accessibility.enable');
+    for (const id of ids) {
+      const expected = await page.evaluate(id => {
+        const dialog = document.getElementById(id);
+        if (!dialog) return null;
+        if (!dialog.open) dialog.showModal();
+        const labelledby = (dialog.getAttribute('aria-labelledby') || '').trim();
+        return labelledby ? document.getElementById(labelledby)?.textContent.trim() || '' : '';
+      }, id);
+      assert(expected, id + ' references a non-empty title');
+      const {nodes} = await client.send('Accessibility.getFullAXTree');
+      await page.evaluate(id => document.getElementById(id).close(), id);
+      const names = nodes.filter(node => !node.ignored && node.role?.value === 'dialog')
+        .map(node => node.name?.value || '');
+      assert.deepEqual(names, [expected], id + ' exposes its title as the accessible name (' + locale + ')');
+    }
+  } finally {
+    await client.detach();
+  }
 }
 
 async function main() {
@@ -59,6 +94,7 @@ async function main() {
         assert.equal(await page.locator('#archive-project').textContent(), 'Archive current project');
         assert.equal(await page.locator('#attention-inbox').textContent(), 'Attention inbox' + inboxCount);
       }
+      await assertModelDialogNames(page, locale);
       for (const width of [1440, 390]) {
         await page.setViewportSize({width, height: 900});
         await audit(page);
@@ -114,7 +150,7 @@ async function main() {
       assert(options[1].top >= options[0].bottom, 'dependency choices form a vertical list without overlap');
       assert(options.every(option => option.width > 100), 'dependency labels have readable width');
     }
-    console.log('Accessible names, labels, ARIA references and page language passed at desktop/mobile sizes in both languages.');
+    console.log('Accessible names, dialog names, labels, ARIA references and page language passed at desktop/mobile sizes in both languages.');
   } finally {
     if (browser) await browser.close();
     server.stdin.end('\n');
