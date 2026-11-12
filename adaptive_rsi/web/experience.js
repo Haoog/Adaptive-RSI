@@ -496,6 +496,10 @@ window.RSIExperience = (() => {
       label.append(input);
       const reasonLabel = el("label", t("干预原因（可选，保留原文）")), reason = el("textarea");
       reason.rows = 2;reason.maxLength = 2000;reasonLabel.append(reason);
+      // 详情轮询与语言切换会整块重建；按任务恢复未提交的审计原文，提交成功后清除。
+      reason.value = draftStore.get('task-reason', task.id) || '';
+      if (reason.value) supplement.open = true;
+      reason.addEventListener('input', () => draftStore.set('task-reason', task.id, reason.value));
       const submit = el("button", t("保存补充并重新评估"), "button");
       submit.type = "submit";
       form.append(label, reasonLabel, submit);
@@ -503,16 +507,17 @@ window.RSIExperience = (() => {
         event.preventDefault();
         safe(async () => {
           if (!current()) return;
-          const value = input.value;
+          const value = input.value, submittedReason = reason.value;
           if (!value.trim()) throw Error(t("补充需求不能为空，请输入需要保留或补充的要求。"));
           submit.disabled = true;
           try {
             const receipt = await api("task/revise", {
               task: task.id,
               supplement: value,
-              reason: reason.value,
+              reason: submittedReason,
             });
             if (draftStore.get('task-supplement', task.id) === value) draftStore.remove('task-supplement', task.id);
+            if (draftStore.get('task-reason', task.id) === submittedReason) draftStore.remove('task-reason', task.id);
             toast(t(receipt.pending ? "补充已收到，将在当前阶段结束后带入下一轮。" : "补充已保存，将重新评估。"));
             await refreshTaskDetail();
           } finally {
@@ -631,6 +636,11 @@ window.RSIExperience = (() => {
             // Rebase even if this form was rebuilt. Its editor still owns newer edits.
             editor.baseline = {dependencies: parents, urgency: !!submitted.urgency};
             editor.version++;
+            // A closed and reopened view owns a different editor for the same task.
+            if (queueEditor && queueEditor !== editor && queueEditor.key === editor.key) {
+              queueEditor.baseline = {dependencies: parents, urgency: !!submitted.urgency};
+              queueEditor.version++;
+            }
             if (!queueEditorCurrent(editor)) return;
             await refresh();
             if (queueEditorCurrent(editor)) toast(t("排队设置已保存"));

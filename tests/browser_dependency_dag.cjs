@@ -50,6 +50,33 @@ const {chromium} = require('playwright');
     assert.deepEqual(persisted,parents.sort());
     await page.reload();
     await page.waitForFunction(() => document.querySelector('#detail-body select[multiple]')?.selectedOptions.length === 2);
+    // Delay the server write itself so reopening sees the old baseline.
+    let release, arrived;
+    const gate = new Promise(resolve => { release = resolve; });
+    const pending = new Promise(resolve => { arrived = resolve; });
+    let cleanup = false;
+    const holdSave = async route => { arrived(); await gate; if (!cleanup) await route.continue(); };
+    await page.route('**/api/task/schedule', holdSave);
+    try {
+      if (!(await queue.evaluate(node => node.open))) await queue.locator(':scope > summary').click();
+      await select.selectOption([]);
+      await page.getByRole('button',{name:'保存排队设置',exact:true}).click();
+      await pending;
+      const reopenedTask = await page.evaluate(() => structuredClone(detailTask));
+      await page.locator('#detail-dialog .close-dialog').click();
+      await page.evaluate(task => showTask(task), reopenedTask);
+      await select.waitFor({state:'attached'});
+      assert.equal(await select.locator('option:checked').count(), 2);
+      const response = page.waitForResponse(r => new URL(r.url()).pathname === '/api/task/schedule');
+      release(); assert.equal((await response).status(), 200);
+      await page.waitForFunction(() => !document.querySelector('.task-queue-editor button[type=submit]')?.disabled);
+      if (!(await queue.evaluate(node => node.open))) await queue.locator(':scope > summary').click();
+      await select.selectOption(parents);
+      await page.locator('#language-select').selectOption('en');
+      await page.waitForFunction(() => document.querySelector('#detail-body select[multiple]'));
+      assert.deepEqual((await select.locator('option:checked').evaluateAll(options => options.map(option => option.value))).sort(), parents.sort(),
+        'reopened editor keeps an undo to its original baseline after acknowledgement and rebuild');
+    } finally { cleanup = true; release(); await page.unroute('**/api/task/schedule', holdSave); }
     assert.deepEqual(errors, []);
     console.log('Multiple predecessor selection, bilingual drafts, persistence and reload browser checks passed without model calls.');
   } finally {

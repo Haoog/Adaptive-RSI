@@ -708,7 +708,7 @@ function renderTasks(){
  }
  document.querySelectorAll('[data-task-filter]').forEach(button=>{button.classList.toggle('active',button.dataset.taskFilter===filter);button.setAttribute('aria-pressed',String(button.dataset.taskFilter===filter));});
  const tasks=visibleTasks(scoped(state.tasks),filter,$('show-system-tasks').checked);
- window.RSIBatch?.toolbar();
+ window.RSIBatch?.toolbar(tasks);
  const candidate=state.selected_project&&state.selected_project!==projectId?null:state.pagination;
  const page=candidate&&candidate.offset===taskOffset&&(candidate.total===0?candidate.offset===0:candidate.offset<candidate.total)?candidate:null;
  $('tasks-prev').disabled=!taskOffset;$('tasks-next').disabled=!page?.has_more;$('tasks-page').textContent=page?(tasks.length?page.offset+1:0)+'–'+(tasks.length?Math.min(page.offset+tasks.length,page.total):0)+' / '+page.total:'';
@@ -771,8 +771,9 @@ function taskOutcome(data){
  }
  outcome.append(stageProgress(data));return outcome;
 }
+const valueFeedbackPending=new Map();
 function valueFeedback(data){
- const key=(data.project||'')+':'+(data.id||''),draft=valueFeedbackDrafts.get(key);
+ const key=JSON.stringify([data.project||'',data.id||'']),draft=valueFeedbackDrafts.get(key);
  const form=el('form',undefined,'value-feedback'),heading=el('h4',t('这次改进有帮助吗？')),hint=el('p',t('评价可选，仅用于观察，不会自动改变排序或策略。'),'muted'),select=el('select'),note=el('textarea'),status=el('p');
  const label=el('label',t('价值评价')),noteLabel=el('label',t('评价说明（可选）'));
  for(const [value,text] of [['','未评价'],['helpful','有帮助'],['unnecessary','没必要'],['false_positive','误报']]){const option=el('option',t(text));option.value=value;select.append(option);}
@@ -782,11 +783,14 @@ function valueFeedback(data){
  const remember=()=>{valueFeedbackDrafts.set(key,{rating:select.value,note:note.value});};
  select.addEventListener('change',remember);note.addEventListener('input',remember);
  const button=el('button',t('保存评价'),'text-button');button.type='submit';
+ const pending=valueFeedbackPending.get(key);if(pending){button.disabled=true;pending.add(button);}
  form.append(heading,hint,label,noteLabel,button,status);
  form.addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
-  button.disabled=true;status.textContent='';
-  try{await api('task/value-feedback',{project:data.project,task:data.task,run:data.id,rating:select.value||null,note:note.value});valueFeedbackDrafts.delete(key);if(form.isConnected)status.textContent=t('评价已保存');}
-  finally{button.disabled=false;}
+  if(valueFeedbackPending.has(key))return;
+  const buttons=new Set([button]);valueFeedbackPending.set(key,buttons);button.disabled=true;status.textContent='';
+  const submittedDraft=valueFeedbackDrafts.get(key),submitted={project:data.project,task:data.task,run:data.id,rating:select.value||null,note:note.value};
+  try{await api('task/value-feedback',submitted);if(valueFeedbackDrafts.get(key)===submittedDraft)valueFeedbackDrafts.delete(key);if(form.isConnected)status.textContent=t('评价已保存');}
+  finally{valueFeedbackPending.delete(key);for(const current of buttons)current.disabled=false;}
  },form);});return form;
 }
 function runPageRows(page){return Array.isArray(page)?page:(Array.isArray(page?.runs)?page.runs:[]);}
@@ -798,7 +802,13 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
  window.RSIExperience?.taskOpened(task,queueDraft);
  const requirements=el('section',undefined,'task-requirements'),copy=el('p',task.body);copy.id='task-requirements';requirements.append(el('h3',t('任务要求')),copy);body.append(requirements);
  const evidence=lazyEvidence('来源与证据',()=>task.evidence||'');evidence.className='detail-section';body.append(evidence);
- const firstPage=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');if(ticket!==detailSequence||projectId!==project)return;
+ // 首屏请求失败时运行记录区块还没创建，不能让详情永久空白：在正文内给出错误与重试，重试重新走一次完整渲染。
+ let firstPage;try{firstPage=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');}catch(error){if(ticket!==detailSequence||projectId!==project)return;
+  // 登录失效要重新进入控制台，保留原有提示，不在详情里诱导反复重试。
+  if(error.code==='session_required')throw error;
+  const failed=el('section',undefined,'detail-section'),retry=action(t('重试'),()=>showTask(task,restoreView),'text-button');
+  failed.append(el('h3',t('检查过程与运行记录')),el('p',t('运行记录加载失败。'),'form-error'),retry);body.append(failed);return;}
+ if(ticket!==detailSequence||projectId!==project)return;
  // 响应为分页信封；同时接受旧服务端的裸数组，避免升级期间把历史区显示为空。
  const history=runPageRows(firstPage);
  let historyBefore=!Array.isArray(firstPage)&&firstPage?.has_more&&firstPage.next_before?firstPage.next_before:null;
@@ -867,22 +877,29 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
   if(plan.affected.length){preview.append(el('p',t('以下后继任务依赖本任务；默认只取消当前任务。')));for(const item of plan.affected)preview.append(el('p',item.title+' · '+t(statusNames[item.state]||item.state)));if(!plan.truncated){const label=el('label',t('同时取消可取消的后继任务'));label.prepend(cascade);preview.append(label);}}
   if(plan.truncated)preview.append(el('p',t('后继过多，预览仅展示前 999 项；本次只能取消当前任务。')));
   const reasonLabel=el('label',t('干预原因（可选，保留原文）'));reasonLabel.append(reason);preview.append(reasonLabel);
-  if(!(await uiConfirm(t('确认取消任务及所选后继？'),preview)))return;
-  await api('cancel',{task:task.id,cascade:cascade.checked,revision:plan.revision,reason:reason.value});closeTaskDetail();await refresh();}));
+  if(!(await uiConfirm(t('确认取消任务及所选后继？'),preview))||!stillCurrent())return;
+  await api('cancel',{task:task.id,cascade:cascade.checked,revision:plan.revision,reason:reason.value});if(stillCurrent())closeTaskDetail();await refresh();}));
   if(task.state==='queued'){
    // 预约授权一个绝对时刻：时区与重复小时一起提交，由后端拒绝缺失/歧义时刻。
-   const scheduleBox=el('div',undefined,'task-schedule-editor'),time=el('input'),zone=el('input'),repeat=el('select');
+   const scheduleBox=el('div',undefined,'task-schedule-editor'),time=el('input'),zone=el('input'),repeat=el('select'),draft=draftStore.get('task-schedule',task.id);
    time.type='datetime-local';
-   zone.type='text';zone.value=displayTz||Intl.DateTimeFormat().resolvedOptions().timeZone;
+   zone.type='text';zone.value=draft?.zone??displayTz??Intl.DateTimeFormat().resolvedOptions().timeZone;
    for(const [value,text] of [['','时间唯一'],['0','第一次'],['1','第二次']]){const option=el('option',t(text));option.value=value;repeat.append(option);}
+   // 详情轮询与语言切换会整块重建；按任务恢复未提交的预约输入。
+   time.value=draft?.time??'';repeat.value=draft?.repeat??'';
+   const rememberSchedule=()=>draftStore.set('task-schedule',task.id,{time:time.value,zone:zone.value,repeat:repeat.value});
+   time.addEventListener('input',rememberSchedule);zone.addEventListener('input',rememberSchedule);repeat.addEventListener('change',rememberSchedule);
    const localLabel=el('label',t('本地时间'));localLabel.append(time);
    const zoneLabel=el('label',t('时区'));zoneLabel.append(zone);
    const repeatLabel=el('label',t('重复小时'));repeatLabel.append(repeat);
    scheduleBox.append(el('p',t('安排检查：此任务将在指定时刻开始运行。')),localLabel,zoneLabel,repeatLabel,
     action(t('预约'),async()=>{if(!time.value||!zone.value.trim()){toast(t('请填写本地时间和时区。'),true);return;}
-     await api('task/schedule-time',{task:task.id,local_time:time.value,timezone:zone.value.trim(),
-      fold:repeat.value===''?undefined:Number(repeat.value)});
-     toast(t('预约已保存'));closeTaskDetail();await refresh();},'button primary'));
+     const submitted={time:time.value,zone:zone.value,repeat:repeat.value};
+     await api('task/schedule-time',{task:task.id,local_time:submitted.time,timezone:submitted.zone.trim(),
+      fold:submitted.repeat===''?undefined:Number(submitted.repeat)});
+     const saved=draftStore.get('task-schedule',task.id);
+     if(saved&&saved.time===submitted.time&&saved.zone===submitted.zone&&saved.repeat===submitted.repeat)draftStore.remove('task-schedule',task.id);
+     toast(t('预约已保存'));if(stillCurrent())closeTaskDetail();await refresh();},'button primary'));
    secondary.append(el('summary',t('安排检查')),scheduleBox);}
   body.append(secondary);}
  restoreView?.(body);
@@ -1428,7 +1445,7 @@ const updateChannels={desktop:'桌面应用',pip:'Python 包（建议用 pip 升
 let desktopUpdate=null,desktopUpdateTimer=null,desktopCheckError=false;
 function stopDesktopUpdatePolling(){clearInterval(desktopUpdateTimer);desktopUpdateTimer=null;}
 async function checkDesktopUpdate(force=false){
- if(window.RSINativeUpdate){await window.RSINativeUpdate.run('check');desktopCheckError=false;return;}
+ if(window.RSINativeUpdate){await (force?window.RSINativeUpdate.run('check'):window.RSINativeUpdate.tick());desktopCheckError=false;return;}
  if(!window.RSIDesktop?.invoke)return;
  try{const info=await window.RSIDesktop.invoke('check_desktop_update',{force});desktopUpdate=info&&info.version?info:null;desktopCheckError=!!(info&&info.check_error);}catch{desktopUpdate=null;desktopCheckError=true;}
  // 下载可能先于本次页面会话开始（刷新界面或切换运行机器后加载）：恢复轮询直到完成或失败。
@@ -1489,7 +1506,9 @@ function renderUpdate(){if(!state)return;const update=state.update||{state:'unch
 $('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop&&window.RSINativeUpdate){await window.RSINativeUpdate.run('check');return;}if(window.RSIDesktop){await checkDesktopUpdate(true);if(desktopCheckError){toast(t('检查更新失败，请稍后重试。'),true);return;}if(!desktopUpdate)toast(t('已是最新稳定版'));return;}const result=await api('updates/check',{});if(result.update){state.update=result.update;renderUpdate();}else await refresh();if(result.started)toast(t('已开始检查更新'));}));
 $('apply-update').addEventListener('click',()=>safe(async()=>{if(!(await uiConfirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？'))))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));
 safe(async()=>{if(window.RSIDesktop){await window.RSIDesktop.ready;restoreRuntimeNavigation();if(window.RSIDesktop.invoke)window.RSIDesktop.invoke('set_native_language',{language}).catch(()=>{});}await refresh();});
-if(window.RSIDesktop)safe(checkDesktopUpdate);
+// native-update.js 在本脚本之后加载，启动检查要等到 DOMContentLoaded 才会走带节流的 tick()；
+// 直接在这里调用会落到旧的 check_desktop_update 命令，每次刷新都请求远端发布源。
+if(window.RSIDesktop)document.addEventListener('DOMContentLoaded',()=>safe(checkDesktopUpdate));
 $('language-select').addEventListener('change',()=>safe(async()=>{
  language=$('language-select').value;
  localWrite('rsi-language',language);

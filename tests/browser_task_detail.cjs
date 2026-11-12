@@ -104,6 +104,59 @@ async function checkTaskDetail(browser, url, errors) {
     assert.equal(persisted.evidence_summary.value_feedback.rating, 'helpful');
     assert.equal(persisted.evidence_summary.value_feedback.note, '<script>original feedback</script>');
     assert.equal(await valueBox.locator('script').count(), 0);
+    // Delay the actual first write across a language rebuild. A newer save must
+    // wait until it finishes, otherwise the delayed write can overwrite it.
+    let releaseFirstWrite, firstWriteArrived;
+    const firstWriteGate = new Promise(resolve => { releaseFirstWrite = resolve; });
+    const firstWriteSeen = new Promise(resolve => { firstWriteArrived = resolve; });
+    const holdFirstWrite = async route => { firstWriteArrived(); await firstWriteGate; await route.continue().catch(() => {}); };
+    await page.route('**/api/task/value-feedback', holdFirstWrite, {times: 1});
+    try {
+      await valueBox.locator('textarea').fill('旧评价');
+      await valueBox.getByRole('button', {name: '保存评价', exact: true}).click();
+      await firstWriteSeen;
+      await page.locator('#language-select').selectOption('en');
+      await valueBox.locator('textarea').fill('新评价');
+      assert.equal(await valueBox.locator('button[type=submit]').isDisabled(), true,
+        'a rebuilt form must not start another write while the previous write is pending');
+      releaseFirstWrite();
+      await valueBox.locator('button[type=submit]:not([disabled])').waitFor();
+      const savedNew = page.waitForResponse(response => new URL(response.url()).pathname === '/api/task/value-feedback' && response.request().method() === 'POST');
+      await valueBox.locator('button[type=submit]').click();
+      assert.equal((await savedNew).status(), 200);
+      assert.equal((await page.evaluate(async () => (await fetch('/api/run?id=detail-h3')).json())).evidence_summary.value_feedback.note, '新评价');
+      await page.locator('#language-select').selectOption('zh-CN');
+    } finally {
+      releaseFirstWrite();
+      await page.unroute('**/api/task/value-feedback', holdFirstWrite);
+    }
+    // Hold a real save acknowledgement while the same form receives newer input.
+    let releaseFeedback, feedbackCommitted;
+    const feedbackGate = new Promise(resolve => { releaseFeedback = resolve; });
+    const feedbackArrived = new Promise(resolve => { feedbackCommitted = resolve; });
+    const holdFeedback = async route => {
+      const response = await route.fetch();
+      feedbackCommitted(); await feedbackGate; await route.fulfill({response});
+    };
+    await page.route('**/api/task/value-feedback', holdFeedback);
+    try {
+      await valueBox.getByLabel('评价说明（可选）').fill('提交的评价');
+      await valueBox.getByRole('button', {name: '保存评价', exact: true}).click();
+      await feedbackArrived;
+      await valueBox.getByLabel('价值评价').selectOption('false_positive');
+      await valueBox.getByLabel('评价说明（可选）').fill('回执前的新草稿');
+      releaseFeedback();
+      await valueBox.getByRole('status').filter({hasText: '评价已保存'}).waitFor();
+      await page.locator('#language-select').selectOption('en');
+      await page.locator('#live-task-outcome .value-feedback').waitFor();
+      assert.equal(await valueBox.locator('select').inputValue(), 'false_positive');
+      assert.equal(await valueBox.locator('textarea').inputValue(), '回执前的新草稿');
+      await page.locator('#language-select').selectOption('zh-CN');
+      await page.locator('#live-task-outcome .value-feedback').waitFor();
+    } finally {
+      releaseFeedback();
+      await page.unroute('**/api/task/value-feedback', holdFeedback);
+    }
     await closeDetail(page);
     await openDetail(page, '详情历史任务', 'attention');
     await page.locator('#live-task-outcome .value-feedback').waitFor();
@@ -246,9 +299,28 @@ async function checkTaskDetail(browser, url, errors) {
     await page.locator('dialog.confirm-dialog[open]').waitFor({ timeout: 5000 });
     await page.locator('dialog.confirm-dialog').getByLabel('同时取消可取消的后继任务', {exact: true}).check();
     await page.locator('dialog.confirm-dialog').getByLabel('干预原因（可选，保留原文）', {exact: true}).fill('取消整个相关范围');
+    let releaseCancel, cancelCommitted;
+    const cancelGate = new Promise(resolve => { releaseCancel = resolve; });
+    const cancelArrived = new Promise(resolve => { cancelCommitted = resolve; });
+    const holdCancel = async route => { const response = await route.fetch(); cancelCommitted(); await cancelGate; await route.fulfill({response}); };
+    await page.route('**/api/cancel', holdCancel, {times: 1});
     await page.locator('dialog.confirm-dialog button', { hasText: '确认' }).click();
+    await cancelArrived;
+    await openDetail(page, '详情历史任务', 'attention');
+    const otherFeedback = page.locator('#live-task-outcome .value-feedback');
+    await otherFeedback.locator('textarea').fill('取消回执前的草稿');
+    releaseCancel();
     const cancelled = await cancelRequest;
     assert.equal(cancelled.status(), 200, await cancelled.text());
+    await page.waitForTimeout(300);
+    assert.equal(await page.locator('#detail-dialog').evaluate(dialog => dialog.open), true,
+      'a cancellation receipt must not close another task');
+    assert.equal(await otherFeedback.locator('textarea').inputValue(), '取消回执前的草稿');
+    await page.locator('#language-select').selectOption('en');
+    assert.equal(await otherFeedback.locator('textarea').inputValue(), '取消回执前的草稿',
+      'the other task draft must survive a detail rebuild');
+    await page.locator('#language-select').selectOption('zh-CN');
+    await closeDetail(page);
     const cancellation = await cancelled.json();
     assert.equal(cancellation.cascade, true);
     assert.equal(cancellation.receipts.filter(item => item.state === 'cancelled').length, 2);
@@ -280,6 +352,31 @@ async function checkTaskDetail(browser, url, errors) {
     await budgetRetry.click();
     assert.equal((await budgetResponse).status(), 200);
     await page.locator('#detail-body .badge').filter({ hasText: '排队中' }).waitFor({ timeout: 10000 });
+    // Hold a real successful schedule acknowledgement while opening another task.
+    await page.locator('.task-secondary-actions > summary').first().click();
+    const schedule = page.locator('.task-schedule-editor');
+    await schedule.getByLabel('本地时间').fill('2035-01-01T12:00');
+    await schedule.getByLabel('时区').fill('UTC');
+    let release, committed;
+    const gate = new Promise(resolve => { release = resolve; });
+    const arrived = new Promise(resolve => { committed = resolve; });
+    const holdSchedule = async route => {
+      const response = await route.fetch();
+      assert.equal(response.status(), 200, await response.text());
+      committed(); await gate; await route.fulfill({response});
+    };
+    await page.route('**/api/task/schedule-time', holdSchedule);
+    try {
+      await schedule.getByRole('button', {name: '预约', exact: true}).click();
+      await arrived;
+      await openDetail(page, '过时详情任务', 'history');
+      const acknowledged = page.waitForResponse(response => new URL(response.url()).pathname === '/api/task/schedule-time');
+      release(); await acknowledged;
+      await page.locator('#toast').filter({hasText: '预约已保存'}).waitFor();
+      assert.equal(await page.locator('#detail-dialog').evaluate(dialog => dialog.open), true,
+        'an older schedule acknowledgement must not close another task');
+      assert.equal(await page.locator('#detail-title').textContent(), '过时详情任务');
+    } finally { release(); await page.unroute('**/api/task/schedule-time', holdSchedule); }
     await closeDetail(page);
 
     // ---------- 4) 过时任务详情内可重试 ----------
