@@ -974,6 +974,52 @@ class AuditMaintenanceRetentionTest(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_archive_verification_statuses_are_loaded_in_one_batch(self):
+        from adaptive_rsi.maintenance import Maintenance
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory)
+            try:
+                archives = store.root / 'archives'
+                archives.mkdir()
+                names = [f'{index:03}.sqlite3.gz' for index in range(40)]
+                fresh = time.time() - 60
+                for name in names:
+                    (archives / name).write_bytes(b'fixture')
+                    store.put_setting('archive-verification:' + name,
+                                      {'valid': True, 'checked_at': fresh})
+                due_key = 'archive-verification:' + names[20]
+                store.put_setting(due_key, {'valid': True, 'checked_at': 1.0})
+                corrupt_key = 'archive-verification:' + names[30]
+                store.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',
+                              (corrupt_key, '{broken'))
+                runtime = self.archive_maintenance(store)
+                original_query = store.query
+                with patch.object(store, 'query', wraps=original_query) as queries:
+                    with patch('adaptive_rsi.storage_tools.verify_archive',
+                               return_value={'valid': True, 'checked_at': time.time()}) as checked:
+                        Maintenance.maintenance(runtime)
+                        self.assertEqual(Path(checked.call_args.args[0]).name, names[20])
+                        store.execute("DELETE FROM settings WHERE key='maintenance-last'")
+                        Maintenance.maintenance(runtime)
+                status_reads = [call for call in queries.call_args_list
+                                if 'settings' in call.args[0] and
+                                any(isinstance(value, str) and
+                                    value.startswith('archive-verification:')
+                                    for value in (call.args[1] if len(call.args) > 1 else ()))]
+                self.assertEqual(len(status_reads), 2)
+                self.assertTrue(all('SELECT key,value FROM settings' in call.args[0]
+                                    for call in status_reads))
+                self.assertTrue(all(call.args[1] == ('archive-verification:*',)
+                                    for call in status_reads))
+                self.assertEqual(checked.call_count, 2)
+                self.assertEqual([Path(call.args[0]).name for call in checked.call_args_list],
+                                 [names[20], names[30]])
+                self.assertEqual(store.setting(due_key)['valid'], True)
+                self.assertEqual(store.setting(corrupt_key)['valid'], True)
+                self.assertEqual(self.repaired_events(store), 1)
+            finally:
+                store.close()
+
 
 class AuditResourceFairnessTest(unittest.TestCase):
     setUp = AuditRound6Test.setUp

@@ -173,7 +173,7 @@ def _merged_monitoring_completed(result):
     return isinstance(parsed, dict) and bool(parsed.get("monitoring_completed"))
 
 
-def _archive_verification_due(store, key, now):
+def _archive_verification_due(value, now):
     """Return (due, previous_type) for one stored archive verification report.
 
     Settings are untrusted input: a restored backup or a hand edit can leave a
@@ -184,11 +184,10 @@ def _archive_verification_due(store, key, now):
     second item names the original shape (never its content) for the repair
     event, and is None when no record existed or the stored one is usable.
     """
-    row = store.one("SELECT value FROM settings WHERE key=?", (key,))
-    if row is None:
+    if value is None:
         return True, None
     try:
-        previous = json.loads(row["value"])
+        previous = json.loads(value)
     except (ValueError, TypeError):
         return True, "unreadable"
     checked_at = previous.get("checked_at") if isinstance(previous, dict) else None
@@ -788,11 +787,18 @@ class Maintenance:
         # Passive checkpoint yields to readers; archive checks are capped per cycle.
         self.store.wal_diagnostics(checkpoint=True)
         from .storage_tools import verify_archive
-        for path in sorted((self.store.root / "archives").glob("*.sqlite3.gz")):
-            if path.is_symlink():
-                continue
-            key = "archive-verification:" + path.name
-            due, previous_type = _archive_verification_due(self.store, key, now)
+        archive_paths = sorted(
+            path for path in (self.store.root / "archives").glob("*.sqlite3.gz")
+            if not path.is_symlink())
+        prefix = "archive-verification:"
+        verification_rows = self.store.query(
+            "SELECT key,value FROM settings WHERE key GLOB ?",
+            (prefix + "*",)) if archive_paths else []
+        verification_status = {row["key"]: row["value"] for row in verification_rows}
+        for path in archive_paths:
+            key = prefix + path.name
+            due, previous_type = _archive_verification_due(
+                verification_status.get(key), now)
             if not due:
                 continue
             if previous_type is not None:
