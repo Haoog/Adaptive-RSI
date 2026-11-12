@@ -64,7 +64,7 @@ async function checkReleaseRetryUI(browser,url,errors){
 async function checkAccountAndReleaseUI(browser,url,errors){
  const page=await browser.newPage({viewport:{width:1100,height:900}}),requests=[];
  page.on('pageerror',error=>errors.push(error.message));
- let signedIn=false,complete=false,authActive=false,releaseStarted,authStarts=0,pollTransientFailure=true,completionStatusFailures=0,catalogFailures=0;
+ let signedIn=false,complete=false,authActive=false,releaseStarted,authStarts=0,pollTransientFailure=true,completionStatusFailures=0,catalogFailures=0,releaseAuthorizations=0;
  const session={id:'browser-auth-session',backend:'codex',provider:null,state:'awaiting_authorization',method:'code',verification_url:'https://auth.openai.com/device',user_code:'TEST-1234',expires_at:Math.floor(Date.now()/1000)+600};
  const reply=(route,data,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(data)});
  await page.route('**/api/auth/**',async route=>{
@@ -82,7 +82,7 @@ async function checkAccountAndReleaseUI(browser,url,errors){
  await page.route('**/api/model-center/fetch',route=>{catalogs++;if(catalogFailures++===0)return reply(route,{error:'Temporary catalog failure'},503);return reply(route,{ok:true});});
  await page.route('**/api/model-center/probe',route=>{probes++;return reply(route,{ok:true});});
  await page.route('**/api/release-workflows?*',route=>reply(route,{workflows:[{workflow:'.github/workflows/release.yml',name:'Release',compatible:true}]}));
- await page.route('**/api/release-authorize',route=>{requests.push({path:'/api/release-authorize',body:route.request().postDataJSON()});return reply(route,{enabled:true,workflow:'.github/workflows/release.yml',ref:'rsi-workflow-test',sha:'a'.repeat(40)});});
+ await page.route('**/api/release-authorize',route=>{requests.push({path:'/api/release-authorize',body:route.request().postDataJSON()});if(releaseAuthorizations++<2)return reply(route,{error:'Unable to inspect this workflow right now; retry after the GitHub request succeeds',error_code:'validation_error'},400);return reply(route,{enabled:true,workflow:'.github/workflows/release.yml',ref:'rsi-workflow-test',sha:'a'.repeat(40)});});
  try{
   await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('.sidebar [data-view=models]').click();await page.locator('[data-mc-tab="providers"]').click();await page.locator('#mc-provider-list .mc-provider').filter({hasText:'Codex 登录'}).click();
   await page.getByRole('button',{name:'前往 Codex 官方登录',exact:true}).click();
@@ -109,7 +109,9 @@ async function checkAccountAndReleaseUI(browser,url,errors){
   await page.waitForFunction(()=>document.querySelector('#mc-auth input[type="password"]').value==='');assert.equal(requests.find(r=>r.path.endsWith('/key')).body.provider,'openai');
   await page.locator('#project-settings').click();
   assert.equal(await page.locator('#deploy-health-settings').isVisible(),false);
-  await page.locator('#release-workflow-list').selectOption('.github/workflows/release.yml');await page.locator('#release-authorize').click();await page.locator('#release-authorization-feedback').filter({hasText:'工作流已授权'}).waitFor();
+  await page.locator('#release-workflow-list').selectOption('.github/workflows/release.yml');await page.locator('#release-authorize').click();await page.locator('#toast').filter({hasText:'暂时无法读取此工作流'}).waitFor();assert.equal(await page.locator('[data-path="delivery.release.enabled"]').isChecked(),false);
+  await page.locator('#language-select').selectOption('en');await page.locator('#release-authorize').click();await page.locator('#toast').filter({hasText:'This workflow could not be inspected temporarily'}).waitFor();assert.equal(await page.locator('[data-path="delivery.release.enabled"]').isChecked(),false);
+  await page.locator('#language-select').selectOption('zh-CN');await page.locator('#release-authorize').click();await page.locator('#release-authorization-feedback').filter({hasText:'工作流已授权'}).waitFor();assert.equal(releaseAuthorizations,3);
   assert.equal(await page.locator('[data-path="delivery.release.enabled"]').isChecked(),true);assert.equal(await page.locator('[data-path="delivery.release.sha"]').inputValue(),'a'.repeat(40));assert.equal(requests.find(r=>r.path==='/api/release-authorize').body.kind,'release');
   await page.locator('#deploy-authorize').click();await page.locator('#deploy-health-settings').waitFor();await page.locator('[data-path="delivery.deploy.enabled"]').uncheck();assert.equal(await page.locator('#deploy-health-settings').isVisible(),false);
   if(process.env.RSI_SCREENSHOT_DIR)await page.locator('#release-settings').screenshot({path:process.env.RSI_SCREENSHOT_DIR+'/release-settings.png'});

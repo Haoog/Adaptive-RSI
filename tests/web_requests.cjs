@@ -54,6 +54,25 @@ test('oversized patch errors are found by error code and localized in both conso
   assert.match(page.context.t(localized),/2 MiB preview limit/);
   assert.match(page.context.t(localized),/download it from the run directory/);
 });
+test('workflow inspection retry errors reach the UI in both languages', async()=>{
+  const message='Unable to inspect this workflow right now; retry after the GitHub request succeeds';
+  const page=browser();
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  vm.runInContext(i18n.slice(0,i18n.indexOf('const staticText =')),page.context);
+  page.context.fetch=async()=>response({error:message,error_code:'validation_error'},400);
+  for(const [locale,expected] of [
+    ['zh-CN','暂时无法读取此工作流。请等待 GitHub 请求恢复后重试。'],
+    ['en','This workflow could not be inspected temporarily. Wait for GitHub requests to recover, then try again.']
+  ]){
+    vm.runInContext(`language=${JSON.stringify(locale)}`,page.context);
+    await assert.rejects(page.context.api('release-authorize',{project:'a',kind:'release',workflow:'.github/workflows/deploy.yml'}),error=>{
+      assert.equal(error.code,'validation_error');
+      assert.equal(error.message,expected);
+      assert.notEqual(error.message,'Invalid request');
+      return true;
+    });
+  }
+});
 function descendants(node) {
   return (node.children || []).flatMap(child => [child, ...descendants(child)]);
 }
