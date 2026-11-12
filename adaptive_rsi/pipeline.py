@@ -97,7 +97,7 @@ def _acceptance_baseline_failed(future):
         return False
     try:
         error = future.exception()
-        if isinstance(error, Cancelled):
+        if isinstance(error, (Cancelled, concurrent.futures.CancelledError)):
             return False
         if error is not None:
             return True
@@ -106,7 +106,7 @@ def _acceptance_baseline_failed(future):
         # Future 本身被取消与 evaluator 环境故障不同；让运行时保留取消语义。
         return False
     except Exception:
-        # 评估异常或被取消的 future 同样说明基线不可用；取消谓词自身不许抛出。
+        # Future 状态或结果读取异常按基线不可用兜底；取消谓词自身不许抛出。
         return True
     return isinstance(outcome, dict) and outcome.get("decision") == "insufficient_evidence"
 

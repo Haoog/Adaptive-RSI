@@ -957,6 +957,38 @@ class RuntimeTest(unittest.TestCase):
         self.assertFalse((self.store.root / "runs" / run["id"] / "candidate.patch").exists())
         self.assertNotIn("review", [role for role, _ in self.runtime.agent.roles])
 
+    def test_acceptance_baseline_future_cancellation_during_implementation_stays_interrupted(self):
+        """实现期间 Future 以 CancelledError 结束时，不得误判为环境故障。"""
+        baseline_done = threading.Event()
+
+        class HighRisk(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                if role == "implementation":
+                    self_test.assertTrue(baseline_done.wait(5), "baseline should cancel during implementation")
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == "planning":
+                    result["risk"] = "high"
+                return result
+
+        self_test = self
+        self.runtime.agent = HighRisk()
+
+        def baseline(*args, **kwargs):
+            baseline_done.set()
+            raise concurrent.futures.CancelledError("Acceptance baseline cancelled")
+
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline", side_effect=baseline), \
+             patch.object(self.runtime.evaluator, "evaluate") as candidate_evaluate:
+            task, run = self.claim("acceptance baseline cancelled during implementation")
+            self.runtime.process(run)
+
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "interrupted", row["result"])
+        self.assertNotIn("failure", json.loads(row["result"]))
+        candidate_evaluate.assert_not_called()
+        self.assertNotIn("review", [role for role, _ in self.runtime.agent.roles])
+
     def test_acceptance_baseline_failure_after_implementation_is_environment_failure(self):
         """实现返回及其最终取消检查完成后，基线异常仍按环境故障收尾。"""
         baseline_started = threading.Event()
@@ -1009,46 +1041,51 @@ class RuntimeTest(unittest.TestCase):
 
     def test_acceptance_baseline_cancellation_after_implementation_stays_interrupted(self):
         """实现返回后验收 worker 的主动取消仍按用户暂停语义收尾。"""
-        baseline_started = threading.Event()
-        implementation_returned = threading.Event()
-
-        def baseline(*args, **kwargs):
-            baseline_started.set()
-            self_test.assertTrue(implementation_returned.wait(5),
-                                 "baseline cancellation must follow implementation return")
-            raise Cancelled("User paused project")
-
-        class HighRisk(FakeAgent):
-            def invoke(self, role, prompt, workspace, *args, **kwargs):
-                if role == "implementation":
-                    self_test.assertTrue(baseline_started.wait(5), "baseline should start during implementation")
-                result = super().invoke(role, prompt, workspace, *args, **kwargs)
-                if role == "planning":
-                    result["risk"] = "high"
-                return result
-
         self_test = self
-        self.runtime.agent = HighRisk()
-        real_invoke = self.runtime.invoke
+        cancellations = (Cancelled("User paused project"),
+                         concurrent.futures.CancelledError("Acceptance baseline cancelled"))
+        for cancellation in cancellations:
+            with self.subTest(cancellation=type(cancellation).__name__):
+                baseline_started = threading.Event()
+                implementation_returned = threading.Event()
 
-        def invoke(role, *args, **kwargs):
-            result = real_invoke(role, *args, **kwargs)
-            if role == "implementation":
-                implementation_returned.set()
-            return result
+                def baseline(*args, **kwargs):
+                    baseline_started.set()
+                    self_test.assertTrue(implementation_returned.wait(5),
+                                         "baseline cancellation must follow implementation return")
+                    raise cancellation
 
-        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
-             patch.object(self.runtime, "invoke", side_effect=invoke), \
-             patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline", side_effect=baseline), \
-             patch.object(self.runtime.evaluator, "evaluate") as candidate_evaluate:
-            task, run = self.claim()
-            self.runtime.process(run)
+                class HighRisk(FakeAgent):
+                    def invoke(self, role, prompt, workspace, *args, **kwargs):
+                        if role == "implementation":
+                            self_test.assertTrue(baseline_started.wait(5),
+                                                 "baseline should start during implementation")
+                        result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                        if role == "planning":
+                            result["risk"] = "high"
+                        return result
 
-        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
-        self.assertEqual(row["state"], "interrupted", row["result"])
-        self.assertNotIn("failure", json.loads(row["result"]))
-        candidate_evaluate.assert_not_called()
-        self.assertNotIn("review", [role for role, _ in self.runtime.agent.roles])
+                self.runtime.agent = HighRisk()
+                real_invoke = self.runtime.invoke
+
+                def invoke(role, *args, **kwargs):
+                    result = real_invoke(role, *args, **kwargs)
+                    if role == "implementation":
+                        implementation_returned.set()
+                    return result
+
+                with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+                     patch.object(self.runtime, "invoke", side_effect=invoke), \
+                     patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline", side_effect=baseline), \
+                     patch.object(self.runtime.evaluator, "evaluate") as candidate_evaluate:
+                    task, run = self.claim("acceptance baseline cancellation " + type(cancellation).__name__)
+                    self.runtime.process(run)
+
+                row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+                self.assertEqual(row["state"], "interrupted", row["result"])
+                self.assertNotIn("failure", json.loads(row["result"]))
+                candidate_evaluate.assert_not_called()
+                self.assertNotIn("review", [role for role, _ in self.runtime.agent.roles])
 
     def test_acceptance_baseline_pass_lets_implementation_finish(self):
         """基线正常通过时取消谓词不得误触发：实现照旧完成并进入评估。"""
@@ -1073,6 +1110,49 @@ class RuntimeTest(unittest.TestCase):
         row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
         self.assertEqual(row["state"], "awaiting_approval", row["result"])
         self.assertEqual([role for role, _ in self.runtime.agent.roles].count("implementation"), 1)
+
+    def test_acceptance_baseline_check_failure_still_evaluates_candidate(self):
+        """基线验收断言失败是有效证据，不能误当环境故障跳过候选评估。"""
+        baseline_started = threading.Event()
+
+        class HighRisk(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                if role == "implementation":
+                    self_test.assertTrue(baseline_started.wait(5), "baseline should finish during implementation")
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == "planning":
+                    result["risk"] = "high"
+                return result
+
+        self_test = self
+        self.runtime.agent = HighRisk()
+        baseline = {"decision": "fail", "reason": "Baseline acceptance check failed",
+                    "rows": [{"name": "new behavior", "passed": False}],
+                    "execution_environment": None}
+        candidate_evaluation = {"decision": "fail", "reason": "Candidate acceptance check failed",
+                                "checks": {"acceptance": [{"name": "new behavior", "passed": False}]}}
+
+        def evaluate_baseline(*args, **kwargs):
+            baseline_started.set()
+            return baseline
+
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch.object(self.runtime.evaluator, "execution_identity", return_value=None), \
+             patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline", side_effect=evaluate_baseline), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value=candidate_evaluation) as evaluate:
+            task, run = self.claim("acceptance baseline assertion failure")
+            self.runtime.process(run)
+
+        evaluate.assert_called_once()
+        self.assertEqual(evaluate.call_args.kwargs["acceptance_baseline"], baseline)
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("implementation"), 1)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        result = json.loads(row["result"])
+        self.assertEqual(row["state"], "failed", row["result"])
+        self.assertEqual(result["failure"]["code"], "checks")
+        self.assertNotEqual(result["failure"]["code"], "environment")
+        self.assertEqual(result["reason"], "Candidate acceptance check failed")
+        self.assertNotIn("review", [role for role, _ in self.runtime.agent.roles])
 
     def test_environment_setup_rewriting_tracked_file_stops_before_planning(self):
         """准备命令改写 tracked 文件时点名 setup，并在任何付费调用前收尾。"""
