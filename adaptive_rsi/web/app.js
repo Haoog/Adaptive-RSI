@@ -158,6 +158,7 @@ const apiErrors={
  "Automatic deployment rollback requires an explicit health URL": "自动回滚需要先填写 HTTPS 健康检查地址：请补全「上线后检查地址」，或关闭「检查失败时恢复上一正常版本」。",
  "Workflow repository must match the selected project's origin": "无法读取工作流：项目设置中的 GitHub 仓库与项目本地 origin 不一致。请把 GitHub 仓库改成与 origin 相同的 owner/name（或更新项目 origin）后点击「刷新工作流」。",
  "Workflow must be an existing repository file": "无法读取工作流：仓库中不存在该工作流文件。请确认 .github/workflows 下的工作流路径后点击「刷新工作流」。",
+ "Unable to inspect this workflow right now; retry after the GitHub request succeeds":"暂时无法读取此工作流。请等待 GitHub 请求恢复后重试。",
 
  "Select the root of an existing Git repository": "请选择已有 Git 仓库的根目录。",
  "Expected a GitHub repository URL": "请填写 GitHub 仓库链接，例如 https://github.com/owner/repository。",
