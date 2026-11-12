@@ -76,6 +76,21 @@ class AuditEvolutionTest(unittest.TestCase):
     def test_non_string_sources_are_excluded_and_safe_to_stratify(self):
         from adaptive_rsi.evolution import case_stratum, select_cases
         args = self.setup_proposal()
+        for split in ('validation', 'holdout'):
+            row = self.store.one('SELECT spec FROM cases WHERE id=?', (split,))
+            spec = json.loads(row['spec'])
+            spec.pop('source')
+            self.store.execute('UPDATE cases SET spec=? WHERE id=?', (encode(spec), split))
+        cases = self.evolution.eligible_cases('p', self.config['evolution']['max_holdout_uses'])
+        self.assertEqual({case['id'] for case in cases}, {'validation', 'holdout'})
+        self.assertTrue(all(case_stratum(case) == ('unknown', 'small') for case in cases))
+
+        for split in ('validation', 'holdout'):
+            row = self.store.one('SELECT spec FROM cases WHERE id=?', (split,))
+            spec = json.loads(row['spec'])
+            spec['source'] = 'real'
+            self.store.execute('UPDATE cases SET spec=? WHERE id=?', (encode(spec), split))
+
         for index, source in enumerate(({'legacy': 'object'}, ['legacy'], None, 7)):
             with self.subTest(source_type=type(source).__name__):
                 for split in ('validation', 'holdout'):
