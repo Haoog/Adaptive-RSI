@@ -1377,6 +1377,13 @@ class Handler(BaseHTTPRequestHandler):
                             raise RequestError(str(exc)) from exc
                 self.respond(result)
                 return
+            path = urlparse(self.path).path
+            if path == "/api/session/rotate":
+                # 先等会话锁再拿 dispatch_lock。轮换响应需持有会话锁直至新 cookie
+                # 发出；若反向等待，会让第二个轮换请求在 dispatch_lock 内排队，
+                # 连带阻塞所有写端点。
+                response_lock = self.server._session_lock
+                response_lock.acquire()
             with runtime.dispatch_lock:
                 path = urlparse(self.path).path
                 if path != "/api/cancel":
@@ -1473,8 +1480,6 @@ class Handler(BaseHTTPRequestHandler):
                     result = {"id": Evolution(runtime).import_case(body["project"], body["manifest"])}
                 elif path == "/api/session/rotate":
                     # 轮换后旧链接立即失效；响应携带新 cookie，当前浏览器保持登录。
-                    response_lock = self.server._session_lock
-                    response_lock.acquire()
                     result = self.server.rotate_session()
                     response_headers = {"Set-Cookie": self.server.cookie_header(self.headers.get("Host"))}
                 else:

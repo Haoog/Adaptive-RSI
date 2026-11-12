@@ -172,6 +172,7 @@ class ReleaseAutomationTest(unittest.TestCase):
     def test_corrupt_automation_receipt_is_preserved_and_blocks_dispatch(self):
         from adaptive_rsi.release import status
         for raw in ('{broken', '[]', 'null', '{}', '{"state":3}', '{"state":"mystery_state"}',
+                    '{"state":"rolling_back","rollback":{"state":"mystery_state"}}',
                     '{"state":"submitted"}'):
             with self.subTest(raw=raw):
                 self.runtime.store.execute('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)',
