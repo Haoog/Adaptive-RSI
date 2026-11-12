@@ -1,4 +1,5 @@
 import concurrent.futures
+import errno
 import fcntl
 import json
 import os
@@ -338,6 +339,77 @@ class RuntimeTest(unittest.TestCase):
             fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:
             probe.close()
+
+    def test_flock_io_error_does_not_skip_contention_check_on_retry(self):
+        opened = []
+        real_open = Path.open
+
+        def track_lockfile(file_path, *args, **kwargs):
+            handle = real_open(file_path, *args, **kwargs)
+            if file_path.name == "runtime.lock":
+                opened.append(handle)
+            return handle
+
+        with patch("adaptive_rsi.runtime.fcntl.flock",
+                   side_effect=OSError(errno.EIO, "simulated lock I/O failure")), \
+                patch.object(Path, "open", new=track_lockfile):
+            with self.assertRaises(OSError) as raised:
+                self.runtime.start()
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        self.assertIsNone(self.runtime.lockfile)
+        self.assertIsNone(self.runtime.thread)
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].closed)
+
+        owner = (self.store.root / "runtime.lock").open("a+")
+        try:
+            fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch("adaptive_rsi.runtime.fcntl.flock", wraps=fcntl.flock) as acquire:
+                with self.assertRaisesRegex(RuntimeError, "Another runtime already owns") as raised:
+                    self.runtime.start()
+            self.assertEqual(acquire.call_count, 1)
+            self.assertIsInstance(raised.exception.__context__, BlockingIOError)
+            self.assertIsNone(self.runtime.lockfile)
+            self.assertIsNone(self.runtime.thread)
+        finally:
+            owner.close()
+
+        self.runtime.start()
+        self.assertTrue(self.runtime.thread.is_alive())
+        self.runtime.close()
+
+    def test_runtime_open_releases_lock_after_non_contention_flock_error(self):
+        root = self.root / "open-lock-error"
+        opened = []
+        real_open = Path.open
+
+        def track_lockfile(file_path, *args, **kwargs):
+            handle = real_open(file_path, *args, **kwargs)
+            if file_path.name == "runtime.lock":
+                opened.append(handle)
+            return handle
+
+        with patch("adaptive_rsi.runtime.fcntl.flock",
+                   side_effect=OSError(errno.EIO, "simulated lock I/O failure")), \
+                patch.object(Path, "open", new=track_lockfile):
+            with self.assertRaises(OSError) as raised:
+                Runtime.open(root, agent=self.agent)
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].closed)
+
+        probe = (root / "runtime.lock").open("a+")
+        try:
+            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            probe.close()
+
+        runtime = Runtime.open(root, agent=self.agent)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "Another runtime already owns"):
+                Runtime.open(root, agent=self.agent)
+        finally:
+            runtime.close()
 
     def test_scheduler_thread_start_failure_can_still_close_runtime(self):
         thread_start = threading.Thread.start

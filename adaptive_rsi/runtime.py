@@ -960,13 +960,16 @@ class Runtime(Maintenance):
             if self.thread and self.thread.is_alive():
                 return
             if self.lockfile is None or self.lockfile.closed:
-                self.lockfile = (self.store.root / "runtime.lock").open("a+")
+                lockfile = (self.store.root / "runtime.lock").open("a+")
                 try:
-                    fcntl.flock(self.lockfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(lockfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
-                    self.lockfile.close()
-                    self.lockfile = None
+                    lockfile.close()
                     raise RuntimeError("Another runtime already owns this state directory")
+                except BaseException:
+                    lockfile.close()
+                    raise
+                self.lockfile = lockfile
             try:
                 self.operations.recover()
                 if paused:
