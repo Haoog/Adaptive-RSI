@@ -176,15 +176,26 @@ class AuditRound5Test(unittest.TestCase):
     def test_monitor_does_not_resurrect_concurrently_rolled_back_candidate(self):
         self.store.execute("INSERT INTO candidates(id,project,status,content,evidence) VALUES ('c','p','stable','{}','{}')")
         self.store.execute("INSERT INTO runs(id,project,strategy,config) VALUES ('r','p','[{\"id\":\"c\"}]','{}')")
-        evolution = Evolution(SimpleNamespace(store=self.store, config=lambda p: {"evolution": {"monitor_tasks": 10}}))
-        original = self.store.query
-        def query(sql, args=()):
-            rows = original(sql, args)
-            if sql == "SELECT * FROM candidates WHERE project=? AND status='stable'":
-                evolution.rollback("c")
-            return rows
-        with patch.object(self.store, "query", side_effect=query):
-            evolution.monitor("p", True, {"id": "r"})
+        entered = threading.Event()
+        def config(project):
+            entered.set()
+            return {"evolution": {"monitor_tasks": 10}}
+        evolution = Evolution(SimpleNamespace(store=self.store, config=config))
+        errors = []
+        def monitor():
+            try:
+                evolution.monitor("p", True, {"id": "r"})
+            except Exception as exc:
+                errors.append(exc)
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            evolution._rollback_in_transaction(db, "c")
+            thread = threading.Thread(target=monitor)
+            thread.start()
+            self.assertTrue(entered.wait(5))
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
         self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='c'")["status"], "rolled_back")
 
     def test_search_reports_match_limit(self):
@@ -327,7 +338,7 @@ class AuditRound5Test(unittest.TestCase):
         self.assertTrue(restored["restored"])
         checked = Store(self.root / "restored")
         self.addCleanup(checked.close)
-        self.assertEqual([row["version"] for row in checked.schema_migrations()], [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        self.assertEqual([row["version"] for row in checked.schema_migrations()], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
 
     def test_snapshot_and_config_revision_prevent_cross_tab_overwrite(self):
         with self.store.snapshot():

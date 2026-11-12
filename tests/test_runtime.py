@@ -1503,6 +1503,147 @@ Path(%r).write_text('allowed output')
         self.assertEqual(self.runtime.active_strategies(self.project), [])
         self.assertEqual(self.runtime.memories(self.project, "add"), [])
 
+    def test_failure_monitor_recovers_after_restart(self):
+        config = self.runtime.config(self.project)
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                           ('recovery-candidate', self.project, 'strategy', 'stable', '{}',
+                            encode({'monitor': {'passed': 0, 'failed': 0, 'runs': []}}), time.time()))
+        task_id, run = self.claim('failure monitor restart')
+        self.store.execute('UPDATE runs SET strategy=? WHERE id=?',
+                           (encode([{'id': 'recovery-candidate'}]), run['id']))
+        task = self.store.one('SELECT * FROM tasks WHERE id=?', (task_id,))
+        check = {'name': 'regression', 'argv': ['true'], 'cwd': '.'}
+        result = {'decision': 'fail', 'evaluation': {'checks': {
+            'baseline': [{**check, 'passed': True}], 'candidate': [{**check, 'passed': False}]}}}
+        with patch.object(self.runtime, 'monitor_strategy', side_effect=RuntimeError('injected monitor failure')):
+            with self.assertRaisesRegex(RuntimeError, 'injected monitor failure'):
+                self.runtime.finish_failure(run, task, result, config)
+        self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))['state'], 'failed')
+        self.runtime.close()
+        self.store = Store(self.root / 'controller')
+        self.runtime = Runtime(self.store, self.agent)
+        updater = patch.object(self.runtime.updates, 'tick')
+        updater.start()
+        self.addCleanup(updater.stop)
+        self.runtime.start(paused=True)
+        deadline = time.monotonic() + 7
+        while time.monotonic() < deadline:
+            row = self.store.one("SELECT status,evidence FROM candidates WHERE id='recovery-candidate'")
+            if row['status'] == 'rolled_back':
+                break
+            time.sleep(0.05)
+        self.assertEqual(row['status'], 'rolled_back')
+        self.assertEqual(json.loads(row['evidence'])['monitor']['failed'], 1)
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='rollback'")), 1)
+
+    def test_failure_outbox_and_terminal_transition_are_atomic(self):
+        import sqlite3
+        config = self.runtime.config(self.project)
+        task_id, run = self.claim('outbox insert failure')
+        task = self.store.one('SELECT * FROM tasks WHERE id=?', (task_id,))
+        self.store.execute("CREATE TRIGGER reject_monitor_outbox BEFORE INSERT ON failure_monitor_outbox "
+                           "BEGIN SELECT RAISE(ABORT,'outbox unavailable'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'outbox unavailable'):
+            self.runtime.finish_failure(run, task, {'decision': 'fail'}, config)
+        self.assertIsNone(self.store.one('SELECT ended FROM runs WHERE id=?', (run['id'],))['ended'])
+        self.assertEqual(self.store.query('SELECT * FROM failure_monitor_outbox'), [])
+        self.store.execute('DROP TRIGGER reject_monitor_outbox')
+        self.runtime.finish_failure(run, task, {'decision': 'fail'}, config)
+        self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))['state'], 'failed')
+
+    def test_cancelled_failure_does_not_create_monitor_outbox(self):
+        config = self.runtime.config(self.project)
+        task_id, run = self.claim('cancelled failure')
+        self.store.execute("UPDATE tasks SET state='cancelled' WHERE id=?", (task_id,))
+        task = self.store.one('SELECT * FROM tasks WHERE id=?', (task_id,))
+        self.runtime.finish_failure(run, task, {'decision': 'fail'}, config)
+        self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))['state'], 'cancelled')
+        self.assertEqual(self.store.query('SELECT * FROM failure_monitor_outbox'), [])
+
+    def test_failure_outbox_retry_rolls_back_all_effects_and_deduplicates(self):
+        import sqlite3
+        config = self.runtime.config(self.project)
+        evidence = {'monitor': {'passed': 0, 'failed': 0, 'runs': []}}
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                           ('outbox-candidate', self.project, 'strategy', 'stable', '{}', encode(evidence), time.time()))
+        task_id, run = self.claim('outbox retry')
+        self.store.execute('UPDATE runs SET strategy=? WHERE id=?', (encode([{'id': 'outbox-candidate'}]), run['id']))
+        task = self.store.one('SELECT * FROM tasks WHERE id=?', (task_id,))
+        check = {'name': 'regression', 'argv': ['true'], 'cwd': '.'}
+        result = {'decision': 'fail', 'evaluation': {'checks': {
+            'baseline': [{**check, 'passed': True}], 'candidate': [{**check, 'passed': False}]}}}
+        self.store.execute("CREATE TRIGGER reject_outbox_ack BEFORE DELETE ON failure_monitor_outbox "
+                           "BEGIN SELECT RAISE(ABORT,'ack unavailable'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'ack unavailable'):
+            self.runtime.finish_failure(run, task, result, config)
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id='outbox-candidate'")
+        self.assertEqual(row['status'], 'stable')
+        self.assertEqual(json.loads(row['evidence']), evidence)
+        self.assertEqual(len(self.store.query('SELECT * FROM failure_monitor_outbox')), 1)
+        self.assertEqual(self.store.query("SELECT seq FROM events WHERE kind='rollback'"), [])
+        self.store.execute('DROP TRIGGER reject_outbox_ack')
+        self.runtime.drain_failure_monitors()
+        self.runtime.drain_failure_monitors()
+        self.runtime.monitor_strategy(self.project, False, run, attributable=True)
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id='outbox-candidate'")
+        self.assertEqual(row['status'], 'rolled_back')
+        self.assertEqual(json.loads(row['evidence'])['monitor']['failed'], 1)
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='rollback'")), 1)
+        self.assertEqual(self.store.query('SELECT * FROM failure_monitor_outbox'), [])
+
+    def test_shared_failure_outbox_retries_all_candidates_together(self):
+        config = self.runtime.config(self.project)
+        evidence = {'monitor': {'passed': 0, 'failed': 0, 'runs': []}}
+        for candidate in ('outbox-a', 'outbox-b'):
+            self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                               (candidate, self.project, 'strategy', 'stable', '{}', encode(evidence), time.time()))
+        task_id, run = self.claim('shared outbox retry')
+        self.store.execute('UPDATE runs SET strategy=? WHERE id=?',
+                           (encode([{'id': 'outbox-a'}, {'id': 'outbox-b'}]), run['id']))
+        task = self.store.one('SELECT * FROM tasks WHERE id=?', (task_id,))
+        check = {'name': 'regression', 'argv': ['true'], 'cwd': '.'}
+        result = {'decision': 'fail', 'evaluation': {'checks': {
+            'baseline': [{**check, 'passed': True}], 'candidate': [{**check, 'passed': False}]}}}
+        with patch.object(self.runtime, 'monitor_strategy', side_effect=RuntimeError('crash')):
+            with self.assertRaisesRegex(RuntimeError, 'crash'):
+                self.runtime.finish_failure(run, task, result, config)
+        self.store.execute("CREATE TRIGGER reject_second BEFORE UPDATE OF evidence ON candidates "
+                           "WHEN NEW.id='outbox-b' BEGIN SELECT RAISE(ABORT,'second candidate'); END")
+        self.runtime.drain_failure_monitors()
+        for candidate in ('outbox-a', 'outbox-b'):
+            row = self.store.one('SELECT evidence,status FROM candidates WHERE id=?', (candidate,))
+            self.assertEqual(json.loads(row['evidence']), evidence)
+            self.assertEqual(row['status'], 'stable')
+        self.assertEqual(self.store.query("SELECT seq FROM events WHERE kind='strategy_inconclusive'"), [])
+        self.assertEqual(len(self.store.query('SELECT run FROM failure_monitor_outbox')), 1)
+        self.store.execute('DROP TRIGGER reject_second')
+        self.runtime.drain_failure_monitors()
+        self.runtime.drain_failure_monitors()
+        for candidate in ('outbox-a', 'outbox-b'):
+            row = self.store.one('SELECT evidence,status FROM candidates WHERE id=?', (candidate,))
+            self.assertEqual(json.loads(row['evidence'])['monitor']['failed'], 1)
+            self.assertEqual(row['status'], 'stable')
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='strategy_inconclusive'")), 1)
+        self.assertEqual(self.store.query('SELECT run FROM failure_monitor_outbox'), [])
+
+    def test_failure_outbox_batches_do_not_starve_later_entries(self):
+        with self.store.connect() as db:
+            for number in range(101):
+                run_id = 'pending-%03d' % number
+                db.execute("INSERT INTO runs(id,project,state,ended) VALUES (?,?,'failed',1)",
+                           (run_id, self.project))
+                db.execute('INSERT INTO failure_monitor_outbox(run,project,attributable,created) VALUES (?,?,1,?)',
+                           (run_id, self.project, number))
+        # A failed consumer leaves rows in place; the next batch still reaches later work.
+        with patch.object(self.runtime, '_consume_failure_monitor', side_effect=RuntimeError('unavailable')) as consume, \
+                patch.object(self.store, 'event'):
+            self.runtime.drain_failure_monitors()
+            self.assertEqual(consume.call_count, 100)
+            self.runtime.drain_failure_monitors()
+            self.assertEqual(consume.call_args.args[0], 'pending-100')
+            self.runtime.drain_failure_monitors()
+            self.assertEqual(consume.call_args.args[0], 'pending-099')
+
     def test_finish_failure_aligns_regression_attribution_by_check_identity(self):
         config = self.runtime.config(self.project)
         check_a = {"name": "check_a", "argv": ["python3", "-c", "print(1)"], "cwd": "."}

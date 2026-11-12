@@ -247,7 +247,7 @@ class TaskLifecycleTest(unittest.TestCase):
         reopened = Store(self.store.root)
         try:
             self.assertEqual([row['version'] for row in reopened.schema_migrations()],
-                             [1, 2, 3, 4, 5, 6, 7, 8, 9])
+                             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
             index = reopened.one("SELECT sql FROM sqlite_master WHERE type='index' "
                                  "AND name='events_intervention_task'")
             self.assertIn("json_extract(data,'$.task')", index['sql'])

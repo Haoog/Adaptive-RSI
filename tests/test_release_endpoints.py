@@ -1080,6 +1080,7 @@ class ManualReconciliationTest(_ManualReconciliationFixture):
             self.assertEqual(len(calls), 1)
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(calls[0]).query)
             self.assertEqual(query["event"], ["workflow_dispatch"])
+            self.assertEqual(query["head_sha"], [self.TRUSTED])
             self.assertEqual(query["created"], [">=" + time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime(data["created_at"] - release.RECONCILIATION_CREATED_MARGIN_SECONDS))])
             saved = self.saved()
@@ -1111,6 +1112,34 @@ class ManualReconciliationTest(_ManualReconciliationFixture):
         self.assertEqual(result["reconciliation"]["state"], "awaiting_remote_visibility")
         self.assertEqual(len(calls), 10)
         self.assertNotIn("created=", calls[0])
+        self.assertEqual(self.posts, [])
+
+    def test_legacy_receipt_filters_by_head_sha_instead_of_paging_the_history(self):
+        data = self.operation(created_at=None)
+        calls = []
+        matching = self.remote(77, status="completed", conclusion="success")
+        noise = [self.remote(2000 + index, head_sha="c" * 40, display_title="another-operation")
+                 for index in range(1000)]
+
+        def handler(repo, endpoint, method="GET", fields=None):
+            calls.append(endpoint)
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(endpoint).query)
+            runs = noise + [matching]
+            if "head_sha" in query:
+                runs = [item for item in runs if item.get("head_sha") in query["head_sha"]]
+            page = int(query.get("page", ["1"])[0])
+            return {"workflow_runs": runs[(page - 1) * 100:page * 100], "total_count": len(runs)}
+
+        with patch.object(release, "api", side_effect=handler):
+            result = release.reconcile(self.runtime, self.record, "release", data, persist=True)
+        # The own run sits behind 1,000 runs from another head_sha: only the
+        # server-side filter makes it visible inside GitHub's 1,000-result cap.
+        self.assertEqual(result["state"], "workflow_succeeded")
+        self.assertEqual(len(calls), 1)
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(calls[0]).query)
+        self.assertEqual(query["head_sha"], [self.TRUSTED])
+        self.assertEqual(query["event"], ["workflow_dispatch"])
+        self.assertNotIn("created", query)
         self.assertEqual(self.posts, [])
 
     def test_retry_network_timeout_sets_rerun_unknown_and_enables_immediate_reconciliation(self):

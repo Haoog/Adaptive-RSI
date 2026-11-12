@@ -916,20 +916,21 @@ class MigrationLedgerConcurrencyTest(unittest.TestCase):
     def test_migration_applied_between_precheck_and_lock_runs_once(self):
         from adaptive_rsi import schema_migrations
         Store(self.root).close()
-        # v10 迁移体照问题报告写成幂等形式（DDL 幂等 + 计数行）：重放不再报建表冲突，
+        # 迁移体照问题报告写成幂等形式（DDL 幂等 + 计数行）：重放不再报建表冲突，
         # 只能靠行数发现；同时复现报告的 IntegrityError 判据（仅当修复不完整时）。
+        next_version = max(version for version, _ in schema_migrations.scripts()) + 1
         pending = schema_migrations.scripts() + [
-            (10, b"CREATE TABLE IF NOT EXISTS race_probe(x INTEGER);\n"
+            (next_version, b"CREATE TABLE IF NOT EXISTS race_probe(x INTEGER);\n"
                  b"INSERT INTO race_probe VALUES (1);\n")]
         barrier = threading.Barrier(2, timeout=15)
         aligned = threading.local()
         real_ledger_has = schema_migrations._ledger_has
 
         def gated(db, version):
-            # 每个线程只在 v10 的锁外预检上对齐一次，把「预检之后、BEGIN IMMEDIATE
+            # 每个线程只在新迁移的锁外预检上对齐一次，把「预检之后、BEGIN IMMEDIATE
             # 之前」的窗口固定成必然发生，而不是靠 sleep 撞时序。
             result = real_ledger_has(db, version)
-            if version == 10 and not getattr(aligned, "done", False):
+            if version == next_version and not getattr(aligned, "done", False):
                 aligned.done = True
                 barrier.wait()
             return result
@@ -960,7 +961,7 @@ class MigrationLedgerConcurrencyTest(unittest.TestCase):
                 "SELECT version FROM schema_migrations GROUP BY version HAVING count(*) > 1").fetchall(), [])
             self.assertEqual([row[0] for row in db.execute(
                 "SELECT version FROM schema_migrations ORDER BY version")],
-                list(range(1, 11)))
+                list(range(1, next_version + 1)))
 
 
 if __name__ == "__main__":
