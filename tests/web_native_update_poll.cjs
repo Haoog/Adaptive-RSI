@@ -28,7 +28,7 @@ function fakeClock(start=1700000000000){
  return clock;
 }
 
-function fixture({visibility='visible',policy,respond}={}){
+function fixture({visibility='visible',readyState,policy,versionScope='patch',respond}={}){
  let panel;const saved=new Map(),calls=[],listeners={},writes={total:0,option:0};
  const clock=fakeClock();
  let reply=respond||(()=>({state:'latest'}));
@@ -42,14 +42,14 @@ function fixture({visibility='visible',policy,respond}={}){
   if(text)node.textContent=text;
   return node;
  };
- const document={activeElement:null,visibilityState:visibility,documentElement:{lang:'zh-CN'},
+ const document={activeElement:null,visibilityState:visibility,readyState,documentElement:{lang:'zh-CN'},
   addEventListener(type,handler){(listeners[type]||(listeners[type]=[])).push(handler);},
   createElement:()=>el('a')};
  const invoke=async(_,args)=>{calls.push({action:args.action,at:clock.now()});return reply(args);};
  const context={
   window:{RSIDesktop:{invoke,ready:Promise.resolve({kind:'local',owned:true})}},
   document,el,$:()=>el('anchor'),t:x=>x,
-  localRead:key=>key==='rsi-native-update-checked'?String(clock.now()):policy,
+  localRead:key=>key==='rsi-native-update-checked'?String(clock.now()):key==='rsi-native-update-policy'?policy:key==='rsi-native-update-scope'?versionScope:undefined,
   localStorage:{setItem(key,value){saved.set(key,value);}},safe:fn=>fn(),
   setTimeout:clock.setTimeout,clearTimeout:clock.clearTimeout,setInterval:clock.setInterval,
   Date:{now:()=>clock.now()},Math,Number,String,Error,JSON,
@@ -59,6 +59,7 @@ function fixture({visibility='visible',policy,respond}={}){
  const all=node=>[node,...node.children.flatMap(all)];
  return{api,clock,calls,writes,saved,
   boot(){for(const handler of listeners.DOMContentLoaded||[])handler();},
+  preReady(handler){(listeners.DOMContentLoaded||(listeners.DOMContentLoaded=[])).unshift(handler);},
   flush:clock.flush,
   advance:clock.advance,
   pendingTimers:clock.pending,
@@ -244,4 +245,55 @@ test('a user-started download replaces the pending idle timer',async()=>{
  assert.ok(f.statusCount()-before>=3,`${f.statusCount()-before} progress reads in three seconds`);
  assert.match(f.text(),/25%/,'progress replaces the stale settled view');
  assert.equal(f.button('取消').hidden,false,'the download is cancellable right away');
+});
+
+test('a failed status read retries after its backoff instead of waiting for the idle cadence',async()=>{
+ let calls=0;
+ const f=fixture({respond:()=>{
+  calls++;
+  if(calls===2)throw Error('temporary status failure');
+  return {state:'latest'};
+ }});
+ f.boot();
+ await f.advance(5000);
+ assert.equal(f.statusCount(),1);
+ await f.advance(300000);
+ assert.equal(f.statusCount(),2,'the idle poll fails while retaining the last settled snapshot');
+ assert.equal(f.pendingTimers(),1);
+ await f.advance(4999);
+ assert.equal(f.statusCount(),2,'the retry waits for the five-second backoff');
+ await f.advance(1);
+ assert.equal(f.statusCount(),3,'the failed read is retried when its backoff expires');
+ assert.equal(f.pendingTimers(),1,'a successful retry leaves one timer scheduled');
+});
+
+test('a manual install before startup authorization sync authorizes before invoking install',async()=>{
+ const f=fixture({readyState:'interactive',respond:args=>{
+  if(args.action==='authorize')return {authorization_revision:args.revision};
+  return {state:'ready'};
+ }});
+ await f.api.run('install');
+ assert.ok(f.calls.findIndex(call=>call.action==='authorize')<f.calls.findIndex(call=>call.action==='install'));
+ assert.equal(f.calls.filter(call=>call.action==='install').length,1);
+});
+
+test('a DOMContentLoaded startup tick cannot run an automatic action before authorization sync',async()=>{
+ let authorized=false;
+ const f=fixture({readyState:'interactive',policy:'automatic',versionScope:'stable',respond:args=>{
+  if(args.action==='authorize'){authorized=true;return {authorization_revision:args.revision};}
+  if(args.action==='status')return {state:'ready',current_version:'1.2.3',version:'1.2.4'};
+  if(args.action==='install'&&!authorized)return {state:'error',error_code:'update_authorization_invalid'};
+  return {state:'restarting'};
+ }});
+ // app.js registers its DOMContentLoaded listener before this deferred module, so
+ // #463's startup check calls tick() before this module's delayed sync begins.
+ let startupTick;
+ f.preReady(()=>{startupTick=f.api.tick();});
+ f.boot();
+ await startupTick;
+ assert.equal(f.statusCount(),1,'startup still refreshes local native status');
+ assert.equal(f.calls.some(call=>call.action==='install'),false,'automatic install waits for authorization');
+ await f.advance(5000);
+ assert.ok(f.calls.findIndex(call=>call.action==='authorize')<f.calls.findIndex(call=>call.action==='install'));
+ assert.equal(f.calls.filter(call=>call.action==='install').length,1,'the authorized automatic action starts without a rejected attempt');
 });
