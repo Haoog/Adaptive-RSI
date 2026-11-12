@@ -67,6 +67,8 @@ function fixture({visibility='visible',readyState,policy,versionScope='patch',re
   statusCount:()=>calls.filter(call=>call.action==='status').length,
   setVisibility(state){document.visibilityState=state;for(const handler of listeners.visibilitychange||[])handler();},
   button(label){return all(panel).find(node=>node.tag==='button'&&node.textContent===label);},
+  select(index){return all(panel).filter(node=>node.tag==='select')[index];},
+  authorizationErrorVisible(){return all(panel).some(node=>node.className==='form-error'&&node.hidden===false);},
   resetWrites(){writes.total=0;writes.option=0;},
   text:()=>all(panel).map(node=>node.textContent).join(' '),
  };
@@ -296,4 +298,81 @@ test('a DOMContentLoaded startup tick cannot run an automatic action before auth
  await f.advance(5000);
  assert.ok(f.calls.findIndex(call=>call.action==='authorize')<f.calls.findIndex(call=>call.action==='install'));
  assert.equal(f.calls.filter(call=>call.action==='install').length,1,'the authorized automatic action starts without a rejected attempt');
+});
+
+test('a failed startup authorization can recover through changed settings and manual install',async()=>{
+ let authorizations=0;
+ const f=fixture({readyState:'complete',respond:args=>{
+  if(args.action==='authorize'&&++authorizations===1)throw Error('authorization unavailable');
+  if(args.action==='authorize')return {authorization_revision:args.revision};
+  if(args.action==='status')return {state:'ready',current_version:'1.2.3',version:'1.2.4'};
+  if(args.action==='install')return {state:'restarting'};
+  return {state:'latest'};
+ }});
+ f.boot();
+ await f.advance(5000);
+ assert.equal(authorizations,1);
+ const scope=f.select(1);
+ scope.value='minor';
+ scope.onchange();
+ await f.flush();
+ assert.equal(authorizations,2,'changing the settings synchronizes a fresh authorization');
+ await f.button('重启并更新').onclick();
+ assert.equal(f.calls.filter(call=>call.action==='install').length,1,'the real install button reaches native install after authorization recovers');
+});
+
+test('repeated authorization failures remain visible in the update panel',async()=>{
+ const f=fixture({readyState:'complete',respond:args=>{
+  if(args.action==='authorize')throw Error('authorization unavailable');
+  if(args.action==='status')return {state:'ready',current_version:'1.2.3',version:'1.2.4'};
+  return {state:'latest'};
+ }});
+ f.boot();
+ await f.advance(5000);
+ const error=()=>f.select(0)&&f.button('重启并更新')&&f.text();
+ assert.match(error(),/更新未完成，请重试或手动安装。/);
+ assert.equal(f.authorizationErrorVisible(),true,'the authorization error is visible in the panel');
+ const scope=f.select(1);
+ scope.value='minor';
+ scope.onchange();
+ await f.flush();
+ assert.match(error(),/更新未完成，请重试或手动安装。/,'the second failed authorization leaves a visible error');
+ assert.equal(f.authorizationErrorVisible(),true,'the repeated authorization failure remains visible');
+ assert.equal(f.calls.filter(call=>call.action==='install').length,0);
+});
+
+test('manual install retries authorization after an earlier authorization failure',async()=>{
+ let authorizations=0;
+ const f=fixture({readyState:'complete',respond:args=>{
+  if(args.action==='authorize'&&++authorizations===1)throw Error('authorization unavailable');
+  if(args.action==='authorize')return {authorization_revision:args.revision};
+  if(args.action==='status')return {state:'ready',current_version:'1.2.3',version:'1.2.4'};
+  if(args.action==='install')return {state:'restarting'};
+  return {state:'latest'};
+ }});
+ f.boot();
+ await f.advance(5000);
+ await f.button('重启并更新').onclick();
+ assert.equal(authorizations,2,'the manual retry makes a fresh authorization request');
+ assert.equal(f.calls.filter(call=>call.action==='install').length,1);
+});
+
+test('concurrent manual install clicks cannot bypass pending authorization',async()=>{
+ let authorize;
+ const pending=new Promise(resolve=>{authorize=resolve;});
+ const f=fixture({readyState:'complete',respond:args=>{
+  if(args.action==='authorize')return pending;
+  if(args.action==='status')return {state:'ready',current_version:'1.2.3',version:'1.2.4'};
+  return {state:'restarting'};
+ }});
+ f.boot();
+ await f.advance(5000);
+ const install=f.button('重启并更新');
+ const first=install.onclick(),second=install.onclick();
+ await f.flush();
+ assert.equal(f.calls.filter(call=>call.action==='authorize').length,1);
+ assert.equal(f.calls.filter(call=>call.action==='install').length,0);
+ authorize({authorization_revision:1});
+ await Promise.all([first,second]);
+ assert.equal(f.calls.filter(call=>call.action==='install').length,1,'concurrent clicks start only one install after authorization succeeds');
 });

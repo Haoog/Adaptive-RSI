@@ -121,10 +121,16 @@ window.RSINativeUpdate=(()=>{
    return true;
   }catch(error){authorizationError=String(error&&error.message||error||'update_cancel_failed');return false;}
  }
+ function trackAuthorization(authorization){
+  initialAuthorization=authorization;
+  authorization.then(accepted=>{if(!accepted&&initialAuthorization===authorization)initialAuthorization=null;});
+  return authorization;
+ }
  // A settings change revokes a waiting install even when the new revision could
  // not be stored: an install approved under stale consent must not continue.
  async function settingsChanged(){
-  const accepted=await syncAuthorization();
+  const authorization=trackAuthorization(syncAuthorization());
+  const accepted=await authorization;
   await revokeInstall();
   if(!accepted&&!authorizationError)authorizationError='update_authorization_failed';
   render();
@@ -258,8 +264,13 @@ window.RSINativeUpdate=(()=>{
    // A status tick can reveal a ready update before the delayed startup auth
    // sync. If the user installs in that window, authorize first with this action.
    if(action==='install'&&['interactive','complete'].includes(document.readyState)){
-    initialAuthorization=initialAuthorization||syncAuthorization();
-    if(!await initialAuthorization||authorizationError)return;
+    if(!initialAuthorization){
+     trackAuthorization(syncAuthorization());
+    }
+    if(!await initialAuthorization||authorizationError){
+     if(!authorizationError)authorizationError='update_authorization_failed';
+     return;
+    }
    }
    snapshot=await window.RSIDesktop.invoke('native_update',{action,automatic,installationWindow:action==='install'?(automatic?installWindow:'any'):null,revision:action==='install'?revision:null});
    if(snapshot.state==='error')throw Error(snapshot.error_code||'update_check_failed');
@@ -354,7 +365,7 @@ window.RSINativeUpdate=(()=>{
   render();
   document.addEventListener('visibilitychange',visibilityChanged);
   pollActive=true;
-  setTimeout(()=>{initialAuthorization=initialAuthorization||syncAuthorization();safe(poll);},5000);
+  setTimeout(()=>{trackAuthorization(initialAuthorization||syncAuthorization());safe(poll);},5000);
  });
  return {render,run,tick,pollDelay,poll,eligible,withinWindow,phaseOf,statusText,progressText,formatBytes,speedText,sampleSpeed,scopeText,errorText,errorCode,exportReceipt,syncAuthorization,settingsChanged,revision:()=>revision};
 })();
