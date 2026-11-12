@@ -801,6 +801,7 @@ const english = {
   "服务器尚未准备认证运行镜像，请先完成运行环境安装。": "The authentication worker image is not ready on the server. Complete runtime setup first.",
   "运行机器的状态目录不可写（可能磁盘已满或只读），请清理磁盘或修复权限后重试。": "The server cannot save credentials because its state directory is not writable (disk full or read-only). Free disk space or fix permissions, then try again.",
   "请先为项目添加支持自动交付的工作流，再刷新列表。": "Add a workflow that supports automatic delivery to this project, then refresh the list.",
+  "暂时无法读取此工作流。请等待 GitHub 请求恢复后重试。": "This workflow could not be inspected temporarily. Wait for GitHub requests to recover, then try again.",
   "工作流标签已指向其他版本，请重新授权。": "The workflow tag now points to another version. Authorize it again.",
   "工作流标签已改变，请重新授权。": "The workflow tag changed. Authorize it again.",
   "发布授权已关闭或目标已改变，请检查项目设置。": "Release authorization was disabled or its target changed. Check project settings.",
