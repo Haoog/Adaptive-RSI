@@ -1626,6 +1626,35 @@ Path(%r).write_text('allowed output')
         self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='strategy_inconclusive'")), 1)
         self.assertEqual(self.store.query('SELECT run FROM failure_monitor_outbox'), [])
 
+    def test_unattributable_shared_failure_is_recorded_before_outbox_ack(self):
+        evidence = {'monitor': {'passed': 0, 'failed': 0, 'runs': []}}
+        for candidate in ('shared-a', 'shared-b', 'not-in-run'):
+            self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                               (candidate, self.project, 'strategy', 'stable', '{}', encode(evidence), time.time()))
+        task_id, run = self.claim('unattributable shared failure')
+        self.store.execute('UPDATE runs SET strategy=? WHERE id=?',
+                           (encode([{'id': 'shared-b'}, {'id': 'shared-a'}]), run['id']))
+        task = self.store.one('SELECT * FROM tasks WHERE id=?', (task_id,))
+
+        self.runtime.finish_failure(run, task, {'decision': 'fail', 'reason': 'execution error'},
+                                    self.runtime.config(self.project))
+
+        self.assertEqual(self.store.query('SELECT * FROM failure_monitor_outbox'), [])
+        for candidate in ('shared-a', 'shared-b'):
+            row = self.store.one('SELECT status,evidence FROM candidates WHERE id=?', (candidate,))
+            monitor = json.loads(row['evidence'])['monitor']
+            self.assertEqual(row['status'], 'stable')
+            self.assertEqual(monitor['failed'], 1)
+            self.assertEqual(monitor['shared_failed'], 1)
+            self.assertEqual(monitor['attribution'], 'shared')
+            self.assertEqual(monitor['runs'], [run['id']])
+        unrelated = json.loads(self.store.one("SELECT evidence FROM candidates WHERE id='not-in-run'")['evidence'])
+        self.assertEqual(unrelated, evidence)
+        inconclusive = self.store.query("SELECT data FROM events WHERE kind='strategy_inconclusive' AND run=?",
+                                        (run['id'],))
+        self.assertEqual(len(inconclusive), 1)
+        self.assertEqual(json.loads(inconclusive[0]['data'])['attribution'], 'shared')
+
     def test_failure_outbox_batches_do_not_starve_later_entries(self):
         with self.store.connect() as db:
             for number in range(101):
@@ -1714,7 +1743,8 @@ Path(%r).write_text('allowed output')
                 "evaluation": {
                     "checks": {
                         "baseline": [{**check_b, "passed": False}, {**check_a, "passed": True}],
-                        "candidate": [{**check_a, "passed": False}, {**check_b, "passed": True}],
+                        "candidate": [{**check_a, "passed": False, "exit_code": 0},
+                                      {**check_b, "passed": True}],
                     }
                 }
             }
