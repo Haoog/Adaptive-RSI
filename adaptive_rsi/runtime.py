@@ -206,6 +206,8 @@ class Runtime(Maintenance):
         self._future_runs = {}
         self._scheduler_failures = {}
         self._scheduler_failures_lock = threading.Lock()
+        self._stage_budget_recoveries = {}
+        self._stage_budget_recoveries_lock = threading.Lock()
         self.automation_receipt_failures = {}
         self.automation_receipt_failures_lock = threading.Lock()
         self._project_deadlines = {}
@@ -1394,6 +1396,24 @@ class Runtime(Maintenance):
                 if self.updates.is_busy():
                     continue
                 self.maintenance_async()
+                with self.scheduler_scope('stage_budget_recovery'):
+                    with self._stage_budget_recoveries_lock:
+                        pending = list(self._stage_budget_recoveries.values())
+                    for record in pending:
+                        run_id = record['run']
+                        with self.scheduler_scope('stage_budget_recovery_run', run=run_id):
+                            self.store.mark_stage_budget_failure(
+                                run_id, record['task'], record['error'], record['retry_at'])
+                            self.store.reconcile_stage_budget_failure(run_id, record)
+                            with self._stage_budget_recoveries_lock:
+                                self._stage_budget_recoveries.pop(run_id, None)
+                    for run_id, record in self.store.stage_budget_recovery_records().items():
+                        with self._stage_budget_recoveries_lock:
+                            record = self._stage_budget_recoveries.get(run_id, record)
+                        with self.scheduler_scope('stage_budget_recovery_run', run=run_id):
+                            self.store.reconcile_stage_budget_failure(run_id, record)
+                            with self._stage_budget_recoveries_lock:
+                                self._stage_budget_recoveries.pop(run_id, None)
                 with self.scheduler_scope('postprocess'):
                     self.drain_postprocess()
                 for future in tuple(self.futures):
@@ -2143,6 +2163,10 @@ class Runtime(Maintenance):
         """
         detail = str(detail or '')[:300] or 'Stage budget ledger is unreadable'
         retry_at = time.time() + STAGE_BUDGET_BACKOFF_SECONDS
+        record = {'run': run['id'], 'task': run['task'], 'error': detail,
+                  'retry_at': retry_at}
+        with self._stage_budget_recoveries_lock:
+            record = self._stage_budget_recoveries.setdefault(run['id'], record)
 
         def retry_database(operation):
             error = None
@@ -2157,26 +2181,24 @@ class Runtime(Maintenance):
 
         try:
             self.store.event('stage_budget_unavailable',
-                             'Stage budget ledger unavailable; run interrupted and task requeued',
+                             'Stage budget ledger unavailable; recovery is pending',
                              run.get('project'), run.get('id'),
-                             {'run': run.get('id'), 'error': detail})
+                             {'run': run.get('id'), 'task': run.get('task'), 'error': detail,
+                              'retry_at': record['retry_at']})
         except Exception:
             logging.getLogger(__name__).exception(
                 'Could not record stage budget failure for %s', run.get('id'))
         try:
-            task = retry_database(lambda: self.store.one(
-                'SELECT attempts FROM tasks WHERE id=?', (run['task'],)))
-            attempts = max(0, (task['attempts'] or 0) - 1) if task else 0
-            retry_database(lambda: self.store.transition(
-                run['id'], 'interrupted',
-                {'reason': 'Stage budget unavailable',
-                 'failure': {'code': 'environment', 'action': 'check_environment',
-                             'detail': detail}},
-                True, task_fields={'state': 'queued', 'available': retry_at,
-                                   'attempts': attempts}))
+            record = retry_database(lambda: self.store.mark_stage_budget_failure(
+                run['id'], run['task'], detail, record['retry_at']))
+            retry_database(lambda: self.store.reconcile_stage_budget_failure(run['id'], record))
+            with self._stage_budget_recoveries_lock:
+                self._stage_budget_recoveries.pop(run['id'], None)
         except Exception:
             logging.getLogger(__name__).exception(
                 'Could not interrupt run %s after stage budget failure', run.get('id'))
+        finally:
+            self.wake.set()
 
     def _process(self, run):
         try:

@@ -42,6 +42,7 @@ def encode(value):
 
 
 _LOAD_PROGRESS = object()
+STAGE_BUDGET_RECOVERY_PREFIX = 'stage-budget-recovery:'
 
 
 def issue_sync_progress(db, project):
@@ -1358,13 +1359,16 @@ class Store:
         db.commit()
         return applied
 
-    def transition(self, run, state, result=None, terminal=False, task_fields=None):
+    def transition(self, run, state, result=None, terminal=False, task_fields=None,
+                   recovery_key=None, refund_attempt=False, stage_budget_failure=None):
         """Persist a transition, resolving stop requests atomically; return whether a write occurred."""
         now = time.time()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM runs WHERE id=?", (run,)).fetchone()
             if not row or row["ended"] is not None:
+                if recovery_key:
+                    db.execute("DELETE FROM settings WHERE key=?", (recovery_key,))
                 return False
             task = db.execute("SELECT state FROM tasks WHERE id=?", (row["task"],)).fetchone()
             revision_key = "revision-pending:" + run
@@ -1422,6 +1426,10 @@ class Store:
                 if safe_fields:
                     extra = "," + ",".join(field + "=?" for field in safe_fields)
                     values = [safe_fields[field] for field in safe_fields]
+            refund = bool(refund_attempt and task and task["state"] != "cancelled" and
+                          task_fields is not None and state == "interrupted")
+            if refund:
+                extra += ",attempts=max(0,attempts-1)"
             db.execute("UPDATE tasks SET state=?,updated=?" + extra + " WHERE id=?",
                        (state, now, *values, row["task"]))
             if state == "deferred":
@@ -1431,9 +1439,123 @@ class Store:
                            "WHERE id=? AND source NOT LIKE 'system_%'", (now, row["task"]))
             db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
                        (row["project"], run, state, (result or {}).get("reason", state), encode(result or {}), now))
+            if stage_budget_failure:
+                detail = (result or {}).get("reason", state)
+                failure_data = {**stage_budget_failure, "outcome": state}
+                db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                           (row["project"], run, "stage_budget_unavailable",
+                            "Stage budget unavailable; outcome: " + str(detail),
+                            encode(failure_data), now))
+            if recovery_key:
+                db.execute("DELETE FROM settings WHERE key=?", (recovery_key,))
+        return True
+
+    def mark_stage_budget_failure(self, run, task, error, retry_at):
+        """Persist a retryable handoff obligation before attempting the run transition."""
+        key = STAGE_BUDGET_RECOVERY_PREFIX + run
+        record = {"run": run, "task": task, "error": str(error or "")[:300],
+                  "retry_at": retry_at}
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)",
+                       (key, encode(record)))
+        return record
+
+    def stage_budget_recovery_ids(self):
+        prefix = STAGE_BUDGET_RECOVERY_PREFIX
+        rows = self.query("SELECT key FROM settings WHERE key>=? AND key<? ORDER BY key",
+                          (prefix, prefix + '\uffff'))
+        return [row["key"][len(prefix):] for row in rows]
+
+    def stage_budget_recovery_records(self):
+        """Read pending handoffs from either durable marker so partial writes remain recoverable."""
+        prefix = STAGE_BUDGET_RECOVERY_PREFIX
+        records = {}
+        rows = self.query("SELECT key,value FROM settings WHERE key>=? AND key<? ORDER BY key",
+                          (prefix, prefix + '\uffff'))
+        for row in rows:
+            run = row["key"][len(prefix):]
+            try:
+                records[run] = json.loads(row["value"])
+            except (TypeError, ValueError):
+                records[run] = {}
+        events = self.query("SELECT e.run,r.task,e.data FROM events e JOIN runs r ON r.id=e.run "
+                            "WHERE e.kind='stage_budget_unavailable' AND r.ended IS NULL "
+                            "ORDER BY e.seq")
+        for event in events:
+            current = records.get(event["run"])
+            if isinstance(current, dict) and current.get('task'):
+                continue
+            try:
+                data = json.loads(event["data"] or "{}")
+            except (TypeError, ValueError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            records[event["run"]] = {
+                "run": event["run"],
+                "task": event["task"],
+                "error": data.get("error") or "Stage budget ledger is unreadable",
+                # Older #435 builds persisted the pending event without a deadline.
+                # Recovery should unblock the task promptly while still avoiding a hot loop.
+                "retry_at": data.get("retry_at") or time.time() + 30,
+            }
+        return records
+
+    def reconcile_stage_budget_failure(self, run, record=None):
+        key = STAGE_BUDGET_RECOVERY_PREFIX + run
+        source_key = key
+        if record is None:
+            row = self.one("SELECT value FROM settings WHERE key=?", (key,))
+            if not row:
+                pending = self.one("SELECT data FROM events WHERE run=? AND kind='stage_budget_unavailable' "
+                                   "ORDER BY seq DESC LIMIT 1", (run,))
+                if not pending:
+                    return False
+                source_key = None
+                try:
+                    record = json.loads(pending['data'] or '{}')
+                except (TypeError, ValueError):
+                    record = {}
+                if not isinstance(record, dict):
+                    record = {}
+                record = {"run": run, "task": record.get('task'),
+                          "error": record.get('error') or "Stage budget ledger is unreadable",
+                          "retry_at": record.get('retry_at') or time.time() + 30}
+            else:
+                try:
+                    record = json.loads(row["value"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("Invalid stage budget recovery record") from exc
+        if not isinstance(record, dict) or not record.get('task'):
+            run_row = self.one('SELECT task FROM runs WHERE id=?', (run,))
+            if run_row:
+                record = {**(record if isinstance(record, dict) else {}),
+                          'run': run, 'task': run_row['task'],
+                          'error': (record or {}).get('error') or 'Stage budget ledger is unreadable',
+                          'retry_at': (record or {}).get('retry_at') or time.time() + 30}
+        if (not isinstance(record, dict) or record.get("run") != run or
+                record.get("task") is not None and not isinstance(record.get("task"), str) or
+                isinstance(record.get("retry_at"), bool) or
+                not isinstance(record.get("retry_at"), (int, float))):
+            raise ValueError("Invalid stage budget recovery record")
+        detail = str(record.get("error") or "Stage budget ledger is unreadable")[:300]
+        result = {"reason": "Stage budget unavailable",
+                  "failure": {"code": "environment", "action": "check_environment",
+                              "detail": detail}}
+        task_fields = ({"state": "queued", "available": record["retry_at"]}
+                       if record.get('task') else None)
+        self.transition(run, "interrupted", result, True, task_fields=task_fields,
+                        recovery_key=source_key, refund_attempt=bool(task_fields),
+                        stage_budget_failure={"run": run, "error": detail,
+                                              "retry_at": record["retry_at"]})
         return True
 
     def recover(self):
+        # Stage-budget handoffs carry an attempt refund and retry deadline. Reconcile these
+        # before generic crash recovery, in the same transition transaction as their receipt.
+        for run, record in self.stage_budget_recovery_records().items():
+            self.reconcile_stage_budget_failure(run, record)
         rows = self.query("SELECT id FROM runs WHERE ended IS NULL")
         for row in rows:
             self.transition(row["id"], "interrupted", {"reason": "Runtime restarted; artifacts retained. Retry creates a fresh isolated run."}, True)
