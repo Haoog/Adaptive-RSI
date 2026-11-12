@@ -2350,16 +2350,16 @@ class Runtime(Maintenance):
         if state == "failed":
             checks = (result.get("evaluation") or {}).get("checks") or {}
             candidate_rows = checks.get("candidate_full") or checks.get("candidate") or []
-            candidate_by_id = {
-                check_identity(row): row
+            candidate_failures = {
+                check_identity(row)
                 for row in candidate_rows
-                if isinstance(row, dict) and check_identity(row) is not None
+                if isinstance(row, dict) and check_identity(row) is not None and not row.get("passed")
             }
             baseline_rows = checks.get("baseline") or []
             regression = any(
-                old.get("passed") and not candidate_by_id[check_identity(old)].get("passed")
+                old.get("passed") and check_identity(old) in candidate_failures
                 for old in baseline_rows
-                if isinstance(old, dict) and check_identity(old) in candidate_by_id
+                if isinstance(old, dict) and check_identity(old) is not None
             )
         transitioned = self.store.transition(run["id"], state, result, True, task_fields=task_fields,
                                              failure_monitor=regression if state == "failed" else None)
