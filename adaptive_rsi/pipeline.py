@@ -96,9 +96,15 @@ def _acceptance_baseline_failed(future):
     if future is None or not future.done():
         return False
     try:
-        if future.exception() is not None:
+        error = future.exception()
+        if isinstance(error, Cancelled):
+            return False
+        if error is not None:
             return True
         outcome = future.result()
+    except concurrent.futures.CancelledError:
+        # Future 本身被取消与 evaluator 环境故障不同；让运行时保留取消语义。
+        return False
     except Exception:
         # 评估异常或被取消的 future 同样说明基线不可用；取消谓词自身不许抛出。
         return True
@@ -915,7 +921,16 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             # 不能提前切到 evaluation，否则实现越慢，留给评估的预算越少。
             runtime.begin_phase(run, "evaluation")
         if acceptance_future is not None:
-            acceptance_baseline = acceptance_future.result()
+            try:
+                acceptance_baseline = acceptance_future.result()
+            except Cancelled:
+                raise
+            except concurrent.futures.CancelledError:
+                raise Cancelled("Acceptance baseline evaluation cancelled") from None
+            except Exception:
+                # 实现已返回后，取消谓词不再有机会转换基线故障；与实现期间
+                # 的失败保持同一环境故障分类，并保留 Future 中的原始异常原因。
+                raise AcceptanceBaselineUnavailable(_acceptance_baseline_outcome(acceptance_future)) from None
             acceptance_executor.shutdown(wait=True)
             acceptance_executor = None
         evaluation_source = _evaluation_source(config, base, checks, patch, environment["sha256"],
