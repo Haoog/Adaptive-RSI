@@ -339,6 +339,128 @@ class RuntimeTest(unittest.TestCase):
         finally:
             probe.close()
 
+    def test_scheduler_thread_start_failure_can_still_close_runtime(self):
+        thread_start = threading.Thread.start
+
+        def fail_scheduler_start(thread):
+            if thread.name == "rsi-scheduler":
+                raise RuntimeError("scheduler thread failed to start")
+            return thread_start(thread)
+
+        with patch.object(threading.Thread, "start", new=fail_scheduler_start):
+            with self.assertRaisesRegex(RuntimeError, "scheduler thread failed to start"):
+                self.runtime.start()
+        self.runtime.close()
+        self.assertTrue(self.runtime._closed)
+        self.assertIsNone(self.runtime.thread)
+
+    def test_concurrent_start_runs_initialization_once(self):
+        entered = threading.Event()
+        release = threading.Event()
+        second_attempted = threading.Event()
+        second_returned = threading.Event()
+        recover_calls = []
+        errors = []
+
+        def recover():
+            recover_calls.append(True)
+            if len(recover_calls) == 1:
+                entered.set()
+                release.wait(5)
+
+        def start():
+            try:
+                self.runtime.start()
+            except Exception as exc:
+                errors.append(exc)
+
+        def second_start():
+            second_attempted.set()
+            try:
+                start()
+            finally:
+                second_returned.set()
+
+        first = threading.Thread(target=start)
+        second = threading.Thread(target=second_start)
+        with patch.object(self.runtime.operations, "recover", side_effect=recover), \
+                patch.object(self.runtime.updates, "restore_startup"), \
+                patch.object(self.runtime.store, "recover"), \
+                patch.object(self.runtime.store, "execute"), \
+                patch.object(self.runtime, "_index_postprocess_pending"), \
+                patch.object(self.runtime, "loop", side_effect=self.runtime.stop.wait):
+            try:
+                first.start()
+                self.assertTrue(entered.wait(5), "First start should enter initialization")
+                second.start()
+                self.assertTrue(second_attempted.wait(5), "Second start should attempt initialization")
+                self.assertFalse(second_returned.wait(0.1),
+                                 "Concurrent start must wait for the first initialization")
+            finally:
+                release.set()
+                first.join(5)
+                second.join(5)
+                self.runtime.close()
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(recover_calls), 1)
+
+    def test_close_waits_for_startup_before_closing_runtime(self):
+        entered = threading.Event()
+        release = threading.Event()
+        close_started = threading.Event()
+        close_finished = threading.Event()
+        errors = []
+
+        def recover():
+            entered.set()
+            release.wait(5)
+
+        def start():
+            try:
+                self.runtime.start()
+            except Exception as exc:
+                errors.append(exc)
+
+        def close():
+            close_started.set()
+            self.runtime.close()
+            close_finished.set()
+
+        starter = threading.Thread(target=start)
+        closer = threading.Thread(target=close)
+        with patch.object(self.runtime.operations, "recover", side_effect=recover), \
+                patch.object(self.runtime.updates, "restore_startup"), \
+                patch.object(self.runtime.store, "recover"), \
+                patch.object(self.runtime.store, "execute"), \
+                patch.object(self.runtime, "_index_postprocess_pending"), \
+                patch.object(self.runtime, "loop", side_effect=self.runtime.stop.wait):
+            try:
+                starter.start()
+                self.assertTrue(entered.wait(5), "Start should be held during initialization")
+                closer.start()
+                self.assertTrue(close_started.wait(5))
+                deadline = time.monotonic() + 5
+                while not self.runtime._closing and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                self.assertTrue(self.runtime._closing, "Close should close admission before waiting")
+                self.assertFalse(close_finished.wait(0.1),
+                                 "Close must not close storage while startup is in progress")
+            finally:
+                release.set()
+                starter.join(5)
+                if closer.ident is not None:
+                    closer.join(5)
+                self.runtime.close()
+        self.assertFalse(starter.is_alive())
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(self.runtime._closed)
+        self.assertIsNotNone(self.runtime.lockfile)
+        self.assertTrue(self.runtime.lockfile.closed)
+        self.assertFalse(self.runtime.thread.is_alive())
+
     def test_start_is_idempotent_and_keeps_one_scheduler_thread(self):
         self.runtime.configure({"updates": {"mode": "manual"}})
         self.runtime.start()
