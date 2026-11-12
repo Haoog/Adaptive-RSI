@@ -1626,6 +1626,92 @@ Path(%r).write_text('allowed output')
         self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='strategy_inconclusive'")), 1)
         self.assertEqual(self.store.query('SELECT run FROM failure_monitor_outbox'), [])
 
+    def test_process_failure_kinds_reach_failure_monitor_through_evaluator(self):
+        class HighRisk(FakeAgent):
+            def invoke(self, role, *args, **kwargs):
+                result = super().invoke(role, *args, **kwargs)
+                if role == "planning":
+                    result["risk"] = "high"
+                return result
+
+        self.runtime.agent = HighRisk()
+        config = self.runtime.config(self.project)
+        environment = {"backend": "stub", "image": None}
+        cases = [
+            ("timeout", -9, "Command timed out", "", "timeout"),
+            ("execution_error", 2, "Runner exited unexpectedly", "RuntimeError: child process failed", "exit"),
+            ("assertion", 1, None, "AssertionError: expected 5, received -1", "exit"),
+        ]
+        for kind, exit_code, error, stderr, error_kind in cases:
+            with self.subTest(kind=kind):
+                candidate_id = "failure-" + kind
+                self.store.execute(
+                    "INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+                    (candidate_id, self.project, "strategy", "stable", "{}",
+                     encode({"monitor": {"passed": 0, "failed": 0, "runs": []}}), time.time()),
+                )
+
+                def check(_sandbox, spec, workspace, *args, **kwargs):
+                    failed = (Path(workspace).name in {"candidate", "candidate_full"} and
+                              spec["name"] == "real unittest regression")
+                    return {"name": spec["name"], "argv": spec["argv"],
+                            "exit_code": exit_code if failed else 0, "stdout": "",
+                            "stderr": stderr if failed else "Ran 1 test\nOK\n",
+                            "seconds": 0.01, "error": error if failed else None,
+                            "error_kind": error_kind if failed else None}
+
+                baseline = {"decision": "pass", "rows": [], "execution_environment": environment}
+                with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+                     patch.object(self.runtime.evaluator, "_execution_environment",
+                                  return_value=(config, environment)), \
+                     patch.object(self.runtime.evaluator, "execution_identity", return_value=environment), \
+                     patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline", return_value=baseline), \
+                     patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=check):
+                    task_id, run = self.claim("Production failure evidence: " + kind)
+                    self.runtime.process(run)
+
+                row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+                result = json.loads(row["result"])
+                evaluation = result["evaluation"]
+                failed_row = next(item for item in evaluation["checks"]["candidate_full"]
+                                  if item["name"] == "real unittest regression")
+                self.assertEqual(row["state"], "failed", row["result"])
+                self.assertFalse(failed_row["passed"])
+                self.assertEqual(failed_row["error"], error)
+                self.assertEqual(failed_row["error_kind"], error_kind)
+                self.assertEqual(result["decision"], "fail")
+                candidate = self.store.one("SELECT status,evidence FROM candidates WHERE id=?", (candidate_id,))
+                self.assertEqual(candidate["status"], "rolled_back")
+                monitor = json.loads(candidate["evidence"])["monitor"]
+                self.assertEqual(monitor["failed"], 1)
+                self.assertEqual(monitor["runs"], [run["id"]])
+                self.assertEqual(self.store.query(
+                    "SELECT * FROM failure_monitor_outbox WHERE run=?", (run["id"],)), [])
+
+    def test_duplicate_check_identity_does_not_hide_regression(self):
+        config = self.runtime.config(self.project)
+        candidate = "duplicate-check-identity"
+        evidence = {"monitor": {"passed": 0, "failed": 0, "runs": []}}
+        self.store.execute(
+            "INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+            (candidate, self.project, "strategy", "stable", "{}", encode(evidence), time.time()),
+        )
+        task_id, run = self.claim("duplicate check identity")
+        self.store.execute("UPDATE runs SET strategy=?,config=? WHERE id=?",
+                           (encode([{"id": candidate}]), encode(config), run["id"]))
+        task = self.store.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        duplicate = {"name": "same", "argv": ["true"], "cwd": "."}
+        result = {"decision": "fail", "evaluation": {"checks": {
+            "baseline": [{**duplicate, "passed": True}],
+            "candidate": [{**duplicate, "passed": False}, {**duplicate, "passed": True}],
+        }}}
+        self.runtime.finish_failure(run, task, result, config)
+
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id=?", (candidate,))
+        self.assertEqual(row["status"], "rolled_back")
+        self.assertEqual(json.loads(row["evidence"])["monitor"]["failed"], 1)
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='rollback'")), 1)
+
     def test_unattributable_shared_failure_is_recorded_before_outbox_ack(self):
         evidence = {'monitor': {'passed': 0, 'failed': 0, 'runs': []}}
         for candidate in ('shared-a', 'shared-b', 'not-in-run'):
