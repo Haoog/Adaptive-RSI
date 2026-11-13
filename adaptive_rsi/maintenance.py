@@ -174,18 +174,21 @@ def _merged_monitoring_completed(result):
     return isinstance(parsed, dict) and bool(parsed.get("monitoring_completed"))
 
 
+_ARCHIVE_VERIFICATION_MISSING = object()
+
+
 def _archive_verification_due(value, now):
     """Return (due, previous_type) for one stored archive verification report.
 
     Settings are untrusted input: a restored backup or a hand edit can leave a
-    string, list or NaN under ``checked_at``.  The old subtraction raised
-    TypeError at the end of every pass, so ``maintenance-last`` never advanced
-    and each retry re-ran the whole retention sweep.  Unusable records count as
-    expired so the archive is verified again and the report overwritten; the
-    second item names the original shape (never its content) for the repair
-    event, and is None when no record existed or the stored one is usable.
+    string, list or NaN under ``checked_at``. The missing sentinel distinguishes
+    an absent row from a present SQL NULL; absent rows have no previous shape,
+    while SQL NULL is unreadable. Unusable records count as expired so the
+    archive is verified again and the report overwritten; the second item names
+    the original shape (never its content) for the repair event, and is None
+    when no record existed or the stored one is usable.
     """
-    if value is None:
+    if value is _ARCHIVE_VERIFICATION_MISSING:
         return True, None
     try:
         previous = json.loads(value)
@@ -800,8 +803,10 @@ class Maintenance:
                 tuple(keys))
             verification_status = {row["key"]: row["value"] for row in rows}
             for path, key in zip(batch, keys):
+                if path.is_symlink():
+                    continue
                 due, previous_type = _archive_verification_due(
-                    verification_status.get(key), now)
+                    verification_status.get(key, _ARCHIVE_VERIFICATION_MISSING), now)
                 if not due:
                     continue
                 if previous_type is not None:

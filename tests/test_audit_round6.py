@@ -844,6 +844,134 @@ class AuditRequestSamplingTest(unittest.TestCase):
 
 
 class AuditMaintenanceRetentionTest(unittest.TestCase):
+    def test_archive_maintenance_skips_archive_replaced_with_symlink(self):
+        from adaptive_rsi.maintenance import ARCHIVE_VERIFICATION_READ_BATCH_SIZE, Maintenance
+
+        with tempfile.TemporaryDirectory(prefix="archive-symlink-race-") as directory:
+            store = Store(directory)
+            try:
+                archive_dir = store.root / "archives"
+                archive_dir.mkdir(exist_ok=True)
+                first = archive_dir / "a.sqlite3.gz"
+                second = archive_dir / "b.sqlite3.gz"
+                third = archive_dir / "c.sqlite3.gz"
+                first.write_bytes(b"first archive")
+                second.write_bytes(b"second archive")
+                third.write_bytes(b"third archive")
+
+                target = Path(store.root) / "ordinary-temp-file"
+                target.write_bytes(b"ordinary file")
+                probe = Path(store.root) / "symlink-support-probe"
+                try:
+                    probe.symlink_to(target)
+                    probe.unlink()
+                except (OSError, NotImplementedError) as exc:
+                    self.skipTest("symlinks are unavailable: %s" % exc)
+
+                store.put_setting(
+                    "archive-verification:" + first.name,
+                    {"valid": True, "checked_at": time.time()})
+                runtime = self.archive_maintenance(store)
+                original_query = store.query
+                settings_batches = []
+                replaced = []
+
+                def intercept_query(sql, args=()):
+                    if sql.startswith("SELECT key,value FROM settings WHERE key IN ("):
+                        settings_batches.append(tuple(args))
+                        if not replaced:
+                            second.unlink()
+                            second.symlink_to(target)
+                            replaced.append(True)
+                    return original_query(sql, args)
+
+                report = {"valid": True, "checked_at": time.time()}
+                with patch.object(store, "query", side_effect=intercept_query), patch(
+                        "adaptive_rsi.storage_tools.verify_archive", return_value=report) as verify:
+                    Maintenance.maintenance(runtime)
+
+                self.assertEqual(replaced, [True])
+                self.assertTrue(second.is_symlink())
+                verify.assert_called_once_with(third, timeout=5)
+                self.assertIsNone(store.one(
+                    "SELECT value FROM settings WHERE key=?",
+                    ("archive-verification:" + second.name,)))
+                self.assertIsNotNone(store.one(
+                    "SELECT value FROM settings WHERE key=?",
+                    ("archive-verification:" + third.name,)))
+                self.assertEqual(
+                    [key for batch in settings_batches for key in batch],
+                    ["archive-verification:" + path.name for path in (first, second, third)])
+                self.assertTrue(all(
+                    0 < len(batch) <= ARCHIVE_VERIFICATION_READ_BATCH_SIZE
+                    for batch in settings_batches))
+            finally:
+                store.close()
+
+    def test_legacy_null_archive_verification_is_repaired_and_missing_is_not(self):
+        from adaptive_rsi.maintenance import Maintenance
+        from adaptive_rsi.storage_tools import archive
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            AuditMigrationHistoryTest._create_historical_fixture(root, 'legacy_v1')
+            null_name = 'legacy-null.sqlite3.gz'
+            missing_name = 'missing.sqlite3.gz'
+            null_key = 'archive-verification:' + null_name
+            missing_key = 'archive-verification:' + missing_name
+            with sqlite3.connect(str(root / 'state.sqlite3')) as db:
+                # The shared legacy fixture contains a project; these cases exercise only
+                # archive maintenance, so remove its unrelated task and project.
+                db.execute('DELETE FROM tasks')
+                db.execute('DELETE FROM projects')
+                db.execute('INSERT INTO settings(key,value) VALUES (?, NULL)', (null_key,))
+
+            store = Store(directory)
+            try:
+                legacy_row = store.one('SELECT value FROM settings WHERE key=?', (null_key,))
+                self.assertIsNotNone(legacy_row)
+                self.assertIsNone(legacy_row['value'])
+                value_column = next(column for column in store.query('PRAGMA table_info(settings)')
+                                    if column['name'] == 'value')
+                self.assertEqual(value_column['notnull'], 0)
+                self.assertIsNone(store.one('SELECT value FROM settings WHERE key=?',
+                                            (missing_key,)))
+
+                created = archive(store)
+                created_path = Path(created['path'])
+                null_path = created_path.with_name(null_name)
+                if created_path != null_path:
+                    created_path.replace(null_path)
+                missing_path = null_path.with_name(missing_name)
+                missing_path.write_bytes(null_path.read_bytes())
+
+                report = {'valid': True, 'checked_at': time.time()}
+                runtime = self.archive_maintenance(store)
+                with patch('adaptive_rsi.storage_tools.verify_archive',
+                           return_value=report) as checked:
+                    Maintenance.maintenance(runtime)
+                    self.assertEqual(checked.call_count, 1)
+                    self.assertEqual(Path(checked.call_args.args[0]).name, null_name)
+                    self.assertIs(store.setting(null_key)['valid'], True)
+                    event = store.one(
+                        "SELECT data FROM events WHERE kind='archive_verification_repaired'")
+                    self.assertIsNotNone(event)
+                    event_data = json.loads(event['data'])
+                    self.assertEqual(event_data['key'], null_key)
+                    self.assertEqual(event_data['previous_type'], 'unreadable')
+
+                    store.execute("DELETE FROM settings WHERE key='maintenance-last'")
+                    Maintenance.maintenance(runtime)
+                    self.assertEqual(checked.call_count, 2)
+                    self.assertEqual(Path(checked.call_args.args[0]).name, missing_name)
+                    self.assertIs(store.setting(missing_key)['valid'], True)
+
+                self.assertEqual(self.repaired_events(store), 1)
+                repaired = store.one(
+                    "SELECT data FROM events WHERE kind='archive_verification_repaired'")
+                self.assertEqual(json.loads(repaired['data'])['key'], null_key)
+            finally:
+                store.close()
+
     def test_old_finished_receipts_expire_but_unknown_and_active_survive(self):
         import contextlib
         from types import SimpleNamespace
