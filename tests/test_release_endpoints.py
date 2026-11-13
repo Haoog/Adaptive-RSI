@@ -417,6 +417,83 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                 self.assertTrue(res4["workflows"][0]["compatible"])
                 self.assertIsNot(res4, res3)
 
+    def test_release_workflows_http_refresh_bypasses_disabled_cache_without_sha_change(self):
+        import base64
+        import http.client
+        from adaptive_rsi import server as server_module
+
+        path = ".github/workflows/deploy.yml"
+        sha = "d" * 40
+        state = {"value": "disabled_manually"}
+        calls = []
+        content = base64.b64encode(("name: Deploy\n"
+                                    "run-name: ${{ inputs.rsi_operation_id }}\n"
+                                    "on:\n"
+                                    "  workflow_dispatch:\n"
+                                    "    inputs:\n"
+                                    "      rsi_operation_id:\n"
+                                    "        type: string\n"
+                                    "        required: true\n"
+                                    "      rsi_sha:\n"
+                                    "        type: string\n"
+                                    "        required: true\n").encode("utf-8")).decode("ascii")
+        with tempfile.TemporaryDirectory() as temp:
+            runtime, project = self._authorization_project(temp)
+            server = server_module.Server(runtime)
+            thread = threading.Thread(target=server.serve_forever,
+                                      kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            self.addCleanup(thread.join, 3)
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+
+            def mock_api(repo, endpoint, method="GET", fields=None):
+                calls.append(endpoint)
+                if endpoint == "":
+                    return {"default_branch": "main"}
+                if endpoint == "commits/main":
+                    return {"sha": sha}
+                if endpoint.startswith("actions/workflows?"):
+                    return {"workflows": [{"path": path, "name": "Deploy", "state": state["value"]}]}
+                if endpoint == "contents/" + path + "?ref=" + sha:
+                    return {"encoding": "base64", "type": "file", "content": content}
+                raise AssertionError("unexpected API call: " + endpoint)
+
+            def get_choices(refresh=False):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    query = "project=" + project + ("&refresh=true" if refresh else "")
+                    connection.request("GET", "/api/release-workflows?" + query,
+                                       headers={"Cookie": server.cookie + "=" + server.token})
+                    response = connection.getresponse()
+                    return response.status, json.loads(response.read())
+                finally:
+                    connection.close()
+
+            with patch("adaptive_rsi.release.api", side_effect=mock_api):
+                status, disabled = get_choices()
+                self.assertEqual(status, 200)
+                self.assertEqual(disabled["sha"], sha)
+                self.assertFalse(disabled["workflows"][0]["compatible"])
+                self.assertEqual(disabled["workflows"][0]["reason_code"], "workflow_disabled")
+                self.assertEqual(disabled["workflows"][0]["reason"],
+                                 "This workflow is disabled. Enable it in the repository before authorizing.")
+                self.assertEqual(calls.count("actions/workflows?per_page=100"), 1)
+
+                state["value"] = "active"
+                status, cached = get_choices()
+                self.assertEqual(status, 200)
+                self.assertIs(cached["workflows"][0]["compatible"], False)
+                self.assertEqual(calls.count("actions/workflows?per_page=100"), 1)
+
+                status, refreshed = get_choices(refresh=True)
+                self.assertEqual(status, 200)
+                self.assertEqual(refreshed["sha"], sha)
+                self.assertTrue(refreshed["workflows"][0]["compatible"])
+                self.assertEqual(refreshed["workflows"][0]["reason_code"], "")
+                self.assertEqual(calls.count("actions/workflows?per_page=100"), 2)
+                self.assertEqual(calls.count("contents/" + path + "?ref=" + sha), 1)
+
     def test_authorize_workflow_penetrates_cache_with_fresh_validation(self):
         import base64
         with tempfile.TemporaryDirectory() as temp:
@@ -592,6 +669,81 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                 self.assertEqual(response.status, 400)
                 self.assertEqual(payload, {"error": expected, "error_code": "validation_error"})
                 self.assertNotIn("private", json.dumps(payload))
+                self.assertFalse(runtime.config(project)["delivery"]["release"]["enabled"])
+                self.assertFalse(runtime.store.query("SELECT 1 FROM events WHERE kind='workflow_authorized'"))
+
+    def test_authorize_workflow_http_distinguishes_state_lookup_failure_from_disabled(self):
+        import base64
+        import http.client
+        from adaptive_rsi import server as server_module
+
+        retry_message = "Unable to inspect this workflow right now; retry after the GitHub request succeeds"
+        incompatible_message = "Select a compatible existing workflow from this project"
+        path = ".github/workflows/deploy.yml"
+        content = base64.b64encode(("name: Deploy\n"
+                                    "run-name: ${{ inputs.rsi_operation_id }}\n"
+                                    "on:\n"
+                                    "  workflow_dispatch:\n"
+                                    "    inputs:\n"
+                                    "      rsi_operation_id:\n"
+                                    "        type: string\n"
+                                    "        required: true\n"
+                                    "      rsi_sha:\n"
+                                    "        type: string\n"
+                                    "        required: true\n").encode("utf-8")).decode("ascii")
+        cases = [
+            ("rate limit", release.ApiRejected("private response", 429), retry_message),
+            ("server error", release.ApiRejected("private response", 503), retry_message),
+            ("transport error", RuntimeError("private transport detail"), retry_message),
+            ("malformed response", [], retry_message),
+            ("missing state", {}, retry_message),
+            ("missing workflow", release.ApiRejected("not found", 404), incompatible_message),
+            ("disabled workflow", {"state": "disabled_manually"}, incompatible_message),
+        ]
+        for label, state_result, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as temp:
+                runtime, project = self._authorization_project(temp)
+                writes = []
+                server = server_module.Server(runtime)
+                thread = threading.Thread(target=server.serve_forever,
+                                          kwargs={"poll_interval": 0.01}, daemon=True)
+                thread.start()
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    def mock_api(repo, endpoint, method="GET", fields=None):
+                        if method != "GET":
+                            writes.append(endpoint)
+                            return {}
+                        if endpoint == "":
+                            return {"default_branch": "main"}
+                        if endpoint == "commits/main":
+                            return {"sha": "f" * 40}
+                        if endpoint.startswith("contents/"):
+                            return {"encoding": "base64", "type": "file", "content": content}
+                        if endpoint == "actions/workflows/deploy.yml":
+                            if isinstance(state_result, Exception):
+                                raise state_result
+                            return state_result
+                        raise AssertionError("unexpected API call: " + endpoint)
+
+                    with patch("adaptive_rsi.release.api", side_effect=mock_api):
+                        body = json.dumps({"project": project, "kind": "release", "workflow": path})
+                        connection.request("POST", "/api/release-authorize", body, {
+                            "Cookie": server.cookie + "=" + server.token,
+                            "Origin": server.origin, "X-RSI-CSRF": server.csrf,
+                            "Content-Type": "application/json"})
+                        response = connection.getresponse()
+                        payload = json.loads(response.read())
+                finally:
+                    connection.close()
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(3)
+
+                self.assertEqual(response.status, 400)
+                self.assertEqual(payload, {"error": expected, "error_code": "validation_error"})
+                self.assertNotIn("private", json.dumps(payload))
+                self.assertEqual(writes, [])
                 self.assertFalse(runtime.config(project)["delivery"]["release"]["enabled"])
                 self.assertFalse(runtime.store.query("SELECT 1 FROM events WHERE kind='workflow_authorized'"))
 

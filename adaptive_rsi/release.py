@@ -218,6 +218,9 @@ def compatible_workflow(text):
 
 WORKFLOW_CHOICES_TTL = 300
 _workflow_choices_cache = {}
+_DISABLED_WORKFLOW_STATES = frozenset({
+    "deleted", "disabled_fork", "disabled_inactivity", "disabled_manually",
+})
 
 
 def _validated_repository(runtime, project_id):
@@ -256,15 +259,22 @@ def workflow_choices(runtime, project_id, refresh=False):
         # 目录里的 state 已经说明这个文件不会被调度；再读内容既没有意义，也会把
         # 「已禁用」误报成 YAML 写错了，让运维去改一份本来合规的文件。
         state = item.get("state")
+        if state in _DISABLED_WORKFLOW_STATES:
+            return {"workflow": path, "name": name, "compatible": False,
+                    "reason_code": "workflow_disabled",
+                    "reason": "This workflow is disabled. Enable it in the repository before authorizing."}
         if state != "active":
             return {"workflow": path, "name": name, "compatible": False,
-                    "reason": "This workflow is disabled (state=%s); enable it in the repository before authorizing" % (state or "unknown")}
+                    "reason_code": "workflow_inspection_failed",
+                    "reason": "Unable to inspect this workflow; refresh before authorizing"}
         try:
             compatible = compatible_workflow(workflow_content(repo, path, sha))
         except (RuntimeError, ValueError, OSError):
             return {"workflow": path, "name": name, "compatible": False,
+                    "reason_code": "workflow_inspection_failed",
                     "reason": "Unable to inspect this workflow; refresh before authorizing"}
         return {"workflow": path, "name": name, "compatible": compatible,
+                "reason_code": "" if compatible else "workflow_incompatible",
                 "reason": "" if compatible else "Requires explicit block-style YAML: workflow_dispatch inputs rsi_operation_id/rsi_sha (required string), and top-level run-name: ${{ inputs.rsi_operation_id }}; anchors, aliases and flow mappings require manual inspection"}
     # 逐个 workflow 拉取内容很慢；受控并发把对话框打开时间压到单次往返级别。
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -285,12 +295,15 @@ def _workflow_state(repo, workflow):
     """Read one workflow file's repository state (active/disabled_*).
 
     The single-file endpoint is keyed by the file name, so only the last path
-    segment is sent. Callers treat an unreadable state as "not active".
+    segment is sent. Missing or malformed state is an inspection failure.
     """
     data = api(repo, "actions/workflows/" + quote(workflow.split("/")[-1], safe=""))
     if not isinstance(data, dict):
         raise ValueError("Invalid workflow response")
-    return data.get("state")
+    state = data.get("state")
+    if not isinstance(state, str) or not state:
+        raise ValueError("Invalid workflow state")
+    return state
 
 
 def authorize_workflow(runtime, project_id, kind, workflow):
@@ -320,15 +333,20 @@ def authorize_workflow(runtime, project_id, kind, workflow):
         compatible = False
     if not compatible:
         raise ValueError("Select a compatible existing workflow from this project")
-    # 对话框只把 active 的工作流标为可用；这里必须用同一条规则，否则 API 调用方
-    # 能把一个永远不会被调度的 disabled workflow 钉进 delivery。state 读不到时
-    # 与内容读不到一样按不可用处理（fail closed）。
+    # 对话框只把 active 的工作流标为可用；这里必须用同一条规则。明确禁用或缺失
+    # 时拒绝选择，暂时无法检查时提示重试；所有情况都在任何 GitHub 写入前结束。
     try:
         state = _workflow_state(repo, workflow)
+    except ApiRejected as exc:
+        if exc.status == 404:
+            raise ValueError("Select a compatible existing workflow from this project") from None
+        raise ValueError("Unable to inspect this workflow right now; retry after the GitHub request succeeds") from None
     except (RuntimeError, ValueError, OSError):
-        state = None
-    if state != "active":
+        raise ValueError("Unable to inspect this workflow right now; retry after the GitHub request succeeds") from None
+    if state in _DISABLED_WORKFLOW_STATES:
         raise ValueError("Select a compatible existing workflow from this project")
+    if state != "active":
+        raise ValueError("Unable to inspect this workflow right now; retry after the GitHub request succeeds")
     tag = "rsi-workflow/" + sha
     # GitHub rejects duplicate refs. Read before creation so repeated authorization is safe.
     refs = api(repo, "git/matching-refs/tags/" + tag)

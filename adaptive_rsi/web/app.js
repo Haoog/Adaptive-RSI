@@ -1276,12 +1276,12 @@ const releaseStates={waiting_verification:'等待合并后检查',blocked_verifi
 releaseStates.health_unconfirmed='健康状态未确认';
 releaseStates.rollback_health_unconfirmed='回滚健康状态未确认';
 let releaseWorkflowSequence=0;
-async function loadReleaseWorkflows(){
+async function loadReleaseWorkflows(refresh=false){
  const project=projectId,ticket=++releaseWorkflowSequence;if(!project||$('config-scope').value!=='project')return;
  const list=$('release-workflow-list');list.replaceChildren();const placeholder=el('option',t('正在读取工作流…'));placeholder.value='';list.append(placeholder);
- try{const result=await api('release-workflows?project='+encodeURIComponent(project));if(ticket!==releaseWorkflowSequence||project!==projectId||$('config-scope').value!=='project')return;
+ try{const result=await api('release-workflows?project='+encodeURIComponent(project)+(refresh?'&refresh=true':''));if(ticket!==releaseWorkflowSequence||project!==projectId||$('config-scope').value!=='project')return;
   list.replaceChildren();const first=el('option',t('选择发布或部署工作流'));first.value='';list.append(first);
-  for(const workflow of result.workflows||[]){const option=el('option',workflow.name+' · '+workflow.workflow+(workflow.compatible?'':' · '+t('需要补充自动交付输入')));option.value=workflow.workflow;option.disabled=!workflow.compatible;list.append(option);}
+  for(const workflow of result.workflows||[]){const reason={workflow_disabled:'工作流已禁用，请在 GitHub 仓库中启用后刷新。',workflow_inspection_failed:'暂时无法检查此工作流，请刷新重试。',workflow_incompatible:'工作流不符合自动交付要求，请检查所需输入。'}[workflow.reason_code]||'需要补充自动交付输入';const option=el('option',workflow.name+' · '+workflow.workflow+(workflow.compatible?'':' · '+t(reason)));option.value=workflow.workflow;option.disabled=!workflow.compatible;list.append(option);}
   if(!result.workflows?.length)$('release-authorization-feedback').textContent=t('此仓库还没有可用工作流。可在高级设置手动指定，或先为项目添加工作流。');else $('release-authorization-feedback').textContent='';
  }catch(error){if(ticket!==releaseWorkflowSequence)return;list.replaceChildren();const failed=el('option',t('读取失败：')+error.message);failed.value='';list.append(failed);$('release-authorization-feedback').textContent=error.message;}
 }
@@ -1417,7 +1417,7 @@ async function renderReleaseOutcome(node,run,project){
   section.append(row);
  }node.append(section);
 }
-$('release-workflows-refresh').addEventListener('click',()=>safe(loadReleaseWorkflows));
+$('release-workflows-refresh').addEventListener('click',()=>safe(()=>loadReleaseWorkflows(true)));
 $('release-authorize').addEventListener('click',()=>safe(()=>authorizeRelease('release')));
 $('deploy-authorize').addEventListener('click',()=>safe(()=>authorizeRelease('deploy')));
 for(const kind of ['release','deploy'])document.querySelector('[data-path="delivery.'+kind+'.enabled"]')?.addEventListener('change',event=>{
