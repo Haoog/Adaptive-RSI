@@ -238,6 +238,8 @@ class TaskLifecycleTest(unittest.TestCase):
         self.assertEqual(len(indexed_page['entries']), 1)
 
     def test_index_migration_applies_to_existing_events(self):
+        from adaptive_rsi.schema_migrations import scripts
+        expected_versions = [1, 2] + [version for version, _ in scripts()]
         self.store.event('manual_retry', 'legacy', 'p', data={'task': 'legacy'})
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -246,8 +248,7 @@ class TaskLifecycleTest(unittest.TestCase):
         self.store.close()
         reopened = Store(self.store.root)
         try:
-            self.assertEqual([row['version'] for row in reopened.schema_migrations()],
-                             [1, 2, 3, 4, 5, 6, 7, 8, 9])
+            self.assertEqual([row['version'] for row in reopened.schema_migrations()], expected_versions)
             index = reopened.one("SELECT sql FROM sqlite_master WHERE type='index' "
                                  "AND name='events_intervention_task'")
             self.assertIn("json_extract(data,'$.task')", index['sql'])
