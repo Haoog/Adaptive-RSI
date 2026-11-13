@@ -97,9 +97,8 @@ class RelatedWorkTest(unittest.TestCase):
                     raise RuntimeError("Provider timeout")
                 return super().invoke(role, *args, **kwargs)
 
-        # 本用例只验证 related work 变化后重建 planning 缓存；readiness 的沙箱探测
-        # 依赖宿主的 Docker 守护进程，出现瞬时失败会在 planning 之前以
-        # insufficient_evidence 收尾，制造与本用例无关的假失败。
+        # This test covers related-work cache invalidation; do not make it
+        # depend on a live Docker daemon during readiness probing.
         with tempfile.TemporaryDirectory() as directory, \
                 patch("adaptive_rsi.readiness.Sandbox.backend", return_value="docker"):
             root = Path(directory).resolve()
