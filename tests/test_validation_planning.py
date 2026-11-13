@@ -592,7 +592,10 @@ class WorkerDiagnosticsTest(unittest.TestCase):
         progress.set('running', 'tests.demo.Case')
         probe = threading.Thread(target=gate.wait, name='rsi-diagnostic-probe', daemon=True)
         probe.start()
-        own, child, sibling = os.getpid(), os.getpid() + 7, os.getpid() + 101
+        own, child = os.getpid(), os.getpid() + 7
+        thread_id = str(probe.ident)
+        sibling = next(int(thread_id[index:index + 4]) for index in range(len(thread_id) - 3)
+                       if thread_id[index] != '0' and int(thread_id[index:index + 4]) not in {own, child})
         rows = ('  {child}  {own} S+ /usr/bin/child\n'
                 '  {sibling}  1 Ss /usr/bin/sibling\n'
                 '  {own}  1 Ss /usr/bin/python\n').format(own=own, child=child, sibling=sibling)
@@ -609,8 +612,11 @@ class WorkerDiagnosticsTest(unittest.TestCase):
         self.assertIn('phase=running', text)
         self.assertIn('selector=tests.demo.Case', text)
         self.assertIn('rsi-diagnostic-probe', text)
-        self.assertIn('child pid={}'.format(child), text)
-        self.assertNotIn(str(sibling), text)
+        child_records = [line for line in text.splitlines() if line.startswith('[worker] child pid=')]
+        self.assertTrue(any(line.startswith('[worker] child pid={} ppid={} '.format(child, own))
+                            for line in child_records))
+        self.assertFalse(any(line.startswith('[worker] child pid={} '.format(sibling))
+                             for line in child_records))
         self.assertEqual(run.call_args.args[0], ['ps', '-axo', 'pid=,ppid=,stat=,comm='])
         self.assertNotIn('args', ' '.join(run.call_args.args[0]))
         self.assertLessEqual(run.call_args.kwargs['timeout'], 5)
