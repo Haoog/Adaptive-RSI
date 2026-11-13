@@ -2,7 +2,7 @@
 window.RSINativeUpdate=(()=>{
  const labels={checking:'正在检查更新',latest:'已是最新稳定版',available:'发现新版本',downloading:'正在下载新版本…',verifying:'正在校验签名',replacing:'正在替换应用',ready:'新版本已准备好',waiting_idle:'等待当前任务结束后更新',installing:'正在安装更新',restarting:'正在重启应用',error:'更新未完成'};
  const errors={update_target_changed:'更新目标已变化或撤回，请重新检查并确认。',update_window_closed:'安装窗口已结束，下一次允许的空闲窗口会重新尝试。',updater_key_missing:'当前安装包尚未配置更新签名，请手动安装支持自动更新的版本。',update_disk_space:'磁盘可用空间不足，请清理后重试。',update_download_or_signature_failed:'下载或签名验证失败，当前版本继续可用。',update_wait_cancelled:'已取消等待更新，当前任务继续运行。',update_install_failed:'安装未完成，请重试或手动安装。',update_incompatible_platform:'此更新包与当前系统或架构不兼容，当前版本继续可用。',update_connect_timeout:'连接更新服务器超时，当前版本继续可用。请检查网络后重试。',update_response_timeout:'更新服务器响应超时，当前版本继续可用。',update_download_timeout:'下载新版本超过总时限，已停止。当前版本继续可用。',update_transfer_stalled:'下载长时间没有数据，已停止。当前版本继续可用。',update_connection_failed:'无法连接更新服务器，当前版本继续可用。',update_download_incomplete:'更新包下载不完整，已重新开始；请重试。',update_range_rejected:'服务器拒绝续传分段，已删除分段；请重试重新下载。',update_cache_unavailable:'更新缓存不可用，请检查磁盘权限或空间后重试。',update_size_limit:'更新包超过允许的大小上限，已停止。当前版本继续可用。',update_unsupported_platform:'当前平台不支持应用内更新，请手动安装。',update_authorization_changed:'更新授权已变化，本次安装已撤销；请按当前设置重新确认。',update_authorization_invalid:'更新设置无效，请重新选择更新策略、版本范围与安装时间。',update_authorization_failed:'更新设置未能同步到本机，请重试。',update_cancel_failed:'未能确认本机已撤销安装，请查看更新状态后再操作。',update_receipt_missing:'本机还没有已持久化的升级回执。',update_receipt_unavailable:'升级回执无法写入本机，安装未开始。',update_version_mismatch:'重启后的版本与升级目标不一致，已记录为未生效。',update_health_failed:'升级后的本机服务未通过健康检查，已记录为升级失败。'};
- let snapshot={},busy=false,checking=false,nodes=null,failures=0,retryAt=0,storageError=false,polling=false,installRetryAt=0;
+ let snapshot={},busy=false,checking=false,nodes=null,failures=0,retryAt=0,statusRetryAt=0,storageError=false,polling=false,installRetryAt=0;
  let runtimeInfo=null,lastSample=null,currentSpeed=0;
  // A running download needs per-second progress; a settled client does not. The
  // panel used to run a 1s interval for the life of the page even when nothing
@@ -121,10 +121,16 @@ window.RSINativeUpdate=(()=>{
    return true;
   }catch(error){authorizationError=String(error&&error.message||error||'update_cancel_failed');return false;}
  }
+ function trackAuthorization(authorization){
+  initialAuthorization=authorization;
+  authorization.then(accepted=>{if(!accepted&&initialAuthorization===authorization)initialAuthorization=null;});
+  return authorization;
+ }
  // A settings change revokes a waiting install even when the new revision could
  // not be stored: an install approved under stale consent must not continue.
  async function settingsChanged(){
-  const accepted=await syncAuthorization();
+  const authorization=trackAuthorization(syncAuthorization());
+  const accepted=await authorization;
   await revokeInstall();
   if(!accepted&&!authorizationError)authorizationError='update_authorization_failed';
   render();
@@ -255,6 +261,17 @@ window.RSINativeUpdate=(()=>{
   // to the active cadence now instead of when run() finally settles.
   schedulePoll();
   try{
+   // A status tick can reveal a ready update before the delayed startup auth
+   // sync. If the user installs in that window, authorize first with this action.
+   if(action==='install'&&['interactive','complete'].includes(document.readyState)){
+    if(!initialAuthorization){
+     trackAuthorization(syncAuthorization());
+    }
+    if(!await initialAuthorization||authorizationError){
+     if(!authorizationError)authorizationError='update_authorization_failed';
+     return;
+    }
+   }
    snapshot=await window.RSIDesktop.invoke('native_update',{action,automatic,installationWindow:action==='install'?(automatic?installWindow:'any'):null,revision:action==='install'?revision:null});
    if(snapshot.state==='error')throw Error(snapshot.error_code||'update_check_failed');
    if(action==='install'){failureCounts.install=0;installRetryAt=0;}
@@ -268,8 +285,8 @@ window.RSINativeUpdate=(()=>{
  }
  async function readStatus(){
   if(polling||!enabled())return false;polling=true;
-  try{snapshot=await window.RSIDesktop.invoke('native_update',{action:'status'});render();return true;}
-  catch(error){failures++;retryAt=Date.now()+Math.min(300000,5000*2**Math.min(failures-1,6));return false;}
+  try{snapshot=await window.RSIDesktop.invoke('native_update',{action:'status'});statusRetryAt=0;render();return true;}
+  catch(error){failures++;statusRetryAt=Date.now()+Math.min(300000,5000*2**Math.min(failures-1,6));retryAt=statusRetryAt;return false;}
   finally{polling=false;}
  }
  // An automatic download or install keeps its IPC call pending for as long as the
@@ -278,6 +295,9 @@ window.RSINativeUpdate=(()=>{
  async function act(){
   if(checking||busy||!enabled()||Date.now()<retryAt)return;checking=true;
   try{
+   // app.js can call tick() from its earlier DOMContentLoaded listener. Wait
+   // until this module starts the initial authorization sync before any action.
+   if(['interactive','complete'].includes(document.readyState)&&!initialAuthorization)return;
    // Status reads must continue during startup authorization, but automatic
    // actions must still wait for the authorization reply.
    if(initialAuthorization)await initialAuthorization;
@@ -301,6 +321,9 @@ window.RSINativeUpdate=(()=>{
   // the immediate refresh when it becomes visible closes the gap, and nothing in
   // the panel is being read while hidden.
   if(document.visibilityState==='hidden')return POLL_HIDDEN;
+  // A failed status read must retry on its own backoff rather than inheriting a
+  // slower cadence from the last successful (now stale) snapshot.
+  if(statusRetryAt>Date.now())return statusRetryAt-Date.now();
   const phase=phaseOf(snapshot);
   // A user or automatic action keeps its IPC call pending for the whole
   // operation, before the snapshot reports the new phase.
@@ -342,7 +365,7 @@ window.RSINativeUpdate=(()=>{
   render();
   document.addEventListener('visibilitychange',visibilityChanged);
   pollActive=true;
-  setTimeout(()=>{initialAuthorization=syncAuthorization();safe(poll);},5000);
+  setTimeout(()=>{trackAuthorization(initialAuthorization||syncAuthorization());safe(poll);},5000);
  });
  return {render,run,tick,pollDelay,poll,eligible,withinWindow,phaseOf,statusText,progressText,formatBytes,speedText,sampleSpeed,scopeText,errorText,errorCode,exportReceipt,syncAuthorization,settingsChanged,revision:()=>revision};
 })();
