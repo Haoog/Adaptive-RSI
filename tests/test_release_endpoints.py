@@ -540,6 +540,61 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
             self.assertEqual([endpoint for endpoint in calls if endpoint.startswith("contents/")],
                              ["contents/.github/workflows/deploy.yml?ref=" + sha])
 
+    def test_authorize_workflow_http_preserves_retry_and_incompatible_guidance(self):
+        import http.client
+        from adaptive_rsi import server as server_module
+
+        retry_message = "Unable to inspect this workflow right now; retry after the GitHub request succeeds"
+        incompatible_message = "Select a compatible existing workflow from this project"
+        cases = [
+            ("rate limit", release.ApiRejected("private GitHub response", 429), retry_message),
+            ("other transient failure", RuntimeError("private transport detail"), retry_message),
+            ("missing workflow", release.ApiRejected("not found", 404), incompatible_message),
+            ("incompatible workflow", {"encoding": "base64", "type": "file",
+                                        "content": "bmFtZTogRGVwbG95Cm9uOiBwdXNoCg=="}, incompatible_message),
+        ]
+        for label, failure, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as temp:
+                runtime, project = self._authorization_project(temp)
+                server = server_module.Server(runtime)
+                thread = threading.Thread(target=server.serve_forever,
+                                          kwargs={"poll_interval": 0.01}, daemon=True)
+                thread.start()
+                self.addCleanup(thread.join, 3)
+                self.addCleanup(server.server_close)
+                self.addCleanup(server.shutdown)
+
+                def mock_api(repo, endpoint, method="GET", fields=None):
+                    if endpoint == "":
+                        return {"default_branch": "main"}
+                    if endpoint == "commits/main":
+                        return {"sha": "f" * 40}
+                    if endpoint.startswith("contents/"):
+                        if isinstance(failure, dict):
+                            return failure
+                        raise failure
+                    raise AssertionError("unexpected API call: " + endpoint)
+
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    with patch("adaptive_rsi.release.api", side_effect=mock_api):
+                        body = json.dumps({"project": project, "kind": "release",
+                                           "workflow": ".github/workflows/deploy.yml"})
+                        connection.request("POST", "/api/release-authorize", body, {
+                            "Cookie": server.cookie + "=" + server.token,
+                            "Origin": server.origin, "X-RSI-CSRF": server.csrf,
+                            "Content-Type": "application/json"})
+                        response = connection.getresponse()
+                        payload = json.loads(response.read())
+                finally:
+                    connection.close()
+
+                self.assertEqual(response.status, 400)
+                self.assertEqual(payload, {"error": expected, "error_code": "validation_error"})
+                self.assertNotIn("private", json.dumps(payload))
+                self.assertFalse(runtime.config(project)["delivery"]["release"]["enabled"])
+                self.assertFalse(runtime.store.query("SELECT 1 FROM events WHERE kind='workflow_authorized'"))
+
     def test_authorize_workflow_rejects_missing_or_incompatible_files(self):
         import base64
         sha = "f" * 40
@@ -657,6 +712,30 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                 self.assertEqual(str(caught.exception), "Select a compatible existing workflow from this project")
                 self.assertEqual(writes, [])
                 self.assertFalse(runtime.config(project)["delivery"]["release"]["enabled"])
+
+    def test_authorize_workflow_reports_unreadable_files_as_retryable(self):
+        sha = "f" * 40
+
+        def stub(repo, endpoint, method="GET", fields=None):
+            if endpoint == "":
+                return {"default_branch": "main"}
+            if endpoint == "commits/main":
+                return {"sha": sha}
+            raise AssertionError("unexpected API call: " + endpoint)
+
+        failures = [RuntimeError("gh: rate limited (HTTP 429)"),
+                    release.ApiRejected("gh: rate limited (HTTP 429)", 429)]
+        for failure in failures:
+            with self.subTest(error=type(failure).__name__), tempfile.TemporaryDirectory() as temp:
+                runtime, project = self._authorization_project(temp)
+                with patch("adaptive_rsi.release.api", side_effect=stub), \
+                        patch("adaptive_rsi.release.workflow_content", side_effect=failure):
+                    with self.assertRaises(ValueError) as caught:
+                        release.authorize_workflow(runtime, project, "release", ".github/workflows/deploy.yml")
+                self.assertIn("Unable to inspect", str(caught.exception))
+                self.assertNotIn("Select a compatible", str(caught.exception))
+                self.assertFalse(runtime.config(project)["delivery"]["release"]["enabled"])
+                self.assertFalse(runtime.store.query("SELECT 1 FROM events WHERE kind='workflow_authorized'"))
 
 
 class _ManualReconciliationFixture(unittest.TestCase):

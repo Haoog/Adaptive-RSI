@@ -1655,9 +1655,9 @@ class WorkflowConfigurationTest(unittest.TestCase):
         jobs = workflow["jobs"]
         self.assertEqual(jobs["python"]["runs-on"], "${{ matrix.os }}")
         self.assertTrue(all(item["os"] == "ubuntu-latest" for item in jobs["python"]["strategy"]["matrix"]["include"]))
-        self.assertEqual(jobs["browser"]["runs-on"], "macos-14")
-        self.assertEqual(jobs["macos_sandbox_core"]["runs-on"], "macos-14")
-        self.assertEqual(jobs["macos_sandbox_flows"]["runs-on"], "macos-14")
+        self.assertEqual(jobs["browser"]["runs-on"], "macos-latest")
+        self.assertEqual(jobs["macos_sandbox_core"]["runs-on"], "macos-latest")
+        self.assertEqual(jobs["macos_sandbox_flows"]["runs-on"], "macos-latest")
         required = set(jobs["verify"]["needs"])
         self.assertTrue({"python", "macos_sandbox_core", "macos_sandbox_flows", "browser", "linux"} <= required)
         text = (self.ROOT / ".github/workflows/checks.yml").read_text()
