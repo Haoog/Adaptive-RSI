@@ -12,6 +12,7 @@ FIXED = {
     'Deployment health URLs must be unique': ('config_health_targets', 'delivery.deploy.health_urls'),
     'Additional deployment health URLs require a primary URL and at most seven HTTPS targets': ('config_health_targets', 'delivery.deploy.health_urls'),
     'Deployment health URL requires HTTPS without credentials, query or fragment': ('config_health_url', 'delivery.deploy.health_url'),
+    'Deployment health URL requires a valid HTTPS address and a port between 1 and 65535': ('config_health_url', 'delivery.deploy.health_url'),
     'Automatic deployment rollback requires an explicit health URL': ('config_rollback_health', 'delivery.deploy.health_url'),
     'Invalid deployment rollback data compatibility policy': ('config_rollback_data', 'delivery.deploy.rollback_data_policy'),
     'Deployment rollback recovery notes exceed 2000 characters': ('config_rollback_notes', 'delivery.deploy.rollback_recovery_notes'),
