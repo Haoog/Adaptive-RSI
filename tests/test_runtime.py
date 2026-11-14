@@ -1925,6 +1925,43 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(shown["name"], "repo")
             self.assertEqual(shown["path"], str(repo.resolve()))
 
+    def test_task_revision_passes_request_id_unchanged_to_runtime(self):
+        result = {"saved": True, "pending": False}
+        request_id = "  client-request-id  "
+        with patch.object(self.runtime, "revise_task", return_value=result) as revise:
+            response = self.post("/api/task/revise", {
+                "task": "task-1", "supplement": "new information", "request_id": request_id,
+            })
+        self.assertEqual(response, result)
+        revise.assert_called_once_with("task-1", "new information", None, request_id=request_id)
+
+    def test_task_revision_rejects_invalid_request_ids_without_echo_or_dispatch(self):
+        invalid_ids = [None, 17, {"value": "secret-input-never-echo"}, "", "   ", "oversized-" + "x" * 101]
+        with patch.object(self.runtime, "revise_task", return_value={"saved": True}) as revise:
+            for request_id in invalid_ids:
+                with self.subTest(request_id_type=type(request_id).__name__,
+                                  request_id_length=len(request_id) if isinstance(request_id, str) else None):
+                    with self.assertRaises(urllib.error.HTTPError) as caught:
+                        self.post("/api/task/revise", {
+                            "task": "task-1", "supplement": "new information", "request_id": request_id,
+                        })
+                    self.assertEqual(caught.exception.code, 400)
+                    payload = caught.exception.read().decode()
+                    self.assertNotIn("secret-input-never-echo", payload)
+                    if isinstance(request_id, str) and request_id:
+                        self.assertNotIn(request_id, payload)
+                    caught.exception.close()
+            revise.assert_not_called()
+
+    def test_task_revision_without_request_id_keeps_legacy_dispatch(self):
+        result = {"saved": True, "pending": False}
+        with patch.object(self.runtime, "revise_task", return_value=result) as revise:
+            response = self.post("/api/task/revise", {
+                "task": "task-1", "supplement": "new information",
+            })
+        self.assertEqual(response, result)
+        revise.assert_called_once_with("task-1", "new information", None)
+
     def test_aborted_response_does_not_escape_as_server_error(self):
         class ClosedConnection:
             close_connection = False
