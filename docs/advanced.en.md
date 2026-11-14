@@ -98,7 +98,7 @@ When adding a provider, **Advanced connection settings** edits the actual protoc
 
 The default Codex route reads [App Server `model/list`](https://developers.openai.com/codex/app-server#list-models-modellist). Responses, Chat Completions, Codex-compatible gateways and Anthropic use `/models`; Gemini uses `/models` and filters entries explicitly lacking `generateContent`; Ollama uses `/api/tags`; LM Studio uses `/v1/models`. Pagination fetches up to 1,000 entries per refresh while retaining prior and custom entries. Explicit image/embedding and other non-coding types cannot be enabled; unknown capabilities are not assumed to be supported.
 
-Fetching a directory starts no inference. **More → Test model** explicitly runs basic tools and structured output, may incur charges, and records actual usage without quotas. No project code is sent. Catalog visibility, basic tool checks and real task success remain separate evidence levels.
+Fetching a directory starts no inference. **More → Test model** explicitly runs basic tools and structured output, may incur charges, and records actual usage without quotas. No project code is sent. Closing the dialog or choosing **Stop waiting** only aborts the browser request; the server-side test may continue, incur charges, and record results. Repeated tests may reach the concurrency limit. Catalog visibility, basic tool checks and real task success remain separate evidence levels.
 
 Model lists support favorites, enabled-only filtering, search and 20 entries per page; role pickers also filter by provider. Advanced parameters provide visual fallback provider/model/effort controls, and role drafts can be discarded. Each role shows draft inheritance, fallback routing and the tool-test status for its exact effort.
 
