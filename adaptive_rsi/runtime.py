@@ -188,6 +188,8 @@ class Runtime(Maintenance):
                           "scheduler_timed_out": False, "maintenance_timed_out": False,
                           "workers_timed_out": False, "reconcile_failed": 0}
         self._close_lock = threading.Lock()
+        # Startup initialization and shutdown must not mutate the same runtime concurrently.
+        self._lifecycle_lock = threading.Lock()
         self._closed = False
         # 领取与关闭的共同边界：close 先关闭准入，再排空线程池；竞态下不会留下已领取
         # 但从未启动的 run，也不会在关闭开始后继续领取新任务。
@@ -946,34 +948,49 @@ class Runtime(Maintenance):
         return task
 
     def start(self, paused=False):
-        if self.lockfile is None or self.lockfile.closed:
-            self.lockfile = (self.store.root / "runtime.lock").open("a+")
+        """Claim the state directory lock and launch the scheduler thread.
+
+        Idempotent while the scheduler is running: a second call returns without
+        starting another thread or re-applying ``paused``, so in-process callers
+        see the same single-owner contract as ``Runtime.open()``.
+        """
+        with self._lifecycle_lock:
+            if self._closing or self._closed:
+                raise RuntimeError("Runtime is closing or closed")
+            if self.thread and self.thread.is_alive():
+                return
+            if self.lockfile is None or self.lockfile.closed:
+                lockfile = (self.store.root / "runtime.lock").open("a+")
+                try:
+                    fcntl.flock(lockfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    lockfile.close()
+                    raise RuntimeError("Another runtime already owns this state directory")
+                except BaseException:
+                    lockfile.close()
+                    raise
+                self.lockfile = lockfile
             try:
-                fcntl.flock(self.lockfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+                self.operations.recover()
+                if paused:
+                    self.store.execute("UPDATE projects SET paused=1")
+                self.updates.restore_startup()
+                self.store.recover()
+                # 旧版本没有待办索引；一次性为历史 pending 记录补索引，之后每轮只按索引领取。
+                self._index_postprocess_pending()
+                self.store.execute("DELETE FROM settings WHERE key IN "
+                                   "(SELECT 'run-stop:' || id FROM runs WHERE ended IS NOT NULL)")
+                # 只有已获授权的发布任务可续跑；普通任务保留中断证据，由用户手动重试。
+                self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? "
+                                   "WHERE source='system_publish' AND state='interrupted'", (time.time(),))
+                thread = threading.Thread(target=self.loop, name="rsi-scheduler", daemon=True)
+                thread.start()
+                self.thread = thread
+            except BaseException:
+                # 启动失败时释放状态目录锁并关闭文件，成功路径保持原有行为（锁持有到 stop/进程结束）。
                 self.lockfile.close()
                 self.lockfile = None
-                raise RuntimeError("Another runtime already owns this state directory")
-        try:
-            self.operations.recover()
-            if paused:
-                self.store.execute("UPDATE projects SET paused=1")
-            self.updates.restore_startup()
-            self.store.recover()
-            # 旧版本没有待办索引；一次性为历史 pending 记录补索引，之后每轮只按索引领取。
-            self._index_postprocess_pending()
-            self.store.execute("DELETE FROM settings WHERE key IN "
-                               "(SELECT 'run-stop:' || id FROM runs WHERE ended IS NOT NULL)")
-            # 只有已获授权的发布任务可续跑；普通任务保留中断证据，由用户手动重试。
-            self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? "
-                               "WHERE source='system_publish' AND state='interrupted'", (time.time(),))
-            self.thread = threading.Thread(target=self.loop, name="rsi-scheduler", daemon=True)
-            self.thread.start()
-        except BaseException:
-            # 启动失败时释放状态目录锁并关闭文件，成功路径保持原有行为（锁持有到 stop/进程结束）。
-            self.lockfile.close()
-            self.lockfile = None
-            raise
+                raise
 
     def shutdown_status(self):
         return {**self._shutdown, 'remaining_workers': sum(not f.done() for f in tuple(self.futures)),
@@ -989,16 +1006,17 @@ class Runtime(Maintenance):
             # 已进入临界区的 claim+submit 仍由 _close 的 reconcile 收尾。
             with self._admission:
                 self._closing = True
-            self._shutdown.update(phase='stopping', started=time.time())
-            try:
-                self._close()
-            except BaseException:
-                self._shutdown.update(phase='failed', ended=time.time())
-                raise
-            self._closed = True
-            # completed 只表示关闭流程走完；reconcile_failed>0 表示仍有已领取的
-            # run 未能落终态，必须等下一次启动的 store.recover() 修复。
-            self._shutdown.update(phase='completed', ended=time.time())
+            with self._lifecycle_lock:
+                self._shutdown.update(phase='stopping', started=time.time())
+                try:
+                    self._close()
+                except BaseException:
+                    self._shutdown.update(phase='failed', ended=time.time())
+                    raise
+                self._closed = True
+                # completed 只表示关闭流程走完；reconcile_failed>0 表示仍有已领取的
+                # run 未能落终态，必须等下一次启动的 store.recover() 修复。
+                self._shutdown.update(phase='completed', ended=time.time())
 
     def _close(self):
         self.stop.set()
