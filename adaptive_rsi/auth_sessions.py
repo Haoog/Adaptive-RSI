@@ -960,8 +960,11 @@ class AuthSessions:
         self.sessions = {}
         self.workers = {}
         self.discoveries = set()
+        # (backend, provider) -> 该凭据正在被登出删除。登出在 self.lock 外做删除与
+        # CLI 子进程，等 credential_lock 的 _save() 与 reserve() 据此放弃回装/登记。
+        self.logging_out = set()
         self.threads = set()
-        # 线程登记不占用 self.lock：后者在 install_credential/logout 期间被长时间持有，
+        # 线程登记不占用 self.lock：后者在 install_credential 期间被长时间持有，
         # 过期快照的后台刷新若等待它，请求线程仍会被阻塞。
         self.threads_lock = threading.Lock()
         self.closed = False
@@ -1055,6 +1058,11 @@ class AuthSessions:
         if not isinstance(backend, str) or backend not in {"codex", "opencode"}:
             raise AuthError("invalid_backend")
         return backend
+
+    @staticmethod
+    def _logout_key(backend, provider):
+        """登出标记的粒度：codex 只有一个 provider，按后端标记；opencode 按 provider。"""
+        return (backend, provider if backend == "opencode" else None)
 
     @property
     def busy(self):
@@ -1407,6 +1415,10 @@ class AuthSessions:
         with self.lock:
             if self.closed:
                 raise AuthError("service_closed")
+            # 同凭据的登出正在锁外删除/调 CLI；此时登记的会话会在登出收尾时被取消，
+            # 不如让调用方稍后重试（旧实现靠锁住整段登出达到同样效果）。
+            if self._logout_key(backend, provider) in self.logging_out:
+                raise AuthError("auth_busy")
             # busy 的非阻塞过期扫描在锁竞争时可能跳过；这里持锁，必须先把同后端
             # 已过 expires_at 却仍为 ACTIVE 的行收成 expired，否则过期会话会
             # 在 TTL 内持续 auth_busy。
@@ -1646,6 +1658,10 @@ class AuthSessions:
                 if self.now() >= current_session["expires_at"]:
                     self._update(session_id, state="expired", error="auth_expired")
                     return
+                if self._logout_key(backend, provider) in self.logging_out:
+                    # 凭据已被登出删除；此时安装会把刚删掉的凭据装回去。会话通常已
+                    # 被登出取消（上面的 ACTIVE 判定会先返回），这里是兜底。
+                    raise AuthError("auth_protocol_error")
                 if backend == "codex":
                     # 与 opencode 分支一致：合并写回，保留用户手放的 OPENAI_API_KEY
                     # 和新版 CLI 写入的未知字段，只覆盖凭据本身的同名字段。
@@ -1738,40 +1754,54 @@ class AuthSessions:
             with self.lock:
                 if self.closed:
                     raise AuthError("service_closed")
-                if backend == "codex":
-                    path = _codex_path()
-                    try:
-                        path.unlink()
-                    except FileNotFoundError:
-                        pass
-                else:
-                    binary = shutil.which("opencode")
-                    try:
-                        remove_auth_export(provider)
-                        if not self.custom_factory and binary:
-                            logout_provider(provider, binary)
-                    except (OpenCodeCompatibilityError, RuntimeError, OSError):
-                        raise AuthError("auth_protocol_error") from None
-                    path = auth_path()
-                    data = _read_json_for_write(path)
-                    if provider in data:
-                        data.pop(provider, None)
-                        _write_json(path, data)
+                # 凭据删除、opencode auth logout 子进程（timeout=20）与写盘都在
+                # self.lock 之外：服务端在 dispatch_lock 临界区内调 reserve()，而
+                # reserve() 要取 self.lock，锁内起子进程会让任务领取、配置保存和
+                # 交付/发版写入一起停摆。凭据改写的互斥由 credential_lock 保证；
+                # logging_out 让等锁的 _save() 在拿到锁后放弃回装已删除的凭据。
+                self.logging_out.add(self._logout_key(backend, provider))
+            if backend == "codex":
+                path = _codex_path()
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            else:
+                binary = shutil.which("opencode")
+                try:
+                    remove_auth_export(provider)
+                    if not self.custom_factory and binary:
+                        logout_provider(provider, binary)
+                except (OpenCodeCompatibilityError, RuntimeError, OSError):
+                    raise AuthError("auth_protocol_error") from None
+                path = auth_path()
+                data = _read_json_for_write(path)
+                if provider in data:
+                    data.pop(provider, None)
+                    _write_json(path, data)
+            with self.lock:
                 # 凭据移除全部成功后再取消会话：移除失败时若已把会话标成 cancelled，
                 # 用户虽收到 auth_protocol_error，进行中的登录却已被终止，重试也无从恢复。
-                for session_id, item in self.sessions.items():
-                    if item["backend"] == backend and item["state"] in ACTIVE:
-                        self._update(session_id, state="cancelled")
-                        if session_id in self.workers:
-                            workers.append(self.workers[session_id])
+                for session_id, item in list(self.sessions.items()):
+                    if item["backend"] != backend or item["state"] not in ACTIVE:
+                        continue
+                    # opencode 同一后端可有多个 provider：退出 B 不能连带取消正在为
+                    # A 进行的设备授权，否则用户必须重新取设备码才能继续；codex 只有
+                    # 一个 provider，仍按后端取消全部会话。
+                    if backend == "opencode" and item.get("provider") != provider:
+                        continue
+                    self._update(session_id, state="cancelled")
+                    if session_id in self.workers:
+                        workers.append(self.workers[session_id])
+                self._invalidate_caches(backend)
         finally:
+            with self.lock:
+                self.logging_out.discard(self._logout_key(backend, provider))
             credential_lock.release()
             for worker, stop in workers:
                 stop.set()
                 if worker:
                     worker.close()
-        with self.lock:
-            self._invalidate_caches(backend)
         return self.snapshot()
 
     def set_api_key(self, backend, provider, key):
