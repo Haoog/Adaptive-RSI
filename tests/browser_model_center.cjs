@@ -27,14 +27,32 @@ async function main() {
       posts++;
       if (request.url().endsWith('/api/model-center/remove')) removes.push(request.postDataJSON());
     });
+    // 列表汇总只读快照：切换服务不应额外请求 /api/model-center。
+    const snapshots = [];
+    page.on('request', request => {
+      if (request.method() === 'GET' && new URL(request.url()).pathname === '/api/model-center') snapshots.push(request.url());
+    });
     const step = id => page.locator('#' + id);
     const dialog = page.locator('.confirm-dialog');
-    const pick = name => page.locator('#mc-provider-list .mc-provider').filter({hasText: name}).click();
+    const dialogText = async () => (await dialog.innerText()).replace(/\s+/g, '');
+    const row = name => page.locator('#mc-provider-list .mc-provider').filter({hasText: name});
+    const pick = name => row(name).click();
 
     await page.goto(url);
     await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
     await page.locator('.sidebar [data-view=models]').click();
     await page.locator('[data-mc-tab="providers"]').click();
+
+    // 列表行直接汇总模型数、目录新鲜度与使用角色，无需逐个点开详情。
+    const loadedSnapshots = snapshots.length;
+    assert.ok(loadedSnapshots > 0, 'the provider list renders from a model-center snapshot');
+    assert.match(await row('本地目录服务').innerText(), /2 个模型 · 更新于 \d/);
+    assert.match(await row('本地目录服务').innerText(), /被 0 个角色使用/);
+    assert.match(await row('引用中转').innerText(), /被 1 个角色使用/);
+    assert.match(await row('未获取中转').innerText(), /0 个模型 · 尚未获取/);
+    await row('引用中转').click();
+    await row('未获取中转').click();
+    assert.equal(snapshots.length, loadedSnapshots, 'switching providers must not refetch /api/model-center');
 
     // OAuth（Codex 登录）未连接时第 2 步保持 current。
     await pick('Codex 登录');
@@ -193,6 +211,8 @@ async function main() {
     await dialog.waitFor();
     assert.match(await dialog.innerText(), /不可恢复/);
     assert.match(await dialog.innerText(), /新连接/);
+    assert.match(await dialogText(), /若仍被角色分工或备用模型引用，服务端会拒绝移除。/);
+    assert.doesNotMatch(await dialogText(), /此连接仍被角色分工使用/);
     assert.equal(removes.length, 0);
     await dialog.getByRole('button', {name: '取消', exact: true}).click();
     await dialog.waitFor({state: 'detached'});
@@ -202,9 +222,11 @@ async function main() {
 
     // 确认文案跟随界面语言。
     await page.locator('#language-select').selectOption('en');
+    assert.match(await row('引用中转').innerText(), /2 models · Updated .+ · Used by 1 role/);
     await page.locator('#mc-remove-provider').click();
     await dialog.waitFor();
     assert.match(await dialog.innerText(), /cannot be undone/i);
+    assert.match(await dialogText(), /Theserverrejectsremoval/);
     await dialog.getByRole('button', {name: 'Cancel', exact: true}).click();
     await dialog.waitFor({state: 'detached'});
     await page.locator('#language-select').selectOption('zh-CN');
@@ -213,6 +235,7 @@ async function main() {
     await pick('引用中转');
     await page.locator('#mc-remove-provider').click();
     await dialog.waitFor();
+    assert.match(await dialogText(), /此连接仍被角色分工使用：规划。请先更换这些角色的主模型或备用模型。/);
     await dialog.getByRole('button', {name: '确认', exact: true}).click();
     await page.waitForFunction(() => document.getElementById('toast').textContent.includes('此连接仍被角色或备用模型使用'));
     assert.equal(removes.length, 1);
