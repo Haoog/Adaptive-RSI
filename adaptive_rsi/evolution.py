@@ -10,7 +10,7 @@ from pathlib import Path
 from .config import BUILTIN_PROVIDERS, compatibility, fingerprint, merge, validate
 from .gitops import git, repository, snapshot
 from .process import Cancelled, scrub_tree
-from .store import encode, uid
+from .store import decode_object, encode, uid
 from .usage_report import one_snapshot
 
 
@@ -364,6 +364,14 @@ def _stale_running_attempt(attempt):
 
 
 class Evolution:
+    ROLLBACK_MESSAGES = {
+        "restored": "Restored previous stable strategy and invalidated its learned skill",
+        "rollback_incompatible_parent": "Previous stable strategy is incompatible with the current configuration; no strategy is active, re-promote it explicitly after restoring the old configuration",
+        "rollback_unreadable_parent": "Previous stable strategy has unreadable evidence; no strategy is active until an explicit revalidation",
+        "rollback_missing_parent": "Previous stable strategy no longer exists; no strategy is active",
+        "rollback_without_parent": "Rolled back the active strategy; no previous stable strategy to restore",
+    }
+
     def __init__(self, runtime):
         self.runtime = runtime
         self.store = runtime.store
@@ -2228,7 +2236,36 @@ class Evolution:
             if not passed:
                 self.rollback(row["id"])
 
+    def restore_parent(self, db, parent, current):
+        """把被替换的父候选恢复为 stable；只有它能在 active_strategies 中生效时才恢复。
+
+        可见性规则与 Runtime.active_strategies 一致：封存指纹存在时必须匹配当前配置，
+        证据或内容无法解析的候选同样不可见。不匹配时保留候选并置为 ready，供用户改回
+        配置后显式重新启用，而不是恢复一个静默失效的 stable。
+        """
+        if not parent:
+            return {"outcome": "rollback_without_parent"}
+        row = db.execute("SELECT content,evidence FROM candidates WHERE id=?", (parent,)).fetchone()
+        if not row:
+            return {"parent": parent, "outcome": "rollback_missing_parent"}
+        evidence, content = decode_object(row["evidence"]), decode_object(row["content"])
+        sealed = evidence.get("compatibility")
+        detail = {"parent": parent, "parent_compatibility": sealed, "current_compatibility": current}
+        if evidence.get("evidence_error") or content.get("evidence_error"):
+            return {**detail, "outcome": "rollback_unreadable_parent"}
+        if sealed and sealed != current:
+            db.execute("UPDATE candidates SET status='ready' WHERE id=?", (parent,))
+            return {**detail, "outcome": "rollback_incompatible_parent"}
+        db.execute("UPDATE candidates SET status='stable' WHERE id=?", (parent,))
+        return {**detail, "outcome": "restored"}
+
     def rollback(self, candidate):
+        # 恢复父候选前要按当前配置核对它的封存指纹；配置在事务外读取，避免持有
+        # BEGIN IMMEDIATE 写事务时再从连接池借一条连接。
+        row = self.store.one("SELECT project,parent FROM candidates WHERE id=?", (candidate,))
+        if not row:
+            raise ValueError("Candidate not found")
+        current = compatibility(self.runtime.config(row["project"])) if row["parent"] else None
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM candidates WHERE id=?", (candidate,)).fetchone()
@@ -2240,8 +2277,7 @@ class Evolution:
             if row["status"] != "stable":
                 raise ValueError("Only an active strategy can be rolled back")
             db.execute("UPDATE candidates SET status='rolled_back' WHERE id=?", (candidate,))
-            if row["parent"]:
-                db.execute("UPDATE candidates SET status='stable' WHERE id=?", (row["parent"],))
+            restored = self.restore_parent(db, row["parent"], current)
             # Roll back learned instructions as well as the strategy pointer.
             for skill in db.execute("SELECT id,evidence FROM skills WHERE project=? AND status='verified'", (row["project"],)).fetchall():
                 try:
@@ -2250,7 +2286,8 @@ class Evolution:
                     skill_evidence = {}
                 if isinstance(skill_evidence, dict) and skill_evidence.get("candidate") == candidate:
                     db.execute("UPDATE skills SET status='invalidated' WHERE id=?", (skill["id"],))
-        self.store.event("rollback", "Restored previous stable strategy and invalidated its learned skill", row["project"], data={"candidate": candidate})
+        self.store.event("rollback", self.ROLLBACK_MESSAGES[restored["outcome"]], row["project"],
+                         data={"candidate": candidate, **restored})
 
 
 reproduce_bundle = Evolution.reproduce_bundle

@@ -9,8 +9,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from adaptive_rsi.config import fingerprint
+from adaptive_rsi.config import compatibility, fingerprint
 from adaptive_rsi.evolution import Evolution, case_spec, paired_summary
+from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store, encode
 
 
@@ -497,6 +498,72 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(drift['phase'], 'sentinel')
         self.assertEqual(drift['sampled_passed'], 1)
         self.assertAlmostEqual(drift['unbiased_pass_ratio'], 30 / 40, places=3)
+
+    def rollback_runtime(self):
+        """真实 Runtime：active_strategies 的兼容性过滤必须来自生产实现。"""
+        runtime = Runtime(self.store, agent=object())
+        self.addCleanup(runtime.close)
+        self.store.execute("INSERT INTO projects(id,name,path,config,paused,created) VALUES (?,?,?,?,?,?)",
+                           ('p', 'p', str(self.root / 'repo'), '{}', 1, 1))
+        return runtime
+
+    def rollback_candidates(self, sealed, current):
+        """a 在 sealed 配置下晋升，b 在 current 配置下接管；b 之后监控失败触发回滚。"""
+        for candidate, parent, status, compat in (('a', None, 'superseded', sealed), ('b', 'a', 'stable', current)):
+            self.store.execute('INSERT INTO candidates(id,project,kind,parent,status,content,evidence,created) '
+                               'VALUES (?,?,?,?,?,?,?,?)',
+                               (candidate, 'p', 'strategy', parent, status,
+                                encode({'guidance': 'Check boundaries', 'triggers': ['add']}),
+                                encode({'compatibility': compat}), 1))
+
+    def test_rollback_restores_a_parent_that_matches_the_current_configuration(self):
+        runtime = self.rollback_runtime()
+        sealed = compatibility(runtime.config('p'))
+        self.rollback_candidates(sealed, sealed)
+        self.store.execute('INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)',
+                           ('skill-a', 'p', None, 'verified', '["add"]', 'lesson a',
+                            '{"candidate":"a"}', time.time() + 100, time.time()))
+        runtime.rollback_strategy('b')
+        self.assertEqual(self.store.one('SELECT status FROM candidates WHERE id=?', ('a',))['status'], 'stable')
+        self.assertEqual([candidate['id'] for candidate in runtime.active_strategies('p')], ['a'])
+        self.assertEqual([item['content'] for item in runtime.memories('p', 'add')], ['lesson a'])
+        event = self.store.one("SELECT * FROM events WHERE kind='rollback' ORDER BY seq DESC")
+        self.assertEqual(event['message'], 'Restored previous stable strategy and invalidated its learned skill')
+
+    def test_rollback_keeps_an_incompatible_parent_out_of_active_strategies(self):
+        runtime = self.rollback_runtime()
+        sealed = compatibility(runtime.config('p'))
+        self.store.execute('UPDATE projects SET config=? WHERE id=?',
+                           (encode({'checks': [{'name': 'b', 'cwd': '.', 'argv': ['true']}]}), 'p'))
+        current = compatibility(runtime.config('p'))
+        self.assertNotEqual(sealed, current)
+        self.rollback_candidates(sealed, current)
+        runtime.rollback_strategy('b')
+        # 父候选的封存指纹属于旧配置，恢复成 stable 只会被 active_strategies 静默过滤。
+        self.assertEqual(self.store.one('SELECT status FROM candidates WHERE id=?', ('a',))['status'], 'ready')
+        self.assertEqual(runtime.active_strategies('p'), [])
+        event = self.store.one("SELECT * FROM events WHERE kind='rollback' ORDER BY seq DESC")
+        self.assertNotIn('Restored previous stable strategy', event['message'])
+        self.assertEqual(json.loads(event['data']), {'candidate': 'b', 'parent': 'a',
+                                                     'parent_compatibility': sealed,
+                                                     'current_compatibility': current,
+                                                     'outcome': 'rollback_incompatible_parent'})
+        # 用户改回旧配置后仍可显式启用该候选，而不是永久失去这条策略。
+        self.store.execute('UPDATE projects SET config=? WHERE id=?', ('{}', 'p'))
+        self.assertEqual(runtime.promote_strategy('a'), {'candidate': 'a', 'status': 'stable'})
+        self.assertEqual([candidate['id'] for candidate in runtime.active_strategies('p')], ['a'])
+
+    def test_rollback_reports_a_parent_whose_evidence_cannot_be_read(self):
+        runtime = self.rollback_runtime()
+        sealed = compatibility(runtime.config('p'))
+        self.rollback_candidates(sealed, sealed)
+        self.store.execute("UPDATE candidates SET content='{broken' WHERE id='a'")
+        runtime.rollback_strategy('b')
+        # 内容不可解析的父候选同样不会出现在 active_strategies 中，不能谎称已恢复。
+        self.assertEqual(self.store.one('SELECT status FROM candidates WHERE id=?', ('a',))['status'], 'superseded')
+        event = self.store.one("SELECT * FROM events WHERE kind='rollback' ORDER BY seq DESC")
+        self.assertEqual(json.loads(event['data'])['outcome'], 'rollback_unreadable_parent')
+        self.assertNotIn('Restored previous stable strategy', event['message'])
 
     def test_retirement_and_reclassification_keep_exposure(self):
         self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)', ('x', 'p', 'family', 'validation', encode({'signature': 's'}), 2, 1))
