@@ -1646,18 +1646,20 @@ class AuthSessions:
                 if self.now() >= current_session["expires_at"]:
                     self._update(session_id, state="expired", error="auth_expired")
                     return
-                if backend == "codex":
-                    # 与 opencode 分支一致：合并写回，保留用户手放的 OPENAI_API_KEY
-                    # 和新版 CLI 写入的未知字段，只覆盖凭据本身的同名字段。
-                    merged = _read_json_for_write(_codex_path())
-                    merged.update(data)
-                    _write_json(_codex_path(), merged)
-                elif modern:
+                if backend != "codex" and modern:
                     worker.install_credential(provider, value)
                 else:
-                    current = _read_json_for_write(auth_path())
-                    current[provider] = value
-                    _write_json(auth_path(), current)
+                    try:
+                        if backend == "codex":
+                            merged = _read_json_for_write(_codex_path())
+                            merged.update(data)
+                            _write_json(_codex_path(), merged)
+                        else:
+                            current = _read_json_for_write(auth_path())
+                            current[provider] = value
+                            _write_json(auth_path(), current)
+                    except OSError as exc:
+                        raise AuthError("auth_storage_failed", {"errno": exc.errno}) from None
                 # 授权期间的状态/供应商查询可能重新填充旧缓存，保存凭据后再次失效。
                 self._invalidate_caches(backend)
                 self._update(session_id, state="completed")

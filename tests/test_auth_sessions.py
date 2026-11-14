@@ -1478,6 +1478,82 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual(replacement["state"], "starting")
         self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "failed")
 
+    def test_credential_storage_failure_uses_dedicated_error_code(self):
+        manager = AuthSessions(self.root / "credential-storage", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        real = auth_sessions._write_json
+
+        def write(path, value):
+            if Path(path) == auth_sessions._codex_path():
+                raise OSError(28, "No space left on device")
+            return real(path, value)
+
+        self.gate.set()
+        with patch("adaptive_rsi.auth_sessions._write_json", side_effect=write):
+            manager._run(session["id"], 0, None)
+        result = manager.status(session["id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "auth_storage_failed")
+        # 会话行与快照只保留错误码；errno、路径和异常文本都不能离开进程。
+        for payload in (result, manager.snapshot()):
+            serialized = json.dumps(payload)
+            self.assertNotIn("errno", serialized)
+            self.assertNotIn("No space left", serialized)
+            self.assertNotIn(str(self.root), serialized)
+
+    def test_credential_install_subprocess_failure_stays_protocol_error(self):
+        def factory(backend):
+            worker = FakeAuth(backend, self.gate)
+            worker.capabilities = types.SimpleNamespace(modern=True)
+            worker.export_credential = lambda provider: [{"integrationID": provider}]
+
+            def install(provider, credentials):
+                raise RuntimeError("OpenCode credential import failed")
+
+            worker.install_credential = install
+            self.created.append(worker)
+            return worker
+
+        manager = AuthSessions(self.root / "install-failure", factory=factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("opencode", "openai")
+        self.gate.set()
+        manager._run(session["id"], 0, None)
+        result = manager.status(session["id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "auth_protocol_error")
+
+    def test_untrusted_exception_attributes_are_not_logged(self):
+        class UntrustedError(Exception):
+            code = "SECRET-CODE"
+            errno = "SECRET-ERRNO"
+        def factory(_backend):
+            raise UntrustedError("SECRET-MESSAGE")
+        manager = AuthSessions(self.root / "unsafe-exception", factory=factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        with self.assertLogs("adaptive_rsi.auth_sessions", level="WARNING") as captured:
+            manager._run(session["id"], 0, None)
+        self.assertNotIn("SECRET", " ".join(captured.output))
+        self.assertEqual(manager.status(session["id"])["error"], "auth_protocol_error")
+
+    def test_credential_install_oserror_stays_protocol_error(self):
+        def factory(backend):
+            worker = FakeAuth(backend, self.gate)
+            worker.capabilities = types.SimpleNamespace(modern=True)
+            worker.export_credential = lambda provider: [{"integrationID": provider}]
+            def install(provider, credentials):
+                raise OSError(2, "missing executable")
+            worker.install_credential = install
+            return worker
+        manager = AuthSessions(self.root / "install-oserror", factory=factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("opencode", "openai")
+        self.gate.set()
+        manager._run(session["id"], 0, None)
+        self.assertEqual(manager.status(session["id"])["error"], "auth_protocol_error")
+
     def test_failed_state_write_does_not_abort_close(self):
         manager = AuthSessions(self.root / "state", factory=self.factory, ttl=600)
         self.addCleanup(manager.close)
