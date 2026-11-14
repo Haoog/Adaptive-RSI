@@ -2155,10 +2155,15 @@ class Evolution:
         if not recorded:
             return
         active = {c["id"] for c in json.loads(recorded["strategy"] or "[]") if c.get("id")}
+        # 一次运行可能同时覆盖多个 kind 各自晋升的候选（如 strategy 与 adapter）。
+        # 这类失败仍要计入监控与 drift，但无法归因到单个候选，因此只观察、不自动回滚。
+        shared = len(active) > 1
         if not passed and len(active) != 1:
+            event = {"strategies": sorted(active)}
+            if shared:
+                event["attribution"] = "shared"
             self.store.event("strategy_inconclusive", "Regression cannot be attributed to a single strategy; no automatic rollback",
-                             project, run["id"], {"strategies": sorted(active)})
-            return
+                             project, run["id"], event)
         for row in self.store.query("SELECT * FROM candidates WHERE project=? AND status='stable'", (project,)):
             if row["id"] not in active:
                 continue
@@ -2199,6 +2204,9 @@ class Evolution:
                 if sentinel:
                     monitor["success_sample_rate"] = success_rate
                 monitor["passed" if passed else "failed"] += 1
+                monitor["attribution"] = "shared" if shared else "single"
+                if not passed and shared:
+                    monitor["shared_failed"] = monitor.get("shared_failed", 0) + 1
                 if sentinel and passed:
                     monitor["sampled_passed"] = monitor.get("sampled_passed", 0) + 1
                 monitor["last_run"] = run["id"]
@@ -2216,16 +2224,21 @@ class Evolution:
                     total = monitor["passed"] + monitor["failed"]
                     pass_ratio = monitor["passed"] / total if total else 1.0
                 if not passed or pass_ratio < 0.8:
-                    drift = {"state": "watch", "phase": monitor["phase"],
-                             "reason": "Attributable operational regression" if not passed else "Observed pass ratio below 0.8",
-                             "passed": monitor["passed"], "failed": monitor["failed"]}
+                    if not passed:
+                        reason = ("Shared operational regression; no automatic rollback" if shared
+                                  else "Attributable operational regression")
+                    else:
+                        reason = "Observed pass ratio below 0.8"
+                    drift = {"state": "watch", "phase": monitor["phase"], "reason": reason,
+                             "passed": monitor["passed"], "failed": monitor["failed"],
+                             "attribution": "shared" if shared else "single"}
                     if sentinel:
                         drift.update({"sampled": True, "success_sample_rate": success_rate,
                                       "sampled_passed": monitor.get("sampled_passed", 0),
                                       "unbiased_pass_ratio": round(pass_ratio, 4)})
                     evidence["drift"] = drift
                 db.execute("UPDATE candidates SET evidence=? WHERE id=? AND status='stable'", (encode(evidence), row["id"]))
-            if not passed:
+            if not passed and not shared:
                 self.rollback(row["id"])
 
     def rollback(self, candidate):
