@@ -609,9 +609,9 @@ class Runtime(Maintenance):
         from .release import resolve
         return resolve(self, project, run, kind, workflow_run_id, target, source="console")
 
-    def workflow_choices(self, project):
+    def workflow_choices(self, project, refresh=False):
         from .release import workflow_choices
-        return workflow_choices(self, project)
+        return workflow_choices(self, project, refresh=refresh)
 
     def authorize_workflow(self, project, kind, workflow):
         from .release import authorize_workflow

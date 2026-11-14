@@ -73,6 +73,41 @@ test('workflow inspection retry errors reach the UI in both languages', async()=
     });
   }
 });
+test('refreshing workflow choices bypasses cached disabled state and explains why it is unavailable', async()=>{
+  const page=browser(),calls=[];
+  page.node('config-scope').value='project';
+  let enabled=false;
+  page.context.fetch=async url=>{
+    calls.push(url);
+    return response({workflows:[
+      {workflow:'.github/workflows/deploy.yml',name:'Deploy',compatible:enabled,
+        reason_code:enabled?'':'workflow_disabled'},
+      {workflow:'.github/workflows/legacy.yml',name:'Legacy',compatible:false,reason_code:'workflow_incompatible'}
+    ]});
+  };
+  const refresh=page.node('release-workflows-refresh').handlers.click;
+  assert.equal(typeof refresh,'function');
+  await refresh();
+  let option=page.node('release-workflow-list').children.find(item=>item.value==='.github/workflows/deploy.yml');
+  assert.ok(option.disabled);
+  assert.match(option.textContent,/工作流已禁用/);
+  const incompatible=page.node('release-workflow-list').children.find(item=>item.value==='.github/workflows/legacy.yml');
+  assert.ok(incompatible.disabled);
+  assert.match(incompatible.textContent,/工作流不符合自动交付要求/);
+  enabled=true;
+  await refresh();
+  option=page.node('release-workflow-list').children.find(item=>item.value==='.github/workflows/deploy.yml');
+  assert.equal(option.disabled,false);
+  assert.ok(calls.every(url=>url.includes('refresh=true')));
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  const translations=vm.runInNewContext(i18n.slice(0,i18n.indexOf('const staticText ='))+
+    ';["工作流已禁用，请在 GitHub 仓库中启用后刷新。","暂时无法检查此工作流，请刷新重试。","工作流不符合自动交付要求，请检查所需输入。"].map(key=>english[key])');
+  assert.deepEqual(JSON.parse(JSON.stringify(translations)),[
+    'This workflow is disabled. Enable it in the GitHub repository, then refresh.',
+    'This workflow could not be inspected temporarily. Refresh and try again.',
+    'This workflow is incompatible with automatic delivery. Check its required inputs.'
+  ]);
+});
 function descendants(node) {
   return (node.children || []).flatMap(child => [child, ...descendants(child)]);
 }
