@@ -154,6 +154,22 @@ def _read_json(path):
         raise AuthError("invalid_credentials") from None
 
 
+def _read_json_for_storage(path):
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return {}
+    if size > MAX_BYTES:
+        raise AuthError("invalid_credentials")
+    try:
+        value = json.loads(path.read_text())
+    except (ValueError, RecursionError):
+        raise AuthError("invalid_credentials") from None
+    if not isinstance(value, dict):
+        raise AuthError("invalid_credentials")
+    return value
+
+
 def _write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = None
@@ -183,8 +199,7 @@ def _quarantine_invalid(path):
     except FileNotFoundError:
         return None
     except OSError:
-        # 留档失败时保持原有失败语义，绝不覆盖可能仍可人工恢复的原始字节。
-        raise AuthError("invalid_credentials") from None
+        raise AuthError("auth_storage_failed") from None
     try:
         backup.chmod(0o600)
     except OSError:
@@ -195,9 +210,18 @@ def _quarantine_invalid(path):
 def _read_json_for_write(path):
     """写路径读取：损坏的旧文件先留档再视为空，用户仍可覆盖或退出登录。"""
     try:
-        return _read_json(path)
-    except AuthError:
-        _quarantine_invalid(path)
+        return _read_json_for_storage(path)
+    except OSError:
+        raise AuthError("auth_storage_failed") from None
+    except AuthError as exc:
+        if getattr(exc, "code", None) != "invalid_credentials":
+            raise
+        try:
+            backup = _quarantine_invalid(path)
+        except OSError:
+            raise AuthError("auth_storage_failed") from None
+        if backup is None:
+            raise AuthError("auth_storage_failed")
         return {}
 
 
@@ -1612,7 +1636,10 @@ class AuthSessions:
 
     def _save(self, worker, backend, provider, session_id, stop):
         if backend == "codex":
-            data = _read_json(worker.credentials)
+            try:
+                data = _read_json_for_storage(worker.credentials)
+            except OSError:
+                raise AuthError("auth_storage_failed") from None
             if not isinstance(data.get("tokens"), dict) or not data["tokens"].get("refresh_token"):
                 raise AuthError("invalid_credentials")
         else:
@@ -1622,7 +1649,10 @@ class AuthSessions:
                 if not isinstance(value, list) or not value:
                     raise AuthError("invalid_credentials")
             else:
-                data = _read_json(worker.credentials)
+                try:
+                    data = _read_json_for_storage(worker.credentials)
+                except OSError:
+                    raise AuthError("auth_storage_failed") from None
                 value = data.get(provider)
                 if not isinstance(value, dict) or value.get("type") not in {"oauth", "api"}:
                     raise AuthError("invalid_credentials")
@@ -1646,18 +1676,20 @@ class AuthSessions:
                 if self.now() >= current_session["expires_at"]:
                     self._update(session_id, state="expired", error="auth_expired")
                     return
-                if backend == "codex":
-                    # 与 opencode 分支一致：合并写回，保留用户手放的 OPENAI_API_KEY
-                    # 和新版 CLI 写入的未知字段，只覆盖凭据本身的同名字段。
-                    merged = _read_json_for_write(_codex_path())
-                    merged.update(data)
-                    _write_json(_codex_path(), merged)
-                elif modern:
+                if backend != "codex" and modern:
                     worker.install_credential(provider, value)
                 else:
-                    current = _read_json_for_write(auth_path())
-                    current[provider] = value
-                    _write_json(auth_path(), current)
+                    try:
+                        if backend == "codex":
+                            merged = _read_json_for_write(_codex_path())
+                            merged.update(data)
+                            _write_json(_codex_path(), merged)
+                        else:
+                            current = _read_json_for_write(auth_path())
+                            current[provider] = value
+                            _write_json(auth_path(), current)
+                    except OSError as exc:
+                        raise AuthError("auth_storage_failed", {"errno": exc.errno}) from None
                 # 授权期间的状态/供应商查询可能重新填充旧缓存，保存凭据后再次失效。
                 self._invalidate_caches(backend)
                 self._update(session_id, state="completed")

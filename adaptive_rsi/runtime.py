@@ -1682,22 +1682,46 @@ class Runtime(Maintenance):
             try:
                 self._postprocess_run(key, identifier, record)
             except Exception as exc:
-                attempts += 1
-                record.update(attempts=attempts, last_error=str(exc)[:400], last_failed=time.time())
-                if attempts >= POSTPROCESS_MAX_ATTEMPTS:
-                    # 终态逃逸：损坏/确定性失败的回执不再每 5 秒热循环，摘除待办索引并
-                    # 记录放弃原因；原始回执连同 attempts/last_error 保留在 postprocess: 命名空间。
-                    record.update(state='failed', ended=time.time(),
-                                  reason='Postprocessing abandoned after %d attempts' % attempts)
-                    self.store.put_setting(key, record)
-                    if marker:
-                        self.store.execute('DELETE FROM settings WHERE key=?', (marker,))
+                abandoned = None
+                with self.store.connect() as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+                    if row is None:
+                        return
+                    try:
+                        record = json.loads(row['value'])
+                    except (TypeError, ValueError):
+                        return
+                    if (not isinstance(record, dict)
+                            or record.get('state') != 'pending'
+                            or not isinstance(record.get('steps'), list)):
+                        return
+
+                    attempts = record.get('attempts', 0)
+                    if not isinstance(attempts, int) or attempts < 0:
+                        attempts = 0
+                    attempts += 1
+                    last_error = str(exc)[:400]
+                    record.update(attempts=attempts, last_error=last_error, last_failed=time.time())
+                    if attempts >= POSTPROCESS_MAX_ATTEMPTS:
+                        # 终态逃逸：损坏/确定性失败的回执不再每 5 秒热循环，摘除待办索引并
+                        # 记录放弃原因；原始回执连同 attempts/last_error 保留在 postprocess: 命名空间。
+                        record.update(state='failed', ended=time.time(),
+                                      reason='Postprocessing abandoned after %d attempts' % attempts)
+                        abandoned = (attempts, last_error)
+
+                    db.execute('UPDATE settings SET value=? WHERE key=?',
+                               (encode(record), key))
+                    if abandoned is not None and marker:
+                        db.execute('DELETE FROM settings WHERE key=?', (marker,))
+
+                if abandoned is not None:
+                    attempts, last_error = abandoned
                     self.store.event('postprocess_abandoned',
                                      'Postprocessing gave up after %d attempts: %s' % (attempts, str(exc)[:300]),
                                      run=identifier, data={'key': key, 'attempts': attempts,
-                                                          'last_error': str(exc)[:400]})
+                                                          'last_error': last_error})
                     return
-                self.store.put_setting(key, record)
                 raise
         # 成功/obsolete 后移除索引；瞬时失败仍保持 pending 与索引，下一轮重试。
         if marker:
@@ -1723,7 +1747,33 @@ class Runtime(Maintenance):
 
     def _postprocess_run(self, key, identifier, record):
         run = self.store.one('SELECT * FROM runs WHERE id=?', (identifier,))
-        if not run or run['ended'] is None:
+        if not run:
+            # 回执指向的 run 行已在备份恢复或手工清理中消失。此前这里直接返回，回执
+            # 保持 pending、attempts 永不增加，孤儿会永久占用每轮的有界批次且无任何
+            # 事件痕迹；这里落到终态，让待办索引按 completed/obsolete 规则摘除。
+            # 回执与事件必须同时提交；失败时保留 pending，交由现有重试逻辑处理。
+            with self.store.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                current_run = db.execute('SELECT 1 FROM runs WHERE id=?', (identifier,)).fetchone()
+                latest_row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+                if current_run is not None or latest_row is None:
+                    return
+                try:
+                    latest_receipt = json.loads(latest_row['value'])
+                except (TypeError, ValueError):
+                    return
+                if (not isinstance(latest_receipt, dict)
+                        or latest_receipt.get('state') != 'pending'
+                        or not isinstance(latest_receipt.get('steps'), list)):
+                    return
+                terminal = {**latest_receipt, 'state': 'obsolete',
+                            'reason': 'Run record is missing; postprocessing terminated', 'ended': time.time()}
+                db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, encode(terminal)))
+                db.execute('INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)',
+                           (None, identifier, 'postprocess_orphaned',
+                            'Postprocessing terminated: run record is missing', encode({'key': key}), time.time()))
+            return
+        if run['ended'] is None:
             return
         if self.store.setting('project-archived:' + run['project']):
             record.update(state='obsolete', reason='Project archived; postprocessing terminated', ended=time.time())
