@@ -1,6 +1,6 @@
 'use strict';
 window.RSIAuth = (() => {
-  let snapshot=null,providers=null,context=null,providerQuery='',loading=null,pending=false,polling=false,pollingStopped=false,timer=null;
+  let snapshot=null,providers=null,providerGeneration=0,context=null,providerQuery='',loading=null,pending=false,polling=false,pollingStopped=false,timer=null;
   const sessions=new Map(),selections=new Map();
   // 记住每个后端上次的供应商选择，重开页面后不必重新查找。
   try{for(const [backend,provider] of Object.entries(JSON.parse(localStorage.getItem('rsi-auth-selection')||'{}')))selections.set(backend,provider);}catch{}
@@ -18,6 +18,18 @@ window.RSIAuth = (() => {
   }
   const key=()=>context.backend+':'+(context.provider||'');
   const text=(tag,value,cls)=>el(tag,t(value),cls);
+  // 账号快照只用于展示当前登录身份，不写入本地存储；最近一次完成的 Codex 会话可覆盖刷新后的空会话表。
+  function accountRows(session){
+    if(session&&Array.isArray(session.accounts)&&session.accounts.length)return session.accounts;
+    if(session&&!terminal.has(session.state))return [];
+    const rows=(Array.isArray(snapshot?.sessions)?snapshot.sessions:[]).filter(row=>row&&row.backend==='codex'&&Array.isArray(row.accounts)&&row.accounts.length);
+    return rows.length?rows[rows.length-1].accounts:[];
+  }
+  function connectionLabel(provider){
+    const count=Number(provider?.connection_count);
+    if(!Number.isInteger(count)||count<1)return '';
+    return count===1?t('1 个账号'):count+' '+t('个账号');
+  }
   function external(url,label){
     try{const parsed=new URL(url);if(parsed.protocol!=='https:')return null;const link=text('a',label,'button');link.href=parsed.href;link.target='_blank';link.rel='noopener noreferrer';return link;}catch{return null;}
   }
@@ -37,8 +49,10 @@ window.RSIAuth = (() => {
       }selectPreferredProvider();render();schedule();
     })().finally(()=>loading=null);return loading;
   }
-  async function getProviders(){if(providers)return;const result=await api('auth/providers?backend=opencode');providers=Array.isArray(result)?result:result.providers;
+  async function getProviders(){if(providers)return;const generation=providerGeneration,result=await api('auth/providers?backend=opencode');
+    if(generation!==providerGeneration)return;providers=Array.isArray(result)?result:result.providers;
     selectPreferredProvider();render();}
+  async function refreshProviders(){providers=null;providerGeneration++;render();await getProviders();}
   async function mutate(path,body){pending=true;render();try{return await api('auth/'+path,body);}catch(error){error.message=authMessage(error.code,error.message);throw error;}finally{pending=false;render();}}
   function schedule(){clearTimeout(timer);if(!pollingStopped&&[...sessions.values()].some(s=>!terminal.has(s.state)||s.refreshStage)){const delay=document.visibilityState==='hidden'?30000:1500;timer=setTimeout(()=>safe(poll),delay);}}
   async function refreshCompleted(id,session){
@@ -46,6 +60,7 @@ window.RSIAuth = (() => {
     try{
       if(session.refreshStage==='status'){
         readinessCache.clear();await status(true);if(sessions.get(id)!==session)return;
+        if(session.backend==='opencode')await refreshProviders();if(sessions.get(id)!==session)return;
         session.refreshStage='catalog';
       }
       await session.refresh();if(sessions.get(id)!==session)return;
@@ -103,9 +118,16 @@ window.RSIAuth = (() => {
   function renderBody(){
     const box=$('mc-auth');if(!context){box.hidden=true;return;}box.hidden=false;box.replaceChildren();
     const sessionKey=key(),backend=context.backend,account=snapshot?.[backend],session=sessions.get(sessionKey),connected=backend==='opencode'?account?.authenticated_providers?.includes(context.provider):account?.state==='authenticated';
+    const selected=backend==='opencode'&&Array.isArray(providers)?providers.find(item=>item.id===context.provider):null,connections=connected?connectionLabel(selected):'';
+    const heading=connected?t('账号已连接')+(connections?' · '+connections:''):account?.available===false?t('运行机器尚未安装此工具'):t('尚未登录');
     if($('mc-step-account'))$('mc-step-account').dataset.state=connected?'done':'current';
     if(connected&&$('mc-step-models')?.dataset.state==='pending')$('mc-step-models').dataset.state='current';
-    box.append(text('h3','账号连接'),text('p',snapshot?(connected?'账号已连接':account?.available===false?'运行机器尚未安装此工具':'尚未登录'):'正在读取账号状态…','mc-secondary'));
+    box.append(text('h3','账号连接'),text('p',snapshot?heading:'正在读取账号状态…','mc-secondary'));
+    if(connected&&backend==='codex')for(const row of accountRows(session)){
+      const label=typeof row?.label==='string'?row.label.trim():'',plan=typeof row?.plan==='string'?row.plan.trim():'';
+      if(!label&&!plan)continue;
+      box.append(text('p',label?t('已连接账号：')+label+(plan?' · '+t('套餐 ')+plan:''):t('套餐 ')+plan,'mc-secondary'));
+    }
     if(account?.error)box.append(el('p',authMessage(account.error,account.error),'mc-error'));
     if(backend==='opencode'){
       box.append(text('p','OpenCode Go 使用 API Key。请在供应商列表选择对应的 OpenCode 服务并保存密钥；ChatGPT 登录不提供 Go 凭据。','mc-secondary'));
@@ -115,7 +137,8 @@ window.RSIAuth = (() => {
       search.placeholder=t('搜索供应商');search.setAttribute('aria-label',t('搜索供应商'));
       const fill=()=>{const query=providerQuery.trim().toLocaleLowerCase();const first=text('option','选择供应商');first.value='';select.replaceChildren(first);
         for(const provider of (providers||[]).filter(item=>!query||item.name.toLocaleLowerCase().includes(query)||item.id.toLocaleLowerCase().includes(query))){
-          const option=el('option',provider.name+(provider.connected?' · '+t('已连接'):''));option.value=provider.id;select.append(option);
+          const connections=provider.connected?connectionLabel(provider):'';
+          const option=el('option',provider.name+(provider.connected?' · '+t('已连接')+(connections?' · '+connections:''):''));option.value=provider.id;select.append(option);
         }
         select.value=context.provider||'';};
       fill();search.addEventListener('input',()=>{providerQuery=search.value;fill();});
@@ -142,13 +165,13 @@ window.RSIAuth = (() => {
       if(session.error)box.append(el('p',session.error==='authorization_failed'&&session.state==='awaiting_authorization'?t('授权未完成，请打开新的授权页面后重试。'):authMessage(session.error,session.error),'mc-error'));
     }
     if(running)return;
-    if(connected){const logout=action(t('退出账号'),async()=>{const current={...context};await mutate('logout',{backend:current.backend,provider:current.backend==='codex'?null:current.provider});sessions.delete(current.backend+':'+(current.provider||''));await status(true);readinessCache.clear();},'text-button');logout.disabled=pending;box.append(logout);}
+    if(connected){const logout=action(t('退出账号'),async()=>{const current={...context};await mutate('logout',{backend:current.backend,provider:current.backend==='codex'?null:current.provider});sessions.delete(current.backend+':'+(current.provider||''));await status(true);if(current.backend==='opencode')await refreshProviders();readinessCache.clear();},'text-button');logout.disabled=pending;box.append(logout);}
     const methods=backend==='codex'?[{index:0,type:'oauth',supported:true,label:t('前往 Codex 官方登录')}]:providers?.find(p=>p.id===context.provider)?.methods||[];
     for(const method of methods){
       if(method.type==='api'){
         if(method.supported===false){box.append(el('p',authMessage(method.unsupported_reason,'此登录方式暂不支持远程页面，请使用供应商密钥。'),'mc-secondary'));continue;}
         const form=el('form'),label=text('label','API 密钥'),input=el('input');input.type='password';input.dataset.authField='key:'+context.provider;input.autocomplete='new-password';input.required=true;input.maxLength=8192;label.append(input);const submit=text('button','保存供应商密钥','button');submit.type='submit';submit.disabled=pending;form.append(label,submit);
-        form.addEventListener('submit',event=>{event.preventDefault();const current={...context};safe(async()=>{const secret=input.value;input.value='';await mutate('key',{backend:'opencode',provider:current.provider,key:secret});await status(true);readinessCache.clear();await current.refresh();});});box.append(form);continue;
+        form.addEventListener('submit',event=>{event.preventDefault();const current={...context};safe(async()=>{const secret=input.value;input.value='';await mutate('key',{backend:'opencode',provider:current.provider,key:secret});await status(true);await refreshProviders();readinessCache.clear();await current.refresh();});});box.append(form);continue;
       }
       const form=el('form'),fields=new Map();
       const updatePrompts=()=>{for(const prompt of method.prompts||[]){const field=fields.get(prompt.key),condition=prompt.when,show=!condition||(condition.op==='neq'?fields.get(condition.key)?.input.value!==condition.value:fields.get(condition.key)?.input.value===condition.value);field.label.hidden=!show;field.input.disabled=!show;field.input.required=show;}};
