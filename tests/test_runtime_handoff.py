@@ -368,6 +368,258 @@ class RuntimeHandoffTest(unittest.TestCase):
         # 失败后的新尝试从满额度起算，残留键在载入时已被丢弃。
         self.assertEqual(observed, [{'preparation': 0.0, 'evaluation': 0.0}, None])
 
+    def test_unavailable_stage_budget_ledger_does_not_pin_the_run_in_planning(self):
+        """读不出阶段预算时结案、保留账本并退避，不能耗光重试次数或冻结项目。"""
+        task, run = self.claim()
+        other = self.runtime.goal(self.project, 'Second boundary')
+        previous_budget = {'preparation': 60.0, 'evaluation': 5.0, 'run': run['id']}
+        self.store.put_setting('stage-budget:' + task, previous_budget)
+        real_setting = self.store.setting
+        real_transition = self.store.transition
+        transitions = []
+
+        def locked(key, default=None):
+            if key.startswith('stage-budget:'):
+                raise sqlite3.OperationalError('database is locked')
+            return real_setting(key, default)
+
+        def flaky_transition(*args, **kwargs):
+            transitions.append(args[1])
+            if len(transitions) == 1:
+                raise sqlite3.OperationalError('database is locked')
+            return real_transition(*args, **kwargs)
+
+        started = time.time()
+        # 只坏预算读取并注入一次状态写瞬时失败，验证有限重试能完成收尾。
+        with patch.object(self.store, 'setting', side_effect=locked), \
+             patch.object(self.store, 'transition', side_effect=flaky_transition):
+            self.runtime.process(run)
+        row = self.store.one('SELECT state,ended,result FROM runs WHERE id=?', (run['id'],))
+        self.assertEqual(row['state'], 'interrupted')
+        self.assertIsNotNone(row['ended'])
+        result = json.loads(row['result'])
+        self.assertEqual(result['reason'], 'Stage budget unavailable')
+        self.assertEqual(result['failure']['code'], 'environment')
+        self.assertIn('database is locked', result['failure']['detail'])
+        task_row = self.store.one('SELECT state,attempts,available FROM tasks WHERE id=?', (task,))
+        self.assertEqual((task_row['state'], task_row['attempts']), ('queued', 0))
+        self.assertGreaterEqual(task_row['available'], started + 29)
+        event = self.store.one("SELECT message,data FROM events WHERE run=? AND kind='stage_budget_unavailable'",
+                               (run['id'],))
+        self.assertIsNotNone(event)
+        event_data = json.loads(event['data'])
+        self.assertEqual((event_data['run'], event_data['task'], event_data['error']),
+                         (run['id'], task, 'database is locked'))
+        self.assertGreater(event_data['retry_at'], started)
+        # 预算读取失败时不能用默认零值覆盖此前累计的真实耗时。
+        self.assertEqual(self.store.setting('stage-budget:' + task), previous_budget)
+        self.assertEqual(transitions, ['interrupted', 'interrupted'])
+        # 故障任务退避期间，同项目下一条普通任务仍能领取。
+        second = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertIsNotNone(second)
+        self.assertEqual(second['task'], other)
+
+    def test_stage_budget_transition_outage_recovers_on_scheduler_tick(self):
+        """三次交接写入失败后，真实 scheduler tick 仍会收尾并领取同项目任务。"""
+        task, run = self.claim()
+        other = self.runtime.goal(self.project, 'Claim after scheduler recovery')
+        previous_budget = {'preparation': 60.0, 'evaluation': 5.0, 'run': run['id']}
+        self.store.put_setting('stage-budget:' + task, previous_budget)
+        real_setting = self.store.setting
+
+        def unreadable(key, default=None):
+            if key.startswith('stage-budget:'):
+                raise sqlite3.OperationalError('database is locked')
+            return real_setting(key, default)
+
+        with patch.object(self.store, 'setting', side_effect=unreadable), \
+             patch.object(self.store, 'transition', side_effect=sqlite3.OperationalError('database locked')):
+            self.runtime.process(run)
+
+        self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))['state'], 'planning')
+        task_after_failure = self.store.one('SELECT state,attempts FROM tasks WHERE id=?', (task,))
+        self.assertEqual((task_after_failure['state'], task_after_failure['attempts']), ('planning', 1))
+        self.assertIsNotNone(self.store.setting('stage-budget-recovery:' + run['id']))
+        self.assertEqual(self.store.setting('stage-budget:' + task), previous_budget)
+
+        claimed = threading.Event()
+
+        def complete_other(current):
+            if current['task'] == other:
+                claimed.set()
+                self.store.transition(current['id'], 'completed', {'reason': 'Scheduler recovery test'}, True)
+
+        self.runtime.stop.clear()
+        self.runtime.wake.set()
+        patches = (
+            patch.object(self.runtime.updates, 'is_busy', return_value=False),
+            patch.object(self.runtime.updates, 'tick'),
+            patch.object(self.runtime, 'maintenance_async'),
+            patch.object(self.runtime, 'drain_postprocess'),
+            patch.object(self.runtime, 'schedule'),
+            patch.object(self.runtime, 'defer_project_tick'),
+            patch.object(self.runtime, 'release_dead_dependencies'),
+            patch('adaptive_rsi.delivery.schedule'),
+            patch('adaptive_rsi.runtime.within_hours', return_value=True),
+            patch.object(self.runtime, 'process', side_effect=complete_other),
+        )
+        for item in patches:
+            item.start()
+        loop = threading.Thread(target=self.runtime.loop, daemon=True)
+        try:
+            loop.start()
+            self.assertTrue(claimed.wait(5), 'scheduler did not recover and claim the next ordinary task')
+        finally:
+            self.runtime.stop.set()
+            self.runtime.wake.set()
+            loop.join(5)
+            for item in reversed(patches):
+                item.stop()
+        self.assertFalse(loop.is_alive())
+        failed = self.store.one('SELECT state,ended,result FROM runs WHERE id=?', (run['id'],))
+        self.assertEqual(failed['state'], 'interrupted')
+        self.assertIsNotNone(failed['ended'])
+        self.assertEqual(json.loads(failed['result'])['failure']['code'], 'environment')
+        queued = self.store.one('SELECT state,attempts,available FROM tasks WHERE id=?', (task,))
+        self.assertEqual((queued['state'], queued['attempts']), ('queued', 0))
+        self.assertGreater(queued['available'], time.time())
+        self.assertIsNone(self.store.setting('stage-budget-recovery:' + run['id']))
+        self.assertEqual(self.store.setting('stage-budget:' + task), previous_budget)
+        self.assertIsNotNone(self.store.one('SELECT 1 FROM runs WHERE task=? AND id<>?', (other, run['id'])))
+
+    def test_stage_budget_recovery_survives_restart_and_is_idempotent(self):
+        task, run = self.claim()
+        self.store.put_setting('stage-budget:' + task,
+                               {'preparation': 80.0, 'evaluation': 10.0, 'run': run['id']})
+        original_setting = self.store.setting
+
+        def unreadable(key, default=None):
+            if key.startswith('stage-budget:'):
+                raise sqlite3.OperationalError('database is locked')
+            return original_setting(key, default)
+
+        with patch.object(self.store, 'setting', side_effect=unreadable), \
+             patch.object(self.store, 'transition', side_effect=sqlite3.OperationalError('database locked')):
+            self.runtime.process(run)
+        self.runtime.close()
+
+        restarted_store = Store(self.root / 'state')
+        restarted = Runtime(restarted_store, FakeAgent())
+        self.addCleanup(restarted.close)
+        self.assertEqual(restarted_store.recover(), 0)
+        recovered = restarted_store.one('SELECT state,ended FROM runs WHERE id=?', (run['id'],))
+        self.assertEqual(recovered['state'], 'interrupted')
+        self.assertIsNotNone(recovered['ended'])
+        queued = restarted_store.one('SELECT state,attempts,available FROM tasks WHERE id=?', (task,))
+        self.assertEqual((queued['state'], queued['attempts']), ('queued', 0))
+        self.assertGreaterEqual(queued['available'], time.time() + 29)
+        self.assertIsNone(restarted_store.setting('stage-budget-recovery:' + run['id']))
+        self.assertEqual(restarted_store.setting('stage-budget:' + task),
+                         {'preparation': 80.0, 'evaluation': 10.0, 'run': run['id']})
+        self.assertEqual(len(restarted_store.query("SELECT id FROM runs WHERE ended IS NULL")), 0)
+        self.assertEqual(restarted_store.stage_budget_recovery_records(), {})
+        self.assertEqual(len(restarted_store.query('SELECT seq FROM events WHERE run=? AND kind=\'interrupted\'',
+                                                  (run['id'],))), 1)
+
+    def test_stage_budget_recovery_event_failure_rolls_back_and_honors_pause(self):
+        task, run = self.claim()
+        self.store.put_setting('stage-budget:' + task,
+                               {'preparation': 30.0, 'evaluation': 0.0, 'run': run['id']})
+        original_setting = self.store.setting
+
+        def unreadable(key, default=None):
+            if key.startswith('stage-budget:'):
+                raise sqlite3.OperationalError('database is locked')
+            return original_setting(key, default)
+
+        with patch.object(self.store, 'setting', side_effect=unreadable), \
+             patch.object(self.store, 'transition', side_effect=sqlite3.OperationalError('database locked')):
+            self.runtime.process(run)
+        self.store.execute("CREATE TRIGGER reject_recovery_event BEFORE INSERT ON events "
+                           "WHEN NEW.run='" + run['id'] + "' AND NEW.kind='interrupted' "
+                           "BEGIN SELECT RAISE(ABORT, 'Injected transition event failure'); END")
+        try:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, 'Injected transition event failure'):
+                self.store.reconcile_stage_budget_failure(run['id'])
+            self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))['state'], 'planning')
+            self.assertIsNotNone(self.store.setting('stage-budget-recovery:' + run['id']))
+            self.assertEqual(self.store.one('SELECT attempts FROM tasks WHERE id=?', (task,))['attempts'], 1)
+        finally:
+            self.store.execute('DROP TRIGGER reject_recovery_event')
+        self.runtime.pause(self.project, True)
+        self.assertTrue(self.store.reconcile_stage_budget_failure(run['id']))
+        row = self.store.one('SELECT state,result FROM runs WHERE id=?', (run['id'],))
+        self.assertEqual(row['state'], 'interrupted')
+        self.assertEqual(json.loads(row['result'])['reason'], 'Project pause requested; retry creates a fresh run')
+        task_row = self.store.one('SELECT state,attempts FROM tasks WHERE id=?', (task,))
+        self.assertEqual((task_row['state'], task_row['attempts']), ('interrupted', 1))
+        event = self.store.one("SELECT message,data FROM events WHERE run=? AND kind='interrupted'", (run['id'],))
+        self.assertEqual(event['message'], 'Project pause requested; retry creates a fresh run')
+        self.assertIsNone(self.store.setting('stage-budget-recovery:' + run['id']))
+
+    def test_concurrent_stage_budget_reconciliation_has_one_transition_side_effect(self):
+        task, run = self.claim()
+        record = {'run': run['id'], 'task': task, 'error': 'database is locked',
+                  'retry_at': time.time() + 30}
+        self.store.put_setting('stage-budget-recovery:' + run['id'], record)
+        barrier = threading.Barrier(3)
+        outcomes = []
+        errors = []
+
+        def reconcile():
+            try:
+                barrier.wait(3)
+                outcomes.append(self.store.reconcile_stage_budget_failure(run['id'], record))
+            except Exception as exc:
+                errors.append(exc)
+
+        workers = [threading.Thread(target=reconcile) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        barrier.wait(3)
+        for worker in workers:
+            worker.join(5)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(outcomes), 2)
+        self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))['state'], 'interrupted')
+        task_after_recovery = self.store.one('SELECT state,attempts FROM tasks WHERE id=?', (task,))
+        self.assertEqual((task_after_recovery['state'], task_after_recovery['attempts']), ('queued', 0))
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE run=? AND kind='interrupted'",
+                                              (run['id'],))), 1)
+        self.assertIsNone(self.store.setting('stage-budget-recovery:' + run['id']))
+
+    def test_run_state_read_failure_still_settles_the_stage_budget(self):
+        """终态查询失败时保留预算，再按 owner 的最终状态决定是否交接。"""
+        for final_state in ('interrupted', 'failed'):
+            with self.subTest(final_state=final_state):
+                task, run = self.claim()
+                clock = [1000.0]
+                original_one = self.store.one
+
+                def finish(current):
+                    clock[0] += 60.0
+                    self.store.execute('UPDATE runs SET state=?,ended=? WHERE id=?',
+                                       (final_state, time.time(), current['id']))
+
+                def fail_final_read(sql, args=()):
+                    if sql == 'SELECT state,ended FROM runs WHERE id=?' and tuple(args) == (run['id'],):
+                        raise sqlite3.OperationalError('database is locked')
+                    return original_one(sql, args)
+
+                with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]), \
+                     patch.object(self.runtime, '_process', side_effect=finish), \
+                     patch.object(self.store, 'one', side_effect=fail_final_read):
+                    self.runtime.process(run)
+                key = 'stage-budget:' + task
+                self.assertEqual(self.store.setting(key),
+                                 {'preparation': 60.0, 'evaluation': 0.0, 'run': run['id']})
+                loaded = self.runtime._load_stage_budget({'task': task, 'id': 'next-attempt'})
+                expected = 60.0 if final_state == 'interrupted' else 0.0
+                self.assertEqual(loaded, {'preparation': expected, 'evaluation': 0.0})
+                if final_state == 'failed':
+                    self.assertIsNone(self.store.setting(key))
+                self.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (task,))
+
     def test_trial_phase_clock_ignores_parent_planning_and_propagates_timeout(self):
         _, parent = self.claim()
         parent['_deadline_started'] = time.monotonic() - 5000
