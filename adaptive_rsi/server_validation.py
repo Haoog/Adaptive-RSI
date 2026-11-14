@@ -82,6 +82,7 @@ Automation requires a fixed trusted tag
 Automation requires the trusted workflow tag's full commit SHA
 Release/deploy requires an explicit project and a pinned workflow tag
 Deployment health URL requires HTTPS without credentials, query or fragment
+Deployment health URL requires a valid HTTPS address and a port between 1 and 65535
 Automatic deployment rollback requires an explicit health URL
 Workflow repository must match the selected project's origin
 Workflow must be an existing repository file

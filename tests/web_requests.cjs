@@ -73,8 +73,43 @@ test('workflow inspection retry errors reach the UI in both languages', async()=
     });
   }
 });
+test('refreshing workflow choices bypasses cached disabled state and explains why it is unavailable', async()=>{
+  const page=browser(),calls=[];
+  page.node('config-scope').value='project';
+  let enabled=false;
+  page.context.fetch=async url=>{
+    calls.push(url);
+    return response({workflows:[
+      {workflow:'.github/workflows/deploy.yml',name:'Deploy',compatible:enabled,
+        reason_code:enabled?'':'workflow_disabled'},
+      {workflow:'.github/workflows/legacy.yml',name:'Legacy',compatible:false,reason_code:'workflow_incompatible'}
+    ]});
+  };
+  const refresh=page.node('release-workflows-refresh').handlers.click;
+  assert.equal(typeof refresh,'function');
+  await refresh();
+  let option=page.node('release-workflow-list').children.find(item=>item.value==='.github/workflows/deploy.yml');
+  assert.ok(option.disabled);
+  assert.match(option.textContent,/工作流已禁用/);
+  const incompatible=page.node('release-workflow-list').children.find(item=>item.value==='.github/workflows/legacy.yml');
+  assert.ok(incompatible.disabled);
+  assert.match(incompatible.textContent,/工作流不符合自动交付要求/);
+  enabled=true;
+  await refresh();
+  option=page.node('release-workflow-list').children.find(item=>item.value==='.github/workflows/deploy.yml');
+  assert.equal(option.disabled,false);
+  assert.ok(calls.every(url=>url.includes('refresh=true')));
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  const translations=vm.runInNewContext(i18n.slice(0,i18n.indexOf('const staticText ='))+
+    ';["工作流已禁用，请在 GitHub 仓库中启用后刷新。","暂时无法检查此工作流，请刷新重试。","工作流不符合自动交付要求，请检查所需输入。"].map(key=>english[key])');
+  assert.deepEqual(JSON.parse(JSON.stringify(translations)),[
+    'This workflow is disabled. Enable it in the GitHub repository, then refresh.',
+    'This workflow could not be inspected temporarily. Refresh and try again.',
+    'This workflow is incompatible with automatic delivery. Check its required inputs.'
+  ]);
+});
 function descendants(node) {
-  return (node.children || []).flatMap(child => [child, ...descendants(child)]);
+  return (node.children || []).flatMap(child => child.isConnected === false ? [] : [child, ...descendants(child)]);
 }
 
 function editorForm(controls, className) {
@@ -2171,6 +2206,173 @@ test('an oversized Issue composition explains the 30000-character limit in the f
 function queueForm(page) {
   return editorForm(page.node('detail-body'), 'task-queue-editor');
 }
+test('history retry preserves queue edits and intervention reason in the live controls', async () => {
+  const page = experiencePage(), task = fixtureTask('child', 'queued'), posts = [];
+  let historyRequests = 0;
+  const metadata = {...task, dependency:null, urgency:0, available:0, revisions:[]};
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') {posts.push({url, body:JSON.parse(options.body)}); return response({saved:true});}
+    if (url.includes('/task-runs?')) return ++historyRequests === 1 ? response({error:'temporary outage'},500) : response([]);
+    if (url.includes('/state?')) return response({tasks:[fixtureTask('parent'), fixtureTask('newer')]});
+    if (url.includes('id=parent&')) return response(fixtureTask('parent'));
+    if (url.includes('id=newer&')) return response(fixtureTask('newer'));
+    return response(metadata);
+  };
+  await page.context.showTask(task, undefined, {dependencies:['parent'], urgency:true});
+  await waitFor(() => !!queueForm(page) && !!supplementForm(page.node('detail-body')));
+  const queue = queueForm(page), supplement = supplementForm(page.node('detail-body'));
+  queue.children[0].children[0].value = 'newer';
+  queue.children[1].children[0].checked = false;
+  supplement.children[0].children[0].value = 'Keep the added requirement';
+  supplement.children[1].children[0].value = 'Keep the intervention reason';
+  const retry = descendants(page.node('detail-body')).find(node => node.tagName === 'BUTTON' && node.textContent === '重试');
+  assert.ok(retry); await retry.handlers.click();
+  await waitFor(() => !!queueForm(page) && !!supplementForm(page.node('detail-body')));
+  const currentQueue = queueForm(page), currentSupplement = supplementForm(page.node('detail-body'));
+  assert.equal(currentQueue.children[0].children[0].value, 'newer');
+  assert.equal(currentQueue.children[1].children[0].checked, false);
+  assert.equal(currentSupplement.children[1].children[0].value, 'Keep the intervention reason');
+  assert.equal(historyRequests, 2);
+  currentQueue.onsubmit({preventDefault(){}}); await page.context.lastAction;
+  assert.deepEqual(posts.find(post => post.url.endsWith('/task/schedule')).body,
+                   {task:'child', dependency:'newer', urgency:0});
+});
+
+test('history retry retains an unsaved reason through eventual submission', async () => {
+  const page = experiencePage(), task = fixtureTask('child', 'failed'), posts = [];
+  let requests = 0;
+  const metadata = {...task, available:0, revisions:[]};
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') {posts.push({url, body:JSON.parse(options.body)}); return response({saved:true});}
+    if (url.includes('/task-runs?')) return ++requests === 1 ? response({error:'outage'},500) : response([]);
+    return response(metadata);
+  };
+  await page.context.showTask(task); await waitFor(() => !!supplementForm(page.node('detail-body')));
+  const form = supplementForm(page.node('detail-body'));
+  form.children[0].children[0].value = 'An added requirement';
+  form.children[0].children[0].handlers.input();
+  form.children[1].children[0].value = 'The unsaved reason';
+  const retry = descendants(page.node('detail-body')).find(node => node.tagName === 'BUTTON' && node.textContent === '重试');
+  assert.ok(retry); await retry.handlers.click();
+  await waitFor(() => !!supplementForm(page.node('detail-body')));
+  const after = supplementForm(page.node('detail-body'));
+  assert.equal(after.children[0].children[0].value, 'An added requirement');
+  assert.equal(after.children[1].children[0].value, 'The unsaved reason');
+  after.onsubmit({preventDefault(){}}); await page.context.lastAction;
+  assert.deepEqual(posts.find(post => post.url.endsWith('/task/revise')).body,
+                   {task:'child', supplement:'An added requirement', reason:'The unsaved reason'});
+});
+
+test('a history retry keeps asynchronously loading task controls and later edits', async () => {
+  const page = experiencePage(), task = fixtureTask('child', 'failed');
+  let historyRequests = 0, metadataRequests = 0, finishMetadata, finishRetry;
+  page.context.fetch = async url => {
+    if (url.includes('/task-runs?')) {
+      if (++historyRequests === 1) return response({error:'outage'},500);
+      return new Promise(resolve => {finishRetry = () => resolve(response([]));});
+    }
+    if (url.includes('/task?')) {
+      metadataRequests++;
+      if (metadataRequests === 1) return new Promise(resolve => {finishMetadata = () => resolve(response({...task,available:0,revisions:[]}));});
+      return response({...task,available:0,revisions:[]});
+    }
+    return response({tasks:[]});
+  };
+  await page.context.showTask(task);
+  await waitFor(() => !!finishMetadata);
+  const retry = descendants(page.node('detail-body')).find(node => node.tagName === 'BUTTON' && node.textContent === '重试');
+  assert.ok(retry); const pending = retry.handlers.click(); await waitFor(() => !!finishRetry);
+  finishMetadata(); await waitFor(() => !!supplementForm(page.node('detail-body')));
+  const before = supplementForm(page.node('detail-body'));
+  before.children[1].children[0].value = 'Typed during history retry';
+  finishRetry(); await pending;
+  assert.equal(metadataRequests, 1, 'retry must not restart the task controls request');
+  assert.equal(supplementForm(page.node('detail-body')), before);
+  assert.equal(before.children[1].children[0].value, 'Typed during history retry');
+});
+
+test('history retry stops offering a stale retry after authentication expires', async () => {
+  const page = browser(), task = {id:'a',project:'a',title:'Task a',body:'',evidence:'[]',state:'failed'};
+  let requests = 0;
+  page.context.fetch = async url => {
+    if (url.includes('task-runs?')) return ++requests === 1 ? response({error:'outage'},500) : response({error:'expired'},401);
+    return response({});
+  };
+  await page.context.showTask(task);
+  const body = page.node('detail-body');
+  const retry = descendants(body).find(node => node.tagName === 'BUTTON' && node.textContent === '重试');
+  assert.ok(retry);
+  await assert.rejects(retry.handlers.click(), error => error.code === 'session_required');
+  assert.equal(descendants(body).filter(node => node.tagName === 'BUTTON' && node.textContent === '重试').length, 0);
+  await retry.handlers.click();
+  assert.equal(requests, 2, 'the detached retry callback cannot bypass expired authentication');
+});
+
+test('history retry keeps one failure control across repeated outages', async () => {
+  const page = browser(), task = {id:'a',project:'a',title:'Task a',body:'',evidence:'[]',state:'failed'};
+  let requests = 0;
+  page.context.fetch = async url => url.includes('task-runs?') && ++requests <= 2 ? response({error:'outage'},500) : response([]);
+  await page.context.showTask(task);
+  const body = page.node('detail-body');
+  const retry = descendants(body).find(node => node.tagName === 'BUTTON' && node.textContent === '重试');
+  assert.ok(retry); await retry.handlers.click();
+  assert.equal(descendants(body).filter(node => node.tagName === 'BUTTON' && node.textContent === '重试').length, 1);
+  await retry.handlers.click();
+  assert.equal(descendants(body).filter(node => node.tagName === 'BUTTON' && node.textContent === '重试').length, 0);
+  await retry.handlers.click();
+  assert.equal(requests, 3, 'detached successful retry must not fetch again');
+});
+
+test('slow history retry ignores extra clicks and cannot reopen a closed task', async () => {
+  const page = browser(), task = {id:'a', project:'a', title:'Task a', body:'', evidence:'[]', state:'failed'};
+  let requests = 0, finish;
+  page.context.fetch = async url => {
+    if (url.includes('task-runs?')) {
+      requests++;
+      if (requests === 1) return response({error:'temporary outage'},500);
+      return new Promise(resolve => {finish = () => resolve(response({runs:[{id:'old',task:'a',project:'a'}],has_more:false}));});
+    }
+    return response({state:'failed',config:{models:{}},result:{reason:'stale'}});
+  };
+  await page.context.showTask(task);
+  const body = page.node('detail-body');
+  const retry = descendants(body).find(node => node.tagName === 'BUTTON' && node.textContent === '重试');
+  assert.ok(retry); const pending = retry.handlers.click(); const duplicate = retry.handlers.click();
+  assert.equal(requests, 2, 'a pending retry cannot issue an extra request');
+  page.context.closeTaskDetail();
+  finish(); await Promise.all([pending, duplicate]);
+  assert.equal(page.node('detail-dialog').open, false);
+  assert.equal(descendants(body).filter(node => node.id === 'live-task-outcome').length, 0);
+});
+
+for (const changed of ['task', 'project']) {
+  for (const status of [200, 500, 401]) {
+    test(`stale history retry ${status} cannot mutate a newer ${changed} view`, async () => {
+      const page = browser(), task = {id:'a',project:'a',title:'Task a',body:'',evidence:'[]',state:'failed'};
+      let calls=0, finish;
+      page.context.fetch = async url => {
+        if (url.includes('task-runs?task=a')) {
+          if (++calls === 1) return response({error:'outage'},500);
+          return new Promise(resolve => {finish=()=>resolve(response(status===200?[]:{error:'stale failure'},status));});
+        }
+        if (url.includes('task-runs?task=b')) return response([]);
+        return response({});
+      };
+      await page.context.showTask(task);
+      const body=page.node('detail-body');
+      const retry=descendants(body).find(node => node.tagName==='BUTTON' && node.textContent==='重试');
+      const pending=retry.handlers.click();
+      if(changed==='task') await page.context.showTask({...task,id:'b',title:'Task b'});
+      else vm.runInContext('projectId="b"',page.context);
+      const title=page.node('detail-title').textContent, children=[...body.children];
+      finish(); await pending;
+      assert.equal(page.node('detail-title').textContent,title);
+      assert.deepEqual(body.children,children);
+      assert.equal(page.node('toast').textContent,'');
+    });
+  }
+}
+
 function changeDetailLanguage(page, language = 'en') {
   Object.assign(page.context, {language: 'zh-CN', english: {}, translateStatic() {}});
   page.node('language-select').value = language;
