@@ -2138,6 +2138,13 @@ class Runtime(Maintenance):
                 if original["state"] != "awaiting_approval":
                     raise Cancelled("Candidate approval is no longer valid; publishing stopped")
                 candidate = Path(original["path"]) / "candidate"
+                replay = self.store.setting("delivery-replay:" + original["id"])
+                if (isinstance(replay, dict) and replay.get("base") == original["base"]
+                        and isinstance(replay.get("workspace"), str)
+                        and Path(replay["workspace"]).parent == Path(original["path"])):
+                    # 已在新基线上重放并重验的候选：重试读取同一棵树，避免把旧基线的
+                    # 补丁再和已前进的 runs.base 比较而误判候选被改动。
+                    candidate = Path(replay["workspace"])
                 if not candidate.is_dir():
                     # maintenance 会清理超过保留期的候选；给用户可操作的指引而不是裸 git 错误。
                     raise RuntimeError("Candidate was cleaned up after the retention window; regenerate it before publishing")
@@ -2152,7 +2159,7 @@ class Runtime(Maintenance):
                                     "; publishing stopped")
                 from .delivery import StaleCandidate
                 try:
-                    url = self.publish(project, source_task, original, candidate, config)
+                    url = self.publish(project, source_task, original, candidate, config, outcome)
                 except StaleCandidate as exc:
                     outcome["reason"] = str(exc)
                     # Issue work must wait for synchronization to replace stale evidence.
@@ -2680,9 +2687,9 @@ class Runtime(Maintenance):
             return False
         return True
 
-    def publish(self, project, task, run, workspace, config):
+    def publish(self, project, task, run, workspace, config, outcome=None):
         from .delivery import publish
-        return publish(self, project, task, run, workspace, config)
+        return publish(self, project, task, run, workspace, config, outcome)
 
     def maybe_evolve(self, project, config):
         if not config["evolution"]["enabled"]:

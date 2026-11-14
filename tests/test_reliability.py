@@ -502,6 +502,98 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
         self.assertTrue(self.saved_implementation(second)["patch"])
 
+    def test_advanced_baseline_replays_validated_patch_without_reimplementing(self):
+        from adaptive_rsi import task_feedback
+        task, run = self.claim()
+        with ExitStack() as stack:
+            for scenario in self.evaluation_sandbox():
+                stack.enter_context(scenario)
+            self.runtime.process(run)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
+        first = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 1)
+
+        (self.repo / "MAINLINE.md").write_text("unrelated mainline change\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=t@localhost", "commit", "-qm", "advance")
+        base1 = git(self.repo, "rev-parse", "HEAD")
+        self.store.execute("UPDATE tasks SET state='blocked' WHERE id=?", (task,))
+        self.runtime.retry(task)
+        second = self.store.claim(self.project, self.runtime.config(self.project))
+        with ExitStack() as stack:
+            for scenario in self.evaluation_sandbox():
+                stack.enter_context(scenario)
+            evaluate = stack.enter_context(patch.object(
+                self.runtime.evaluator, "evaluate", wraps=self.runtime.evaluator.evaluate))
+            self.runtime.process(second)
+        # 只有补丁跨基线复用；评估必须在新基线上真实重跑一次。
+        self.assertEqual(evaluate.call_count, 1)
+        row = self.store.one("SELECT state,base,result FROM runs WHERE id=?", (second["id"],))
+        self.assertEqual(row["base"], base1)
+        self.assertEqual(row["state"], "awaiting_approval")
+        result = json.loads(row["result"])
+        self.assertEqual(result["evaluation"]["decision"], "pass")
+        self.assertEqual(result["patch_hash"], first["patch_hash"])
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 1)
+        self.assertIn("implementation", task_feedback.summary(self.store, second["id"])["reused_stages"])
+
+    def test_rejected_replayed_patch_invalidates_original_checkpoint(self):
+        padding = "\n" + "# padding\n" * 12
+        path = self.repo / "calculator.py"
+        path.write_text(path.read_text() + padding)
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=t@localhost", "commit", "-qm", "long base")
+        task, first = self.claim()
+        invoke = self.runtime.agent.invoke
+        def preserve_padding(role, prompt, workspace, *args, **kwargs):
+            result = invoke(role, prompt, workspace, *args, **kwargs)
+            if role == "implementation":
+                target = workspace / "calculator.py"
+                target.write_text(target.read_text() + padding)
+            return result
+        with ExitStack() as stack:
+            for scenario in self.evaluation_sandbox():
+                stack.enter_context(scenario)
+            stack.enter_context(patch.object(self.runtime.agent, "invoke", side_effect=preserve_padding))
+            self.runtime.process(first)
+        old = self.saved_implementation(first)["patch_hash"]
+        path.write_text(path.read_text() + "# independent change\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=t@localhost", "commit", "-qm", "advance")
+        self.store.execute("UPDATE tasks SET state='blocked' WHERE id=?", (task,))
+        self.runtime.retry(task)
+        second = self.store.claim(self.project, self.runtime.config(self.project))
+        with ExitStack() as stack:
+            for scenario in self.evaluation_sandbox():
+                stack.enter_context(scenario)
+            stack.enter_context(patch.object(self.runtime.evaluator, "evaluate", return_value={
+                "decision": "fail", "reason": "rejected", "checks": {}}))
+            self.runtime.process(second)
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 1)
+        rows = self.store.query("SELECT data FROM stages WHERE run=? AND stage IN ('implementation','validated_candidate')", (first["id"],))
+        self.assertFalse(any(json.loads(row["data"]).get("patch_hash") == old for row in rows))
+
+    def test_conflicting_new_baseline_falls_back_to_reimplementation(self):
+        task, run = self.claim()
+        with ExitStack() as stack:
+            for scenario in self.evaluation_sandbox():
+                stack.enter_context(scenario)
+            self.runtime.process(run)
+        (self.repo / "calculator.py").write_text("def add(a, b):\n    return a * b\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=t@localhost", "commit", "-qm", "conflicting mainline")
+        self.store.execute("UPDATE tasks SET state='blocked' WHERE id=?", (task,))
+        self.runtime.retry(task)
+        second = self.store.claim(self.project, self.runtime.config(self.project))
+        with ExitStack() as stack:
+            for scenario in self.evaluation_sandbox():
+                stack.enter_context(scenario)
+            self.runtime.process(second)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 2)
+        result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (second["id"],))["result"])
+        self.assertEqual(result["evaluation"]["decision"], "pass")
+
     def test_evaluation_reuse_requires_matching_tree_checks_and_controls(self):
         config = self.runtime.config(self.project)
         source = _evaluation_source(config, "a" * 40, CHECKS, "candidate patch", "digest", None,

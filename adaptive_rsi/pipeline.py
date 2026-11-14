@@ -53,6 +53,84 @@ def _within_scope(path, scope):
     return scope == "." or path == scope.rstrip("/") or path.startswith(scope.rstrip("/") + "/")
 
 
+def _replay_prior_patch(runtime, run, task, workspace, identity, scope, test_first=False,
+                        original_scope=None, regression_scope=None):
+    """Reuse a previously verified patch when the baseline advanced.
+
+    Only the patch crosses baselines: evaluation, acceptance and review still
+    run fresh on the new tree. A patch that no longer applies, came from
+    different inputs, or escaped the new plan gate is skipped and the caller
+    implements normally.
+    """
+    rows = runtime.store.query(
+        "SELECT s.data AS data, s.run AS run FROM stages s JOIN runs r ON r.id=s.run "
+        "WHERE r.task=? AND s.stage IN ('validated_candidate','implementation') AND r.id<>? "
+        "ORDER BY s.created DESC LIMIT 8", (task["id"], run["id"]))
+    for row in rows:
+        try:
+            data = json.loads(row["data"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get("implementation_key") != identity:
+            continue
+        patch = data.get("patch")
+        if not isinstance(patch, str) or not patch.strip() or fingerprint(patch) != data.get("patch_hash"):
+            continue
+        path = Path(str(workspace) + ".prior-patch")
+        path.write_text(patch + "\n", encoding="utf-8")
+        try:
+            git(workspace, "apply", "--check", str(path))
+            git(workspace, "apply", "--index", str(path))
+        except (RuntimeError, OSError):
+            git(workspace, "reset", "--hard", "HEAD")
+            git(workspace, "clean", "-fdq")
+            continue
+        touched = sorted({item for item in git(workspace, "diff", "--cached", "--name-only", "-z").split("\0") if item})
+        if test_first:
+            added = {item for item in git(workspace, "diff", "--cached", "--diff-filter=A",
+                                          "--name-only", "-z").split("\0") if item and test_path(item)}
+            fits = bool(touched) and 1 <= len(added) <= 8 and all(
+                (item in added and _within_scope(item, regression_scope or "")) if test_path(item)
+                else any(_within_scope(item, allowed) for allowed in (original_scope or scope))
+                for item in touched)
+        else:
+            fits = bool(touched) and all(any(_within_scope(item, allowed) for allowed in scope)
+                                         for item in touched)
+        if not fits:
+            git(workspace, "reset", "--hard", "HEAD")
+            git(workspace, "clean", "-fdq")
+            continue
+        # Hand the tree back clean: the caller applies the returned patch itself,
+        # so applying it here as well would fail on the second attempt.
+        git(workspace, "reset", "--hard", "HEAD")
+        git(workspace, "clean", "-fdq")
+        runtime.store.event("stage_reused", "Reused a verified patch on the new baseline",
+                            run["project"], run["id"],
+                            {"stage": "implementation", "from_run": row["run"],
+                             "patch_hash": data["patch_hash"]})
+        return {"summary": data.get("summary") or "Replayed verified patch",
+                "patch": patch, "patch_hash": data["patch_hash"], "files": touched,
+                "replay_source_hashes": [*data.get("replay_source_hashes", []), data["patch_hash"]]}
+    return None
+
+
+def _discard_patch(runtime, task, signature, patch, source_hashes=()):
+    """Reject one exact patch everywhere it was checkpointed for this task.
+
+    A replayed patch may live under an older baseline's signature, so failure
+    must retire every copy by patch hash; otherwise the next attempt replays
+    the same rejected change instead of implementing against the new baseline.
+    """
+    with runtime.store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        for patch_hash in {fingerprint(patch), *source_hashes}:
+            db.execute(
+                "DELETE FROM stages WHERE stage IN ('validated_candidate','implementation') "
+                "AND run IN (SELECT id FROM runs WHERE task=?) "
+                "AND (signature=? OR (json_valid(data) AND json_extract(data,'$.patch_hash')=?))",
+                (task["id"], signature, patch_hash))
+
+
 class AcceptanceBaselineUnavailable(RuntimeError):
     """独立验收基线因确定性环境问题不可用，而不是用户暂停或取消。
 
@@ -773,12 +851,17 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         acceptance["contract"] = contract
         (directory / "acceptance.json").write_text(encode(acceptance), encoding="utf-8")
     implementation_config, _ = _stage_config(config, "implementation")
-    candidate_key = fingerprint({"inputs": signature(run, task, base, strategies, implementation_config),
-                                 "dependencies": environment["sha256"], "outcomes": planning_outcomes, "prs": open_prs,
-                                 "related_work": overlaps, "issue_comments": comment_evidence, "pr_feedback": pr_feedback,
-                                 "skills": skill_evidence,
-                                 "plan": plan, "acceptance_hash": acceptance["hash"] if acceptance else None,
-                                 "test_first": test_first, "checks": checks})
+    cached_inputs = {"dependencies": environment["sha256"], "outcomes": planning_outcomes, "prs": open_prs,
+                     "related_work": overlaps, "issue_comments": comment_evidence, "pr_feedback": pr_feedback,
+                     "skills": skill_evidence,
+                     "plan": plan, "acceptance_hash": acceptance["hash"] if acceptance else None,
+                     "test_first": test_first, "checks": checks}
+    candidate_key = fingerprint({**cached_inputs,
+                                 "inputs": signature(run, task, base, strategies, implementation_config)})
+    # 实现阶段与基线解耦：主线前进后同一任务的补丁仍可复用，所以该身份不含 base。
+    # 技能、固定检查、计划或配置变化仍会改变它，重放就必须让位给真实实现。
+    implementation_key = fingerprint({**cached_inputs,
+                                      "inputs": signature(run, task, None, strategies, implementation_config)})
     saved_candidate = None if experiment else cached(runtime, run, "validated_candidate", candidate_key)
     saved_implementation = None
     if saved_candidate is None and not experiment and task["source"] != "rollback":
@@ -787,10 +870,17 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         # implementation checkpoint is the recovery anchor for that gap: replay
         # the sealed patch instead of paying for the same implementation call
         # again.  Replay never carries a verdict, so evaluation, review and the
-        # scope gate still run on the replayed patch.
+        # scope gate still run on the replayed patch.  A baseline that advanced
+        # since the patch was sealed changes the cache key, so fall back to the
+        # newest stored patch for this task and apply it to the new tree.
         saved_implementation = cached(runtime, run, "implementation", candidate_key,
                                       normalize=_reusable_implementation)
+        if saved_implementation is None:
+            saved_implementation = _replay_prior_patch(
+                runtime, run, task, workspace, implementation_key, plan["scope"], test_first=test_first,
+                original_scope=original_scope, regression_scope=regression_test_scope)
     baseline = snapshot(source, directory / "baseline", base)
+    replay_source_hashes = (saved_candidate or saved_implementation or {}).get("replay_source_hashes", [])
     acceptance_executor = None
     acceptance_future = None
     acceptance_cancel = threading.Event()
@@ -907,6 +997,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             # failure must be recoverable by replaying this exact change.
             save(runtime, run, "implementation", {"files": files, "patch": patch,
                                                   "patch_hash": fingerprint(patch),
+                                                  "implementation_key": implementation_key,
+                                                  "replay_source_hashes": replay_source_hashes,
                                                   "summary": result["summary"]}, candidate_key)
         transition("evaluating")
         if experiment:
@@ -966,13 +1058,16 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         # A completed evaluation that did not pass rejects this exact patch, so
         # the retry must implement again rather than replay it unchanged; only
         # runs that never reached a verdict keep the implementation checkpoint.
-        runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage IN ('validated_candidate','implementation') AND run IN (SELECT id FROM runs WHERE task=?)", (candidate_key, task["id"]))
+        _discard_patch(runtime, task, candidate_key, patch, replay_source_hashes)
         return {**evaluation, "evaluation": evaluation}
     if not experiment and evaluation["decision"] == "pass":
         runtime.store.put_setting("verified-checks:" + project["id"], {"base": base, "checks": checks,
                                "compatibility": compatibility(config), "at": time.time()})
     if not experiment:
-        save(runtime, run, "validated_candidate", {"patch": patch, "patch_hash": fingerprint(patch), "summary": result["summary"]}, candidate_key)
+        save(runtime, run, "validated_candidate", {"patch": patch, "patch_hash": fingerprint(patch),
+                                                   "implementation_key": implementation_key,
+                                                   "replay_source_hashes": replay_source_hashes,
+                                                   "summary": result["summary"]}, candidate_key)
     transition("evaluating", {"stage": "review"})
     # 试验判定在评估失败时直接取评估结论（见 outcome["decision"]），评审 verdict 必然
     # 被丢弃；此时仍为 review/risk_review 各付一次模型调用纯属浪费，两个付费调用一并
@@ -1039,10 +1134,11 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         save(runtime, run, "review", review, review_key)
         if review["decision"] != "pass":
             # A rejected patch must be implemented again, not replayed unchanged.
-            runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage IN ('validated_candidate','implementation') AND run IN (SELECT id FROM runs WHERE task=?)", (candidate_key, task["id"]))
+            _discard_patch(runtime, task, candidate_key, patch, replay_source_hashes)
     outcome = {"decision": review["decision"] if evaluation["decision"] == "pass" else evaluation["decision"], "reason": review["reason"], "summary": result["summary"], "files": files,
                "evaluation": evaluation, "review": review, "risk": plan["risk"], "base": base,
                "risk_review": risk_review,
+               "checks_spec": checks,
                "value": plan.get("value"),
                "patch_hash": fingerprint(patch)}
     return outcome
