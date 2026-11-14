@@ -11,11 +11,13 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from adaptive_rsi.config import DEFAULTS, fingerprint
+from adaptive_rsi.config import DEFAULTS, InvalidDeploymentHealth, fingerprint, validate, validate_legacy_schedule
 from adaptive_rsi.delivery import StaleCandidate, publish, tick
 from adaptive_rsi.gitops import changes, git, snapshot
 from adaptive_rsi.process import Cancelled
 from adaptive_rsi.runtime import Runtime
+from adaptive_rsi.server import Server
+from urllib.error import HTTPError
 from adaptive_rsi.store import Store, encode
 from tests.test_runtime import FakeAgent, fixture
 
@@ -2947,6 +2949,342 @@ class ReleaseAbandonTest(_ManualReconciliationFixture):
         self.assertEqual(self.saved()["workflow_run_id"], 17)
         self.assertEqual(self.saved()["operator_abandon"]["visibility"], "run_not_visible")
 
+
+class LegacyHealthConfigRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        repo = fixture(root / "project")
+        self.runtime = Runtime(Store(root / "state"))
+        self.addCleanup(self.runtime.close)
+        self.project = self.runtime.add_project(repo, enabled=False)
+        self.runtime.configure({"sources": {"issues": False}, "schedule": {"weight": 3}}, self.project)
+        raw = json.loads(self.runtime.project(self.project)["config"])
+        raw.setdefault("delivery", {}).setdefault("deploy", {})["health_url"] = "https://app.example:0/health"
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(raw), self.project))
+        self.invalid = raw
+
+    def _due_rows(self):
+        return {row["kind"]: row["due"] for row in self.runtime.store.query(
+            "SELECT kind,due FROM schedules WHERE project=?", (self.project,))}
+
+    def _seed_due(self):
+        for index, kind in enumerate(("light", "issues", "deep"), 1):
+            self.runtime.store.execute(
+                "INSERT OR REPLACE INTO schedules(project,kind,due,fingerprint) VALUES (?,?,?,?)",
+                (self.project, kind, index * 100.0, ""),
+            )
+
+    def test_repair_preserves_other_overrides_revision_and_pause(self):
+        before = self.runtime.store.config_revision(self.project)
+        result = self.runtime.configure(
+            {"delivery": {"deploy": {"health_url": "https://app.example:443/health"}}},
+            self.project, expected_revision=before,
+        )
+        saved = json.loads(self.runtime.project(self.project)["config"])
+        self.assertTrue(result["saved"])
+        self.assertEqual(result["revision"], before + 1)
+        self.assertEqual(saved["sources"], self.invalid["sources"])
+        self.assertEqual(saved["schedule"], self.invalid["schedule"])
+        self.assertEqual(saved["delivery"]["deploy"]["health_url"], "https://app.example:443/health")
+        self.assertTrue(self.runtime.project(self.project)["paused"])
+
+    def test_repair_reschedules_only_changed_interval(self):
+        self._seed_due()
+        with patch("adaptive_rsi.runtime.time.time", return_value=1000):
+            self.runtime.configure(
+                {"schedule": {"light_minutes": 61},
+                 "delivery": {"deploy": {"health_url": "https://app.example:443/health"}}},
+                self.project,
+            )
+        self.assertEqual(self._due_rows(), {"light": 4660.0, "issues": 200.0, "deep": 300.0})
+
+    def test_invalid_repair_and_stale_revision_leave_config_unchanged(self):
+        before = self.runtime.store.config_revision(self.project)
+        for values, revision in (
+            ({"delivery": {"deploy": {"health_url": "https://app.example:65536/health"}}}, before),
+            ({"delivery": {"deploy": {"health_url": "https://app.example:443/health"}}}, before + 1),
+        ):
+            with self.subTest(values=values, revision=revision), self.assertRaises(ValueError):
+                self.runtime.configure(values, self.project, expected_revision=revision)
+            self.assertEqual(json.loads(self.runtime.project(self.project)["config"]), self.invalid)
+            self.assertEqual(self.runtime.store.config_revision(self.project), before)
+
+    def test_other_invalid_configuration_does_not_use_health_recovery(self):
+        raw = dict(self.invalid)
+        raw["schedule"] = {"light_minutes": 60.0}
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(raw), self.project))
+        with self.assertRaisesRegex(ValueError, "schedule.light_minutes has the wrong type"):
+            self.runtime.configure(
+                {"schedule": {"light_minutes": 60},
+                 "delivery": {"deploy": {"health_url": "https://app.example:443/health"}}},
+                self.project,
+            )
+        self.assertEqual(json.loads(self.runtime.project(self.project)["config"]), raw)
+
+    def test_replacement_repair_preserves_replacement_and_schedule_semantics(self):
+        raw = json.loads(self.runtime.project(self.project)["config"])
+        raw["schedule"]["light_minutes"] = 70
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(raw), self.project))
+        self._seed_due()
+        revision = self.runtime.store.config_revision(self.project)
+        with patch("adaptive_rsi.runtime.time.time", return_value=1000), self.runtime.dispatch_lock:
+            self.runtime._configure({"sources": {"issues": True}}, self.project,
+                                    expected_revision=revision, replacement=True, source="undo")
+        self.assertEqual(json.loads(self.runtime.project(self.project)["config"]), {"sources": {"issues": True}})
+        self.assertEqual(self._due_rows(), {"light": 4600.0, "issues": 200.0, "deep": 300.0})
+        self.assertEqual(self.runtime.store.config_revision(self.project), revision + 1)
+
+    def test_combined_repair_of_legacy_health_and_retry_policy(self):
+        self.runtime.store.put_setting("config", {"delivery": {"deploy": {"health_attempts": 2}}})
+        raw = json.loads(self.runtime.project(self.project)["config"])
+        raw["delivery"]["deploy"]["health_consecutive_successes"] = 3
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(raw), self.project))
+        self.runtime.configure({"delivery": {"deploy": {"health_url": "https://app.example:443/health",
+                                                        "health_consecutive_successes": 2}}}, self.project)
+        effective = self.runtime.config(self.project)
+        self.assertEqual(effective["delivery"]["deploy"]["health_consecutive_successes"], 2)
+        self.assertEqual(effective["delivery"]["deploy"]["health_url"], "https://app.example:443/health")
+        self.assertFalse(effective["sources"]["issues"])
+
+    def test_health_repair_inheriting_global_interval_updates_only_affected_due(self):
+        raw = json.loads(self.runtime.project(self.project)["config"])
+        raw["schedule"]["light_minutes"] = 70
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(raw), self.project))
+        self._seed_due()
+        with patch("adaptive_rsi.runtime.time.time", return_value=1000):
+            self.runtime.configure({"delivery": {"deploy": {"health_url": "https://app.example:443/health"}}},
+                                   self.project, inherit=["schedule.light_minutes"])
+        self.assertEqual(self._due_rows(), {"light": 4600.0, "issues": 200.0, "deep": 300.0})
+        self.assertNotIn("light_minutes", json.loads(self.runtime.project(self.project)["config"])["schedule"])
+
+    def test_authenticated_config_endpoint_rejects_invalid_repair_without_write(self):
+        server = Server(self.runtime)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        try:
+            revision = self.runtime.store.config_revision(self.project)
+            body = {"project": self.project, "revision": revision,
+                    "values": {"delivery": {"deploy": {"health_url": "https://app.example:65536/health"}}}}
+            headers = {"Cookie": server.cookie + "=" + server.token, "Origin": server.origin,
+                       "X-RSI-CSRF": server.csrf, "Content-Type": "application/json"}
+            request = urllib.request.Request(server.origin + "/api/config", json.dumps(body).encode(), headers)
+            with self.assertRaises(HTTPError) as error:
+                urllib.request.urlopen(request, timeout=8)
+            self.assertEqual(error.exception.code, 400)
+            self.assertEqual(json.loads(self.runtime.project(self.project)["config"]), self.invalid)
+            self.assertEqual(self.runtime.store.config_revision(self.project), revision)
+            self.assertTrue(self.runtime.project(self.project)["paused"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_authenticated_config_endpoint_repairs_legacy_url(self):
+        server = Server(self.runtime)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        try:
+            revision = self.runtime.store.config_revision(self.project)
+            body = {"project": self.project, "revision": revision,
+                    "values": {"delivery": {"deploy": {"health_url": "https://app.example:443/health"}}}}
+            headers = {"Cookie": server.cookie + "=" + server.token, "Origin": server.origin,
+                       "X-RSI-CSRF": server.csrf, "Content-Type": "application/json"}
+            request = urllib.request.Request(server.origin + "/api/config", json.dumps(body).encode(), headers)
+            with urllib.request.urlopen(request, timeout=8) as response:
+                result = json.load(response)
+                self.assertEqual(response.status, 200)
+            self.assertTrue(result["saved"])
+            self.assertEqual(result["revision"], revision + 1)
+            saved = json.loads(self.runtime.project(self.project)["config"])
+            self.assertEqual(saved["delivery"]["deploy"]["health_url"], "https://app.example:443/health")
+            self.assertEqual(saved["sources"], self.invalid["sources"])
+            self.assertTrue(self.runtime.project(self.project)["paused"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+class LegacyGlobalHealthConfigRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.runtime = Runtime(Store(self.root / "state"))
+        self.addCleanup(self.runtime.close)
+        self.projects = [self.runtime.add_project(fixture(self.root / ("project" + str(i))), enabled=False)
+                         for i in range(4)]
+        overrides = [
+            {},
+            {"delivery": {"deploy": {"health_url": "https://app.example:443/health"}},
+             "schedule": {"light_minutes": 75}},
+            {"delivery": {"deploy": {"health_url": "https://app.example:65536/health"}}},
+            {"schedule": {"light_minutes": 60.0}},
+        ]
+        for project, override in zip(self.projects, overrides):
+            self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(override), project))
+            for index, kind in enumerate(("light", "issues", "deep"), 1):
+                self.runtime.store.execute(
+                    "INSERT OR REPLACE INTO schedules(project,kind,due,fingerprint) VALUES (?,?,?,?)",
+                    (project, kind, index * 100.0, ""),
+                )
+        self.runtime.store.put_setting("config", {"delivery": {"deploy": {
+            "health_url": "https://app.example:0/health"}}})
+
+    def test_continuing_invalid_url_does_not_hide_new_retry_policy_error(self):
+        global_before = {"delivery": {"deploy": {"health_attempts": 4}}}
+        self.runtime.store.put_setting("config", global_before)
+        override = {"delivery": {"deploy": {"health_url": "https://app.example:0/health",
+                                            "health_consecutive_successes": 3}}}
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(override), self.projects[1]))
+        revision = self.runtime.store.config_revision(None)
+        with self.assertRaisesRegex(ValueError, "Invalid deployment health retry policy"):
+            self.runtime.configure({"schedule": {"light_minutes": 61},
+                                    "delivery": {"deploy": {"health_attempts": 2}}})
+        self.assertEqual(self.runtime.store.setting("config"), global_before)
+        self.assertEqual(self.runtime.store.config_revision(None), revision)
+        # Fixing just the old URL must remain possible when the failed global save
+        # has not silently introduced an unrelated retry-policy error.
+        self.runtime.configure({"delivery": {"deploy": {"health_url": "https://app.example:443/health"}}},
+                               self.projects[1])
+
+    def test_global_stale_revision_preserves_project_revisions_and_due_rows(self):
+        before = self.runtime.store.setting("config")
+        revision = self.runtime.store.config_revision(None)
+        project_revisions = [self.runtime.store.config_revision(project) for project in self.projects]
+        with self.assertRaisesRegex(ValueError, "Configuration changed in another window"):
+            self.runtime.configure({"schedule": {"light_minutes": 61},
+                                    "delivery": {"deploy": {"health_url": "https://app.example/health"}}},
+                                   expected_revision=revision + 1)
+        self.assertEqual(self.runtime.store.setting("config"), before)
+        self.assertEqual(self.runtime.store.config_revision(None), revision)
+        self.assertEqual([self.runtime.store.config_revision(project) for project in self.projects], project_revisions)
+        for project in self.projects:
+            row = self.runtime.store.one("SELECT due FROM schedules WHERE project=? AND kind='light'", (project,))
+            self.assertEqual(row["due"], 100.0)
+
+    def test_global_health_repair_rejects_new_project_validation_failure(self):
+        old_global = {"delivery": {"deploy": {"health_url": "https://app.example:0/health", "health_attempts": 4}}}
+        self.runtime.store.put_setting("config", old_global)
+        override = {"delivery": {"deploy": {"health_consecutive_successes": 3}}}
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(override), self.projects[1]))
+        revision = self.runtime.store.config_revision(None)
+        with self.assertRaisesRegex(ValueError, "Invalid deployment health retry policy"):
+            self.runtime.configure(
+                {"schedule": {"light_minutes": 61}, "delivery": {"deploy": {
+                    "health_url": "https://app.example:443/health", "health_attempts": 2}}}
+            )
+        self.assertEqual(self.runtime.store.setting("config"), old_global)
+        self.assertEqual(self.runtime.store.config_revision(None), revision)
+        row = self.runtime.store.one("SELECT due FROM schedules WHERE project=? AND kind='light'", (self.projects[1],))
+        self.assertEqual(row["due"], 100.0)
+        # The same health/schedule repair can proceed with the compatible retry policy.
+        with patch("adaptive_rsi.runtime.time.time", return_value=1000):
+            self.runtime.configure({"schedule": {"light_minutes": 61}, "delivery": {"deploy": {
+                "health_url": "https://app.example:443/health"}}})
+        row = self.runtime.store.one("SELECT due FROM schedules WHERE project=? AND kind='light'", (self.projects[1],))
+        self.assertEqual(row["due"], 4660.0)
+
+    def test_global_update_rejects_invalidating_previously_valid_project(self):
+        global_before = {"delivery": {"deploy": {"health_attempts": 4}}}
+        self.runtime.store.put_setting("config", global_before)
+        override = {"delivery": {"deploy": {"health_consecutive_successes": 3}}}
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(override), self.projects[1]))
+        self.assertEqual(self.runtime.config(self.projects[1])["delivery"]["deploy"]["health_consecutive_successes"], 3)
+        revision = self.runtime.store.config_revision(None)
+        with self.assertRaisesRegex(ValueError, "Invalid deployment health retry policy"):
+            self.runtime.configure({"delivery": {"deploy": {"health_attempts": 2}}})
+        self.assertEqual(self.runtime.store.setting("config"), global_before)
+        self.assertEqual(self.runtime.store.config_revision(None), revision)
+
+    def test_global_repair_reschedules_only_valid_projects_and_changed_intervals(self):
+        with patch("adaptive_rsi.runtime.time.time", return_value=1000):
+            result = self.runtime.configure(
+                {"schedule": {"light_minutes": 61},
+                 "delivery": {"deploy": {"health_url": "https://app.example:443/health"}}}
+            )
+        self.assertTrue(result["saved"])
+        schedules = {project: {row["kind"]: row["due"] for row in self.runtime.store.query(
+            "SELECT kind,due FROM schedules WHERE project=?", (project,))} for project in self.projects}
+        self.assertEqual(schedules[self.projects[0]], {"light": 4660.0, "issues": 200.0, "deep": 300.0})
+        self.assertEqual(schedules[self.projects[1]], {"light": 100.0, "issues": 200.0, "deep": 300.0})
+        # A project with its own still-invalid health URL can be repaired later.
+        # Its valid inherited schedule must not retain the old global deadline.
+        self.assertEqual(schedules[self.projects[2]], {"light": 4660.0, "issues": 200.0, "deep": 300.0})
+        self.assertEqual(schedules[self.projects[3]], {"light": 100.0, "issues": 200.0, "deep": 300.0})
+        self.assertEqual(self.runtime.config(self.projects[0])["schedule"]["light_minutes"], 61)
+        self.assertEqual(self.runtime.config(self.projects[1])["schedule"]["light_minutes"], 75)
+        with self.assertRaises(ValueError):
+            self.runtime.config(self.projects[2])
+        with self.assertRaises(ValueError):
+            self.runtime.config(self.projects[3])
+        self.runtime.configure({"delivery": {"deploy": {"health_url": "https://app.example:443/health"}}},
+                               self.projects[2])
+        light = self.runtime.store.one("SELECT due FROM schedules WHERE project=? AND kind='light'", (self.projects[2],))
+        self.assertEqual(light["due"], 4660.0)
+
+class LegacyScheduleValidationTests(unittest.TestCase):
+    def test_strict_validation_and_legacy_schedule_with_multiple_bad_ports(self):
+        raw = {"delivery": {"deploy": {
+            "health_url": "https://app.example:0/health",
+            "health_urls": ["https://second.example:65536/health"],
+        }}}
+        original = copy.deepcopy(raw)
+
+        with self.assertRaises(InvalidDeploymentHealth):
+            validate(raw)
+
+        self.assertEqual(validate_legacy_schedule(raw), DEFAULTS["schedule"])
+        self.assertEqual(raw, original)
+
+    def test_legacy_schedule_does_not_ignore_other_health_url_errors(self):
+        for additional_url, message in (
+            ("http://app.example/health", "requires HTTPS"),
+            ("https://user:secret@app.example/health", "without credentials"),
+            ("https://app.example/health?token=example", "without credentials"),
+            ("https://app.example/health#fragment", "without credentials"),
+        ):
+            raw = {"delivery": {"deploy": {
+                "health_url": "https://primary.example:0/health",
+                "health_urls": [additional_url],
+            }}}
+            with self.subTest(additional_url=additional_url):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_legacy_schedule(raw)
+
+    def test_legacy_schedule_includes_malformed_origin_only_as_schedule_evidence(self):
+        # urlsplit cannot establish the complete authority here. This helper is
+        # allowed to recover only a schedule; strict config remains invalid.
+        raw = {"delivery": {"deploy": {"health_url": "http://[::1/health"}}}
+        with self.assertRaises(InvalidDeploymentHealth):
+            validate(raw)
+        self.assertEqual(validate_legacy_schedule(raw), DEFAULTS["schedule"])
+
+    def test_legacy_schedule_does_not_ignore_duplicate_health_urls(self):
+        url = "https://app.example:0/health"
+        raw = {"delivery": {"deploy": {"health_url": url, "health_urls": [url]}}}
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            validate_legacy_schedule(raw)
+
+    def test_legacy_schedule_continues_to_retry_policy_validation(self):
+        raw = {"delivery": {"deploy": {
+            "health_url": "https://app.example:0/health",
+            "health_attempts": 2,
+            "health_consecutive_successes": 3,
+        }}}
+        with self.assertRaises(InvalidDeploymentHealth):
+            validate(raw)
+        with self.assertRaisesRegex(ValueError, "Invalid deployment health retry policy"):
+            validate_legacy_schedule(raw)
+
+    def test_legacy_schedule_does_not_hide_earlier_shape_errors(self):
+        raw = {
+            "schedule": {"light_minutes": 60.0},
+            "delivery": {"deploy": {"health_url": "https://app.example:0/health"}},
+        }
+        with self.assertRaisesRegex(ValueError, "schedule.light_minutes has the wrong type"):
+            validate_legacy_schedule(raw)
 
 if __name__ == "__main__":
     unittest.main()

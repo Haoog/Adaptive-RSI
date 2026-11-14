@@ -180,7 +180,7 @@ const english = {
  "资源准入门槛须为 0–1048576 MiB，0 表示关闭。": "Resource thresholds must be 0\u20131048576 MiB; 0 disables the check.",
  "连续成功次数不能超过总检查轮数；请检查轮数、间隔和预热范围。": "Consecutive successes cannot exceed total rounds. Check rounds, interval and warmup limits.",
  "请保留主检查地址，最多增加 7 个不同的 HTTPS 端点。": "Keep a primary health URL and add up to seven distinct HTTPS endpoints.",
- "健康检查地址须为 HTTPS，且不含账号、查询参数或片段。": "Health URLs require HTTPS without credentials, query parameters or fragments.",
+ "健康检查地址须为 HTTPS，指定端口须在 1–65535 之间，且不含账号、查询参数或片段。": "Health URLs must use HTTPS; specified ports must be between 1 and 65535. Credentials, query parameters and fragments are not allowed.",
  "自动回滚需要主健康检查地址。": "Automatic rollback requires a primary health URL.",
  "请选择人工恢复或明确确认数据向后兼容。": "Choose manual recovery or explicitly confirm backward data compatibility.",
  "人工恢复说明不能超过 2000 个字符。": "Manual recovery notes must not exceed 2000 characters.",
