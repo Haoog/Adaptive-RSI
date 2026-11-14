@@ -171,7 +171,9 @@ class ReleaseAutomationTest(unittest.TestCase):
 
     def test_corrupt_automation_receipt_is_preserved_and_blocks_dispatch(self):
         from adaptive_rsi.release import status
-        for raw in ('{broken', '[]', 'null', '{}', '{"state":3}', '{"state":"submitted"}'):
+        for raw in ('{broken', '[]', 'null', '{}', '{"state":3}', '{"state":"mystery_state"}',
+                    '{"state":"rolling_back","rollback":{"state":"mystery_state"}}',
+                    '{"state":"submitted"}'):
             with self.subTest(raw=raw):
                 self.runtime.store.execute('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)',
                                            (key(self.run['id'], 'release'), raw))
@@ -179,7 +181,11 @@ class ReleaseAutomationTest(unittest.TestCase):
                     self.assertFalse(pending(self.runtime, self.run))
                     result = self.tick()
                     self.assertEqual(result['release']['receipt_error'], 'invalid_automation_receipt')
-                    self.assertEqual(status(self.runtime, self.project, self.run['id'])['release']['state'], 'blocked')
+                    diagnosis = status(self.runtime, self.project, self.run['id'])['release']
+                    self.assertEqual(diagnosis['state'], 'blocked')
+                    self.assertEqual(diagnosis['receipt_error'], 'invalid_automation_receipt')
+                    self.assertEqual(diagnosis['error'],
+                                     'Automation record is unreadable; repair the stored record before continuing')
                     api.assert_not_called()
                 self.assertEqual(self.runtime.store.one('SELECT value FROM settings WHERE key=?',
                                  (key(self.run['id'], 'release'),))['value'], raw)

@@ -1204,6 +1204,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_POST(self):
         started = time.time()
+        response_lock = None
         if not self.authenticated():
             return
         if self.headers.get("Origin") not in {self.server.origin, self.server.local_origin} or not self._token_matches(self.headers.get("X-RSI-CSRF", ""), self.server.csrf):
@@ -1231,6 +1232,7 @@ class Handler(BaseHTTPRequestHandler):
                     name = {str: "a string", bool: "a boolean", int: "an integer",
                             dict: "an object", list: "a list"}.get(expected, "a scalar")
                     raise RequestError(field + " must be " + name)
+            response_code, response_headers, response_lock = 200, None, None
             if path == "/api/operations":
                 self.respond(runtime.operations.start(body.get("kind"), body.get("parameters", {})))
                 return
@@ -1289,6 +1291,7 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/model-center/"):
                 center = runtime.model_center
                 project = body.get("project") or None
+                response_code = 200
                 if path == "/api/model-center/fetch":
                     result = center.fetch(body.get("provider"), project)
                 elif path == "/api/model-center/probe":
@@ -1319,9 +1322,8 @@ class Handler(BaseHTTPRequestHandler):
                         elif path == "/api/model-center/resume":
                             result = center.resume_provider(body.get("provider"), project)
                         else:
-                            self.respond({"error": "Not found"}, 404)
-                            return
-                self.respond(result)
+                            result, response_code = {"error": "Not found"}, 404
+                self.respond(result, response_code)
                 return
             if urlparse(self.path).path == "/api/models":
                 try:
@@ -1375,6 +1377,13 @@ class Handler(BaseHTTPRequestHandler):
                             raise RequestError(str(exc)) from exc
                 self.respond(result)
                 return
+            path = urlparse(self.path).path
+            if path == "/api/session/rotate":
+                # 先等会话锁再拿 dispatch_lock。轮换响应需持有会话锁直至新 cookie
+                # 发出；若反向等待，会让第二个轮换请求在 dispatch_lock 内排队，
+                # 连带阻塞所有写端点。
+                response_lock = self.server._session_lock
+                response_lock.acquire()
             with runtime.dispatch_lock:
                 path = urlparse(self.path).path
                 if path != "/api/cancel":
@@ -1471,17 +1480,16 @@ class Handler(BaseHTTPRequestHandler):
                     result = {"id": Evolution(runtime).import_case(body["project"], body["manifest"])}
                 elif path == "/api/session/rotate":
                     # 轮换后旧链接立即失效；响应携带新 cookie，当前浏览器保持登录。
-                    with self.server._session_lock:
-                        result = self.server.rotate_session()
-                        self.respond(result, headers={"Set-Cookie": self.server.cookie_header(self.headers.get("Host"))})
-                    return
+                    result = self.server.rotate_session()
+                    response_headers = {"Set-Cookie": self.server.cookie_header(self.headers.get("Host"))}
                 else:
-                    self.respond({"error": "Not found"}, 404)
-                    return
-                self.respond(result)
+                    result, response_code = {"error": "Not found"}, 404
+            self.respond(result, response_code, headers=response_headers)
         except Exception as exc:
             self.api_error(exc)
         finally:
+            if response_lock is not None:
+                response_lock.release()
             if urlparse(self.path).path.startswith("/api/"):
                 try:
                     status = getattr(self, "_response_status", 500)

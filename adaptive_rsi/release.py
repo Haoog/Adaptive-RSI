@@ -337,7 +337,7 @@ def _read_automation(runtime, run_id, kind):
     raw = row["value"]
     try:
         data = json.loads(raw)
-        if not isinstance(data, dict) or not isinstance(data.get("state"), str) or not data["state"]:
+        if not isinstance(data, dict) or not isinstance(data.get("state"), str) or data["state"] not in AUTOMATION_STATES:
             raise ValueError("Invalid automation state")
         if any(field in data and not isinstance(data[field], dict) for field in ("rollback", "reconciliation")):
             raise ValueError("Invalid automation details")
@@ -346,6 +346,8 @@ def _read_automation(runtime, run_id, kind):
         if data.get("state") == "rolling_back" and "rollback" not in data:
             raise ValueError("Missing rollback details")
         for target in targets:
+            if not isinstance(target.get("state"), str) or target["state"] not in AUTOMATION_STATES:
+                raise ValueError("Invalid automation state")
             if target.get("state") in active and any(not isinstance(target.get(field), str) or not target[field]
                     for field in ("repository", "workflow", "ref", "sha", "workflow_sha", "operation_id")):
                 raise ValueError("Missing automation identity")
