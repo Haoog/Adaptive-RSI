@@ -125,7 +125,8 @@ class DeliveryLoopTest(unittest.TestCase):
         self.runtime.pause(self.project, False)
         self.runtime.goal(self.project, "Fix addition")
         run = self.store.claim(self.project, self.runtime.config(self.project))
-        self.runtime.process(run)
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}):
+            self.runtime.process(run)
         result = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
         payload = json.loads(result["result"] or "{}")
         self.assertEqual([r[0] for r in self.runtime.agent.roles], ["planning"], result["result"])
@@ -1399,7 +1400,9 @@ print('BOUNDARIES_OK')
         with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), head, "main")), patch(
                 "adaptive_rsi.delivery.committed_changes", side_effect=RuntimeError("corrupt git history")), patch(
                 "adaptive_rsi.evaluator.detect", return_value={"checks": [check]}), patch(
-                "adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=execute):
+                "adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=execute), patch.object(
+                self.runtime.evaluator, "_execution_environment",
+                side_effect=lambda config: (config, EXECUTION_IDENTITY)):
             feedback(self.runtime, self.runtime.project(self.project), run, outcome,
                      self.runtime.config(self.project), time.time())
         result = outcome["feedback"]
