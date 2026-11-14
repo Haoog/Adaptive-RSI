@@ -281,6 +281,19 @@ def main():
                 # 全部直接落库，不调用模型，也不改变自动晋升配置。
                 now = time.time()
                 guidance = "Reproduce arithmetic boundary cases before editing"
+                from adaptive_rsi.gitops import git
+                repository = str(Path(runtime.project(project)["path"]))
+                base = git(repository, "rev-parse", "HEAD")
+                sealed_spec = {"task": "Fix addition", "base": base, "checks": CHECKS,
+                               "source": "real", "repository": repository, "overlay": None}
+                # 手动晋升会重算封存输入的 spec/task/checks/tree/overlay，占位 manifest
+                # 会被判为输入漂移；这里按真实封存格式记录 holdout 用例。
+                sealed_manifest = [{"case": "browser-holdout-0", "split": "holdout", "source": "real",
+                                    "signature": "", "family": "browser-holdout-0",
+                                    "tree": git(repository, "rev-parse", base + "^{tree}"),
+                                    "checks": fingerprint(CHECKS), "task": fingerprint(sealed_spec["task"]),
+                                    "spec": fingerprint(sealed_spec), "overlay": None, "sampled": True,
+                                    "environment": fingerprint(runtime.config(project)["environment"])}]
                 stable_evidence = json.dumps({
                     "reason": "Repeated paired improvement on both splits without observed regressions",
                     "trials": [{"case": "browser-case-" + str(index % 3), "split": "validation",
@@ -301,7 +314,7 @@ def main():
                     "preregistered_plan": {"sha256": fingerprint(ready_plan), "data": ready_plan},
                     "final_review": {"split": "holdout", "purpose": "final_confirmation_only", "fresh": True,
                                      "cases": [sample["id"] for sample in ready_plan["samples"]]},
-                    "dataset": {"version": 1, "manifest": [{"case": "browser-case-0", "tree": "fixture-tree"}]}})
+                    "dataset": {"version": 1, "manifest": sealed_manifest}})
                 exhausted_evidence = json.dumps({
                     "reason": "Validation or holdout exposure limit reached; import new cases or raise evolution.max_holdout_uses",
                     "trials": []})
@@ -316,10 +329,11 @@ def main():
                         (candidate, project, "strategy", parent, status, content, evidence, created))
                 for split, count, uses in [("development", 4, 0), ("validation", 3, 2), ("holdout", 3, 3)]:
                     for index in range(count):
+                        case_id = "browser-" + split + "-" + str(index)
+                        spec = json.dumps(sealed_spec) if case_id == "browser-holdout-0" else "{}"
                         runtime.store.execute(
                             "INSERT INTO cases(id,project,family,split,spec,uses,created) VALUES (?,?,?,?,?,?,?)",
-                            ("browser-" + split + "-" + str(index), project,
-                             "browser-" + split + "-" + str(index), split, "{}", uses, now))
+                            (case_id, project, case_id, split, spec, uses, now))
             runtime.store.event("issue_revision", "Issue closed or excluded during execution; recheck before delivery", project)
             server = Server(runtime)
             threading.Thread(target=server.serve_forever, daemon=True).start()

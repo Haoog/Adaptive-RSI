@@ -61,6 +61,51 @@ class AuditEvolutionTest(unittest.TestCase):
                                (split, 'p', split, split, encode(spec), holdout_uses if split == 'holdout' else 0, 1))
         return {'id': 'p'}, repo, self.root / 'run', {'id': 'run', 'task': 'task', 'config': encode(self.config)}
 
+    def ready_candidate(self, *, drift=False, unsampled_drift=False):
+        """构造一个证据完整、等待人工晋升的 ready 候选。"""
+        from adaptive_rsi.config import DEFAULTS, compatibility, merge
+        from adaptive_rsi.gitops import git
+        from tests.test_runtime import CHECKS, fixture
+        repo = fixture(self.root / 'repo')
+        self.config = merge(DEFAULTS, {'evolution': {'repeats': 1}})
+        self.store.execute("INSERT INTO projects(id,name,path,config,paused,created) "
+                           "VALUES ('p','p','/tmp/p','{}',0,0)")
+        spec = {'task': 'fix add', 'base': git(repo, 'rev-parse', 'HEAD'), 'checks': CHECKS,
+                'source': 'real', 'repository': str(repo), 'overlay': None}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('case-1', 'p', 'f1', 'validation', encode(spec), 0, 1))
+        manifest = [{'case': 'case-1', 'split': 'validation', 'family': 'f1', 'sampled': True,
+                     'spec': fingerprint(spec), 'task': fingerprint(spec['task']),
+                     'checks': fingerprint(spec['checks']), 'overlay': None,
+                     'tree': git(repo, 'rev-parse', spec['base'] + '^{tree}')}]
+        if unsampled_drift:
+            other = {**spec, 'task': 'other task'}
+            self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                               ('case-2', 'p', 'f2', 'validation', encode(other), 0, 2))
+            manifest.append({**manifest[0], 'case': 'case-2', 'family': 'f2', 'sampled': False,
+                             'spec': fingerprint(other), 'task': fingerprint(other['task'])})
+            self.store.execute('UPDATE cases SET spec=? WHERE id=?',
+                               (encode({**other, 'active': False}), 'case-2'))
+        if drift:
+            self.store.execute('UPDATE cases SET spec=? WHERE id=?',
+                               (encode({**spec, 'task': 'drifted task'}), 'case-1'))
+        plan = {'version': 2, 'repeats': 1, 'samples': [{'id': 'case-1', 'split': 'validation'}]}
+        evidence = {'dataset': {'version': 1, 'manifest': manifest},
+                    'preregistered_plan': {'data': plan, 'sha256': fingerprint(plan)},
+                    'trials': [{'case': 'case-1', 'split': 'validation', 'repetition': 0,
+                                'stable': {'pass': True}, 'candidate': {'pass': True}}],
+                    'final_review': {'fresh': True},
+                    'promotion_review': {'limitations': []},
+                    'compatibility': compatibility(self.config)}
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) '
+                           'VALUES (?,?,?,?,?,?,?)',
+                           ('candidate', 'p', 'strategy', 'ready',
+                            encode({'guidance': 'new guidance', 'triggers': []}), encode(evidence), 2))
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) '
+                           'VALUES (?,?,?,?,?,?,?)',
+                           ('previous', 'p', 'strategy', 'stable',
+                            encode({'guidance': 'old', 'triggers': []}), encode({}), 1))
+
     def test_malformed_case_specs_are_skipped_without_blocking_the_proposal(self):
         args = self.setup_proposal()
         self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
@@ -730,6 +775,66 @@ class AuditEvolutionTest(unittest.TestCase):
         spec['task'] = 'different task'
         self.store.execute('UPDATE cases SET spec=? WHERE id=?', (encode(spec), 'case'))
         self.assertFalse(self.evolution.verify_inputs('p', [item])['valid'])
+
+    def test_promote_rejects_drifted_sealed_inputs_without_side_effects(self):
+        """用例在人工复核窗口内漂移后，手动晋升不能按旧证据注入 stable 技能。"""
+        self.ready_candidate(drift=True)
+        with self.assertRaisesRegex(ValueError, r'case-1 \(.*task'):
+            self.evolution.promote('candidate')
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='candidate'")['status'], 'ready')
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='previous'")['status'], 'stable')
+        self.assertEqual(self.store.query('SELECT * FROM skills'), [])
+
+    def assert_promotion_rejects_post_verification_change(self, target):
+        self.ready_candidate()
+        verify = self.evolution.verify_inputs
+
+        def change_after_verification(*args, **kwargs):
+            result = verify(*args, **kwargs)
+            if target == 'case':
+                self.store.execute("UPDATE cases SET spec=? WHERE id='case-1'", ('{}',))
+            else:
+                self.store.execute("UPDATE candidates SET evidence=? WHERE id='candidate'", ('{}',))
+            return result
+
+        with patch.object(self.evolution, 'verify_inputs', side_effect=change_after_verification):
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                self.evolution.promote('candidate')
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='candidate'")['status'], 'ready')
+        self.assertEqual(self.store.query('SELECT * FROM skills'), [])
+
+    def test_promote_rejects_case_change_after_input_verification(self):
+        self.assert_promotion_rejects_post_verification_change('case')
+
+    def test_promote_rejects_evidence_change_after_input_verification(self):
+        self.assert_promotion_rejects_post_verification_change('evidence')
+
+    def test_promote_rejects_reclassified_sealed_case(self):
+        self.ready_candidate()
+        self.store.execute("UPDATE cases SET split='development' WHERE id='case-1'")
+        with self.assertRaisesRegex(ValueError, 'split'):
+            self.evolution.promote('candidate')
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='candidate'")['status'], 'ready')
+        self.assertEqual(self.store.query('SELECT * FROM skills'), [])
+
+    def test_promote_with_unchanged_sealed_inputs_still_promotes(self):
+        self.ready_candidate()
+        result = self.evolution.promote('candidate')
+        self.assertEqual(result, {'candidate': 'candidate', 'status': 'stable'})
+        row = self.store.one("SELECT status,parent FROM candidates WHERE id='candidate'")
+        self.assertEqual((row['status'], row['parent']), ('stable', 'previous'))
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='previous'")['status'], 'superseded')
+        skills = self.store.query('SELECT * FROM skills') or []
+        self.assertEqual([(skill['status'], skill['content']) for skill in skills], [('verified', 'new guidance')])
+
+    def test_promote_records_unsampled_drift_without_blocking(self):
+        """未抽中用例的漂移只留档，不阻断晋升（与自动晋升同一口径）。"""
+        self.ready_candidate(unsampled_drift=True)
+        result = self.evolution.promote('candidate')
+        self.assertEqual(result['status'], 'stable')
+        evidence = json.loads(self.store.one("SELECT evidence FROM candidates WHERE id='candidate'")['evidence'])
+        self.assertEqual([row['case'] for row in evidence['input_verification']['unsampled_mismatches']], ['case-2'])
+        self.assertIn('case-2', evidence['promotion_review']['limitations'][0])
 
     def test_overlay_identity_includes_empty_directories_and_modes(self):
         overlay = self.root / 'overlay'
