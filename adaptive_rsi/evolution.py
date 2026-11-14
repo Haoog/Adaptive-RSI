@@ -831,19 +831,27 @@ class Evolution:
                     continue
                 target = root / "cases" / item["case"]
                 target.mkdir(parents=True)
-                snapshot(spec["repository"], target / "repository", spec["base"])
-                # bundle 只封存工作树文件：snapshot 写出的 .git 既含 origin 指向的宿主机
-                # suite 绝对路径（本地路径泄漏），又因不入 manifest 成为校验盲区，且
-                # 对象库白白增大包体。reproduce_bundle 只按 case.json 的 checks 执行，
-                # 不依赖 git 元数据，导出时整棵删除；删不干净即失败而不是照常导出。
-                sealed_tree(target / "repository")
+                # 同一个 tree 的抽中用例共用一份仓库基线：tree 哈希由 git 现算，
+                # N 份完全相同的检出只会让包体、清单和逐文件校验按样本数放大，
+                # 对校验没有增量信息。case.json 记相对路径指过去，接收方仍按
+                # 用例目录定位各自的树，不必猜包内固定目录名。
+                tree = git(spec["repository"], "rev-parse", spec["base"] + "^{tree}")
+                shared = root / "repositories" / tree
+                if not shared.exists():
+                    snapshot(spec["repository"], shared, spec["base"])
+                    # bundle 只封存工作树文件：snapshot 写出的 .git 既含 origin 指向的宿主机
+                    # suite 绝对路径（本地路径泄漏），又因不入 manifest 成为校验盲区，且
+                    # 对象库白白增大包体。reproduce_bundle 只按 case.json 的 checks 执行，
+                    # 不依赖 git 元数据，导出时整棵删除；删不干净即失败而不是照常导出。
+                    sealed_tree(shared)
                 if spec.get("overlay"):
                     scrub_tree(spec["overlay"])
                     shutil.copytree(spec["overlay"], target / "overlay", symlinks=True)
                     # overlay 是宿主机目录，同样可能自带 .git：留下会把宿主机路径带进
                     # 包体，并让 verify_bundle 把刚导出的包判为失效。
                     sealed_tree(target / "overlay")
-                spec = {**spec, "repository": "repository", "overlay": "overlay" if spec.get("overlay") else None}
+                spec = {**spec, "repository": Path(os.path.relpath(shared, target)).as_posix(),
+                        "overlay": "overlay" if spec.get("overlay") else None}
                 (target / "case.json").write_text(encode(spec), encoding="utf-8")
                 entry["exported"] = True
             if unsampled:
@@ -1065,15 +1073,39 @@ class Evolution:
                 if error:
                     malformed_checks.append(f"Case {case_id}: checks[{i}] {error}")
 
+        # case.json 的 repository/overlay 是相对用例目录的路径。新包把同 tree 的
+        # 仓库基线去重到 repositories/<tree>/，旧包（"repository"）仍按用例目录
+        # 解析，两种布局都要能定位。解析结果必须留在 bundle 内：绝对路径、../
+        # 或符号链接把目录指到包外时一律当缺失，交给调用方记录失败，不读取包外内容。
+        def sealed_dir(case_entry, value, fallback):
+            value = value if isinstance(value, str) and value else fallback
+            try:
+                path = (case_entry / value).resolve()
+            except (OSError, RuntimeError):
+                return None
+            if root not in path.parents:
+                return None
+            return path if path.is_dir() else None
+
+        invalid_overlays = {}
+        for case_id, case_entry, spec in case_items:
+            declared = spec.get("overlay")
+            if declared is not None and (not isinstance(declared, str) or not declared
+                                         or sealed_dir(case_entry, declared, None) is None):
+                invalid_overlays[case_id] = "overlay is missing or escapes the bundle"
+
         # argv[0] 含路径分隔符且不是绝对路径时，subprocess 按检查 cwd（一次性副本
         # 内）解析，不是宿主 PATH 查询：必须到用例 repository/overlay 里定位。否则
         # 包内自带的 ./run.sh 会被 which() 按宿主进程当前目录判成缺工具，整包检查
         # 随之全部跳过，失败原因还会指向宿主环境。绝对路径仍指宿主文件，照旧处理。
-        def bundle_executable(case_entry, check, cmd):
+        def bundle_executable(case_entry, spec, check, cmd):
             relative = Path(check.get("cwd", ".")) / cmd
-            for base in ("overlay", "repository"):
+            for value, fallback in ((spec.get("overlay"), "overlay"),
+                                    (spec.get("repository"), "repository")):
+                root_dir = sealed_dir(case_entry, value, fallback)
+                if root_dir is None:
+                    continue
                 try:
-                    root_dir = (case_entry / base).resolve()
                     target = (root_dir / relative).resolve()
                 except (OSError, RuntimeError):
                     continue
@@ -1113,7 +1145,7 @@ class Evolution:
                 table = seen_bundle if bundled else seen_tools
                 if key not in table:
                     if bundled:
-                        found = bundle_executable(case_entry, check, cmd)
+                        found = bundle_executable(case_entry, spec, check, cmd)
                         if found:
                             info = {"name": cmd, "type": "bundle",
                                     "path": found.relative_to(root).as_posix(),
@@ -1234,6 +1266,9 @@ class Evolution:
             if msg not in repro_limitations:
                 repro_limitations.append(msg)
 
+        for case_id, error in invalid_overlays.items():
+            repro_limitations.append(f"Case {case_id}: {error}")
+
         # 5. Optional check execution
         # 检查命令在一次性临时副本上执行：先复制 repository，再把封存 overlay
         # 叠上去（与 evaluator 同一套 scrub + 符号链接拒绝语义），bundle 原文件保持不变。
@@ -1241,8 +1276,21 @@ class Evolution:
         if run_checks and integrity.get("valid") and not missing_tools and not missing_bundle:
             import tempfile
             for case_id, case_entry, spec in case_items:
-                repo_dir = case_entry / "repository"
-                overlay_dir = case_entry / "overlay"
+                repo_dir = sealed_dir(case_entry, spec.get("repository"), "repository")
+                overlay_dir = sealed_dir(case_entry, spec.get("overlay"), "overlay")
+                if case_id in invalid_overlays:
+                    executed_checks.append({
+                        "case": case_id, "check": None, "argv": [],
+                        "exit_code": -1, "passed": False, "error": invalid_overlays[case_id],
+                    })
+                    continue
+                if repo_dir is None:
+                    executed_checks.append({
+                        "case": case_id, "check": None, "argv": [],
+                        "exit_code": -1, "passed": False,
+                        "error": "repository is missing or escapes the bundle",
+                    })
+                    continue
                 staging_tmp = None
                 try:
                     staging_tmp = tempfile.mkdtemp(prefix="bundle-check-")
@@ -1254,7 +1302,7 @@ class Evolution:
                     overlay_applied = False
                     try:
                         shutil.copytree(repo_dir, staging, symlinks=True)
-                        if overlay_dir.is_dir():
+                        if overlay_dir is not None:
                             scrub_tree(overlay_dir)
                             for parent, dirs, files in os.walk(overlay_dir, followlinks=False):
                                 for name in files:
@@ -1366,6 +1414,7 @@ class Evolution:
             len(missing_creds) == 0 and
             credential_limitation is None and
             len(malformed_checks) == 0 and
+            len(invalid_overlays) == 0 and
             checks_passed is not False
         )
 

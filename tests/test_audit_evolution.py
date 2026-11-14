@@ -1,6 +1,7 @@
 """Evidence integrity and dataset lifecycle acceptance without external models."""
 import hashlib
 import json
+import os
 import shutil
 import tempfile
 import time
@@ -1713,7 +1714,7 @@ class AuditEvolutionTest(unittest.TestCase):
         case = destination / 'cases' / 'case-unlisted'
         self.assertTrue(Evolution.verify_bundle(destination)['valid'])
 
-        injected = [case / 'repository' / 'sitecustomize.py',
+        injected = [self.case_tree(destination, 'case-unlisted') / 'sitecustomize.py',
                     case / 'UNLISTED.txt',
                     destination / 'UNLISTED.txt']
         for path in injected:
@@ -1741,7 +1742,7 @@ class AuditEvolutionTest(unittest.TestCase):
             capture_output=True, text=True, env={'PATH': '/usr/bin:/bin'})
         self.assertEqual(cli.returncode, 1, cli.stdout + cli.stderr)
         self.assertNotIn('All bundle files verified', cli.stdout)
-        self.assertIn('cases/case-unlisted/repository/sitecustomize.py', cli.stdout)
+        self.assertIn(injected[0].relative_to(destination).as_posix(), cli.stdout)
         self.assertFalse(marker.exists())
 
         # 未注入的正常导出包不回归：verify 通过，--strict 退出 0 且检查真实执行。
@@ -1759,10 +1760,10 @@ class AuditEvolutionTest(unittest.TestCase):
         """导出 bundle 只封存工作树：.git 不随包走（origin 指向的宿主机 suite
         路径不外泄），cases/ 下出现 .git 由 verify_bundle 判失效而不是静默豁免。"""
         destination = self.sealed_bundle(repo_name='repo-gitless')
-        repository = destination / 'cases' / 'case-gitless' / 'repository'
+        repository = self.case_tree(destination, 'case-gitless')
         self.assertTrue(repository.is_dir())
         self.assertFalse((repository / '.git').exists())
-        self.assertFalse(list((destination / 'cases').rglob('.git')))
+        self.assertFalse(list(destination.rglob('.git')))
         # 包内任何残留文件都不应包含源仓库的宿主机绝对路径。
         for path in destination.rglob('*'):
             if path.is_file() and not path.is_symlink():
@@ -1774,7 +1775,7 @@ class AuditEvolutionTest(unittest.TestCase):
         (injected / 'config').write_text('[remote "origin"]\n\turl = ' + str(self.root) + '/repo-gitless\n')
         result = Evolution.verify_bundle(destination)
         self.assertFalse(result['valid'])
-        self.assertIn('cases/case-gitless/repository/.git', result['mismatches'])
+        self.assertIn((repository / '.git').relative_to(destination).as_posix(), result['mismatches'])
         # reproduce_bundle 的完整性判定同口径拒绝，run_checks 不再走到复制 .git。
         repro = Evolution.reproduce_bundle(destination)
         self.assertFalse(repro['integrity']['valid'])
@@ -1790,7 +1791,7 @@ class AuditEvolutionTest(unittest.TestCase):
         destination = self.sealed_bundle(repo_name='repo-overlay-git', overlay=overlay)
         case = destination / 'cases' / 'case-overlay-git'
         self.assertEqual((case / 'overlay' / 'protected.txt').read_text(), 'sealed input\n')
-        self.assertFalse(list((destination / 'cases').rglob('.git')))
+        self.assertFalse(list(destination.rglob('.git')))
         for path in destination.rglob('*'):
             if path.is_file() and not path.is_symlink():
                 self.assertNotIn(str(self.root), path.read_bytes().decode('utf-8', errors='replace'))
@@ -1821,10 +1822,11 @@ class AuditEvolutionTest(unittest.TestCase):
         destination = self.root / 'bundle-sampled'
         self.evolution.export_bundle('c', destination)
 
-        # 1. 只有抽中用例封存工作树；未抽中条目连 case.json 都不落盘。
-        self.assertEqual(sorted(path.parent.name for path in (destination / 'cases').glob('*/repository')),
-                         ['case-a', 'case-b'])
+        # 1. 只有抽中用例导出 case.json；未抽中条目连 case.json 都不落盘。
+        #    case-a / case-b 共用同一 base，因此只封存一份仓库树。
         self.assertEqual(sorted(path.name for path in (destination / 'cases').iterdir()), ['case-a', 'case-b'])
+        self.assertEqual(sorted(path.name for path in (destination / 'repositories').iterdir()), [tree])
+        self.assertEqual(self.case_tree(destination, 'case-a'), self.case_tree(destination, 'case-b'))
 
         # 2. bundle.json 保留全部条目的身份与导出标记，审计信息不丢。
         exported = json.loads((destination / 'bundle.json').read_text(encoding='utf-8'))
@@ -1835,11 +1837,11 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(entries['case-c']['split'], 'validation')
         self.assertTrue(any('unsampled' in item for item in exported['limitations']))
 
-        # 3. 包体不随未抽中条目放大：两份工作树而不是四份。
+        # 3. 包体不随抽中用例数放大：两个用例共用一份工作树，而不是各存一份。
         source_bytes = sum(path.stat().st_size for path in repo.rglob('*')
                            if path.is_file() and '.git' not in path.relative_to(repo).parts)
         bundle_bytes = sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())
-        self.assertLess(bundle_bytes, source_bytes * 2 + 16384)
+        self.assertLess(bundle_bytes, source_bytes + 16384)
 
         # 4. 抽中用例仍可校验与离线复现；未执行用例的检查命令不进入依赖清单。
         self.assertTrue(Evolution.verify_bundle(destination)['valid'])
@@ -1849,6 +1851,155 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertTrue(result['integrity']['valid'])
         self.assertNotIn('fake-unsampled-tool', [item['name'] for item in result['dependencies']['missing']])
         self.assertTrue(result['reproducible'])
+
+    def test_export_bundle_shares_one_tree_for_same_base_cases(self):
+        """同一 (repository, base) 的多个抽中用例共用一份树，包体不随样本数放大。"""
+        from tests.test_runtime import fixture
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo-shared')
+        (repo / 'payload.bin').write_bytes(b'payload' * 8192)
+        git(repo, 'add', '.')
+        git(repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost',
+            'commit', '--quiet', '-m', 'payload')
+        base = git(repo, 'rev-parse', 'HEAD')
+        items = []
+        for name in ('a', 'b', 'c'):
+            spec = {'task': 'task ' + name, 'base': base, 'source': 'real',
+                    'checks': [{'name': 'unit_check', 'cwd': '.',
+                                'argv': ['python3', '-c', 'print("ok")']}],
+                    'signature': 'sig-' + name, 'repository': str(repo), 'overlay': None}
+            self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                               ('case-' + name, 'p', 'family-' + name, 'validation',
+                                encode(spec), 0, time.time()))
+            items.append({'case': 'case-' + name, 'split': 'validation', 'sampled': True})
+        self.candidate({'dataset': {'manifest': items}, 'providers': []})
+        destination = self.root / 'bundle-shared'
+        exported = self.evolution.export_bundle('c', destination)
+
+        # 1. 三份完全相同的工作树只落一份；case.json 各自用相对路径指过去。
+        trees = sorted((destination / 'repositories').iterdir())
+        self.assertEqual(len(trees), 1)
+        self.assertEqual({self.case_tree(destination, 'case-' + name) for name in 'abc'}, {trees[0]})
+        for name in 'abc':
+            spec = json.loads((destination / 'cases' / ('case-' + name) / 'case.json')
+                              .read_text(encoding='utf-8'))
+            self.assertTrue(spec['repository'].startswith('..'))
+            self.assertNotIn(str(self.root), spec['repository'])
+
+        # 2. 包体与清单只算一次树：文件登记数等于树内文件数，而不是样本数倍。
+        registered = [path for path in exported['files'] if path.startswith('repositories/')]
+        source_bytes = sum(path.stat().st_size for path in repo.rglob('*')
+                           if path.is_file() and '.git' not in path.relative_to(repo).parts)
+        bundle_bytes = sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())
+        self.assertLess(bundle_bytes, source_bytes + 16384)
+        self.assertEqual(len(registered), sum(1 for path in trees[0].rglob('*') if path.is_file()))
+
+        # 3. 校验与离线复现不变：三个用例都能按 case.json 找到树并执行检查。
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['reproducible'], result['limitations'])
+        self.assertEqual([(row['case'], row['passed']) for row in result['executed_checks']],
+                         [('case-a', True), ('case-b', True), ('case-c', True)])
+
+    def test_export_bundle_separates_trees_for_different_bases_and_overlay(self):
+        """不同 base 的抽中用例各有自己的树；overlay 仍按用例单独封存。"""
+        from tests.test_runtime import fixture
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo-mixed')
+        (repo / 'first.txt').write_text('first\n')
+        git(repo, 'add', '.')
+        git(repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost',
+            'commit', '--quiet', '-m', 'first')
+        first = git(repo, 'rev-parse', 'HEAD')
+        (repo / 'second.txt').write_text('second\n')
+        git(repo, 'add', '.')
+        git(repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost',
+            'commit', '--quiet', '-m', 'second')
+        second = git(repo, 'rev-parse', 'HEAD')
+        overlay = self.root / 'overlay-mixed'
+        overlay.mkdir()
+        (overlay / 'marker.txt').write_text('overlay\n')
+        specs = {'case-first-1': (first, None), 'case-first-2': (first, None),
+                 'case-second': (second, None), 'case-overlay': (first, str(overlay))}
+        items = []
+        for name, (base, cover) in specs.items():
+            spec = {'task': 'task ' + name, 'base': base, 'source': 'real',
+                    'checks': [{'name': 'unit_check', 'cwd': '.',
+                                'argv': ['python3', '-c', 'print("ok")']}],
+                    'signature': 'sig-' + name, 'repository': str(repo), 'overlay': cover}
+            self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                               (name, 'p', 'family-' + name, 'validation', encode(spec), 0, time.time()))
+            items.append({'case': name, 'split': 'validation', 'sampled': True})
+        self.candidate({'dataset': {'manifest': items}, 'providers': []})
+        destination = self.root / 'bundle-mixed'
+        self.evolution.export_bundle('c', destination)
+
+        first_tree = self.case_tree(destination, 'case-first-1')
+        second_tree = self.case_tree(destination, 'case-second')
+        self.assertEqual(len(list((destination / 'repositories').iterdir())), 2)
+        self.assertEqual(self.case_tree(destination, 'case-first-2'), first_tree)
+        self.assertEqual(self.case_tree(destination, 'case-overlay'), first_tree)
+        self.assertNotEqual(second_tree, first_tree)
+        self.assertTrue((second_tree / 'second.txt').is_file())
+        self.assertFalse((first_tree / 'second.txt').exists())
+        # overlay 仍是该用例独有的一份，不被共享树吞掉。
+        self.assertTrue((destination / 'cases' / 'case-overlay' / 'overlay' / 'marker.txt').is_file())
+        self.assertEqual(json.loads((destination / 'cases' / 'case-overlay' / 'case.json')
+                                    .read_text(encoding='utf-8'))['overlay'], 'overlay')
+        self.assertFalse((destination / 'cases' / 'case-first-1' / 'overlay').exists())
+
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['reproducible'], result['limitations'])
+        rows = {row['case']: row for row in result['executed_checks']}
+        self.assertTrue(rows['case-overlay']['overlay_applied'])
+        self.assertFalse(rows['case-second']['overlay_applied'])
+        self.assertTrue(all(row['passed'] for row in result['executed_checks']))
+
+    def test_declared_unresolved_overlay_prevents_reproduction(self):
+        destination = self.sealed_bundle(repo_name='repo-bad-overlay')
+        case = destination / 'cases' / 'case-bad-overlay'
+        spec_path = case / 'case.json'
+        spec = json.loads(spec_path.read_text(encoding='utf-8'))
+        for declared in ('missing-overlay', '../../../protected-overlay', ''):
+            with self.subTest(overlay=declared):
+                spec['overlay'] = declared
+                spec_path.write_text(encode(spec), encoding='utf-8')
+                self.reseal_bundle(destination)
+                for run_checks in (False, True):
+                    result = Evolution.reproduce_bundle(
+                        destination, env={'PATH': '/usr/bin:/bin'}, run_checks=run_checks,
+                        which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+                    self.assertTrue(result['integrity']['valid'])
+                    self.assertFalse(result['reproducible'], result)
+                    self.assertTrue(any('overlay is missing or escapes the bundle' in msg
+                                        for msg in result['limitations']))
+                    if run_checks:
+                        self.assertFalse(result['checks_passed'])
+                        self.assertEqual(result['executed_checks'][0]['check'], None)
+                        self.assertIn('overlay', result['executed_checks'][0]['error'])
+
+    def test_bundle_reproduction_supports_legacy_case_repository_layout(self):
+        """旧包把树放在 cases/<id>/repository、case.json 记 "repository"：仍能复现。"""
+        destination = self.sealed_bundle(repo_name='repo-legacy')
+        case = destination / 'cases' / 'case-legacy'
+        shutil.move(str(self.case_tree(destination, 'case-legacy')), str(case / 'repository'))
+        (destination / 'repositories').rmdir()
+        spec = json.loads((case / 'case.json').read_text(encoding='utf-8'))
+        spec['repository'] = 'repository'
+        (case / 'case.json').write_text(encode(spec), encoding='utf-8')
+        self.reseal_bundle(destination)
+
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertTrue(result['reproducible'], result['limitations'])
+        self.assertEqual([row['passed'] for row in result['executed_checks']], [True])
 
     def sealed_bundle(self, checks=None, providers=None, evidence=None, repo_name='repo', overlay=None):
         """导出一个含单个用例的封存实验包，供 bundle 复现测试复用。"""
@@ -1967,7 +2118,7 @@ class AuditEvolutionTest(unittest.TestCase):
         # 中定位并真实执行，不能被当成「宿主缺少工具」而跳过全部检查。
         destination = self.sealed_bundle(repo_name='repo-relative-argv')
         case = destination / 'cases' / 'case-relative-argv'
-        script = case / 'repository' / 'run.sh'
+        script = self.case_tree(destination, 'case-relative-argv') / 'run.sh'
         script.write_text('#!/bin/sh\nexit 0\n')
         script.chmod(0o755)
         spec = json.loads((case / 'case.json').read_text(encoding='utf-8'))
@@ -2238,6 +2389,14 @@ class AuditEvolutionTest(unittest.TestCase):
         manifest['files'] = files
         (destination / 'bundle.json').write_text(encode(manifest), encoding='utf-8')
 
+    def case_tree(self, destination, case_id):
+        """按 case.json 的相对路径定位随包导出的仓库树；同 tree 的用例共用一份。"""
+        case = destination / 'cases' / case_id
+        spec = json.loads((case / 'case.json').read_text(encoding='utf-8'))
+        # 只要词法归一化，不解析符号链接：临时目录本身可能经符号链接访问
+        # （macOS 的 /var -> private/var），resolve() 会让路径脱离 destination。
+        return Path(os.path.normpath(case / spec['repository']))
+
     def test_bundle_reproduction_applies_sealed_overlay_in_staging_copy(self):
         # 线程 2：overlay-only 检查在一次性副本中可见并执行，bundle 内文件保持不变。
         destination = self.sealed_overlay_bundle()
@@ -2254,7 +2413,7 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual([row['check'] for row in result['executed_checks']],
                          ['sees_staging_copy', 'overlay_only_test'])
         # 覆盖层落盘脚本不在导出目录中：命令确实运行在一次性副本里。
-        self.assertFalse((destination / 'cases' / 'case-01' / 'repository' / 'sealed_marker.txt').exists())
+        self.assertFalse((self.case_tree(destination, 'case-01') / 'sealed_marker.txt').exists())
         for relative, digest in files_before.items():
             self.assertEqual(hashlib.sha256((destination / relative).read_bytes()).hexdigest(), digest,
                              relative)
@@ -2294,7 +2453,8 @@ class AuditEvolutionTest(unittest.TestCase):
         case_dir = destination / 'cases' / 'case-escape'
         outside = self.root / 'outside'
         outside.mkdir()
-        (case_dir / 'repository' / 'vendor').symlink_to(outside)
+        tree = self.case_tree(destination, 'case-escape')
+        (tree / 'vendor').symlink_to(outside)
         overlay = self.root / 'overlay-escape'
         (overlay / 'vendor').mkdir(parents=True)
         (overlay / 'vendor' / 'escaped.txt').write_text('escaped\n')
@@ -2306,7 +2466,7 @@ class AuditEvolutionTest(unittest.TestCase):
         # 未登记的符号链接条目在 verify_bundle 阶段就被拒绝，不再等到 staging。
         rejected = Evolution.verify_bundle(destination)
         self.assertFalse(rejected['valid'])
-        self.assertIn('cases/case-escape/repository/vendor', rejected['mismatches'])
+        self.assertIn((tree / 'vendor').relative_to(destination).as_posix(), rejected['mismatches'])
 
         # 即使完整性校验被绕过，复现侧仍要拒绝 overlay 经仓库内符号链接写到副本外。
         with patch.object(Evolution, 'verify_bundle',
@@ -2363,10 +2523,9 @@ class AuditEvolutionTest(unittest.TestCase):
             checks=[{'name': 'escaped_cwd', 'cwd': 'escape',
                      'argv': ['python3', '-c', 'open("ESCAPED", "w").write("1")']}],
             repo_name='repo-cwd-escape')
-        case_dir = destination / 'cases' / 'case-cwd-escape'
         outside = self.root / 'outside-cwd'
         outside.mkdir()
-        (case_dir / 'repository' / 'escape').symlink_to(outside)
+        (self.case_tree(destination, 'case-cwd-escape') / 'escape').symlink_to(outside)
 
         with patch.object(Evolution, 'verify_bundle',
                           return_value={'valid': True, 'mismatches': [], 'limitations': []}):
