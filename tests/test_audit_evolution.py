@@ -168,6 +168,64 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(json.loads(values_no_guidance[4]), ['t'])
         self.assertEqual(values_no_guidance[5], '')
 
+    def test_overlong_guidance_is_rejected_before_any_trial(self):
+        """超过试验注入上限的正文直接拒绝，不产生候选，也不把未评估部分标成已验证。"""
+        args = self.setup_proposal()
+        self.evolution.runtime.invoke = lambda *unused, **kwargs: {
+            'kind': 'strategy', 'guidance': 'x' * 2001, 'triggers': ['secret']}
+        with self.assertRaisesRegex(RuntimeError, 'exceeds 2000 characters'):
+            self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(self.calls['trial'], 0)
+        self.assertEqual(self.store.query("SELECT * FROM candidates WHERE status='reserved'"), [])
+        failed = self.store.query("SELECT * FROM candidates WHERE status='insufficient_evidence'")
+        self.assertEqual(len(failed), 1)
+        self.assertIn('exceeds 2000 characters', json.loads(failed[0]['evidence'])['reason'])
+        # 边界值 2000 仍被接受：上限不能靠一处静默截断来凑。
+        self.assertTrue(Evolution.validate_proposal(
+            {'kind': 'strategy', 'guidance': 'x' * 2000, 'triggers': ['secret']})[0])
+
+    def test_accepted_guidance_is_identical_in_evaluated_and_promoted_skill(self):
+        """被接受的提案在试验注入与晋升写库两条路径写出的正文逐字相同。"""
+        for length in (1, 2000):
+            proposal = {'kind': 'strategy', 'guidance': 'g' * length, 'triggers': ['secret']}
+            evaluated = Evolution.candidate_skill('candidate', proposal)
+            promoted = Evolution.skill_values('p', 'candidate', proposal, {}, 0)
+            self.assertEqual(evaluated['content'], promoted[5])
+            self.assertEqual(len(promoted[5]), length)
+
+    def test_mixed_trigger_types_are_identical_in_evaluated_and_promoted_skill(self):
+        proposal = {'kind': 'strategy', 'guidance': 'g', 'triggers': ['secret', 123, None, '  ']}
+        evaluated = Evolution.candidate_skill('candidate', proposal)
+        promoted = Evolution.promoted_skill('p', 'candidate', proposal, {}, 0)
+        assert promoted is not None
+        self.assertEqual(json.loads(promoted[4]), evaluated['triggers'])
+        self.assertEqual(json.loads(promoted[4]), ['secret', '  '])
+
+    def test_promotion_without_retrievable_triggers_writes_no_verified_skill(self):
+        """triggers 全为空的候选晋升后不写 verified 技能行，避免不可审计的检索记录。"""
+        args, observed = self.setup_ablation(triggers=(), auto_promote=True)
+        baseline = {'id': 'stable-kind', 'kind': 'strategy', 'content': {'guidance': 'old'}}
+        self.evolution.runtime.active_strategies = lambda project: [baseline]
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(result['status'], 'stable')
+        self.assertEqual(self.store.query('SELECT * FROM skills'), [])
+        self.assertIsNone(Evolution.promoted_skill('p', 'c', {'guidance': 'g', 'triggers': []}, {}, 0))
+        self.assertIsNone(Evolution.promoted_skill('p', 'c', {'guidance': 'g', 'triggers': ['   ']}, {}, 0))
+
+    def test_manual_promotion_without_triggers_writes_no_verified_skill(self):
+        """手动晋升与自动晋升一致：无可检索触发词时只切换策略，不写技能行。"""
+        self.store.execute("INSERT INTO projects(id,name,path,config,paused,created) "
+                           "VALUES ('p','p','/tmp/p','{}',0,0)")
+        for candidate, status in (('old', 'stable'), ('ready', 'ready')):
+            self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) '
+                               'VALUES (?,?,?,?,?,?,?)',
+                               (candidate, 'p', 'strategy', status,
+                                encode({'guidance': 'empty triggers', 'triggers': []}), encode({}), time.time()))
+        result = self.evolution.promote('ready')
+        self.assertEqual(result['status'], 'stable')
+        self.assertEqual(self.store.query('SELECT * FROM skills'), [])
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='old'")['status'], 'superseded')
+
     def test_auto_promote_with_valid_proposal_promotes_to_stable_and_writes_skills(self):
         args, observed = self.setup_ablation(auto_promote=True)
         baseline = {'id': 'stable-kind', 'kind': 'strategy', 'content': {'guidance': 'old'}}
