@@ -1187,6 +1187,53 @@ print('BOUNDARIES_OK')
         self.runtime.retry(task)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
 
+    def test_advanced_baseline_replan_reuses_the_implementation_checkpoint(self):
+        from adaptive_rsi import task_feedback
+        git(self.repo, "remote", "add", "origin", "https://github.com/example/project.git")
+        self.runtime.configure({"github": {"repository": "example/project"},
+                                "delivery": {"mode": "pr", "base_branch": "main"}}, self.project)
+        self.runtime.pause(self.project, False)
+        task = self.runtime.goal(self.project, "Fix addition")
+        base = git(self.repo, "rev-parse", "HEAD")
+        original = self.store.claim(self.project, self.runtime.config(self.project))
+        verdict = {"decision": "pass", "reason": "verified", "checks": {"candidate": [{"passed": True}]},
+                   "execution_environment": EXECUTION_IDENTITY}
+        ready = {"ready": True, "items": []}
+        with patch("adaptive_rsi.readiness.inspect", return_value=ready), \
+                patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base, "main")), \
+                patch.object(self.runtime.evaluator, "evaluate", return_value=verdict):
+            self.runtime.process(original)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (original["id"],))["state"],
+                         "awaiting_approval")
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("implementation"), 1)
+        # 主线被改写（不是快进）：publish 必须拒绝重放，仍按 superseded/requeue 重排。
+        (self.repo / "pyproject.toml").write_text('[project]\nname="fixture"\nversion="0.0.2"\n')
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",
+            "commit", "--quiet", "--amend", "--no-edit")
+        current = git(self.repo, "rev-parse", "HEAD")
+        approval = self.runtime.deliver(original["id"], automatic=True)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (approval,))["state"], "queued")
+        publishing = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertIsNotNone(publishing)
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), current, "main")), \
+                patch("adaptive_rsi.delivery.checked", return_value="[]"):
+            self.runtime.process(publishing)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (original["id"],))["state"], "superseded")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "blocked")
+        self.runtime.retry(task)
+        second = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertIsNotNone(second)
+        with patch("adaptive_rsi.readiness.inspect", return_value=ready), \
+                patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), current, "main")), \
+                patch.object(self.runtime.evaluator, "evaluate", return_value=verdict):
+            self.runtime.process(second)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (second["id"],))["state"],
+                         "awaiting_approval",
+                         self.store.one("SELECT result FROM runs WHERE id=?", (second["id"],))["result"])
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("implementation"), 1)
+        self.assertIn("implementation", task_feedback.summary(self.store, second["id"])["reused_stages"])
+
     def test_historical_service_differences_do_not_starve_rejoining_projects(self):
         other = self.runtime.add_project(fixture(self.root / "other"))
         counts = {self.project: 0, other: 0}

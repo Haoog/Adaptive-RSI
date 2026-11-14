@@ -773,12 +773,18 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         acceptance["contract"] = contract
         (directory / "acceptance.json").write_text(encode(acceptance), encoding="utf-8")
     implementation_config, _ = _stage_config(config, "implementation")
-    candidate_key = fingerprint({"inputs": signature(run, task, base, strategies, implementation_config),
-                                 "dependencies": environment["sha256"], "outcomes": planning_outcomes, "prs": open_prs,
-                                 "related_work": overlaps, "issue_comments": comment_evidence, "pr_feedback": pr_feedback,
-                                 "skills": skill_evidence,
-                                 "plan": plan, "acceptance_hash": acceptance["hash"] if acceptance else None,
-                                 "test_first": test_first, "checks": checks})
+    cached_inputs = {"dependencies": environment["sha256"], "outcomes": planning_outcomes, "prs": open_prs,
+                     "related_work": overlaps, "issue_comments": comment_evidence, "pr_feedback": pr_feedback,
+                     "skills": skill_evidence,
+                     "plan": plan, "acceptance_hash": acceptance["hash"] if acceptance else None,
+                     "test_first": test_first, "checks": checks}
+    candidate_key = fingerprint({**cached_inputs,
+                                 "inputs": signature(run, task, base, strategies, implementation_config)})
+    # 实现阶段与基线解耦：主线前进后 run 会重新排队并重新规划，但同一计划产出的
+    # 补丁仍然有效。用不含 base 的键找回该补丁，评估仍用含 base 的 candidate_key，
+    # 旧基线上的验收结论不会因复用补丁而跳过。
+    implementation_key = fingerprint({**cached_inputs,
+                                      "inputs": signature(run, task, None, strategies, implementation_config)})
     saved_candidate = None if experiment else cached(runtime, run, "validated_candidate", candidate_key)
     saved_implementation = None
     if saved_candidate is None and not experiment and task["source"] != "rollback":
@@ -788,7 +794,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         # the sealed patch instead of paying for the same implementation call
         # again.  Replay never carries a verdict, so evaluation, review and the
         # scope gate still run on the replayed patch.
-        saved_implementation = cached(runtime, run, "implementation", candidate_key,
+        saved_implementation = cached(runtime, run, "implementation", implementation_key,
                                       normalize=_reusable_implementation)
     baseline = snapshot(source, directory / "baseline", base)
     acceptance_executor = None
@@ -815,24 +821,29 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         transition("executing")
     acceptance_baseline = None
     try:
-        if saved_candidate:
-            result = {"summary": saved_candidate["summary"]}
-            patch = saved_candidate["patch"]
-            if fingerprint(patch) != saved_candidate["patch_hash"]:
-                raise RuntimeError("Saved candidate evidence changed; retry refused")
+        replay = saved_candidate if saved_candidate is not None else saved_implementation
+        if replay is not None:
+            result = {"summary": replay["summary"]}
+            patch = replay["patch"]
+            if fingerprint(patch) != replay["patch_hash"]:
+                # 两条重放来源的取证含义不同：候选阶段已带验收结论，实现阶段
+                # 只是封存补丁。恢复各自文案，运维才能判断该重跑哪一段。
+                raise RuntimeError("Saved %s evidence changed; retry refused" %
+                                   ("candidate" if saved_candidate is not None else "implementation"))
             (directory / "resume.patch").write_text(patch + "\n", encoding="utf-8")
-            git(workspace, "apply", "--index", str(directory / "resume.patch"))
-        elif saved_implementation is not None:
-            result = {"summary": saved_implementation["summary"]}
-            patch = saved_implementation["patch"]
-            if fingerprint(patch) != saved_implementation["patch_hash"]:
-                raise RuntimeError("Saved implementation evidence changed; retry refused")
-            (directory / "resume.patch").write_text(patch + "\n", encoding="utf-8")
-            git(workspace, "apply", "--index", str(directory / "resume.patch"))
-        elif task["source"] == "rollback":
+            try:
+                git(workspace, "apply", "--index", str(directory / "resume.patch"))
+            except ProcessError:
+                if saved_candidate is not None:
+                    raise
+                # 主线在同一文件上已有其他改动时，已保存的补丁可能不再适用；
+                # 这属于缓存未命中，应重新实现，而不是把可恢复的基线变化
+                # 判成执行故障。
+                replay = None
+        if replay is None and task["source"] == "rollback":
             git(workspace, "apply", "--reverse", str(patch_path))
             result = {"summary": "Reversed only the saved patch from run " + prior["id"]}
-        else:
+        elif replay is None:
             if test_first:
                 test_instruction = ("Add 1..8 new regression test files within the provided regression_test_scope. "
                                     "At least one must fail on the unchanged baseline; all must pass with the fix. Do not edit existing tests, "
@@ -907,7 +918,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             # failure must be recoverable by replaying this exact change.
             save(runtime, run, "implementation", {"files": files, "patch": patch,
                                                   "patch_hash": fingerprint(patch),
-                                                  "summary": result["summary"]}, candidate_key)
+                                                  "summary": result["summary"]}, implementation_key)
         transition("evaluating")
         if experiment:
             # 实验路径不写 runs.state，必须在评估工作开始前显式起算评估相位。
@@ -966,7 +977,9 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         # A completed evaluation that did not pass rejects this exact patch, so
         # the retry must implement again rather than replay it unchanged; only
         # runs that never reached a verdict keep the implementation checkpoint.
-        runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage IN ('validated_candidate','implementation') AND run IN (SELECT id FROM runs WHERE task=?)", (candidate_key, task["id"]))
+        runtime.store.execute("DELETE FROM stages WHERE stage IN ('validated_candidate','implementation') "
+                              "AND signature IN (?,?) AND run IN (SELECT id FROM runs WHERE task=?)",
+                              (candidate_key, implementation_key, task["id"]))
         return {**evaluation, "evaluation": evaluation}
     if not experiment and evaluation["decision"] == "pass":
         runtime.store.put_setting("verified-checks:" + project["id"], {"base": base, "checks": checks,
@@ -1039,7 +1052,9 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         save(runtime, run, "review", review, review_key)
         if review["decision"] != "pass":
             # A rejected patch must be implemented again, not replayed unchanged.
-            runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage IN ('validated_candidate','implementation') AND run IN (SELECT id FROM runs WHERE task=?)", (candidate_key, task["id"]))
+            runtime.store.execute("DELETE FROM stages WHERE stage IN ('validated_candidate','implementation') "
+                                  "AND signature IN (?,?) AND run IN (SELECT id FROM runs WHERE task=?)",
+                                  (candidate_key, implementation_key, task["id"]))
     outcome = {"decision": review["decision"] if evaluation["decision"] == "pass" else evaluation["decision"], "reason": review["reason"], "summary": result["summary"], "files": files,
                "evaluation": evaluation, "review": review, "risk": plan["risk"], "base": base,
                "risk_review": risk_review,
