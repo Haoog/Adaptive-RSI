@@ -703,6 +703,7 @@ const english = {
   "登录失败，请查看提示后重试。": "Sign-in failed. Check the message and try again.",
   "登录已中断，请重新登录。": "Sign-in interrupted. Start again.",
   "正在读取账号状态…": "Reading account status…",
+  "账号状态读取失败，正在重试。": "Could not read account status. Retrying shortly.",
   "先选择 OpenCode 供应商": "First choose an OpenCode provider",
   "OpenCode 供应商": "OpenCode provider",
   "选择供应商": "Choose a provider",

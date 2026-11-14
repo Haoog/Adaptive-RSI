@@ -1,6 +1,6 @@
 'use strict';
 window.RSIAuth = (() => {
-  let snapshot=null,providers=null,context=null,providerQuery='',loading=null,pending=false,polling=false,pollingStopped=false,timer=null;
+  let snapshot=null,providers=null,context=null,providerQuery='',loading=null,pending=false,polling=false,pollingStopped=false,timer=null,statusError=null,statusAttempts=0,statusTimer=null;
   const sessions=new Map(),selections=new Map();
   // 记住每个后端上次的供应商选择，重开页面后不必重新查找。
   try{for(const [backend,provider] of Object.entries(JSON.parse(localStorage.getItem('rsi-auth-selection')||'{}')))selections.set(backend,provider);}catch{}
@@ -10,6 +10,8 @@ window.RSIAuth = (() => {
   }
   const authErrors={invalid_response:'登录服务返回格式不兼容，请更新运行机器上的工具后重试。',auth_credentials_busy:'模型正在使用此账号，请暂停项目并等待当前调用结束后重试。',auth_container_unavailable:'服务器的容器服务不可用，请启动 Docker 后重试。',auth_worker_image_missing:'服务器尚未准备认证运行镜像，请先完成运行环境安装。',auth_storage_failed:'运行机器的状态目录不可写（可能磁盘已满或只读），请清理磁盘或修复权限后重试。',codex_missing:'请先在运行机器安装 Codex，再返回页面登录。',opencode_missing:'请先在运行机器安装 OpenCode，再返回页面登录。',opencode_version_unknown:'无法确认 OpenCode 版本，请升级 Adaptive RSI，或临时使用 OpenCode 1.19.3。',invalid_provider:'请重新选择供应商。',invalid_auth_method:'请刷新供应商列表后重新选择登录方式。',invalid_auth_inputs:'请填写官方登录需要的信息。',invalid_auth_code:'请重新粘贴官方页面的授权码。',invalid_api_key:'请输入有效的供应商密钥。',unsupported_auth_method:'此登录方式暂不支持远程页面，请使用供应商密钥。',auth_busy:'已有登录正在进行，请先完成或取消。',device_auth_unavailable:'设备登录暂不可用，请在账号设置中启用设备授权后重试。',authorization_failed:'官方授权未完成，请重新登录。',auth_protocol_error:'登录响应无法识别，请更新运行机器上的工具后重试。',auth_timeout:'等待登录超时，请重新登录。',auth_expired:'登录已过期，请重新登录。',process_interrupted:'登录已中断，请重新登录。',invalid_credentials:'账号凭据失效，请重新登录。',unknown_session:'登录会话已结束，请重新登录。',service_closed:'服务正在关闭，请刷新页面后重试。',invalid_auth_state:'此登录步骤已结束，请重新登录。'};
   const terminal=new Set(['completed','cancelled','expired','failed','interrupted']);
+  // 读取失败的会话状态按 5s/15s/60s 退避重试，避免一次瞬时故障永久停在旧快照。
+  const statusRetry=[5000,15000,60000];
   const labels={authenticated:'账号已连接',signed_out:'尚未登录',unavailable:'运行机器尚未安装此工具',starting:'正在准备官方登录…',awaiting_authorization:'等待你在官方页面完成授权',completing:'正在确认授权…',completed:'登录成功，正在更新模型目录。',cancelled:'已取消登录',expired:'登录已过期，请重新登录。',failed:'登录失败，请查看提示后重试。',interrupted:'登录已中断，请重新登录。'};
   function authMessage(code,fallback){
     const match=String(code||'').match(/^opencode_incompatible_(\d+\.\d+\.\d+)$/);
@@ -29,18 +31,27 @@ window.RSIAuth = (() => {
     context.provider=preferred.id;selections.set(context.backend,preferred.id);return true;
   }
   async function status(force=false){
-    if(loading)return loading;if(snapshot&&!force)return;
-    loading=(async()=>{snapshot=await api('auth/status');
+    if(loading)return loading;if(snapshot&&!force&&!statusError)return;
+    clearTimeout(statusTimer);statusTimer=null;
+    loading=(async()=>{
+      try{snapshot=await api('auth/status');}catch(error){statusError=error;statusAttempts++;render();schedule();throw error;}
+      statusError=null;let failed=false;
       for(const metadata of snapshot.sessions||[]){const id=metadata.backend+':'+(metadata.provider||'');if(terminal.has(metadata.state)||sessions.get(id)?.id===metadata.id)continue;
-        const recovered=await api('auth/session?id='+encodeURIComponent(metadata.id)),refresh=context?.backend===metadata.backend?context.refresh:()=>api('model-center/fetch',{provider:metadata.backend==='codex'?'openai':'opencode',project:null});sessions.set(id,{...recovered,refresh});
-        if(context?.backend===metadata.backend&&!context.provider&&metadata.provider){context.provider=metadata.provider;selections.set(metadata.backend,metadata.provider);}
-      }selectPreferredProvider();render();schedule();
+        // 单条会话恢复失败不能中断整次读取，否则快照短路会让登录面板永久停在旧状态。
+        try{const recovered=await api('auth/session?id='+encodeURIComponent(metadata.id)),refresh=context?.backend===metadata.backend?context.refresh:()=>api('model-center/fetch',{provider:metadata.backend==='codex'?'openai':'opencode',project:null});sessions.set(id,{...recovered,refresh});
+          if(context?.backend===metadata.backend&&!context.provider&&metadata.provider){context.provider=metadata.provider;selections.set(metadata.backend,metadata.provider);}
+        }catch(error){statusError=error;failed=true;}
+      }statusAttempts=failed?statusAttempts+1:0;
+      selectPreferredProvider();render();schedule();
     })().finally(()=>loading=null);return loading;
   }
   async function getProviders(){if(providers)return;const result=await api('auth/providers?backend=opencode');providers=Array.isArray(result)?result:result.providers;
     selectPreferredProvider();render();}
   async function mutate(path,body){pending=true;render();try{return await api('auth/'+path,body);}catch(error){error.message=authMessage(error.code,error.message);throw error;}finally{pending=false;render();}}
-  function schedule(){clearTimeout(timer);if(!pollingStopped&&[...sessions.values()].some(s=>!terminal.has(s.state)||s.refreshStage)){const delay=document.visibilityState==='hidden'?30000:1500;timer=setTimeout(()=>safe(poll),delay);}}
+  function schedule(){clearTimeout(timer);if(!pollingStopped&&[...sessions.values()].some(s=>!terminal.has(s.state)||s.refreshStage)){const delay=document.visibilityState==='hidden'?30000:1500;timer=setTimeout(()=>safe(poll),delay);}
+    if(!statusError||pollingStopped){clearTimeout(statusTimer);statusTimer=null;return;}
+    // 已排队的重试不因轮询被反复推迟；每次失败只推进一档退避。
+    if(statusTimer===null){const delay=statusRetry[Math.min(statusAttempts,statusRetry.length)-1]||statusRetry[0];statusTimer=setTimeout(()=>{statusTimer=null;safe(()=>status(true));},delay);}}
   async function refreshCompleted(id,session){
     if(session.refreshing||sessions.get(id)!==session)return;session.refreshing=true;
     try{
@@ -107,6 +118,7 @@ window.RSIAuth = (() => {
     if(connected&&$('mc-step-models')?.dataset.state==='pending')$('mc-step-models').dataset.state='current';
     box.append(text('h3','账号连接'),text('p',snapshot?(connected?'账号已连接':account?.available===false?'运行机器尚未安装此工具':'尚未登录'):'正在读取账号状态…','mc-secondary'));
     if(account?.error)box.append(el('p',authMessage(account.error,account.error),'mc-error'));
+    if(statusError){const retry=text('p','账号状态读取失败，正在重试。','mc-secondary');retry.setAttribute('role','status');box.append(retry);}
     if(backend==='opencode'){
       box.append(text('p','OpenCode Go 使用 API Key。请在供应商列表选择对应的 OpenCode 服务并保存密钥；ChatGPT 登录不提供 Go 凭据。','mc-secondary'));
       const guide=external('https://opencode.ai/v2/docs/console/go/','OpenCode Go 官方说明');if(guide)box.append(guide);
