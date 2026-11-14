@@ -14,9 +14,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from adaptive_rsi.config import validate
-from adaptive_rsi.runtime import Runtime
+from adaptive_rsi.runtime import Runtime, STAGE_BUDGET_CHECKPOINT_SECONDS
 from adaptive_rsi.store import Store, encode
 from tests.test_runtime import FakeAgent, fixture
+
+# 未修复时取消轮询会等满 store 的 15 秒 busy timeout（或被测试里的 gate 卡 5 秒）；
+# 阈值放宽到 2 秒只为区分这两种失败，避免共享 CI 机器上的调度抖动误报。
+PROMPT_RETURN_SECONDS = 2.0
 
 
 class RuntimeHandoffTest(unittest.TestCase):
@@ -339,6 +343,188 @@ class RuntimeHandoffTest(unittest.TestCase):
             self.assertFalse(self.runtime.is_cancelled(trial))
             self.assertEqual(self.store.setting('stage-budget:' + task)['preparation'], 35.0)
 
+    def test_checkpoint_write_blocking_does_not_hold_the_clock_lock(self):
+        """检查点写库阻塞时不占时钟锁：阶段切换与取消轮询不必等这次写。"""
+        task, run = self.claim()
+        clock = [1000.0]
+        run['_stage_used'] = {'preparation': 0.0, 'evaluation': 0.0}
+        run['_deadline_stage'], run['_deadline_started'] = 'preparation', clock[0]
+        run['_deadline_checkpoint'] = clock[0]
+        entered, gate = threading.Event(), threading.Event()
+        original = self.runtime._persist_stage_budget
+        def slow(*args, **kwargs):
+            entered.set()
+            gate.wait(5)
+            return original(*args, **kwargs)
+        with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]), \
+             patch.object(self.runtime, '_persist_stage_budget', side_effect=slow):
+            clock[0] += 20.0
+            poller = threading.Thread(target=lambda: self.runtime.is_cancelled(run))
+            poller.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                for action in (lambda: self.runtime.begin_phase(run, 'evaluation'),
+                               lambda: self.runtime.is_cancelled(run)):
+                    started = time.perf_counter()
+                    action()
+                    self.assertLess(time.perf_counter() - started, PROMPT_RETURN_SECONDS)
+            finally:
+                gate.set()
+                poller.join(5)
+        self.assertFalse(poller.is_alive())
+
+    def test_invoke_reads_run_state_outside_the_clock_lock(self):
+        """invoke 的 runs.state 查询在锁外：慢查询不挡别的线程推进阶段。"""
+        task, run = self.claim()
+        query, entered, gate = self.store.one, threading.Event(), threading.Event()
+        def slow(sql, args=()):
+            if 'SELECT state FROM runs' in sql:
+                entered.set()
+                gate.wait(5)
+            return query(sql, args)
+        results, errors = [], []
+        def call():
+            try:
+                results.append(self.runtime.invoke('planning', 'prompt', self.root / 'workspace', run))
+            except Exception as error:
+                errors.append(error)
+        with patch.object(self.store, 'one', side_effect=slow), \
+             patch.object(self.runtime.agent, 'invoke', return_value='ok'):
+            worker = threading.Thread(target=call)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                started = time.perf_counter()
+                self.runtime.begin_phase(run, 'evaluation')
+                self.assertLess(time.perf_counter() - started, PROMPT_RETURN_SECONDS)
+            finally:
+                gate.set()
+                worker.join(5)
+        self.assertEqual((errors, results), ([], ['ok']))
+
+    def test_busy_database_drops_a_checkpoint_without_stalling_the_cancel_poll(self):
+        """DB 写锁被占用时取消轮询立即返回：本轮检查点丢弃，下个间隔补写。"""
+        task, run = self.claim()
+        clock = [1000.0]
+        run['_stage_used'] = {'preparation': 0.0, 'evaluation': 0.0}
+        run['_deadline_stage'], run['_deadline_started'] = 'preparation', clock[0]
+        run['_deadline_checkpoint'] = clock[0] - STAGE_BUDGET_CHECKPOINT_SECONDS
+        self.store.setting('warm-up')  # 预热连接池，建连耗时不计入下面的断言
+        blocker = sqlite3.connect(self.store.path, timeout=15)
+        probe = sqlite3.connect(self.store.path, timeout=0)
+        try:
+            blocker.execute('BEGIN IMMEDIATE')
+            with self.assertRaises(sqlite3.OperationalError):
+                probe.execute("INSERT OR REPLACE INTO settings VALUES ('checkpoint-probe','1')")
+            with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]):
+                clock[0] += 20.0
+                started = time.perf_counter()
+                self.assertFalse(self.runtime.is_cancelled(run))
+                self.assertLess(time.perf_counter() - started, PROMPT_RETURN_SECONDS)
+                # 占住写锁的那一轮不产生账本，只损失这个检查点窗口。
+                self.assertIsNone(blocker.execute("SELECT value FROM settings WHERE key=?",
+                                                  ('stage-budget:' + task,)).fetchone())
+        finally:
+            probe.close()
+            blocker.rollback()
+            blocker.close()
+        with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]):
+            clock[0] += STAGE_BUDGET_CHECKPOINT_SECONDS
+            self.assertFalse(self.runtime.is_cancelled(run))
+        self.assertEqual(self.store.setting('stage-budget:' + task),
+                         {'preparation': 35.0, 'evaluation': 0.0, 'run': run['id']})
+
+    def test_blocked_checkpoint_does_not_queue_another_runs_cancel_poll(self):
+        """一个 run 的检查点卡在存储上时，别的 run 的取消轮询不排进程级写锁。"""
+        # 两个项目各自一个 run：互不相关，取消轮询不应为对方的检查点排队。
+        other = self.runtime.add_project(fixture(self.root / 'other-project'))
+        self.runtime.configure({'sources': {'inspection': False, 'issues': False},
+                                'evolution': {'enabled': False}}, other)
+        tasks = [self.runtime.goal(self.project, 'Check boundary A'),
+                 self.runtime.goal(other, 'Check boundary B')]
+        for project in (self.project, other):
+            self.runtime.pause(project, False)
+        runs = [self.store.claim(project, self.runtime.config(project))
+                for project in (self.project, other)]
+        clock = [1000.0]
+        for run in runs:
+            run['_stage_used'] = {'preparation': 0.0, 'evaluation': 0.0}
+            run['_deadline_stage'], run['_deadline_started'] = 'preparation', clock[0]
+            run['_deadline_checkpoint'] = clock[0]
+        entered, gate = threading.Event(), threading.Event()
+        writer, connect = None, self.store.connect
+
+        def stalled():
+            if threading.current_thread() is writer:
+                entered.set()
+                gate.wait(5)
+            return connect()
+
+        def checkpoint():
+            snapshot = self.runtime._stage_budget_snapshot(runs[0], clock[0] + 20.0, keep=True)
+            self.runtime._persist_stage_budget(*snapshot, keep=True)
+
+        with patch.object(self.store, 'connect', side_effect=stalled), \
+             patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]):
+            writer = threading.Thread(target=checkpoint)
+            writer.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                clock[0] += 20.0
+                started = time.perf_counter()
+                self.assertFalse(self.runtime.is_cancelled(runs[1]))
+                self.assertLess(time.perf_counter() - started, PROMPT_RETURN_SECONDS)
+            finally:
+                gate.set()
+                writer.join(5)
+        self.assertFalse(writer.is_alive())
+        # 卡住的那次写最终落盘；撞车的另一个 run 只丢这一轮检查点，账本留给下个间隔。
+        self.assertEqual(self.store.setting('stage-budget:' + tasks[0]),
+                         {'preparation': 20.0, 'evaluation': 0.0, 'run': runs[0]['id']})
+        self.assertIsNone(self.store.setting('stage-budget:' + tasks[1]))
+
+    def test_checkpoint_writes_never_regress_the_stage_ledger(self):
+        """连续检查点与乱序完成的写都按阶段取最大值，账本只增不减。"""
+        task, run = self.claim()
+        key = 'stage-budget:' + task
+        clock = [1000.0]
+        run['_stage_used'] = {'preparation': 0.0, 'evaluation': 0.0}
+        run['_deadline_stage'], run['_deadline_started'] = 'preparation', clock[0]
+        run['_deadline_checkpoint'] = clock[0]
+        observed = []
+        with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]):
+            for step in (20.0, 15.0):
+                clock[0] += step
+                self.assertFalse(self.runtime.is_cancelled(run))
+                observed.append(self.store.setting(key))
+        self.assertEqual([item['preparation'] for item in observed], [20.0, 35.0])
+        # 另一轮轮询算得更早、写得更晚：旧快照不能把已记录的额度改回去。
+        self.runtime._persist_stage_budget(key, {'preparation': 20.0, 'evaluation': 0.0}, run['id'], True)
+        self.assertEqual(self.store.setting(key), {'preparation': 35.0, 'evaluation': 0.0, 'run': run['id']})
+
+    def test_run_process_cancel_is_not_delayed_by_a_blocked_checkpoint_write(self):
+        """取消轮询撞上 DB 写忙时，子进程仍应立即被 SIGKILL 而不是等满 busy timeout。"""
+        from adaptive_rsi.process import Cancelled, run_process
+        task, run = self.claim()
+        run['_stage_used'] = {'preparation': 0.0, 'evaluation': 0.0}
+        run['_deadline_stage'], run['_deadline_started'] = 'preparation', time.monotonic() - 20
+        run['_deadline_checkpoint'] = time.monotonic() - STAGE_BUDGET_CHECKPOINT_SECONDS
+        self.store.setting('warm-up')
+        blocker = sqlite3.connect(self.store.path, timeout=15)
+        timer = threading.Timer(.3, lambda: run.setdefault('_timed_out_stage', 'preparation'))
+        try:
+            blocker.execute('BEGIN IMMEDIATE')
+            timer.start()
+            started = time.monotonic()
+            with self.assertRaises(Cancelled):
+                run_process([sys.executable, '-c', 'import time; time.sleep(10)'], timeout=20,
+                            cancel=lambda: self.runtime.is_cancelled(run))
+            self.assertLess(time.monotonic() - started, 2)
+        finally:
+            timer.cancel()
+            blocker.rollback()
+            blocker.close()
+
     def test_terminal_run_budget_residue_is_discarded_before_loading(self):
         """终态提交后、finally 之前崩溃留下的键不能把旧消耗带进下一次尝试。"""
         from adaptive_rsi.gitops import git
@@ -367,6 +553,47 @@ class RuntimeHandoffTest(unittest.TestCase):
             self.runtime.process(retried)
         # 失败后的新尝试从满额度起算，残留键在载入时已被丢弃。
         self.assertEqual(observed, [{'preparation': 0.0, 'evaluation': 0.0}, None])
+
+    def test_late_finished_checkpoint_cannot_recreate_empty_ledger(self):
+        task, stale = self.claim()
+        self.store.execute("UPDATE runs SET state='failed',ended=? WHERE id=?", (time.time(), stale['id']))
+        self.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (task,))
+        self.runtime.retry(task)
+        retried = self.store.claim(self.project, self.runtime.config(self.project))
+        key = 'stage-budget:' + task
+        self.runtime._persist_stage_budget(key, {'preparation': 60.0, 'evaluation': 0.0}, stale['id'], True)
+        self.assertIsNone(self.store.setting(key))
+        self.assertEqual(self.runtime._load_stage_budget(retried),
+                         {'preparation': 0.0, 'evaluation': 0.0})
+        # A delayed interrupted attempt also cannot create a ledger after a newer claim.
+        self.store.execute("UPDATE runs SET state='interrupted' WHERE id=?", (stale['id'],))
+        self.runtime._persist_stage_budget(key, {'preparation': 60.0, 'evaluation': 0.0}, stale['id'], True)
+        self.assertIsNone(self.store.setting(key))
+
+    def test_stale_checkpoint_from_completed_attempt_cannot_charge_the_retry(self):
+        """已完成尝试的迟到检查点既不能把旧消耗并入新账本，也不能覆盖新账本。"""
+        task, stale = self.claim()
+        # 上一尝试已写终态（非 interrupted）：它的 finally 因写锁被占而丢了收尾写，
+        # 迟到的检查点随后才落地——此时新一轮已经载入并开始记账。
+        self.store.execute("UPDATE runs SET state='failed',ended=? WHERE id=?", (time.time(), stale['id']))
+        self.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (task,))
+        self.runtime.retry(task)
+        retried = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertNotEqual(retried['id'], stale['id'])
+        key = 'stage-budget:' + task
+        self.assertIsNone(self.store.setting(key))
+        self.runtime._persist_stage_budget(key, {'preparation': 60.0, 'evaluation': 0.0}, stale['id'], True)
+        # 新一轮自己的快照不得继承旧尝试的 60 秒（否则剩余预算被凭空吃掉）。
+        self.runtime._persist_stage_budget(key, {'preparation': 20.0, 'evaluation': 1.0}, retried['id'], True)
+        self.assertEqual(self.store.setting(key),
+                         {'preparation': 20.0, 'evaluation': 1.0, 'run': retried['id']})
+        # 反向：旧尝试再迟到一次（含收尾删除）也不得改写新账本。
+        self.runtime._persist_stage_budget(key, {'preparation': 60.0, 'evaluation': 0.0}, stale['id'], True)
+        self.assertEqual(self.store.setting(key),
+                         {'preparation': 20.0, 'evaluation': 1.0, 'run': retried['id']})
+        self.runtime._persist_stage_budget(key, {'preparation': 0.0, 'evaluation': 0.0}, stale['id'], False)
+        self.assertEqual(self.store.setting(key),
+                         {'preparation': 20.0, 'evaluation': 1.0, 'run': retried['id']})
 
     def test_trial_phase_clock_ignores_parent_planning_and_propagates_timeout(self):
         _, parent = self.claim()
