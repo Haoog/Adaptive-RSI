@@ -164,6 +164,90 @@ class AuthSessionTests(unittest.TestCase):
             if 'reader' in locals():
                 reader.join(3)
 
+    def test_reserve_rejects_during_api_key_install(self):
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+        def factory(backend):
+            worker = FakeAuth(backend)
+            self.created.append(worker)
+            worker.capabilities = types.SimpleNamespace(modern=True)
+            worker.set_api_key = lambda *args: None
+            worker.export_credential = lambda *args: [{'fixture': True}]
+            def install(*args):
+                entered.set()
+                release.wait(5)
+            worker.install_credential = install
+            return worker
+        self.manager.factory = factory
+        def save():
+            try:
+                self.manager.set_api_key('opencode', 'openai', 'fixture')
+            except Exception as exc:
+                errors.append(exc)
+        writer = threading.Thread(target=save)
+        writer.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            with self.assertRaises(AuthError) as caught:
+                self.manager.reserve('opencode', 'openai')
+            self.assertEqual(caught.exception.code, 'auth_busy')
+        finally:
+            release.set()
+            writer.join(5)
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.manager.reserve('opencode', 'openai')['state'], 'starting')
+
+    def test_reserve_does_not_wait_for_blocked_credential_install(self):
+        entered, release = threading.Event(), threading.Event()
+        session = self.manager.reserve("opencode", "openai")
+        worker = FakeAuth("opencode")
+        self.created.append(worker)
+        worker.capabilities = types.SimpleNamespace(modern=True)
+        worker.export_credential = lambda provider: [{"fixture": True}]
+        installed = []
+
+        def install(provider, value):
+            entered.set()
+            release.wait(3)
+            installed.append((provider, value))
+
+        worker.install_credential = install
+        writer = threading.Thread(target=self.manager._save,
+                                  args=(worker, "opencode", "openai", session["id"], threading.Event()))
+        writer.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            started = time.monotonic()
+            # reserve() 在 /api/auth/start 的 dispatch_lock 临界区内调用；凭据写入
+            # （子进程/fsync）期间它必须立刻返回 auth_busy，而不是等满整段写入。
+            with self.assertRaises(AuthError) as raised:
+                self.manager.reserve("opencode", "openai")
+            self.assertEqual(raised.exception.code, "auth_busy")
+            self.assertLess(time.monotonic() - started, 0.2)
+            started = time.monotonic()
+            self.manager.snapshot()
+            self.assertLess(time.monotonic() - started, 0.1)
+            self.assertEqual(self.manager.status(session["id"])["state"], "starting")
+            self.assertEqual(self.manager.busy, 1)
+            self.assertEqual(installed, [])
+            # 写入中取消会被拒绝，避免「已取消却仍安装凭据」；不是新错误码。
+            with self.assertRaises(AuthError) as cancelled:
+                self.manager.cancel(session["id"])
+            self.assertEqual(cancelled.exception.code, "auth_credentials_busy")
+            with patch.object(self.manager, 'now', return_value=session['expires_at'] + 1):
+                self.assertEqual(self.manager.busy, 1)
+                with self.assertRaises(AuthError) as completed:
+                    self.manager.complete(session['id'], 'fixture')
+                self.assertEqual(completed.exception.code, 'invalid_auth_state')
+                self.assertEqual(self.manager.status(session['id'])['state'], 'starting')
+        finally:
+            release.set()
+            writer.join(3)
+        self.assertEqual(installed, [("openai", [{"fixture": True}])])
+        self.assertEqual(self.manager.status(session["id"])["state"], "completed")
+        self.assertEqual(self.manager.busy, 0)
+
     def test_busy_tolerates_session_pruned_during_status(self):
         session = self.manager.reserve('opencode', 'openai')
         original = self.manager.status
