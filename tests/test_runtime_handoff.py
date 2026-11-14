@@ -1779,3 +1779,93 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.store.put_setting(KEY, ['not', 'a', 'barrier'])
         self.assertIsNone(barrier(self.runtime))
         self.assertIsNone(self.store.setting(KEY))
+
+
+class DispatchClaimSkipTest(unittest.TestCase):
+    """claim 主动跳过一个项目的候选时，调度器不能结束整个 tick。
+
+    旧行为：min(rank) 选中的项目 claim 返回 None 就 return，同一 tick 的其他
+    项目和空闲并发都领不到工作；该项目的公平账本不前进，下个 tick 仍排第一，
+    形成无事件的持续饿死。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.store = Store(self.root / 'state')
+        self.runtime = Runtime(self.store, FakeAgent())
+        self.project = self.runtime.add_project(fixture(self.root / 'project'))
+        self.runtime.configure({'sources': {'inspection': False, 'issues': False},
+                                'evolution': {'enabled': False},
+                                'schedule': {'working_hours': [0, 24]}})
+        self.runtime.pause(self.project, False)
+
+    def tearDown(self):
+        self.runtime.close()
+        self.tmp.cleanup()
+
+    def pending_publish(self, project):
+        """ready_clause 认可、但 claim 因 issue-sync 快照 pending 跳过的发布任务。"""
+        issue = self.store.add_task(project, 'issue', 'issue:owner/project:7', 'Issue 7', priority=1)
+        self.store.execute("UPDATE tasks SET state='merged' WHERE id=?", (issue,))
+        self.store.execute("INSERT INTO runs(id,task,project,state,config,started,ended) "
+                           "VALUES (?,?,?,'merged','{}',0,1)", ('issue-run:' + project, issue, project))
+        publication = self.store.add_task(project, 'system_publish', 'publish:issue-run:' + project,
+                                          'Publish', body='issue-run:' + project, priority=99)
+        self.store.put_setting('issue-sync:' + project,
+                               {'repository': 'owner/project', 'pending': {'7': {}}})
+        return publication
+
+    def extra_project(self, identifier):
+        self.store.execute("INSERT INTO projects VALUES (?,?,?,?,0,?)",
+                           (identifier, identifier, str(self.root / identifier), '{}', time.time()))
+        return identifier
+
+    def dispatch_with(self, projects, concurrency):
+        self.runtime.configure({'limits': {'concurrency': concurrency}})
+        claimed = []
+
+        class Pool:
+            def submit(_, fn, run):
+                claimed.append(run)
+                future = concurrent.futures.Future()
+                future.set_result(None)
+                return future
+
+        eligible = [(self.runtime.project(p), self.runtime.config(p)) for p in projects]
+        with patch.object(self.runtime, 'pool', Pool()):
+            self.runtime.dispatch(eligible)
+        return claimed
+
+    def test_claim_skip_on_one_project_still_dispatches_another(self):
+        other = self.extra_project('other')
+        publication = self.pending_publish(self.project)
+        other_task = self.runtime.goal(other, 'Other project work')
+        claimed = self.dispatch_with([self.project, other], 1)
+        self.assertEqual([run['project'] for run in claimed], [other])
+        self.assertEqual(len(self.runtime.futures), 1)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (other_task,))['state'], 'planning')
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (publication,))['state'], 'queued')
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM runs WHERE state='planning'")['n'], 1)
+
+    def test_claim_skip_leaves_no_idle_slot_for_other_projects(self):
+        others = [self.extra_project('other' + str(index)) for index in range(4)]
+        self.pending_publish(self.project)
+        tasks = {p: self.runtime.goal(p, 'Work ' + p) for p in others}
+        claimed = self.dispatch_with([self.project] + others, 4)
+        self.assertEqual(sorted(run['project'] for run in claimed), sorted(others))
+        self.assertEqual(len(self.runtime.futures), 4)
+        for project, task in tasks.items():
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))['state'],
+                             'planning', project)
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM runs WHERE state='planning'")['n'], 4)
+
+    def test_claim_skip_without_other_work_does_not_spin_or_create_runs(self):
+        publication = self.pending_publish(self.project)
+        with patch.object(self.store, 'claim', wraps=self.store.claim) as claim:
+            claimed = self.dispatch_with([self.project], 4)
+        self.assertEqual(claimed, [])
+        self.assertEqual(claim.call_count, 1)
+        self.assertEqual(len(self.runtime.futures), 0)
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM runs WHERE state='planning'")['n'], 0)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (publication,))['state'], 'queued')
