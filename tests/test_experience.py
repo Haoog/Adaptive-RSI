@@ -7,7 +7,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from adaptive_rsi.auth_sessions import AuthError, AuthSessions
 from adaptive_rsi.dashboard import records
@@ -97,7 +97,10 @@ class RelatedWorkTest(unittest.TestCase):
                     raise RuntimeError("Provider timeout")
                 return super().invoke(role, *args, **kwargs)
 
-        with tempfile.TemporaryDirectory() as directory:
+        # This test covers related-work cache invalidation; do not make it
+        # depend on a live Docker daemon during readiness probing.
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("adaptive_rsi.readiness.Sandbox.backend", return_value="docker"):
             root = Path(directory).resolve()
             store = Store(root / "state")
             runtime = Runtime(store, Outage())
