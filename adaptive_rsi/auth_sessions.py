@@ -1285,7 +1285,18 @@ class AuthSessions:
         docker, image = key
         try:
             inspected = run_process([docker, "image", "inspect", image], timeout=10)
-            readiness = "auth_worker_image_missing" if inspected["exit_code"] or inspected["error"] else ""
+            # 子进程本身没跑完（超时、取消、输出超限）时 daemon 只是卡住或不可用，
+            # 重装镜像并不能解决；与 _Process.binary() 一样归为容器不可用，
+            # 不能引导用户重建 1GB+ 的 worker 镜像。只有命令正常结束且退出码非 0
+            # （无 error/error_kind）才说明镜像确实不存在。
+            probe_failed = inspected["error"] or inspected.get("error_kind") in {
+                "timeout", "cancelled", "output_limit"}
+            if probe_failed:
+                readiness = "auth_container_unavailable"
+            elif inspected["exit_code"]:
+                readiness = "auth_worker_image_missing"
+            else:
+                readiness = ""
         except OSError:
             readiness = "auth_container_unavailable"
         with self.cache_lock:
