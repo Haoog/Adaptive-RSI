@@ -753,7 +753,7 @@ def _created_window(data):
     """Return the ISO lower bound for one dispatch receipt, or ``None``.
 
     Older receipts have no ``created_at`` (or a non-numeric one); those keep the
-    previous unfiltered listing behavior.
+    unbounded listing, which :func:`_remote_runs` narrows to the pinned head SHA.
     """
     try:
         created = float(data.get("created_at"))
@@ -775,6 +775,12 @@ def _remote_runs(repo, data, force=False):
         return None
     since = _created_window(data)
     endpoint = "actions/workflows/" + quote(data["workflow"].split("/")[-1], safe="") + "/runs?event=workflow_dispatch&per_page=100"
+    # Reconciliation already requires head_sha == workflow_sha, so filtering by
+    # the pinned commit server-side is equivalent and keeps a legacy receipt
+    # (no created_at lower bound) under GitHub's 1,000-result cap.
+    head_sha = data.get("workflow_sha")
+    if isinstance(head_sha, str) and head_sha:
+        endpoint += "&head_sha=" + quote(head_sha, safe="")
     if since:
         # Answer "did this dispatch start a run" from the dispatch window instead
         # of rescanning the repository's whole recent history. GitHub accepts the
