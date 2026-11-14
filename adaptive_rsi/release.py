@@ -739,6 +739,10 @@ def _record_reconciliation(data, repo, remotes, state, reason, checked_at=None):
         "redispatch_allowed": False,
         "reason": reason,
     }
+    # Read-only diagnosis of a clock-skewed created window; it is not an event.
+    missed = data.get("created_window_missed_at")
+    if missed:
+        data["reconciliation"]["created_window_missed_at"] = missed
     return candidates
 
 
@@ -768,6 +772,26 @@ def _created_window(data):
         return None
 
 
+def _unfiltered_fallback_ready(data, force):
+    """Return whether this receipt may spend one unfiltered listing page.
+
+    ``created`` is a lower bound evaluated against GitHub's clock, while the
+    receipt timestamp comes from this host's clock. A host clock ahead of
+    GitHub (or a GitHub clock behind it) by more than
+    ``RECONCILIATION_CREATED_MARGIN_SECONDS`` can exclude the target run even
+    when unrelated runs are visible, so a no-match listing gets one unfiltered page.
+    The receipt throttles that page to the recheck cadence: an operation that
+    truly has no run yet must not turn reconciliation into a full scan.
+    """
+    if force:
+        return True
+    try:
+        last = float(data.get("unfiltered_fallback_at"))
+    except (TypeError, ValueError):
+        return True
+    return time.time() - last >= RECONCILIATION_RECHECK_SECONDS
+
+
 def _remote_runs(repo, data, force=False):
     visibility = data.get("remote_visibility") or {}
     if (not force and visibility.get("state") == "workflow_not_visible"
@@ -782,8 +806,8 @@ def _remote_runs(repo, data, force=False):
         endpoint += "&created=" + quote(">=" + since, safe="")
     found = []
     full_page = False
+    scanned = 0
     try:
-        scanned = 0
         for page in range(1, 11):
             payload = api(repo, endpoint + "&page=" + str(page))
             runs = payload.get("workflow_runs", [])
@@ -796,6 +820,17 @@ def _remote_runs(repo, data, force=False):
             total = payload.get("total_count")
             if type(total) is int and 0 < total <= scanned:
                 break
+        if since and not found and _unfiltered_fallback_ready(data, force):
+            # A no-match filtered page can still contain unrelated runs. Because
+            # the lower bound comes from this host's clock, re-read the newest
+            # page without it before declaring the target invisible.
+            data["unfiltered_fallback_at"] = time.time()
+            payload = api(repo, endpoint.split("&created=")[0] + "&page=1")
+            runs = payload.get("workflow_runs", [])
+            runs = runs if isinstance(runs, list) else []
+            found.extend(item for item in runs if isinstance(item, dict) and item.get("display_title") == data["operation_id"])
+            if found:
+                data["created_window_missed_at"] = time.time()
     except ApiRejected as exc:
         if exc.status != 404:
             raise
