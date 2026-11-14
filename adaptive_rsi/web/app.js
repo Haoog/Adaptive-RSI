@@ -708,7 +708,7 @@ function renderTasks(){
  }
  document.querySelectorAll('[data-task-filter]').forEach(button=>{button.classList.toggle('active',button.dataset.taskFilter===filter);button.setAttribute('aria-pressed',String(button.dataset.taskFilter===filter));});
  const tasks=visibleTasks(scoped(state.tasks),filter,$('show-system-tasks').checked);
- window.RSIBatch?.toolbar();
+ window.RSIBatch?.toolbar(tasks);
  const candidate=state.selected_project&&state.selected_project!==projectId?null:state.pagination;
  const page=candidate&&candidate.offset===taskOffset&&(candidate.total===0?candidate.offset===0:candidate.offset<candidate.total)?candidate:null;
  $('tasks-prev').disabled=!taskOffset;$('tasks-next').disabled=!page?.has_more;$('tasks-page').textContent=page?(tasks.length?page.offset+1:0)+'–'+(tasks.length?Math.min(page.offset+tasks.length,page.total):0)+' / '+page.total:'';
@@ -871,10 +871,14 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
   await api('cancel',{task:task.id,cascade:cascade.checked,revision:plan.revision,reason:reason.value});closeTaskDetail();await refresh();}));
   if(task.state==='queued'){
    // 预约授权一个绝对时刻：时区与重复小时一起提交，由后端拒绝缺失/歧义时刻。
-   const scheduleBox=el('div',undefined,'task-schedule-editor'),time=el('input'),zone=el('input'),repeat=el('select');
+   const scheduleBox=el('div',undefined,'task-schedule-editor'),time=el('input'),zone=el('input'),repeat=el('select'),draft=draftStore.get('task-schedule',task.id);
    time.type='datetime-local';
-   zone.type='text';zone.value=displayTz||Intl.DateTimeFormat().resolvedOptions().timeZone;
+   zone.type='text';zone.value=draft?.zone??displayTz??Intl.DateTimeFormat().resolvedOptions().timeZone;
    for(const [value,text] of [['','时间唯一'],['0','第一次'],['1','第二次']]){const option=el('option',t(text));option.value=value;repeat.append(option);}
+   // 详情轮询与语言切换会整块重建；按任务恢复未提交的预约输入。
+   time.value=draft?.time??'';repeat.value=draft?.repeat??'';
+   const rememberSchedule=()=>draftStore.set('task-schedule',task.id,{time:time.value,zone:zone.value,repeat:repeat.value});
+   time.addEventListener('input',rememberSchedule);zone.addEventListener('input',rememberSchedule);repeat.addEventListener('change',rememberSchedule);
    const localLabel=el('label',t('本地时间'));localLabel.append(time);
    const zoneLabel=el('label',t('时区'));zoneLabel.append(zone);
    const repeatLabel=el('label',t('重复小时'));repeatLabel.append(repeat);
@@ -882,6 +886,7 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
     action(t('预约'),async()=>{if(!time.value||!zone.value.trim()){toast(t('请填写本地时间和时区。'),true);return;}
      await api('task/schedule-time',{task:task.id,local_time:time.value,timezone:zone.value.trim(),
       fold:repeat.value===''?undefined:Number(repeat.value)});
+     draftStore.remove('task-schedule',task.id);
      toast(t('预约已保存'));closeTaskDetail();await refresh();},'button primary'));
    secondary.append(el('summary',t('安排检查')),scheduleBox);}
   body.append(secondary);}

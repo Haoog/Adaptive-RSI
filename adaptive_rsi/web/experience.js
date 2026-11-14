@@ -496,6 +496,10 @@ window.RSIExperience = (() => {
       label.append(input);
       const reasonLabel = el("label", t("干预原因（可选，保留原文）")), reason = el("textarea");
       reason.rows = 2;reason.maxLength = 2000;reasonLabel.append(reason);
+      // 详情轮询与语言切换会整块重建；按任务恢复未提交的审计原文，提交成功后清除。
+      reason.value = draftStore.get('task-reason', task.id) || '';
+      if (reason.value) supplement.open = true;
+      reason.addEventListener('input', () => draftStore.set('task-reason', task.id, reason.value));
       const submit = el("button", t("保存补充并重新评估"), "button");
       submit.type = "submit";
       form.append(label, reasonLabel, submit);
@@ -513,6 +517,7 @@ window.RSIExperience = (() => {
               reason: reason.value,
             });
             if (draftStore.get('task-supplement', task.id) === value) draftStore.remove('task-supplement', task.id);
+            if (draftStore.get('task-reason', task.id) === reason.value) draftStore.remove('task-reason', task.id);
             toast(t(receipt.pending ? "补充已收到，将在当前阶段结束后带入下一轮。" : "补充已保存，将重新评估。"));
             await refreshTaskDetail();
           } finally {
