@@ -555,14 +555,12 @@ print('BOUNDARIES_OK')
         runs = [self.tracked_pr(url, "head%d" % number) for number, url in enumerate(urls, 1)]
         return urls, runs, [self.pr_row(url, "head%d" % number) for number, url in enumerate(urls, 1)]
 
-    def tick_with_remote(self, page, view):
-        """Run one tick with a stubbed gh: one listing page plus an exact-read callback."""
+    def tick_with_remote(self, view):
+        """Run one tick with a stubbed gh; any bulk listing is a failure."""
         commands = []
 
         def remote(argv, **kwargs):
             commands.append(list(argv))
-            if argv[:3] == ["gh", "pr", "list"]:
-                return json.dumps(page)
             if argv[:3] == ["gh", "pr", "view"]:
                 return json.dumps(view(argv[3]))
             raise AssertionError("unexpected remote read: " + " ".join(argv))
@@ -572,42 +570,51 @@ print('BOUNDARIES_OK')
 
     def assert_tracked_status(self, runs, status="waiting_review"):
         for run in runs:
-            saved = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+            saved = json.loads(self.store.one("SELECT result FROM runs WHERE id=?",
+                                              (run["id"],))["result"])
             self.assertEqual(saved["delivery_status"], status)
 
-    def test_tick_reads_three_tracked_prs_with_one_listing(self):
+    def assert_no_bulk_list_events(self):
+        # 批量列表读已移除：无论成功、满页还是超时，都不该再出现这两类事件。
+        self.assertEqual(self.store.one(
+            "SELECT COUNT(*) AS n FROM events WHERE kind IN "
+            "('delivery_pr_list_error','delivery_pr_page_full')")["n"], 0)
+
+    def test_tick_reads_each_tracked_pr_exactly_once_without_bulk_listing(self):
         urls, runs, rows = self.tracked_prs()
         with patch("adaptive_rsi.delivery.origin_repository", return_value="example/project") as probe:
-            commands = self.tick_with_remote(rows, lambda url: self.fail("exact read: " + url))
-        self.assertEqual([call[:3] for call in commands], [["gh", "pr", "list"]])
-        self.assertEqual(commands[0][commands[0].index("--limit") + 1], "100")
-        # 同一 tick 内 origin 探测也只做一次，逐 run 重复探测不再随 PR 数增长。
+            commands = self.tick_with_remote(lambda url: rows[urls.index(url)])
+        # 批量 gh pr list 在 PR 较多的仓库稳定 502/504；每个受跟踪 PR 恰好精确读一次。
+        self.assertEqual([call[:3] for call in commands], [["gh", "pr", "view"]] * len(urls))
+        self.assertEqual([call[3] for call in commands], urls)
+        # 同一 tick 内 origin 探测也只做一次，逐 run 重复探测不随 PR 数增长。
         probe.assert_called_once_with(str(self.repo))
+        self.assert_no_bulk_list_events()
         self.assert_tracked_status(runs)
 
-    def test_pr_missing_from_listing_falls_back_to_exact_read_without_affecting_others(self):
+    def test_failed_exact_read_does_not_affect_other_tracked_prs(self):
         urls, runs, rows = self.tracked_prs()
 
         def view(url):
             if url == urls[2]:
                 raise RuntimeError("remote unavailable")
             return rows[urls.index(url)]
-        commands = self.tick_with_remote(rows[:2], view)
-        self.assertEqual([call[3] for call in commands if call[:3] == ["gh", "pr", "view"]], [urls[2]])
+        commands = self.tick_with_remote(view)
+        self.assertEqual([call[3] for call in commands], urls)
         self.assert_tracked_status(runs[:2])
         # 单条读失败只把该 run 记成 delivery_error，其它 run 的状态照常推进。
         self.assertEqual(self.store.one("SELECT COUNT(*) AS n FROM events WHERE kind='delivery_error'")["n"], 1)
+        self.assert_no_bulk_list_events()
         failed = self.store.one("SELECT result FROM runs WHERE id=?", (runs[2]["id"],))["result"]
         self.assertNotIn("delivery_status", json.loads(failed))
 
-    def test_full_pr_page_records_event_and_reads_each_tracked_pr_exactly(self):
-        urls, runs, rows = self.tracked_prs()
-        page = [self.pr_row("https://github.com/example/project/pull/%d" % number, "other%d" % number)
-                for number in range(1000, 1100)]
-        commands = self.tick_with_remote(page, lambda url: rows[urls.index(url)])
-        # 满页不能证明第 101 个 PR 不存在：记事件并逐个精确读，不丢任何跟踪项。
-        self.assertEqual(self.store.one("SELECT COUNT(*) AS n FROM events WHERE kind='delivery_pr_page_full'")["n"], 1)
-        self.assertEqual(sorted(call[3] for call in commands if call[:3] == ["gh", "pr", "view"]), sorted(urls))
+    def test_many_tracked_prs_never_list_the_whole_repository_or_drop_a_page(self):
+        urls, runs, rows = self.tracked_prs(25)
+        commands = self.tick_with_remote(lambda url: rows[urls.index(url)])
+        # 不再预读整页，也就不存在「满页丢弃」：每个 URL 各读一次，数量再多也一样。
+        self.assertEqual(sorted(call[3] for call in commands), sorted(urls))
+        self.assertFalse([call for call in commands if call[:3] == ["gh", "pr", "list"]])
+        self.assert_no_bulk_list_events()
         self.assert_tracked_status(runs)
 
     def test_tracking_feedback_requeues_once_and_preserves_evidence(self):
@@ -1052,13 +1059,12 @@ print('BOUNDARIES_OK')
         old_pr = {"state": "CLOSED", "headRefOid": "head", "baseRefOid": "base"}
 
         def remote(argv, **kwargs):
-            # 本轮共享的列表读是唯一允许的远端调用；关闭/轮转等写入必须为零。
-            self.assertEqual(argv[:3], ["gh", "pr", "list"])
-            return json.dumps([{**old_pr, "url": "https://github.com/example/project/pull/1"}])
+            # 跟踪只走逐条精确读（pr_view 已打桩）；关闭/轮转等写入必须为零。
+            raise AssertionError("unexpected remote read: " + " ".join(argv))
         with patch("adaptive_rsi.delivery.pr_view", return_value=old_pr), \
                 patch("adaptive_rsi.delivery.checked", side_effect=remote) as command:
             tick(self.runtime)
-        self.assertEqual(command.call_count, 1)
+        command.assert_not_called()
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (old["task"],))["state"], "pr_open")
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (old["id"],))["state"], "superseded")
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (fresh["id"],))["state"], "pr_open")
