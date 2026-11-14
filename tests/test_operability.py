@@ -1,16 +1,20 @@
 import concurrent.futures
+import io
 import json
 import sqlite3
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from adaptive_rsi import cli
 from adaptive_rsi.agent import CodexAgent
 from adaptive_rsi.cli import doctor
 from adaptive_rsi.config import fingerprint
+from adaptive_rsi.maintenance import retention_hold
 from adaptive_rsi.model_center import CenterError
 from adaptive_rsi.native import ProviderUnavailable
 from adaptive_rsi.opencode import OpenCodeCapabilities, OpenCodeCompatibilityError
@@ -692,3 +696,62 @@ class OperabilityTest(unittest.TestCase):
         with patch.object(self.store, "connect", side_effect=sqlite3.OperationalError("database is locked")):
             with self.assertRaises(sqlite3.OperationalError):
                 ProviderHealth(self.store).record(config, "openai", "db-failure")
+
+    def hold_fixture(self):
+        now = time.time()
+        self.store.execute("INSERT INTO projects VALUES (?,?,?,?,?,?)",
+                           ("projhold", "fixture", str(Path(self.temp.name) / "hold-project"), "{}", 1, now))
+        self.store.execute("INSERT INTO runs(id,task,project,state,config,started,ended,result) "
+                           "VALUES ('runhold01',NULL,'projhold','completed','{}',?,?,'{}')", (now, now))
+
+    def run_hold_cli(self, *arguments):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            try:
+                code = cli.main(["--state-dir", str(self.store.root), "hold", *arguments])
+            except SystemExit as exc:
+                code = exc.code
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_legal_hold_cli_sets_lists_and_clears_run_and_project_holds(self):
+        self.hold_fixture()
+        code, output, _ = self.run_hold_cli("--run", "runhold01")
+        self.assertIsNone(code)
+        self.assertEqual(json.loads(output)["changed"], ["legal-hold:runhold01"])
+        self.assertEqual(self.store.setting("legal-hold:runhold01"), True)
+        # 维护期读取的正是这个键：设置后保留，解除后恢复清理。
+        self.assertEqual(retention_hold(self.store, "runhold01", "projhold"), "legal-hold:runhold01")
+        self.assertEqual(self.store.one("SELECT project,run FROM events WHERE kind='legal_hold'")["run"], "runhold01")
+        # 重复设置幂等：状态不变，也不追加审计事件。
+        code, output, _ = self.run_hold_cli("--run", "runhold01")
+        self.assertEqual((code, json.loads(output)["changed"]), (None, []))
+        self.assertEqual(self.store.one("SELECT COUNT(*) AS n FROM events WHERE kind='legal_hold'")["n"], 1)
+        code, output, _ = self.run_hold_cli("--project", "projhold")
+        self.assertEqual(json.loads(output)["changed"], ["legal-hold-project:projhold"])
+        self.assertTrue(self.store.setting("legal-hold-project:projhold"))
+        # 不带 id 只列出当前生效的 hold，不写任何键。
+        code, output, _ = self.run_hold_cli()
+        payload = json.loads(output)
+        self.assertEqual((code, payload["changed"]), (None, []))
+        self.assertEqual([(hold["scope"], hold["id"]) for hold in payload["holds"]],
+                         [("project", "projhold"), ("run", "runhold01")])
+        code, output, _ = self.run_hold_cli("--run", "runhold01", "--off")
+        self.assertEqual((code, json.loads(output)["changed"]), (None, ["legal-hold:runhold01"]))
+        self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key='legal-hold:runhold01'"))
+        self.assertTrue(self.store.setting("legal-hold-project:projhold"))
+        # 两个 hold 都解除后，维护期不再保留该运行的产物。
+        code, output, _ = self.run_hold_cli("--project", "projhold", "--off")
+        self.assertEqual((code, json.loads(output)["changed"]), (None, ["legal-hold-project:projhold"]))
+        self.assertIsNone(retention_hold(self.store, "runhold01", "projhold"))
+
+    def test_legal_hold_cli_rejects_unknown_ids_without_writing_any_key(self):
+        self.hold_fixture()
+        code, _, error = self.run_hold_cli("--run", "missing-run")
+        self.assertEqual((code, "Unknown run id missing-run" in error), (1, True))
+        # 一次请求里混入未知 project 时，合法的 run 也不能被部分写入。
+        code, _, error = self.run_hold_cli("--run", "runhold01", "--project", "missing-project")
+        self.assertEqual((code, "Unknown project id missing-project" in error), (1, True))
+        self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key LIKE 'legal-hold%'"))
+        # 入口不接受任意 settings 键，未知参数由 argparse 拒绝。
+        self.assertEqual(self.run_hold_cli("--key", "config")[0], 2)
+        self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key='config'"))
