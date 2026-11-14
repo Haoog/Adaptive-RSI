@@ -231,6 +231,26 @@ class AuditEvolutionTest(unittest.TestCase):
             runtime.active_strategies = original
         self.assertFalse(self.evolution.attempt_due('p', config)[0])
 
+    def test_housekeeping_limits_do_not_rearm_the_failed_experiment(self):
+        """只改 retention_days 等清理参数时同一份证据不再重新付费演化。"""
+        from adaptive_rsi.config import DEFAULTS, merge
+        config = merge(DEFAULTS, {})
+        runtime = SimpleNamespace(store=self.store, config=lambda project: config,
+                                  active_strategies=lambda project: [])
+        evolution = Evolution(runtime)
+        signature = evolution.input_signature('p', config)
+        evolution.record_attempt('p', signature, 'insufficient_evidence')
+        housekeeping = merge(DEFAULTS, {'limits': {'retention_days': 60}})
+        self.assertEqual(signature, evolution.input_signature('p', housekeeping))
+        self.assertFalse(evolution.attempt_due('p', housekeeping)[0])
+        # 执行相关参数仍必须让签名变化：去重不能把真正的实验条件差异也放过。
+        for key, value in (('command_seconds', 1800), ('max_output_mb', 24),
+                           ('concurrency', 2), ('retries', 0),
+                           ('min_free_disk_mb', 256), ('min_available_memory_mb', 256)):
+            changed = merge(DEFAULTS, {'limits': {key: value}})
+            self.assertNotEqual(signature, evolution.input_signature('p', changed), key)
+            self.assertTrue(evolution.attempt_due('p', changed)[0], key)
+
     def test_unknown_cost_quality_pass_keeps_explicit_warning(self):
         trials = []
         for family in range(5):
