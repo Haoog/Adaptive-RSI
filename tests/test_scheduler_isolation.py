@@ -500,6 +500,59 @@ class SchedulerIsolationTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT path FROM runs WHERE id=?", (run["id"],))["path"], str(directory))
         self.assertEqual(self.errors("maintenance_run"), [])
 
+    def test_single_run_cleanup_failure_degrades_pass_and_is_retried(self):
+        bad = self.historical_run("broken", "awaiting_approval")
+        good = self.historical_run("broken", "awaiting_approval")
+        for run in (bad, good):
+            (Path(run["path"]) / "workspace").mkdir(parents=True)
+            (Path(run["path"]) / "workspace" / "keep.txt").write_text("retained evidence")
+        real = maintenance_module._remove_artifact
+
+        def failing(directory, name):
+            if Path(directory).name == bad["id"]:
+                raise PermissionError("simulated undeletable artifact")
+            return real(directory, name)
+
+        with patch.object(maintenance_module, "_remove_artifact", side_effect=failing):
+            self.runtime.maintenance()
+
+            # 单个运行删不掉不阻塞同项目其他运行，整轮仍推进但留降级证据。
+            self.assertFalse((Path(good["path"]) / "workspace").exists())
+            self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (good["id"],))["state"],
+                             "expired")
+            self.assertTrue((Path(bad["path"]) / "workspace" / "keep.txt").exists())
+            self.assertIsNotNone(self.store.one("SELECT path FROM runs WHERE id=?", (bad["id"],))["path"])
+            self.assertGreater(self.store.setting("maintenance-last", 0), 0)
+            self.assertIsNone(self.store.setting("maintenance-retry"))
+            degraded = self.store.setting("maintenance-degraded")
+            self.assertEqual(degraded["count"], 1)
+            self.assertEqual([(row["run"], row["error_type"]) for row in degraded["runs"]],
+                             [(bad["id"], "PermissionError")])
+            self.assertIn("simulated undeletable artifact", degraded["last_error"])
+            self.assertEqual(self.store.one(
+                "SELECT count(*) n FROM events WHERE kind='maintenance_degraded'")["n"], 1)
+            # 运行级失败不再只留下会被去重的 scheduler_error。
+            self.assertEqual(self.errors("maintenance_run"), [])
+
+            # 同一运行连续失败：计数递增，事件每轮一条，不被事件去重吞掉。
+            self.store.put_setting("maintenance-last", 0)
+            self.runtime.maintenance()
+            degraded = self.store.setting("maintenance-degraded")
+            self.assertEqual(degraded["count"], 2)
+            self.assertEqual([row["run"] for row in degraded["runs"]], [bad["id"]])
+            self.assertEqual(self.store.one(
+                "SELECT count(*) n FROM events WHERE kind='maintenance_degraded'")["n"], 2)
+            self.assertIsNone(self.store.setting("maintenance-retry"))
+
+        # 故障消失后下一轮正常清理，降级记录被移除。
+        self.store.put_setting("maintenance-last", 0)
+        self.runtime.maintenance()
+
+        self.assertFalse((Path(bad["path"]) / "workspace").exists())
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (bad["id"],))["state"],
+                         "expired")
+        self.assertIsNone(self.store.setting("maintenance-degraded"))
+
     def test_hold_written_while_an_artifact_is_deleted_waits_for_that_deletion(self):
         run = self.historical_run("healthy", "awaiting_approval")
         directory = Path(run["path"])
