@@ -13,11 +13,12 @@ from unittest.mock import patch
 from adaptive_rsi.acceptance import seal
 from adaptive_rsi.adapters import test_path
 from adaptive_rsi.config import DEFAULTS, merge
-from adaptive_rsi.delivery import CHECK_DETAIL_LIMIT, baseline, delivery_checks, merge_gate, tick
+from adaptive_rsi.delivery import (CHECK_DETAIL_LIMIT, MERGE_ATTEMPT_LIMIT, MERGE_RETRY_INITIAL,
+                                   MERGE_RETRY_MAX, baseline, delivery_checks, merge_gate, tick)
 from adaptive_rsi.evaluator import Evaluator, freeze_harness, write_evaluation_report
 from adaptive_rsi.gitops import changes, git, snapshot
 from adaptive_rsi.runtime import Runtime
-from adaptive_rsi.process import Sandbox, run_process
+from adaptive_rsi.process import ProcessError, Sandbox, run_process
 from adaptive_rsi.store import Store, encode
 from tests.test_runtime import CHECKS, FakeAgent, fixture
 
@@ -1003,6 +1004,83 @@ print('BOUNDARIES_OK')
         self.assertIsNone(self.store.setting("merge-intent:" + run["id"]))
         feedback.assert_called_once()
 
+    def test_merge_write_backs_off_then_succeeds_and_consumes_intent(self):
+        run = self.tracked_pr()
+        pr = {"url": "https://github.com/example/project/pull/1", "state": "OPEN", "headRefOid": "head",
+              "baseRefOid": "base", "baseRefName": "main", "mergeable": "MERGEABLE",
+              "mergeStateStatus": "CLEAN", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+        merges = []
+
+        def remote(argv, **kwargs):
+            if argv[:3] == ["gh", "pr", "merge"]:
+                merges.append(list(argv))
+                if len(merges) == 1:
+                    raise ProcessError({"exit_code": 1, "stderr": "Protected branch update failed"})
+            return ""
+
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), "base", "main")), \
+                patch("adaptive_rsi.delivery.checked", side_effect=remote):
+            tick(self.runtime, 1000)
+            intent = self.store.setting("merge-intent:" + run["id"])
+            self.assertEqual(intent["attempts"], 1)
+            self.assertIsInstance(intent["retry_at"], (int, float))
+            # 退避期内：不重发远端写，也不重复写事件。
+            tick(self.runtime, 1061)
+            self.assertEqual(len(merges), 1)
+            self.assertEqual(self.store.one(
+                "SELECT count(*) AS n FROM events WHERE run=? AND kind='merge_intent_retry'",
+                (run["id"],))["n"], 1)
+            # 到期后再试一次：计数递增而不是被覆盖，成功后键保留待对账消费。
+            tick(self.runtime, 1000 + MERGE_RETRY_INITIAL)
+            self.assertEqual(len(merges), 2)
+            self.assertEqual(self.store.setting("merge-intent:" + run["id"])["attempts"], 2)
+        merged = {**pr, "state": "MERGED", "mergeCommit": {"oid": "merged-sha"}}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=merged), \
+                patch("adaptive_rsi.delivery.feedback") as feedback:
+            tick(self.runtime, 1000 + MERGE_RETRY_INITIAL + 61)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "merged")
+        self.assertTrue(json.loads(row["result"])["merged_by_local"])
+        self.assertIsNone(self.store.setting("merge-intent:" + run["id"]))
+
+    def test_merge_write_stops_at_limit_and_records_visible_terminal_state(self):
+        run = self.tracked_pr()
+        pr = {"url": "https://github.com/example/project/pull/1", "state": "OPEN", "headRefOid": "head",
+              "baseRefOid": "base", "baseRefName": "main", "mergeable": "MERGEABLE",
+              "mergeStateStatus": "CLEAN", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+        merges = []
+
+        def remote(argv, **kwargs):
+            if argv[:3] == ["gh", "pr", "merge"]:
+                merges.append(list(argv))
+                raise ProcessError({"exit_code": 1, "stderr": "Squash merges are not allowed on this repository"})
+            return ""
+
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), "base", "main")), \
+                patch("adaptive_rsi.delivery.checked", side_effect=remote):
+            # 每次间隔都大于最大退避窗口，确保点数只受上限约束。
+            for index in range(MERGE_ATTEMPT_LIMIT):
+                tick(self.runtime, 1000 + index * (MERGE_RETRY_MAX + 1))
+            self.assertEqual(len(merges), MERGE_ATTEMPT_LIMIT)
+            outcome = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+            self.assertNotEqual(outcome["delivery_status"], "ready")
+            self.assertIn({"name": "merge", "state": "BLOCKED", "url": None}, outcome["delivery_checks"])
+            # 终态只记一条事件；之后任意 tick 都不再发起远端写，也不重复告警。
+            tick(self.runtime, 1000 + MERGE_ATTEMPT_LIMIT * (MERGE_RETRY_MAX + 1))
+            tick(self.runtime, 1000 + (MERGE_ATTEMPT_LIMIT + 1) * (MERGE_RETRY_MAX + 1))
+            self.assertEqual(len(merges), MERGE_ATTEMPT_LIMIT)
+            self.assertEqual(self.store.one(
+                "SELECT count(*) AS n FROM events WHERE run=? AND kind='merge_abandoned'",
+                (run["id"],))["n"], 1)
+            self.assertEqual(self.store.one(
+                "SELECT count(*) AS n FROM events WHERE run=? AND kind='merge_intent_retry'",
+                (run["id"],))["n"], MERGE_ATTEMPT_LIMIT - 1)
+            self.assertIsNotNone(self.store.setting("merge-intent:" + run["id"]))
+            outcome = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+            self.assertNotEqual(outcome["delivery_status"], "ready")
+
     def test_merged_pr_without_merge_oid_keeps_task_open_for_oid_retry(self):
         # MERGED 但 mergeCommit.oid 缺失（merge-queue/GC）是有意保留 pr_open 的重试路径：
         # run 记 merge_sha_pending 等下一轮补齐 oid。回归前 bug：无论 target_state 一律把
@@ -1118,6 +1196,8 @@ print('BOUNDARIES_OK')
                 self.store.execute("UPDATE runs SET state='pr_open' WHERE id=?", (run["id"],))
                 git(self.repo, "remote", "set-url", "origin", "https://github.com/example/project.git")
                 self.store.put_setting("delivery-tick", 0)
+                # 每个子用例是独立的授权场景：上一轮的合并意图（含退避）不得带入。
+                self.store.execute("DELETE FROM settings WHERE key=?", ("merge-intent:" + run["id"],))
 
                 def change_during_fetch(*args):
                     if change == "repository":

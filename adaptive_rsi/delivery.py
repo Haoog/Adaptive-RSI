@@ -689,8 +689,13 @@ _CLOSE_PENDING = ("(r.state='superseded' AND json_valid(r.result) "
                   "AND coalesce(json_extract(r.result,'$.close_abandoned'),'')='')")
 
 
+def _retry_delay(initial, cap, attempts):
+    """远端写共用的指数退避窗口：首次等待 initial，逐次翻倍，cap 封顶。"""
+    return min(cap, initial * 2 ** max(0, min(attempts, 8) - 1))
+
+
 def _close_retry_delay(attempts):
-    return min(CLOSE_RETRY_MAX, CLOSE_RETRY_INITIAL * 2 ** max(0, min(attempts, 8) - 1))
+    return _retry_delay(CLOSE_RETRY_INITIAL, CLOSE_RETRY_MAX, attempts)
 
 
 def _close_retry_due(outcome, now):
@@ -785,6 +790,53 @@ def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
     store.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run["id"]))
     store.remote_wait(run["id"], None, time.time())
     return False
+
+
+# 合并写失败的退避与上限：分支保护、仓库禁用 squash、合并队列策略都会持续拒绝，
+# 每个调度周期重发一次 `gh pr merge` 只会刷写事件并触发 GitHub 二次限流，界面还一直
+# 显示「可以合并」。首次失败 5 分钟后重试，逐次翻倍到 1 小时封顶；8 次后落终态交人工。
+MERGE_ATTEMPT_LIMIT = 8
+MERGE_RETRY_INITIAL = 300
+MERGE_RETRY_MAX = 3600
+
+
+def _merge_intent(value, head):
+    """只采信与当前密封 head 一致的意图；换 head 后的旧计数不阻塞新的合并写。"""
+    return value if isinstance(value, dict) and value.get("head") == head else {}
+
+
+def _merge_attempts(intent):
+    attempts = intent.get("attempts")
+    return attempts if isinstance(attempts, int) and not isinstance(attempts, bool) and attempts > 0 else 0
+
+
+def _merge_retry_due(intent, now):
+    attempts = _merge_attempts(intent)
+    last = intent.get("retry_at", intent.get("at"))
+    if not attempts or not isinstance(last, (int, float)):
+        return True
+    return now - last >= _retry_delay(MERGE_RETRY_INITIAL, MERGE_RETRY_MAX, attempts)
+
+
+def _merge_exhausted(intent):
+    return _merge_attempts(intent) >= MERGE_ATTEMPT_LIMIT
+
+
+def _abandon_merge(store, run, outcome, key, intent, reason):
+    """合并被持续拒绝：落可见终态并只记一条事件，此后不再发起远端写。
+
+    幂等：终态落盘后后续 tick 只刷新 status/明细，不重复写事件。意图键保留，
+    直到观测到 MERGED 被消费或人工重置，便于核对最后一次拒因。
+    """
+    attempts = _merge_attempts(intent)
+    outcome["delivery_status"] = "waiting"
+    details = [item for item in outcome.get("delivery_checks") or [] if item.get("name") != "merge"]
+    outcome["delivery_checks"] = details + [{"name": "merge", "state": "BLOCKED", "url": None}]
+    if intent.get("abandoned"):
+        return
+    store.put_setting(key, {**intent, "abandoned": reason})
+    store.event("merge_abandoned", "Merge abandoned after %s attempts: %s" % (attempts, reason),
+                run["project"], run["id"])
 
 
 # 对账放弃后该运行永久退出恢复候选：退避只限频，尝试次数上限才让无果的
@@ -1240,7 +1292,15 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         run_config = {}
                     authorized = _dict_field(run_config, "delivery").get("auto_merge") and config["delivery"]["auto_merge"]
                     authorized = authorized and sealed_target
-                    if gate == "ready" and authorized and not runtime.project(project["id"])["paused"]:
+                    intent_key = "merge-intent:" + run["id"]
+                    intent = _merge_intent(store.setting(intent_key), policy["head"])
+                    # 退避期内（或已达上限）不进入准入复核：既不 fetch/探测远端，也不重发
+                    # `gh pr merge`，更不重复写事件；到期后沿用同一意图计数再试。
+                    if gate == "ready" and authorized and _merge_exhausted(intent):
+                        _abandon_merge(store, run, outcome, intent_key, intent,
+                                       intent.get("last_error") or "remote merge rejected")
+                    if (gate == "ready" and authorized and not _merge_exhausted(intent) and
+                            _merge_retry_due(intent, now) and not runtime.project(project["id"])["paused"]):
                         # 同一 tick 内的就绪 run 共享一次真实 fetch：首个准入复核
                         # （或更早的监控观测）留下的本轮读数按目标分支复用，密封判定
                         # 仍逐 run 对共享值复核 sha/branch，不读跨 tick 陈旧值。
@@ -1302,15 +1362,28 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                     live_identity == {"repository": repo, "branch": policy["branch"], "sha": policy["base"]} and
                                     not live_project["paused"] and not tracking_cancelled()):
                                 merge_admitted = True
-                                store.put_setting("merge-intent:" + run["id"], {"head": policy["head"], "at": now})
+                                # 与关闭写同序：先在意图里落盘 attempts+1 再发请求，响应丢失或
+                                # 进程中断同样计入退避，下一 tick 不会立刻重发同一次失败写入。
+                                prior = _merge_intent(store.setting(intent_key), policy["head"])
+                                store.put_setting(intent_key, {
+                                    "head": policy["head"], "at": now,
+                                    "attempts": _merge_attempts(prior) + 1, "retry_at": now})
                         if merge_admitted:
+                            intent = _merge_intent(store.setting(intent_key), policy["head"])
+                            attempts = _merge_attempts(intent)
                             try:
                                 checked(["gh", "pr", "merge", outcome["pr"], "--repo", repo, "--squash",
                                          "--match-head-commit", policy["head"]])
                             except ProcessError as exc:
                                 # 提交失败时保留意图：远端可能已生效（响应丢失），
-                                # 由下一轮对账凭意图与 pr_view 澄清；明确失败则由用户人工重试。
-                                store.event("merge_intent_retry", str(exc), project["id"], run["id"])
+                                # 由下一轮对账凭意图与 pr_view 澄清；明确的拒绝按退避
+                                # 重试，达到上限后落终态交人工，不再每 tick 重发远端写。
+                                reason = str(exc)[:500]
+                                if attempts >= MERGE_ATTEMPT_LIMIT:
+                                    _abandon_merge(store, run, outcome, intent_key, intent, reason)
+                                else:
+                                    store.put_setting(intent_key, {**intent, "last_error": reason})
+                                    store.event("merge_intent_retry", reason, project["id"], run["id"])
                             else:
                                 outcome["delivery_status"] = "merge_submitted"
                     elif gate == "stale" and not outcome.get("replanned"):
@@ -1587,7 +1660,7 @@ FEEDBACK_RETRY_MAX = 3600
 
 
 def _feedback_retry_delay(attempts):
-    return min(FEEDBACK_RETRY_MAX, FEEDBACK_RETRY_INITIAL * 2 ** max(0, min(attempts, 8) - 1))
+    return _retry_delay(FEEDBACK_RETRY_INITIAL, FEEDBACK_RETRY_MAX, attempts)
 
 
 def _feedback_attempts(outcome):
