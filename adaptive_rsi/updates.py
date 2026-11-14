@@ -351,6 +351,19 @@ class UpdateManager:
         return {**self.status(), "busy": busy, "channel": self.channel(),
                 "desktop_managed": getattr(self, "desktop_managed", False)}
 
+    def console_snapshot(self):
+        """控制台轮询用的只读更新视图，不等待全局 dispatch_lock。
+
+        写端点在 dispatch_lock 内执行发布对账等慢操作时，is_busy() 会把每个
+        /api/state 请求一起阻塞；若还处在 SQLite 读事务内，等待期间会占住连接
+        许可，放大成写线程拿不到连接。展示用 busy 只依赖状态与安装标记，
+        准入判断仍由 is_busy()/require_ready() 在锁内完成。
+        """
+        status = self.status()
+        busy = bool(self.installing or status.get("state") in ("downloading", "restarting"))
+        return {**status, "busy": busy, "channel": self.channel(),
+                "desktop_managed": getattr(self, "desktop_managed", False)}
+
     def require_ready(self):
         if self.is_busy():
             raise UpdateInProgress("Software update in progress")
