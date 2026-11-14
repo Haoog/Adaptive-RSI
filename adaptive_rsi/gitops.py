@@ -57,8 +57,8 @@ def changes(workspace):
     return files, patch
 
 
-def copy_source(source, destination):
-    scrub_tree(source)
+def copy_source(source, destination, state=None):
+    scrub_tree(source, state=state)
     shutil.copytree(source, destination, symlinks=True,
                     ignore=shutil.ignore_patterns(".git", ".rsi-agent", ".rsi-home", ".rsi-build", "__pycache__"))
     return Path(destination)
