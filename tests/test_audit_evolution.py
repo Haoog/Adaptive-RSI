@@ -231,6 +231,26 @@ class AuditEvolutionTest(unittest.TestCase):
             runtime.active_strategies = original
         self.assertFalse(self.evolution.attempt_due('p', config)[0])
 
+    def test_housekeeping_limits_do_not_rearm_the_failed_experiment(self):
+        """只改 retention_days 等清理参数时同一份证据不再重新付费演化。"""
+        from adaptive_rsi.config import DEFAULTS, merge
+        config = merge(DEFAULTS, {})
+        runtime = SimpleNamespace(store=self.store, config=lambda project: config,
+                                  active_strategies=lambda project: [])
+        evolution = Evolution(runtime)
+        signature = evolution.input_signature('p', config)
+        evolution.record_attempt('p', signature, 'insufficient_evidence')
+        housekeeping = merge(DEFAULTS, {'limits': {'retention_days': 60}})
+        self.assertEqual(signature, evolution.input_signature('p', housekeeping))
+        self.assertFalse(evolution.attempt_due('p', housekeeping)[0])
+        # 执行相关参数仍必须让签名变化：去重不能把真正的实验条件差异也放过。
+        for key, value in (('command_seconds', 1800), ('max_output_mb', 24),
+                           ('concurrency', 2), ('retries', 0),
+                           ('min_free_disk_mb', 256), ('min_available_memory_mb', 256)):
+            changed = merge(DEFAULTS, {'limits': {key: value}})
+            self.assertNotEqual(signature, evolution.input_signature('p', changed), key)
+            self.assertTrue(evolution.attempt_due('p', changed)[0], key)
+
     def test_unknown_cost_quality_pass_keeps_explicit_warning(self):
         trials = []
         for family in range(5):
@@ -2818,6 +2838,71 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(plan['selection_policy'], 'traffic_weighted_min_one_per_stratum')
         self.assertEqual(len(plan['samples']), 6)
         self.assertIn('share of the population', ' '.join(evidence['promotion_review']['limitations']))
+
+    def test_sealed_plan_replays_selection_from_recorded_population(self):
+        """uses 是层内排序主键：记录 eligible 全集后审计方才能复算抽中的样本。"""
+        args = self.setup_proposal()
+        from adaptive_rsi.gitops import git
+        from tests.test_runtime import CHECKS
+        repo = args[1]
+        base = git(repo, 'rev-parse', 'HEAD')
+        # 找一个 seeded hash 排在既有 validation 用例之前的 id：真实抽样按 uses 选中
+        # uses=0 的 'validation'；只有把未知 uses 当成 0 复算才会选中 alt。
+        alt = next(name for name in ('validation-alt-%d' % index for index in range(500))
+                   if fingerprint({'id': name, 'seed': 'run'}) < fingerprint({'id': 'validation', 'seed': 'run'}))
+        spec = {'task': 'validation secret task', 'base': base, 'checks': CHECKS, 'source': 'real',
+                'signature': alt, 'repository': str(repo), 'overlay': None}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           (alt, 'p', alt, 'validation', encode(spec), 2, 1))
+        result = self.evolution.propose_and_evaluate(*args)
+        evidence = self.evidence_of(result['candidate'])
+        # 以 JSON 往返模拟审计方从封存文件读回的计划。
+        plan = json.loads(encode(evidence['preregistered_plan']['data']))
+        self.assertEqual(plan['selection_seed'], 'run')
+        self.assertEqual({row['id']: row['uses'] for row in plan['selection_population']['validation']},
+                         {'validation': 0, alt: 2})
+        self.assertEqual([row['id'] for row in plan['samples'] if row['split'] == 'validation'],
+                         ['validation'])
+        verification = Evolution.verify_selection(plan)
+        self.assertTrue(verification['valid'])
+        self.assertEqual(verification['expected'], verification['observed'])
+        self.assertEqual(evidence['promotion_review']['selection_verification'], verification)
+
+        # 篡改排序主键 uses：把未知 uses 当 0 的「最合理复算」会选中另一个样本。
+        erased = json.loads(encode(plan))
+        next(row for row in erased['selection_population']['validation']
+             if row['id'] == alt)['uses'] = 0
+        changed = Evolution.verify_selection(erased)
+        self.assertFalse(changed['valid'])
+        self.assertEqual(changed['reason'], 'sample_not_rederivable')
+        self.assertIn('validation:' + alt, changed['expected'])
+        self.assertNotIn('validation:validation', changed['expected'])
+        # 替换抽中样本或改样本记录的 prior_uses 同样不可复算。
+        for mutate, reason in (
+                (lambda data: data['samples'].__setitem__(
+                    0, {'id': alt, 'split': 'validation', 'stratum': ['real', 'small'], 'prior_uses': 2}),
+                 'sample_not_rederivable'),
+                (lambda data: data['samples'][0].update(prior_uses=9), 'sample_prior_uses_mismatch')):
+            tampered = json.loads(encode(plan))
+            mutate(tampered)
+            self.assertEqual(Evolution.verify_selection(tampered)['reason'], reason)
+
+    def test_unreproducible_selection_blocks_promotion_and_is_flagged(self):
+        args = self.setup_proposal()
+        # 让验证集产生一次真实改进，确保执行到终态评审而不是提前返回。
+        self.evolution.runtime.execute_candidate = lambda *call, **kwargs: {
+            'decision': 'pass' if str(call[5]).endswith('candidate') else 'fail'}
+        invalid = {'valid': False, 'reason': 'sample_not_rederivable',
+                   'expected': ['validation:other'], 'observed': ['validation:validation']}
+        with patch.object(Evolution, 'verify_selection', return_value=invalid):
+            result = self.evolution.propose_and_evaluate(*args)
+        evidence = self.evidence_of(result['candidate'])
+        self.assertEqual(evidence['decision'], 'insufficient_evidence')
+        self.assertIn('cannot be reproduced', evidence['reason'])
+        self.assertEqual(evidence['promotion_review']['selection_verification'], invalid)
+        self.assertTrue(any('cannot be reproduced' in item
+                            for item in evidence['promotion_review']['limitations']))
+        self.assertEqual(result['status'], 'insufficient_evidence')
 
 
 if __name__ == '__main__':
