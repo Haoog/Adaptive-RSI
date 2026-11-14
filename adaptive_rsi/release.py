@@ -4,6 +4,7 @@ import copy
 import json
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -219,8 +220,11 @@ def compatible_workflow(text):
 WORKFLOW_CHOICES_TTL = 300
 _workflow_choices_cache = {}
 _DISABLED_WORKFLOW_STATES = frozenset({
-    "deleted", "disabled_fork", "disabled_inactivity", "disabled_manually",
+    'deleted', 'disabled_fork', 'disabled_inactivity', 'disabled_manually',
 })
+_workflow_choices_cache_lock = threading.Lock()
+_workflow_choices_active_requests = 0
+_workflow_choices_overlap = False
 
 
 def _validated_repository(runtime, project_id):
@@ -233,62 +237,156 @@ def _validated_repository(runtime, project_id):
 
 
 def workflow_choices(runtime, project_id, refresh=False):
-    repo = _validated_repository(runtime, project_id)
-    info = api(repo, "")
-    branch = info["default_branch"]
-    sha = api(repo, "commits/" + quote(branch, safe=""))["sha"]
-    cached = _workflow_choices_cache.get((repo, sha))
-    now = time.time()
-    if not refresh and cached and now - cached[0] < WORKFLOW_CHOICES_TTL:
-        return cached[1]
-    workflows = []
-    for page in range(1, 11):
-        batch = api(repo, "actions/workflows?per_page=100" + ("&page=" + str(page) if page > 1 else "")).get("workflows", [])
-        if not isinstance(batch, list):
-            raise ValueError("Invalid workflow directory response")
-        workflows.extend(batch)
-        if len(batch) < 100:
-            break
-    import concurrent.futures
+    global _workflow_choices_active_requests
+    global _workflow_choices_overlap
 
-    def inspect(item):
-        path = item.get("path", "")
-        if not re.fullmatch(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", path):
-            return None
-        name = item.get("name", path)
-        # 目录里的 state 已经说明这个文件不会被调度；再读内容既没有意义，也会把
-        # 「已禁用」误报成 YAML 写错了，让运维去改一份本来合规的文件。
-        state = item.get("state")
-        if state in _DISABLED_WORKFLOW_STATES:
-            return {"workflow": path, "name": name, "compatible": False,
-                    "reason_code": "workflow_disabled",
-                    "reason": "This workflow is disabled. Enable it in the repository before authorizing."}
-        if state != "active":
-            return {"workflow": path, "name": name, "compatible": False,
-                    "reason_code": "workflow_inspection_failed",
-                    "reason": "Unable to inspect this workflow; refresh before authorizing"}
-        try:
-            compatible = compatible_workflow(workflow_content(repo, path, sha))
-        except (RuntimeError, ValueError, OSError):
-            return {"workflow": path, "name": name, "compatible": False,
-                    "reason_code": "workflow_inspection_failed",
-                    "reason": "Unable to inspect this workflow; refresh before authorizing"}
-        return {"workflow": path, "name": name, "compatible": compatible,
-                "reason_code": "" if compatible else "workflow_incompatible",
-                "reason": "" if compatible else "Requires explicit block-style YAML: workflow_dispatch inputs rsi_operation_id/rsi_sha (required string), and top-level run-name: ${{ inputs.rsi_operation_id }}; anchors, aliases and flow mappings require manual inspection"}
-    # 逐个 workflow 拉取内容很慢；受控并发把对话框打开时间压到单次往返级别。
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        choices = [row for row in pool.map(inspect, workflows) if row]
-    result = {"repository": repo, "sha": sha, "workflows": choices}
-    # 缓存绑定精确的默认分支 SHA；分支前进后键自然失效。授权路径始终重新校验，不受缓存影响。
-    has_transient_error = any(item.get("reason", "").startswith("Unable to inspect this workflow") for item in choices)
-    if not has_transient_error:
-        if len(_workflow_choices_cache) > 32:
-            _workflow_choices_cache.clear()
-        _workflow_choices_cache[(repo, sha)] = (now, result)
-    else:
-        _workflow_choices_cache.pop((repo, sha), None)
-    return result
+    request_registered = False
+    key = None
+
+    try:
+        with _workflow_choices_cache_lock:
+            if _workflow_choices_active_requests == 0:
+                _workflow_choices_overlap = False
+            elif not _workflow_choices_overlap:
+                _workflow_choices_overlap = True
+                _workflow_choices_cache.clear()
+
+            if refresh:
+                _workflow_choices_cache.clear()
+
+            _workflow_choices_active_requests += 1
+            request_registered = True
+
+        repo = _validated_repository(runtime, project_id)
+        info = api(repo, '')
+        branch = info['default_branch']
+        sha = api(repo, 'commits/' + quote(branch, safe=''))['sha']
+        key = (repo, sha)
+        observed_at = time.time()
+
+        if not refresh:
+            with _workflow_choices_cache_lock:
+                if (
+                    not _workflow_choices_overlap
+                    and _workflow_choices_active_requests == 1
+                ):
+                    cached = _workflow_choices_cache.get(key)
+                    if cached is not None:
+                        cached_at, cached_result = cached
+                        if time.time() - cached_at < WORKFLOW_CHOICES_TTL:
+                            # Complete the cache hit under the same lock used to
+                            # register calls, so a later call cannot overlap it.
+                            _workflow_choices_active_requests -= 1
+                            request_registered = False
+                            return cached_result
+                        _workflow_choices_cache.pop(key, None)
+
+        workflows = []
+        for page in range(1, 11):
+            batch = api(
+                repo,
+                'actions/workflows?per_page=100'
+                + ('&page=' + str(page) if page > 1 else ''),
+            ).get('workflows', [])
+            if not isinstance(batch, list):
+                raise ValueError('Invalid workflow directory response')
+            workflows.extend(batch)
+            if len(batch) < 100:
+                break
+
+        import concurrent.futures
+
+        inspection_failure_reason = 'Unable to inspect this workflow; refresh before authorizing'
+
+        def inspect(item):
+            if not isinstance(item, dict):
+                return None
+            path = item.get('path', '')
+            if not isinstance(path, str) or not re.fullmatch(
+                r'\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml', path
+            ):
+                return None
+            name = item.get('name', path)
+
+            state = item.get('state')
+            if not isinstance(state, str):
+                return {
+                    'workflow': path,
+                    'name': name,
+                    'compatible': False,
+                    'reason_code': 'workflow_inspection_failed',
+                    'reason': inspection_failure_reason,
+                }
+            if state in _DISABLED_WORKFLOW_STATES:
+                return {
+                    'workflow': path,
+                    'name': name,
+                    'compatible': False,
+                    'reason_code': 'workflow_disabled',
+                    'reason': 'This workflow is disabled. Enable it in the repository before authorizing.',
+                }
+            if state != 'active':
+                return {
+                    'workflow': path,
+                    'name': name,
+                    'compatible': False,
+                    'reason_code': 'workflow_inspection_failed',
+                    'reason': inspection_failure_reason,
+                }
+            try:
+                compatible = compatible_workflow(workflow_content(repo, path, sha))
+            except (RuntimeError, ValueError, OSError):
+                return {
+                    'workflow': path,
+                    'name': name,
+                    'compatible': False,
+                    'reason_code': 'workflow_inspection_failed',
+                    'reason': inspection_failure_reason,
+                }
+            return {
+                'workflow': path,
+                'name': name,
+                'compatible': compatible,
+                'reason_code': '' if compatible else 'workflow_incompatible',
+                'reason': '' if compatible else 'Requires explicit block-style YAML: workflow_dispatch inputs rsi_operation_id/rsi_sha (required string), and top-level run-name: ${{ inputs.rsi_operation_id }}; anchors, aliases and flow mappings require manual inspection',
+            }
+
+        # Fetching workflow contents is slow; bounded concurrency keeps selector latency low.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            choices = [row for row in pool.map(inspect, workflows) if row]
+
+        result = {'repository': repo, 'sha': sha, 'workflows': choices}
+        has_transient_error = any(
+            item.get('reason', '').startswith(inspection_failure_reason)
+            for item in choices
+        )
+
+        with _workflow_choices_cache_lock:
+            if (
+                not _workflow_choices_overlap
+                and _workflow_choices_active_requests == 1
+            ):
+                if has_transient_error:
+                    _workflow_choices_cache.pop(key, None)
+                else:
+                    if key not in _workflow_choices_cache and len(_workflow_choices_cache) >= 32:
+                        oldest_key = min(
+                            _workflow_choices_cache,
+                            key=lambda cached_key: _workflow_choices_cache[cached_key][0],
+                        )
+                        del _workflow_choices_cache[oldest_key]
+                    _workflow_choices_cache[key] = (observed_at, result)
+
+        return result
+    finally:
+        if request_registered:
+            with _workflow_choices_cache_lock:
+                _workflow_choices_active_requests -= 1
+                request_registered = False
+                if _workflow_choices_active_requests == 0:
+                    if _workflow_choices_overlap:
+                        _workflow_choices_cache.clear()
+                    _workflow_choices_overlap = False
 
 
 def _workflow_state(repo, workflow):
