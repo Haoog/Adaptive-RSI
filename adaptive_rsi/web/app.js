@@ -1399,7 +1399,7 @@ async function renderReleaseOutcome(node,run,project){
  if(project!==projectId||!node.isConnected)return;
  const section=el('section',undefined,'release-outcome');section.append(el('h4',t('发布与上线')));
  for(const [kind,title]of [['release','发布'],['deploy','部署']]){const operation=automation[kind];if(!operation)continue;const row=el('div',undefined,'release-status-row');row.append(el('strong',t(title)+' · '),el('span',t(releaseStates[operation.state]||operation.state)));
-  const rerunUnknown=operation.state==='rerun_unknown'||operation.rollback?.state==='rerun_unknown',dispatchRejected=operation.state==='failed'&&operation.dispatch_receipt==='rejected'&&!operation.workflow_run_id;
+  const rerunUnknown=operation.state==='rerun_unknown'||operation.rollback?.state==='rerun_unknown',dispatchRejected=operation.state==='failed'&&['rejected','preflight_error'].includes(operation.dispatch_receipt)&&!operation.workflow_run_id;
   // 等待中的状态（合并后检查、同服务前次部署、等待发布成功）属进行中，提示用中性样式；其余错误保持红色。
   const waitingNotice=['waiting_verification','waiting_target','waiting_release'].includes(operation.state);
   if(operation.error&&!rerunUnknown)row.append(el('p',t(apiErrors[operation.error]||operation.error),waitingNotice?'muted':'form-error'));

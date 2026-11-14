@@ -795,6 +795,74 @@ class ReleaseAutomationTest(unittest.TestCase):
             closed = abandon(self.runtime, self.project, self.run["id"], "deploy", "GitHub access permanently revoked")
         self.assertEqual(closed["state"], "failed")
 
+    def test_permanent_preflight_failure_stops_polling_and_retry_dispatches_once(self):
+        deploy = self.setup_deployment()
+        self.runtime.store.put_setting(owner_key(self.project, "example/project", deploy),
+                                       {"run": "previous-run", "sha": PREVIOUS})
+        self.runtime.store.put_setting(key("previous-run", "deploy"), {"state": "healthy", "sha": PREVIOUS})
+        before = len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'"))
+        reads = []
+        def forbidden(repo, endpoint, method="GET", fields=None):
+            reads.append(endpoint)
+            if endpoint.startswith("compare/"):
+                raise ApiRejected("gh: Forbidden (HTTP 403)", 403)
+            return self.api(repo, endpoint, method, fields)
+        # 派发前的永久 403 与前两轮的对账失败共用同一预算：3 轮后停止轮询。
+        with patch("adaptive_rsi.release.api", side_effect=forbidden):
+            for expected in ("blocked", "blocked", "failed"):
+                self.assertEqual(self.tick()["deploy"]["state"], expected)
+            self.assertEqual(reads, ["compare/" + PREVIOUS + "..." + MERGED] * 3)
+            self.assertFalse(pending(self.runtime, self.run))
+            # 达到上限后不再调用 GitHub，也不再写事件。
+            reads.clear()
+            for _ in range(2):
+                self.assertEqual(self.tick()["deploy"]["state"], "failed")
+        self.assertEqual(reads, [])
+        saved = self.runtime.store.setting(key(self.run["id"], "deploy"))
+        self.assertEqual(saved["state"], "failed")
+        self.assertEqual(saved["advance_failures"], 3)
+        self.assertEqual(saved["last_advance_error"], "gh: Forbidden (HTTP 403)")
+        self.assertEqual(saved["error"], "gh: Forbidden (HTTP 403)")
+        self.assertEqual(saved["dispatch_receipt"], "preflight_error")
+        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")) - before, 1)
+        # 权限恢复后 retry 清零预算并放回待发，只发起一次新的派发。
+        self.commands.clear()
+        def restored(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("compare/"):
+                return {"status": "ahead", "ahead_by": 1}
+            return self.api(repo, endpoint, method, fields)
+        with patch("adaptive_rsi.release.api", side_effect=restored):
+            self.assertEqual(retry(self.runtime, self.project, self.run["id"], "deploy")["state"], "pending")
+            self.assertEqual(self.tick()["deploy"]["state"], "submitted")
+            self.assertEqual(self.tick()["deploy"]["state"], "submitted")
+        self.assertEqual(sum(method == "POST" and "/dispatches" in endpoint
+                             for endpoint, method, _ in self.commands), 1)
+        resumed = self.runtime.store.setting(key(self.run["id"], "deploy"))
+        self.assertNotIn("advance_failures", resumed)
+
+    def test_preflight_cooldown_does_not_consume_failure_budget(self):
+        deploy = self.setup_deployment()
+        self.runtime.store.put_setting(owner_key(self.project, "example/project", deploy),
+                                       {"run": "previous-run", "sha": PREVIOUS})
+        self.runtime.store.put_setting(key("previous-run", "deploy"), {"state": "healthy", "sha": PREVIOUS})
+        def cooldown(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("compare/"):
+                raise ApiRejected("GitHub rate limit cooldown active; request was not sent", 429, local=True)
+            return self.api(repo, endpoint, method, fields)
+        # 本机冷却没有发出请求：连续多轮也不能把回执推成永久失败。
+        with patch("adaptive_rsi.release.api", side_effect=cooldown):
+            for _ in range(4):
+                self.assertIn(self.tick()["deploy"]["state"], {"pending", "blocked"})
+        saved = self.runtime.store.setting(key(self.run["id"], "deploy"))
+        self.assertNotIn("advance_failures", saved)
+        self.assertTrue(pending(self.runtime, self.run))
+        def restored(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("compare/"):
+                return {"status": "ahead"}
+            return self.api(repo, endpoint, method, fields)
+        with patch("adaptive_rsi.release.api", side_effect=restored):
+            self.assertEqual(self.tick()["deploy"]["state"], "submitted")
+
     def test_health_exception_does_not_modify_concurrent_receipt(self):
         deploy = self.setup_deployment(rollback=True)
         name = key(self.run['id'], 'deploy')
