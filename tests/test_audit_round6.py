@@ -1201,6 +1201,142 @@ class AuditMaintenanceRetentionTest(unittest.TestCase):
                 store.close()
 
 
+    def test_archive_symlink_replaced_with_regular_during_batch_is_verified(self):
+        from adaptive_rsi.maintenance import Maintenance
+
+        with tempfile.TemporaryDirectory(prefix='archive-reverse-symlink-race-') as directory:
+            store = Store(directory)
+            try:
+                archive_dir = store.root / 'archives'
+                archive_dir.mkdir(exist_ok=True)
+                first = archive_dir / 'a.sqlite3.gz'
+                second = archive_dir / 'b.sqlite3.gz'
+                target = store.root / 'ordinary-temp-file'
+                first.write_bytes(b'first archive')
+                target.write_bytes(b'ordinary file')
+                probe = store.root / 'symlink-support-probe'
+                try:
+                    probe.symlink_to(target)
+                    probe.unlink()
+                except (OSError, NotImplementedError) as exc:
+                    self.skipTest('symlinks are unavailable: %s' % exc)
+                second.symlink_to(target)
+
+                first_key = 'archive-verification:' + first.name
+                second_key = 'archive-verification:' + second.name
+                store.put_setting(first_key, {'valid': True, 'checked_at': time.time() - 60})
+                original_query = store.query
+                original_one = store.one
+                batch_reads = []
+                exact_status_reads = []
+                replaced = []
+
+                def intercept_query(sql, args=()):
+                    if sql.startswith('SELECT key,value FROM settings WHERE key IN ('):
+                        batch_reads.append(tuple(args))
+                        if not replaced:
+                            second.unlink()
+                            second.write_bytes(b'second archive')
+                            replaced.append(True)
+                    return original_query(sql, args)
+
+                def capture_one(sql, args=()):
+                    if sql == 'SELECT value FROM settings WHERE key=?' and args == (second_key,):
+                        exact_status_reads.append(tuple(args))
+                    return original_one(sql, args)
+
+                report = {'valid': True, 'checked_at': time.time()}
+                with patch.object(store, 'query', side_effect=intercept_query):
+                    with patch.object(store, 'one', side_effect=capture_one):
+                        with patch('adaptive_rsi.storage_tools.verify_archive',
+                                   return_value=report) as checked:
+                            Maintenance.maintenance(self.archive_maintenance(store))
+
+                self.assertEqual(replaced, [True])
+                self.assertFalse(second.is_symlink())
+                self.assertEqual(batch_reads, [(first_key,)])
+                self.assertEqual(exact_status_reads, [(second_key,)])
+                checked.assert_called_once_with(second, timeout=5)
+                self.assertIsNotNone(store.one(
+                    'SELECT value FROM settings WHERE key=?', (second_key,)))
+            finally:
+                store.close()
+
+    def test_archive_status_read_error_is_ignored_when_all_batch_candidates_become_symlinks(self):
+        from adaptive_rsi.maintenance import Maintenance
+
+        with tempfile.TemporaryDirectory(prefix='archive-status-symlink-error-') as directory:
+            store = Store(directory)
+            try:
+                archive_dir = store.root / 'archives'
+                archive_dir.mkdir(exist_ok=True)
+                current = archive_dir / 'current.sqlite3.gz'
+                target = store.root / 'ordinary-temp-file'
+                current.write_bytes(b'archive')
+                target.write_bytes(b'ordinary file')
+                probe = store.root / 'symlink-support-probe'
+                try:
+                    probe.symlink_to(target)
+                    probe.unlink()
+                except (OSError, NotImplementedError) as exc:
+                    self.skipTest('symlinks are unavailable: %s' % exc)
+                original_query = store.query
+
+                def fail_after_replacement(sql, args=()):
+                    if sql.startswith('SELECT key,value FROM settings WHERE key IN ('):
+                        current.unlink()
+                        current.symlink_to(target)
+                        raise sqlite3.OperationalError('injected archive status read failure')
+                    return original_query(sql, args)
+
+                with patch.object(store, 'query', side_effect=fail_after_replacement):
+                    with patch('adaptive_rsi.storage_tools.verify_archive') as checked:
+                        Maintenance.maintenance(self.archive_maintenance(store))
+                self.assertTrue(current.is_symlink())
+                checked.assert_not_called()
+                self.assertGreater(store.setting('maintenance-last', 0), 0)
+            finally:
+                store.close()
+
+    def test_archive_status_read_error_propagates_if_a_batch_candidate_remains_regular(self):
+        from adaptive_rsi.maintenance import Maintenance
+
+        with tempfile.TemporaryDirectory(prefix='archive-status-mixed-error-') as directory:
+            store = Store(directory)
+            try:
+                archive_dir = store.root / 'archives'
+                archive_dir.mkdir(exist_ok=True)
+                first = archive_dir / 'a.sqlite3.gz'
+                second = archive_dir / 'b.sqlite3.gz'
+                target = store.root / 'ordinary-temp-file'
+                first.write_bytes(b'first archive')
+                second.write_bytes(b'second archive')
+                target.write_bytes(b'ordinary file')
+                probe = store.root / 'symlink-support-probe'
+                try:
+                    probe.symlink_to(target)
+                    probe.unlink()
+                except (OSError, NotImplementedError) as exc:
+                    self.skipTest('symlinks are unavailable: %s' % exc)
+                original_query = store.query
+
+                def fail_after_replacement(sql, args=()):
+                    if sql.startswith('SELECT key,value FROM settings WHERE key IN ('):
+                        first.unlink()
+                        first.symlink_to(target)
+                        raise sqlite3.OperationalError('injected archive status read failure')
+                    return original_query(sql, args)
+
+                with patch.object(store, 'query', side_effect=fail_after_replacement):
+                    with self.assertRaisesRegex(sqlite3.OperationalError,
+                                                'injected archive status read failure'):
+                        Maintenance.maintenance(self.archive_maintenance(store))
+                self.assertTrue(first.is_symlink())
+                self.assertFalse(second.is_symlink())
+            finally:
+                store.close()
+
+
 class AuditResourceFairnessTest(unittest.TestCase):
     setUp = AuditRound6Test.setUp
 

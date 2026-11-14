@@ -791,37 +791,60 @@ class Maintenance:
         # Passive checkpoint yields to readers; archive checks are capped per cycle.
         self.store.wal_diagnostics(checkpoint=True)
         from .storage_tools import verify_archive
-        prefix = "archive-verification:"
-        archive_paths = [path for path in sorted((self.store.root / "archives").glob("*.sqlite3.gz"))
-                         if not path.is_symlink()]
+        prefix = 'archive-verification:'
+        archive_paths = sorted((self.store.root / 'archives').glob('*.sqlite3.gz'))
         for offset in range(0, len(archive_paths), ARCHIVE_VERIFICATION_READ_BATCH_SIZE):
             batch = archive_paths[offset:offset + ARCHIVE_VERIFICATION_READ_BATCH_SIZE]
-            keys = [prefix + path.name for path in batch]
-            placeholders = ",".join("?" for _ in keys)
-            rows = self.store.query(
-                "SELECT key,value FROM settings WHERE key IN (%s)" % placeholders,
-                tuple(keys))
-            verification_status = {row["key"]: row["value"] for row in rows}
-            for path, key in zip(batch, keys):
+            initially_regular_paths = [path for path in batch if not path.is_symlink()]
+            keys = [prefix + path.name for path in initially_regular_paths]
+            initially_regular_keys = set(keys)
+            verification_status = {}
+            status_read_succeeded = False
+            if keys:
+                placeholders = ','.join('?' for _ in keys)
+                sql = 'SELECT key,value FROM settings WHERE key IN (%s)' % placeholders
+                try:
+                    rows = self.store.query(sql, tuple(keys))
+                except Exception:
+                    # If every queried archive became a symlink, the old per-path
+                    # loop would have skipped its status read. Any path that is
+                    # regular when visited still gets an exact read below.
+                    if any(not path.is_symlink() for path in initially_regular_paths):
+                        raise
+                else:
+                    verification_status = {row['key']: row['value'] for row in rows}
+                    status_read_succeeded = True
+
+            for path in batch:
+                key = prefix + path.name
                 if path.is_symlink():
                     continue
-                due, previous_type = _archive_verification_due(
-                    verification_status.get(key, _ARCHIVE_VERIFICATION_MISSING), now)
+                if key in initially_regular_keys and status_read_succeeded:
+                    status_value = verification_status.get(
+                        key, _ARCHIVE_VERIFICATION_MISSING)
+                else:
+                    # This includes paths that were symlinks at enumeration time
+                    # but became regular before their turn in the sorted pass.
+                    row = self.store.one(
+                        'SELECT value FROM settings WHERE key=?', (key,))
+                    status_value = (row['value'] if row is not None
+                                    else _ARCHIVE_VERIFICATION_MISSING)
+                due, previous_type = _archive_verification_due(status_value, now)
                 if not due:
                     continue
                 if previous_type is not None:
                     # 只报形状，不回显原值：损坏内容可能是任意手工写入的文本。
                     try:
-                        self.store.event("archive_verification_repaired",
-                                         "Replaced unusable archive verification record: %s" % key,
-                                         data={"key": key, "previous_type": previous_type})
+                        self.store.event('archive_verification_repaired',
+                                         'Replaced unusable archive verification record: %s' % key,
+                                         data={'key': key, 'previous_type': previous_type})
                     except Exception:
                         logging.getLogger(__name__).exception(
-                            "Archive verification repair event persistence failed: %s", key)
+                            'Archive verification repair event persistence failed: %s', key)
                 try:
                     report = verify_archive(path, timeout=5)
                 except (OSError, ValueError, TimeoutError, sqlite3.Error, EOFError, zlib.error) as exc:
-                    report = {"valid": False, "checked_at": now, "error_type": type(exc).__name__}
+                    report = {'valid': False, 'checked_at': now, 'error_type': type(exc).__name__}
                 self.store.put_setting(key, report)
                 break
             else:
