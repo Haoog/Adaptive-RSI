@@ -1066,7 +1066,8 @@ class Handler(BaseHTTPRequestHandler):
                 except ReconciliationRejected as exc:
                     raise RequestError(str(exc)) from None
             elif parsed.path == "/api/release-workflows":
-                self.respond(runtime.workflow_choices(params.get("project", [""])[0]))
+                refresh = params.get("refresh", [""])[0] == "true"
+                self.respond(runtime.workflow_choices(params.get("project", [""])[0], refresh=refresh))
             elif parsed.path == "/api/task-runs":
                 task = store.one("SELECT project FROM tasks WHERE id=?", (params.get("task", [""])[0],))
                 if not task or task["project"] != params.get("project", [""])[0]:

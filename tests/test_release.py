@@ -184,6 +184,32 @@ class ReleaseAutomationTest(unittest.TestCase):
             closed = abandon(self.runtime, self.project, self.run["id"], "release", "GitHub access permanently revoked")
         self.assertEqual(closed["state"], "failed")
 
+    def _legacy_invalid_health_snapshot(self):
+        self.setup_deployment()
+        saved = json.loads(self.run["config"])
+        saved["delivery"]["deploy"]["health_url"] = "https://app.example:0/health"
+        self.run["config"] = encode(saved)
+        self.runtime.store.execute("UPDATE runs SET config=? WHERE id=?", (encode(saved), self.run["id"]))
+
+    def test_invalid_live_and_frozen_health_policy_blocks_deployment_dispatch(self):
+        self._legacy_invalid_health_snapshot()
+        project = self.runtime.project(self.project)
+        stored = json.loads(project["config"])
+        stored["delivery"]["deploy"]["health_url"] = "https://app.example:0/health"
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(stored), self.project))
+        with patch("adaptive_rsi.release.api") as api:
+            result = self.tick()
+        self.assertEqual(result["deploy"]["state"], "blocked")
+        api.assert_not_called()
+
+    def test_repaired_live_health_does_not_authorize_invalid_frozen_policy(self):
+        self._legacy_invalid_health_snapshot()
+        with patch("adaptive_rsi.release.api") as api:
+            result = self.tick()
+        self.assertEqual(result["deploy"]["state"], "blocked")
+        self.assertIn("authorization revoked or target changed", result["deploy"]["error"])
+        api.assert_not_called()
+
     def test_corrupt_automation_receipt_is_preserved_and_blocks_dispatch(self):
         from adaptive_rsi.release import status
         for raw in ('{broken', '[]', 'null', '{}', '{"state":3}', '{"state":"submitted"}'):
@@ -712,6 +738,9 @@ class ReleaseAutomationTest(unittest.TestCase):
                 return {"sha": TRUSTED}
             if endpoint.startswith("actions/workflows?"):
                 return {"workflows": [{"name": "Publish", "path": self.policy["workflow"], "state": "active"}]}
+            if endpoint.startswith("actions/workflows/"):
+                # 授权路径按文件名读取单个 workflow 的注册状态（active/disabled_*）。
+                return {"name": "Publish", "path": self.policy["workflow"], "state": "active"}
             if endpoint.startswith("git/matching-refs/"):
                 return []
             if endpoint == "git/refs":
@@ -1680,9 +1709,9 @@ class WorkflowConfigurationTest(unittest.TestCase):
         jobs = workflow["jobs"]
         self.assertEqual(jobs["python"]["runs-on"], "${{ matrix.os }}")
         self.assertTrue(all(item["os"] == "ubuntu-latest" for item in jobs["python"]["strategy"]["matrix"]["include"]))
-        self.assertEqual(jobs["browser"]["runs-on"], "macos-14")
-        self.assertEqual(jobs["macos_sandbox_core"]["runs-on"], "macos-14")
-        self.assertEqual(jobs["macos_sandbox_flows"]["runs-on"], "macos-14")
+        self.assertEqual(jobs["browser"]["runs-on"], "macos-latest")
+        self.assertEqual(jobs["macos_sandbox_core"]["runs-on"], "macos-latest")
+        self.assertEqual(jobs["macos_sandbox_flows"]["runs-on"], "macos-latest")
         required = set(jobs["verify"]["needs"])
         self.assertTrue({"python", "macos_sandbox_core", "macos_sandbox_flows", "browser", "linux"} <= required)
         text = (self.ROOT / ".github/workflows/checks.yml").read_text()

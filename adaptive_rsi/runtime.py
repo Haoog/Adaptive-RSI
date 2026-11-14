@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .adapters import detect
 from .agent import CodexAgent
-from .config import BUILTIN_PROVIDERS, DEFAULTS, compatibility, fingerprint, merge, relative_path, validate, within_hours
+from .config import BUILTIN_PROVIDERS, DEFAULTS, InvalidDeploymentHealth, compatibility, fingerprint, merge, relative_path, validate, validate_legacy_schedule, within_hours
 from .evaluator import Evaluator, check_identity
 from .gitops import changes, git, origin_repository, repository, snapshot
 from .process import Cancelled, checked
@@ -513,28 +513,68 @@ class Runtime(Maintenance):
             raise ValueError("Parallel project limit is a global setting; select global defaults")
         if project and "updates" in values:
             raise ValueError("Software updates are a global setting")
-        previous = json.loads(self.project(project)["config"]) if project else self.store.setting("config", {})
-        projects = [self.project(project)] if project else self.store.query("SELECT * FROM projects")
+
+        global_config = self.store.setting("config", {})
+        if project:
+            project_row = self.project(project)
+            projects = [project_row]
+            previous = json.loads(project_row["config"])
+        else:
+            projects = self.store.query("SELECT * FROM projects")
+            previous = global_config
+
         schedules = {}
+        previously_valid = set()
+        invalid_health = set()
         for row in projects:
             try:
-                schedules[row["id"]] = self.config(row["id"])["schedule"]
-            except (ValueError, TypeError, KeyError, AttributeError):
-                if project:
+                override = previous if project else json.loads(row["config"])
+                old_effective = validate(merge(DEFAULTS, global_config, override))
+                schedules[row["id"]] = old_effective["schedule"]
+                previously_valid.add(row["id"])
+            except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                if project and not isinstance(exc, InvalidDeploymentHealth):
                     raise
+                if isinstance(exc, InvalidDeploymentHealth):
+                    # Schedule fields have already passed validation before the
+                    # health-URL check, so preserve their existing due times.
+                    old_raw = merge(DEFAULTS, global_config, previous if project else override)
+                    schedules[row["id"]] = old_raw["schedule"]
+                    invalid_health.add(row["id"])
+
         updated = copy.deepcopy(values) if replacement else merge(previous, values)
         for path in inherit:
             group, key = path.split(".")
             section = updated.get(group)
             if isinstance(section, dict):
                 section.pop(key, None)
-        validate(merge(self.store.setting("config", {}) if project else {}, updated))
-        if not project:
-            # Global changes must also remain valid for every existing project override.
+
+        effective_configs = {}
+        if project:
+            # Project saves remain strict: repairing an invalid project must produce a fully valid config.
+            effective_configs[project] = validate(merge(global_config, updated))["schedule"]
+        else:
+            validate(updated)
+            # Preflight every previously valid project strictly. For a project whose old config
+            # failed specifically on a health URL port, validate the entire candidate config
+            # while ignoring only that legacy URL-port exception. The helper returns only its
+            # schedule, so the result cannot authorize deployment or make the project valid.
             for row in projects:
+                try:
+                    override = json.loads(row["config"])
+                    candidate = merge(updated, override)
+                    if row["id"] in invalid_health:
+                        candidate_schedule = validate_legacy_schedule(candidate)
+                    else:
+                        candidate_schedule = validate(candidate)["schedule"]
+                except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                    # A formerly valid project must stay valid. A formerly health-invalid
+                    # project must pass every other check before a global write is allowed.
+                    if row["id"] in previously_valid or row["id"] in invalid_health:
+                        raise
+                    continue
                 if row["id"] in schedules:
-                    # 写入侧校验：行数据损坏时直接暴露错误，不静默降级通过验证。
-                    validate(merge(updated, json.loads(row["config"])))
+                    effective_configs[row["id"]] = candidate_schedule
         revision_key = "config-revision:" + (project or "global")
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -562,14 +602,16 @@ class Runtime(Maintenance):
                          data=revision_data)
         if "schedule" in values or inherit or replacement:
             for row in projects:
-                if row["id"] not in schedules:
+                project_id = row["id"]
+                if project_id not in schedules or project_id not in effective_configs:
                     continue
-                effective = self.config(row["id"])
+                effective = effective_configs[project_id]
                 for kind in ["light", "issues", "deep"]:
-                    if effective["schedule"][kind + "_minutes"] == schedules[row["id"]][kind + "_minutes"]:
+                    if effective[kind + "_minutes"] == schedules[project_id][kind + "_minutes"]:
                         continue
                     self.store.execute("UPDATE schedules SET due=? WHERE project=? AND kind=?",
-                                       (time.time() + effective["schedule"][kind + "_minutes"] * 60, row["id"], kind))
+                                       (time.time() + effective[kind + "_minutes"] * 60,
+                                        project_id, kind))
         self.wake.set()
         return {"saved": True, "revision": next_revision}
 
@@ -609,9 +651,9 @@ class Runtime(Maintenance):
         from .release import resolve
         return resolve(self, project, run, kind, workflow_run_id, target, source="console")
 
-    def workflow_choices(self, project):
+    def workflow_choices(self, project, refresh=False):
         from .release import workflow_choices
-        return workflow_choices(self, project)
+        return workflow_choices(self, project, refresh=refresh)
 
     def authorize_workflow(self, project, kind, workflow):
         from .release import authorize_workflow

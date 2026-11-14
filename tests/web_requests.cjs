@@ -54,6 +54,60 @@ test('oversized patch errors are found by error code and localized in both conso
   assert.match(page.context.t(localized),/2 MiB preview limit/);
   assert.match(page.context.t(localized),/download it from the run directory/);
 });
+test('workflow inspection retry errors reach the UI in both languages', async()=>{
+  const message='Unable to inspect this workflow right now; retry after the GitHub request succeeds';
+  const page=browser();
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  vm.runInContext(i18n.slice(0,i18n.indexOf('const staticText =')),page.context);
+  page.context.fetch=async()=>response({error:message,error_code:'validation_error'},400);
+  for(const [locale,expected] of [
+    ['zh-CN','暂时无法读取此工作流。请等待 GitHub 请求恢复后重试。'],
+    ['en','This workflow could not be inspected temporarily. Wait for GitHub requests to recover, then try again.']
+  ]){
+    vm.runInContext(`language=${JSON.stringify(locale)}`,page.context);
+    await assert.rejects(page.context.api('release-authorize',{project:'a',kind:'release',workflow:'.github/workflows/deploy.yml'}),error=>{
+      assert.equal(error.code,'validation_error');
+      assert.equal(error.message,expected);
+      assert.notEqual(error.message,'Invalid request');
+      return true;
+    });
+  }
+});
+test('refreshing workflow choices bypasses cached disabled state and explains why it is unavailable', async()=>{
+  const page=browser(),calls=[];
+  page.node('config-scope').value='project';
+  let enabled=false;
+  page.context.fetch=async url=>{
+    calls.push(url);
+    return response({workflows:[
+      {workflow:'.github/workflows/deploy.yml',name:'Deploy',compatible:enabled,
+        reason_code:enabled?'':'workflow_disabled'},
+      {workflow:'.github/workflows/legacy.yml',name:'Legacy',compatible:false,reason_code:'workflow_incompatible'}
+    ]});
+  };
+  const refresh=page.node('release-workflows-refresh').handlers.click;
+  assert.equal(typeof refresh,'function');
+  await refresh();
+  let option=page.node('release-workflow-list').children.find(item=>item.value==='.github/workflows/deploy.yml');
+  assert.ok(option.disabled);
+  assert.match(option.textContent,/工作流已禁用/);
+  const incompatible=page.node('release-workflow-list').children.find(item=>item.value==='.github/workflows/legacy.yml');
+  assert.ok(incompatible.disabled);
+  assert.match(incompatible.textContent,/工作流不符合自动交付要求/);
+  enabled=true;
+  await refresh();
+  option=page.node('release-workflow-list').children.find(item=>item.value==='.github/workflows/deploy.yml');
+  assert.equal(option.disabled,false);
+  assert.ok(calls.every(url=>url.includes('refresh=true')));
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  const translations=vm.runInNewContext(i18n.slice(0,i18n.indexOf('const staticText ='))+
+    ';["工作流已禁用，请在 GitHub 仓库中启用后刷新。","暂时无法检查此工作流，请刷新重试。","工作流不符合自动交付要求，请检查所需输入。"].map(key=>english[key])');
+  assert.deepEqual(JSON.parse(JSON.stringify(translations)),[
+    'This workflow is disabled. Enable it in the GitHub repository, then refresh.',
+    'This workflow could not be inspected temporarily. Refresh and try again.',
+    'This workflow is incompatible with automatic delivery. Check its required inputs.'
+  ]);
+});
 function descendants(node) {
   return (node.children || []).flatMap(child => [child, ...descendants(child)]);
 }
@@ -3596,4 +3650,47 @@ test('returning to the page refreshes once via visibilitychange; focus no longer
   page.listeners.get('visibilitychange')();
   assert.equal(states.length, 2, 'hiding the page does not refresh');
   assert.equal(page.timers.filter(timer => timer.active && timer.delay === 60000).length, 1, 'hidden polling keeps the slow cadence');
+});
+
+test('hidden pages prefix the title with the attention count and keep the project context', () => {
+  const page = browser();
+  Object.assign(page.context.initialState, {
+    projects: [{id: 'a', name: 'Alpha', path: '/work/alpha', paused: true}],
+    selected_project: 'a', tasks: [], runs: [], task_counts: [{state: 'awaiting_approval', count: 2}],
+    schedules: [], events: [], usage: [],
+  });
+  page.node('config-scope').value = 'project';
+  page.document.visibilityState = 'hidden';
+  vm.runInContext('state=initialState;projectId="a";view="overview";language="zh-CN";renderNavigation()', page.context);
+  assert.equal(page.document.title, '● 2 · 需要处理的任务 · Alpha · /work/alpha · Adaptive RSI · 控制台');
+  assert.equal(page.context.window.RSIExperience, undefined, 'the title hint works without the optional notification module or permission');
+  vm.runInContext('state.task_counts=[];renderNavigation()', page.context);
+  assert.equal(page.document.title, 'Alpha · /work/alpha · Adaptive RSI · 控制台', 'zero attention restores the plain title');
+});
+
+test('visibility changes update the title without extra requests and translate its fragment', async () => {
+  const page = browser(), requests = [];
+  Object.assign(page.context.initialState, {
+    projects: [{id: 'a', name: 'Alpha', paused: true}],
+    selected_project: 'a', tasks: [], runs: [], task_counts: [{state: 'awaiting_approval', count: 3}],
+    schedules: [], events: [], usage: [],
+  });
+  page.node('config-scope').value = 'project';
+  page.context.fetch = async url => { requests.push(url); return response({tasks: [], runs: []}); };
+  page.document.visibilityState = 'visible';
+  vm.runInContext('state=initialState;projectId="a";view="overview";language="zh-CN";renderNavigation()', page.context);
+  assert.equal(page.document.title, 'Alpha · Adaptive RSI · 控制台');
+  page.document.visibilityState = 'hidden';
+  page.listeners.get('visibilitychange')();
+  assert.equal(requests.length, 0, 'hiding the page updates the title without a request');
+  assert.match(page.document.title, /^● 3/);
+  page.context.t = value => ({'需要处理的任务': 'Tasks needing attention', 'Adaptive RSI · 控制台': 'Adaptive RSI · Console'}[value] ?? value);
+  page.context.language = 'en';
+  vm.runInContext('renderNavigation()', page.context);
+  assert.equal(page.document.title, '● 3 · Tasks needing attention · Alpha · Adaptive RSI · Console', 'the fragment translates while the project name and suffix stay intact');
+  page.document.visibilityState = 'visible';
+  page.listeners.get('visibilitychange')();
+  assert.equal(requests.length, 1, 'becoming visible keeps the existing single refresh');
+  await page.context.lastAction;
+  assert.equal(page.document.title, 'Alpha · Adaptive RSI · Console');
 });
