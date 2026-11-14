@@ -798,7 +798,26 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
  window.RSIExperience?.taskOpened(task,queueDraft);
  const requirements=el('section',undefined,'task-requirements'),copy=el('p',task.body);copy.id='task-requirements';requirements.append(el('h3',t('任务要求')),copy);body.append(requirements);
  const evidence=lazyEvidence('来源与证据',()=>task.evidence||'');evidence.className='detail-section';body.append(evidence);
- const firstPage=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');if(ticket!==detailSequence||projectId!==project)return;
+ // 首屏请求失败时，保留当前详情；重试只重取第一页，再继续本次渲染。
+ let retrying=false,rendered=false;
+ let firstPage;try{firstPage=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');}catch(error){if(!stillCurrent())return;
+  // 登录失效要重新进入控制台，保留原有提示，不在详情里诱导反复重试。
+  if(error.code==='session_required')throw error;
+  const failed=el('section',undefined,'detail-section');
+  let retry;
+  retry=action(t('重试'),async()=>{if(retrying||rendered||!stillCurrent())return;retrying=true;retry.disabled=true;let page;
+   try{page=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');}
+   catch(retryError){if(!stillCurrent())return;if(retryError.code==='session_required'){rendered=true;failed.remove();throw retryError;}return;}
+   finally{retrying=false;if(!rendered&&stillCurrent())retry.disabled=false;}
+   if(!stillCurrent()||rendered)return;
+   // The existing detail remains visible while history loads; its current
+   // disclosure state takes precedence over the older rebuild snapshot.
+   rendered=true;failed.remove();await completeHistory(page,null);
+  },'text-button');
+  failed.append(el('h3',t('检查过程与运行记录')),el('p',t('运行记录加载失败。'),'form-error'),retry);body.append(failed);return;}
+ await completeHistory(firstPage);
+ async function completeHistory(firstPage,restore=restoreView){
+ if(!stillCurrent())return;
  // 响应为分页信封；同时接受旧服务端的裸数组，避免升级期间把历史区显示为空。
  const history=runPageRows(firstPage);
  let historyBefore=!Array.isArray(firstPage)&&firstPage?.has_more&&firstPage.next_before?firstPage.next_before:null;
@@ -824,7 +843,7 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
   if(data.result.pr){run.pr=data.result.pr;const link=el('a',t('打开 GitHub PR ↗'));if(/^https:\/\/github\.com\//.test(run.pr)){link.href=run.pr;link.target='_blank';link.rel='noreferrer';delivery.append(link);}}
   if(['pr_open','merged'].includes(run.state))delivery.append(action(t('撤销这次修改（先检查再提交）'),async()=>{await api('revert-code',{run:run.id});toast(t('恢复旧版本任务已加入；通过检查后才可交付'));closeTaskDetail();await refresh();}));
   if(index===0)body.insertBefore(delivery,evidence);else section.append(delivery);
-  restoreView?.(body);
+  restore?.(body);
   }
  function appendRun(run,index,before){const section=el('details',undefined,'detail-section');section.dataset.run=run.id;section.append(el('summary',t(index===0?'检查过程与运行记录':'以前的运行')+' · '+run.id));
   // 加载失败不能让区块永久空白：失败后在区块内给出错误项与重试入口；进行中的请求不重复发起。
@@ -885,8 +904,9 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
      toast(t('预约已保存'));closeTaskDetail();await refresh();},'button primary'));
    secondary.append(el('summary',t('安排检查')),scheduleBox);}
   body.append(secondary);}
- restoreView?.(body);
+ restore?.(body);
  if(stillCurrent()&&!$('detail-dialog').open)$('detail-dialog').showModal();}
+}
 const evolutionReasons={
  "Need independent validation/holdout cases before proposing":"需要先导入独立的验证集和最终评估集任务，才能提出改进方案。",
  "Validation or holdout exposure limit reached; import new cases or raise evolution.max_holdout_uses":"验证集或最终评估集的曝光次数已达上限；请导入新的评估任务，或在项目配置中调高 evolution.max_holdout_uses。",
