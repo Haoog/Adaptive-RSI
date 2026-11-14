@@ -365,7 +365,8 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual([s["id"] for s in strategies], ["a", "c"])
         self.assertEqual(strategies[0]["content"]["guidance"], "Reproduce arithmetic boundary cases")
         self.assertEqual([sql for sql in statements if "FROM candidates" in sql],
-                         ["SELECT id,kind,content,evidence FROM candidates WHERE project=? AND status='stable'"])
+                         ["SELECT id,kind,content,evidence,created FROM candidates "
+                          "WHERE project=? AND status='stable'"])
 
     def test_inspection_reads_each_finding_path_only_once(self):
         findings = {"findings": [
@@ -1502,6 +1503,95 @@ Path(%r).write_text('allowed output')
         self.runtime.monitor_strategy(self.project, False, run, attributable=True)
         self.assertEqual(self.runtime.active_strategies(self.project), [])
         self.assertEqual(self.runtime.memories(self.project, "add"), [])
+
+    def test_duplicate_check_identity_does_not_hide_regression(self):
+        config = self.runtime.config(self.project)
+        candidate = "duplicate-check-identity"
+        evidence = {"monitor": {"passed": 0, "failed": 0, "runs": []}}
+        self.store.execute(
+            "INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+            (candidate, self.project, "strategy", "stable", "{}", encode(evidence), time.time()),
+        )
+        task_id, run = self.claim("duplicate check identity")
+        self.store.execute("UPDATE runs SET strategy=?,config=? WHERE id=?",
+                           (encode([{"id": candidate}]), encode(config), run["id"]))
+        task = self.store.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        duplicate = {"name": "same", "argv": ["true"], "cwd": "."}
+        result = {"decision": "fail", "evaluation": {"checks": {
+            "baseline": [{**duplicate, "passed": True}],
+            "candidate": [{**duplicate, "passed": False}, {**duplicate, "passed": True}],
+        }}}
+
+        self.runtime.finish_failure(run, task, result, config)
+
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id=?", (candidate,))
+        self.assertEqual(row["status"], "rolled_back")
+        self.assertEqual(json.loads(row["evidence"])["monitor"]["failed"], 1)
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='rollback'")), 1)
+
+    def test_failure_monitor_ignores_candidate_promoted_after_run_started(self):
+        config = self.runtime.config(self.project)
+        evidence = {"monitor": {"passed": 0, "failed": 0, "runs": []}}
+        for candidate, status, content in (("run-strategy", "stable", "{}"),
+                                           ("promoted-during-run", "ready",
+                                            encode({"guidance": "new", "triggers": []}))):
+            self.store.execute(
+                "INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+                (candidate, self.project, "strategy", status, content, encode(evidence), time.time()),
+            )
+        task_id, run = self.claim("strategy promoted during run")
+        strategies, generations = self.runtime._active_strategy_snapshot(self.project, config)
+        recorded = [{**strategy, "_candidate_created": generations[strategy["id"]]}
+                    for strategy in strategies]
+        self.store.execute("UPDATE runs SET strategy=?,config=? WHERE id=?",
+                           (encode(recorded), encode(config), run["id"]))
+        self.runtime.promote_strategy("promoted-during-run")
+        task = self.store.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        check = {"name": "same", "argv": ["true"], "cwd": "."}
+        result = {"decision": "fail", "evaluation": {"checks": {
+            "baseline": [{**check, "passed": True}],
+            "candidate": [{**check, "passed": False}],
+        }}}
+
+        self.runtime.finish_failure(run, task, result, config)
+
+        promoted = self.store.one("SELECT status,evidence FROM candidates WHERE id='promoted-during-run'")
+        self.assertEqual(promoted["status"], "stable")
+        self.assertEqual(json.loads(promoted["evidence"])["monitor"]["failed"], 0)
+        self.assertEqual(self.store.query("SELECT seq FROM events WHERE kind='rollback'"), [])
+
+    def test_failure_monitor_ignores_reused_candidate_id_created_after_run_started(self):
+        config = self.runtime.config(self.project)
+        candidate = "reused-after-run-start"
+        evidence = {"monitor": {"passed": 0, "failed": 0, "runs": []}}
+        self.store.execute(
+            "INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+            (candidate, self.project, "strategy", "stable", "{}", encode(evidence), time.time()),
+        )
+        task_id, run = self.claim("candidate id reused before terminal persistence")
+        strategies, generations = self.runtime._active_strategy_snapshot(self.project, config)
+        recorded = [{**strategy, "_candidate_created": generations[strategy["id"]]}
+                    for strategy in strategies]
+        self.store.execute("UPDATE runs SET strategy=?,config=? WHERE id=?",
+                           (encode(recorded), encode(config), run["id"]))
+        self.store.execute("DELETE FROM candidates WHERE id=?", (candidate,))
+        self.store.execute(
+            "INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+            (candidate, self.project, "strategy", "stable", "{}", encode(evidence), time.time()),
+        )
+        task = self.store.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        check = {"name": "same", "argv": ["true"], "cwd": "."}
+        result = {"decision": "fail", "evaluation": {"checks": {
+            "baseline": [{**check, "passed": True}],
+            "candidate": [{**check, "passed": False}],
+        }}}
+
+        self.runtime.finish_failure(run, task, result, config)
+
+        reused = self.store.one("SELECT status,evidence FROM candidates WHERE id=?", (candidate,))
+        self.assertEqual(reused["status"], "stable")
+        self.assertEqual(json.loads(reused["evidence"])["monitor"]["failed"], 0)
+        self.assertEqual(self.store.query("SELECT seq FROM events WHERE kind='rollback'"), [])
 
     def test_finish_failure_aligns_regression_attribution_by_check_identity(self):
         config = self.runtime.config(self.project)
