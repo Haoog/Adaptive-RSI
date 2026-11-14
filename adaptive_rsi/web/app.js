@@ -6,7 +6,7 @@ function localRemove(key){try{localStorage.removeItem(preferenceKey(key));}catch
 let state, projectId = localRead('rsi-project') || '', view = 'overview', settingsBaseline, toastTimer;
 const $ = id => document.getElementById(id);
 const evaluationNames={baseline:'修改前的版本',candidate:'原有功能检查',candidate_full:'修改后的完整测试',acceptance_baseline:'修改前的独立检查',acceptance_candidate:'修改后的独立检查'};
-const deliveryNames={waiting:'等待可合并状态',waiting_review:'等待必需评审',waiting_ci:'等待 CI',ci_failed:'线上检查未通过',stale:'基线或待验证改动已变化',issue_changed:'Issue 已变化，等待同步后重评',merged:'已合并',merge_submitted:'已提交合并',closed:'已关闭',unverified_merge:'外部合并包含未经验证的改动',ready:'可合并'};
+const deliveryNames={waiting:'等待可合并状态',waiting_review:'等待必需评审',waiting_ci:'等待 CI',ci_failed:'线上检查未通过',stale:'基线或待验证改动已变化',feedback_replan:'按评审或 CI 反馈重排',issue_changed:'Issue 已变化，等待同步后重评',merged:'已合并',merge_sha_pending:'已合并，等待合并提交回执',merge_submitted:'已提交合并',closed:'已关闭',unverified_merge:'外部合并包含未经验证的改动',ready:'可合并'};
 const statusNames = {expired:'候选已过期',releasing:'正在发布',deploying:'正在部署',release_failed:'发布未完成',deploy_failed:'部署未完成',ci_failed:'线上检查未通过',waiting_budget:'等待模型服务恢复用量',assessed:'价值已评估',unverified_merge:'未经验证的外部合并',reverted:'已恢复旧版本',merged:'已合并',pr_closed:'PR 已关闭',verified:'合并后验证通过',regressed:'合并后出现回归',deferred:'已暂缓',rejected:'不采纳',queued:'排队中',planning:'规划中',executing:'实现中',evaluating:'评估中',awaiting_approval:'待交付',pr_open:'PR 已创建',completed:'已完成',obsolete:'已过时',blocked:'已阻塞',failed:'未通过',interrupted:'已中断',cancelled:'已取消',insufficient_evidence:'证据不足',stable:'稳定使用',superseded:'已被替代',ready:'等待启用',pass:'通过',fail:'未通过',rolled_back:'已恢复旧版本'};
 const sourceNames = {goal:'用户目标',inspection:'自主发现',issue:'GitHub Issue',system_light:'轻量检查',system_deep:'深度检查',system_issues:'GitHub 问题同步',system_evolve:'策略改进',system_delivery:'交付跟踪与复查',system_reassess:'暂缓任务复核',system_publish:'批准交付'};
 const reviewNames = {correctness:'正确性',security:'安全性',maintainability:'可维护性',architecture:'架构',tests:'测试',scope:'改动范围',critical:'致命',high:'高',medium:'中',low:'低'};
@@ -41,7 +41,7 @@ const configReasonLabels={
  "config_resource_threshold": "资源准入门槛须为 0–1048576 MiB，0 表示关闭。",
  "config_health_observation": "连续成功次数不能超过总检查轮数；请检查轮数、间隔和预热范围。",
  "config_health_targets": "请保留主检查地址，最多增加 7 个不同的 HTTPS 端点。",
- "config_health_url": "健康检查地址须为 HTTPS，且不含账号、查询参数或片段。",
+ "config_health_url": "健康检查地址须为 HTTPS，指定端口须在 1–65535 之间，且不含账号、查询参数或片段。",
  "config_rollback_health": "自动回滚需要主健康检查地址。",
  "config_rollback_data": "请选择人工恢复或明确确认数据向后兼容。",
  "config_rollback_notes": "人工恢复说明不能超过 2000 个字符。",
@@ -158,6 +158,7 @@ const apiErrors={
  "Automatic deployment rollback requires an explicit health URL": "自动回滚需要先填写 HTTPS 健康检查地址：请补全「上线后检查地址」，或关闭「检查失败时恢复上一正常版本」。",
  "Workflow repository must match the selected project's origin": "无法读取工作流：项目设置中的 GitHub 仓库与项目本地 origin 不一致。请把 GitHub 仓库改成与 origin 相同的 owner/name（或更新项目 origin）后点击「刷新工作流」。",
  "Workflow must be an existing repository file": "无法读取工作流：仓库中不存在该工作流文件。请确认 .github/workflows 下的工作流路径后点击「刷新工作流」。",
+ "Unable to inspect this workflow right now; retry after the GitHub request succeeds":"暂时无法读取此工作流。请等待 GitHub 请求恢复后重试。",
 
  "Select the root of an existing Git repository": "请选择已有 Git 仓库的根目录。",
  "Expected a GitHub repository URL": "请填写 GitHub 仓库链接，例如 https://github.com/owner/repository。",
@@ -482,11 +483,23 @@ async function refresh(options={}){
  try{return await operation;}finally{if(refreshPromise===operation){refreshPromise=null;refreshController=null;refreshProject=null;refreshKey=null;}if(refreshQueued){refreshQueued=false;const waiters=refreshWaiters.splice(0),forceNext=refreshForce;refreshForce=false;let next;try{next=refresh({force:forceNext});}catch(error){for(const waiter of waiters)waiter.reject(error);scheduleRefreshPoll();}if(next)Promise.resolve(next).then(value=>waiters.forEach(waiter=>waiter.resolve(value)),error=>waiters.forEach(waiter=>waiter.reject(error)));}else scheduleRefreshPoll();}
 }
 function parentView(name){return name==='tasks'?'overview':name;}
+let attentionCount=0;
+function attentionTotal(){
+ const counts=state.selected_project&&state.selected_project!==projectId?null:state.task_counts;
+ return counts?counts.filter(r=>attentionStates.includes(r.state)).reduce((n,r)=>n+r.count,0):visibleTasks(scoped(state.tasks),'attention',true).length;
+}
+// 标题是页面切走后唯一无需权限的待处理提示；项目名与固定后缀始终保留。
+function renderTitle(){
+ if(!state)return;
+ const project=currentProject(),path=projectPath(project);
+ const base=(project?projectName(project)+(path?' · '+path:'')+' · ':'')+t('Adaptive RSI · 控制台');
+ document.title=attentionCount>0&&document.visibilityState==='hidden'?'● '+attentionCount+' · '+t('需要处理的任务')+' · '+base:base;
+}
 function renderNavigation(){
  localWrite('rsi-navigation',JSON.stringify({view,filter:$('task-filter').value,system:$('show-system-tasks').checked}));
  const parent=parentView(view),configScope=$('config-scope').value,project=currentProject();
  document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+parent);
- const path=projectPath(project);document.title=(project?projectName(project)+(path?' · '+path:'')+' · ':'')+t('Adaptive RSI · 控制台');
+ attentionCount=attentionTotal();renderTitle();
  document.querySelectorAll('.nav').forEach(node=>node.classList.toggle('active',node.dataset.view===parent));
  document.querySelectorAll('.nav').forEach(node=>{const selected=node.dataset.view===parent;if(selected)node.setAttribute('aria-current','page');else node.removeAttribute('aria-current');});
  document.querySelector('#tasks-list')?.setAttribute('aria-live','off');
@@ -556,7 +569,7 @@ function render(){
  const next=state.schedules.filter(row=>row.project===projectId&&((row.kind==='issues'&&config.sources.issues&&config.github.repository)||(row.kind==='light'&&config.sources.inspection))).sort((a,b)=>scheduleTime(a)-scheduleTime(b))[0];
  const scheduleTimezone=config.schedule?.timezone||'UTC';
  $('next-check').textContent=t(project?.paused?'启动后开始':!next?'未安排自动检查':'下次 ')+(project&&!project.paused&&next?scheduleStamp(scheduleTime(next),scheduleTimezone)+' · '+t('项目时区')+' '+scheduleTimezone:'');
- const attention=counts?counts.filter(r=>attentionStates.includes(r.state)).reduce((n,r)=>n+r.count,0):visibleTasks(tasks,'attention',true).length;$('attention-banner').hidden=!attention;$('attention-text').textContent=t('需要处理的任务')+' · '+attention;
+ const attention=attentionTotal();$('attention-banner').hidden=!attention;$('attention-text').textContent=t('需要处理的任务')+' · '+attention;
  for(const kind of ['light','issues']){
   const mins=config.schedule[kind+'_minutes'],factor=mins%1440===0?1440:mins%60===0?60:1;
   $(kind+'-interval').textContent=(mins/factor)+' '+t(factor===1440?'天':factor===60?'小时':'分钟');
@@ -785,7 +798,26 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
  window.RSIExperience?.taskOpened(task,queueDraft);
  const requirements=el('section',undefined,'task-requirements'),copy=el('p',task.body);copy.id='task-requirements';requirements.append(el('h3',t('任务要求')),copy);body.append(requirements);
  const evidence=lazyEvidence('来源与证据',()=>task.evidence||'');evidence.className='detail-section';body.append(evidence);
- const firstPage=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');if(ticket!==detailSequence||projectId!==project)return;
+ // 首屏请求失败时，保留当前详情；重试只重取第一页，再继续本次渲染。
+ let retrying=false,rendered=false;
+ let firstPage;try{firstPage=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');}catch(error){if(!stillCurrent())return;
+  // 登录失效要重新进入控制台，保留原有提示，不在详情里诱导反复重试。
+  if(error.code==='session_required')throw error;
+  const failed=el('section',undefined,'detail-section');
+  let retry;
+  retry=action(t('重试'),async()=>{if(retrying||rendered||!stillCurrent())return;retrying=true;retry.disabled=true;let page;
+   try{page=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');}
+   catch(retryError){if(!stillCurrent())return;if(retryError.code==='session_required'){rendered=true;failed.remove();throw retryError;}return;}
+   finally{retrying=false;if(!rendered&&stillCurrent())retry.disabled=false;}
+   if(!stillCurrent()||rendered)return;
+   // The existing detail remains visible while history loads; its current
+   // disclosure state takes precedence over the older rebuild snapshot.
+   rendered=true;failed.remove();await completeHistory(page,null);
+  },'text-button');
+  failed.append(el('h3',t('检查过程与运行记录')),el('p',t('运行记录加载失败。'),'form-error'),retry);body.append(failed);return;}
+ await completeHistory(firstPage);
+ async function completeHistory(firstPage,restore=restoreView){
+ if(!stillCurrent())return;
  // 响应为分页信封；同时接受旧服务端的裸数组，避免升级期间把历史区显示为空。
  const history=runPageRows(firstPage);
  let historyBefore=!Array.isArray(firstPage)&&firstPage?.has_more&&firstPage.next_before?firstPage.next_before:null;
@@ -811,7 +843,7 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
   if(data.result.pr){run.pr=data.result.pr;const link=el('a',t('打开 GitHub PR ↗'));if(/^https:\/\/github\.com\//.test(run.pr)){link.href=run.pr;link.target='_blank';link.rel='noreferrer';delivery.append(link);}}
   if(['pr_open','merged'].includes(run.state))delivery.append(action(t('撤销这次修改（先检查再提交）'),async()=>{await api('revert-code',{run:run.id});toast(t('恢复旧版本任务已加入；通过检查后才可交付'));closeTaskDetail();await refresh();}));
   if(index===0)body.insertBefore(delivery,evidence);else section.append(delivery);
-  restoreView?.(body);
+  restore?.(body);
   }
  function appendRun(run,index,before){const section=el('details',undefined,'detail-section');section.dataset.run=run.id;section.append(el('summary',t(index===0?'检查过程与运行记录':'以前的运行')+' · '+run.id));
   // 加载失败不能让区块永久空白：失败后在区块内给出错误项与重试入口；进行中的请求不重复发起。
@@ -872,8 +904,9 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
      toast(t('预约已保存'));closeTaskDetail();await refresh();},'button primary'));
    secondary.append(el('summary',t('安排检查')),scheduleBox);}
   body.append(secondary);}
- restoreView?.(body);
+ restore?.(body);
  if(stillCurrent()&&!$('detail-dialog').open)$('detail-dialog').showModal();}
+}
 const evolutionReasons={
  "Need independent validation/holdout cases before proposing":"需要先导入独立的验证集和最终评估集任务，才能提出改进方案。",
  "Validation or holdout exposure limit reached; import new cases or raise evolution.max_holdout_uses":"验证集或最终评估集的曝光次数已达上限；请导入新的评估任务，或在项目配置中调高 evolution.max_holdout_uses。",
@@ -1263,12 +1296,12 @@ const releaseStates={waiting_verification:'等待合并后检查',blocked_verifi
 releaseStates.health_unconfirmed='健康状态未确认';
 releaseStates.rollback_health_unconfirmed='回滚健康状态未确认';
 let releaseWorkflowSequence=0;
-async function loadReleaseWorkflows(){
+async function loadReleaseWorkflows(refresh=false){
  const project=projectId,ticket=++releaseWorkflowSequence;if(!project||$('config-scope').value!=='project')return;
  const list=$('release-workflow-list');list.replaceChildren();const placeholder=el('option',t('正在读取工作流…'));placeholder.value='';list.append(placeholder);
- try{const result=await api('release-workflows?project='+encodeURIComponent(project));if(ticket!==releaseWorkflowSequence||project!==projectId||$('config-scope').value!=='project')return;
+ try{const result=await api('release-workflows?project='+encodeURIComponent(project)+(refresh?'&refresh=true':''));if(ticket!==releaseWorkflowSequence||project!==projectId||$('config-scope').value!=='project')return;
   list.replaceChildren();const first=el('option',t('选择发布或部署工作流'));first.value='';list.append(first);
-  for(const workflow of result.workflows||[]){const option=el('option',workflow.name+' · '+workflow.workflow+(workflow.compatible?'':' · '+t('需要补充自动交付输入')));option.value=workflow.workflow;option.disabled=!workflow.compatible;list.append(option);}
+  for(const workflow of result.workflows||[]){const reason={workflow_disabled:'工作流已禁用，请在 GitHub 仓库中启用后刷新。',workflow_inspection_failed:'暂时无法检查此工作流，请刷新重试。',workflow_incompatible:'工作流不符合自动交付要求，请检查所需输入。'}[workflow.reason_code]||'需要补充自动交付输入';const option=el('option',workflow.name+' · '+workflow.workflow+(workflow.compatible?'':' · '+t(reason)));option.value=workflow.workflow;option.disabled=!workflow.compatible;list.append(option);}
   if(!result.workflows?.length)$('release-authorization-feedback').textContent=t('此仓库还没有可用工作流。可在高级设置手动指定，或先为项目添加工作流。');else $('release-authorization-feedback').textContent='';
  }catch(error){if(ticket!==releaseWorkflowSequence)return;list.replaceChildren();const failed=el('option',t('读取失败：')+error.message);failed.value='';list.append(failed);$('release-authorization-feedback').textContent=error.message;}
 }
@@ -1404,7 +1437,7 @@ async function renderReleaseOutcome(node,run,project){
   section.append(row);
  }node.append(section);
 }
-$('release-workflows-refresh').addEventListener('click',()=>safe(loadReleaseWorkflows));
+$('release-workflows-refresh').addEventListener('click',()=>safe(()=>loadReleaseWorkflows(true)));
 $('release-authorize').addEventListener('click',()=>safe(()=>authorizeRelease('release')));
 $('deploy-authorize').addEventListener('click',()=>safe(()=>authorizeRelease('deploy')));
 for(const kind of ['release','deploy'])document.querySelector('[data-path="delivery.'+kind+'.enabled"]')?.addEventListener('change',event=>{
@@ -1502,6 +1535,8 @@ $('language-select').addEventListener('change',()=>safe(async()=>{
 }));
 // 回到页面只由重新可见补一次刷新：可见窗口重复获得焦点不再额外全量拉取 state，常规轮询已覆盖。
 typeof document.addEventListener==='function'&&document.addEventListener('visibilitychange',()=>{
+ // 仅重算标题，不因可见性变化额外请求；可见时仍沿用原有的一次刷新。
+ renderTitle();
  if(document.visibilityState==='visible'&&state)safe(refresh);
  else scheduleRefreshPoll();
 });

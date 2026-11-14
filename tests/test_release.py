@@ -64,6 +64,21 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.commands = []
         self.remote = None
 
+    def test_invalid_health_port_reports_once_and_treats_target_as_unowned(self):
+        from adaptive_rsi.release import deployment_owner
+        for index, url in enumerate(("https://app.example:99999/health", "https://app.example:0/health"), 1):
+            policy = {**self.policy, "health_url": url}
+            for _ in range(2):  # 每个 tick 都会重读；同一目标只报一次
+                self.assertIsNone(deployment_owner(self.runtime, self.project, "example/project", policy))
+            events = self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")
+            self.assertEqual(len(events), index)
+            self.assertEqual({json.loads(row["data"])["error_code"] for row in events},
+                             {"invalid_deployment_health_url"})
+        # 合法地址仍按 origin/port/path 归一：不同项目、仓库指向同一端点时共用归属。
+        deploy = {**self.policy, "health_url": "https://app.example/health"}
+        self.assertEqual(owner_key(self.project, "example/project", deploy),
+                         owner_key("another", "example/other", deploy))
+
     def test_missing_remote_run_preserves_identity_without_error_events(self):
         from adaptive_rsi.release import reconcile
         data = {'state': 'rerun_unknown', 'workflow_run_id': 17, 'repository': 'example/project',
@@ -168,6 +183,32 @@ class ReleaseAutomationTest(unittest.TestCase):
         with patch("adaptive_rsi.release.api", side_effect=ApiRejected("gh: Not Found (HTTP 404)", 404)):
             closed = abandon(self.runtime, self.project, self.run["id"], "release", "GitHub access permanently revoked")
         self.assertEqual(closed["state"], "failed")
+
+    def _legacy_invalid_health_snapshot(self):
+        self.setup_deployment()
+        saved = json.loads(self.run["config"])
+        saved["delivery"]["deploy"]["health_url"] = "https://app.example:0/health"
+        self.run["config"] = encode(saved)
+        self.runtime.store.execute("UPDATE runs SET config=? WHERE id=?", (encode(saved), self.run["id"]))
+
+    def test_invalid_live_and_frozen_health_policy_blocks_deployment_dispatch(self):
+        self._legacy_invalid_health_snapshot()
+        project = self.runtime.project(self.project)
+        stored = json.loads(project["config"])
+        stored["delivery"]["deploy"]["health_url"] = "https://app.example:0/health"
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(stored), self.project))
+        with patch("adaptive_rsi.release.api") as api:
+            result = self.tick()
+        self.assertEqual(result["deploy"]["state"], "blocked")
+        api.assert_not_called()
+
+    def test_repaired_live_health_does_not_authorize_invalid_frozen_policy(self):
+        self._legacy_invalid_health_snapshot()
+        with patch("adaptive_rsi.release.api") as api:
+            result = self.tick()
+        self.assertEqual(result["deploy"]["state"], "blocked")
+        self.assertIn("authorization revoked or target changed", result["deploy"]["error"])
+        api.assert_not_called()
 
     def test_corrupt_automation_receipt_is_preserved_and_blocks_dispatch(self):
         from adaptive_rsi.release import status
@@ -697,6 +738,9 @@ class ReleaseAutomationTest(unittest.TestCase):
                 return {"sha": TRUSTED}
             if endpoint.startswith("actions/workflows?"):
                 return {"workflows": [{"name": "Publish", "path": self.policy["workflow"], "state": "active"}]}
+            if endpoint.startswith("actions/workflows/"):
+                # 授权路径按文件名读取单个 workflow 的注册状态（active/disabled_*）。
+                return {"name": "Publish", "path": self.policy["workflow"], "state": "active"}
             if endpoint.startswith("git/matching-refs/"):
                 return []
             if endpoint == "git/refs":
@@ -1202,6 +1246,19 @@ class StableUpdatePolicyTest(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 validate({"delivery": {"deploy": {"health_url": url}}})
 
+    def test_health_endpoint_port_must_be_in_range(self):
+        for url in ["https://example:0/health", "https://example:99999/health",
+                    "https://example:65536/health", "https://example:abc/health",
+                    "https://[::1/health"]:
+            with self.subTest(url=url), self.assertRaisesRegex(ValueError, "health URL.*port"):
+                validate({"delivery": {"deploy": {"health_url": url}}})
+        self.assertEqual(validate({"delivery": {"deploy": {"health_url": "https://example:8443/health"}}})
+                         ["delivery"]["deploy"]["health_url"], "https://example:8443/health")
+        # 追加端点走同一段校验，不能只在主地址上生效。
+        with self.assertRaises(ValueError):
+            validate({"delivery": {"deploy": {"health_url": "https://example/health",
+                                              "health_urls": ["https://b.example:99999/health"]}}})
+
 
 class ReleaseVersionPatchTest(unittest.TestCase):
     def test_consecutive_releases_preserve_authored_notes_then_reconstruct_empty_unreleased(self):
@@ -1652,9 +1709,9 @@ class WorkflowConfigurationTest(unittest.TestCase):
         jobs = workflow["jobs"]
         self.assertEqual(jobs["python"]["runs-on"], "${{ matrix.os }}")
         self.assertTrue(all(item["os"] == "ubuntu-latest" for item in jobs["python"]["strategy"]["matrix"]["include"]))
-        self.assertEqual(jobs["browser"]["runs-on"], "macos-14")
-        self.assertEqual(jobs["macos_sandbox_core"]["runs-on"], "macos-14")
-        self.assertEqual(jobs["macos_sandbox_flows"]["runs-on"], "macos-14")
+        self.assertEqual(jobs["browser"]["runs-on"], "macos-latest")
+        self.assertEqual(jobs["macos_sandbox_core"]["runs-on"], "macos-latest")
+        self.assertEqual(jobs["macos_sandbox_flows"]["runs-on"], "macos-latest")
         required = set(jobs["verify"]["needs"])
         self.assertTrue({"python", "macos_sandbox_core", "macos_sandbox_flows", "browser", "linux"} <= required)
         text = (self.ROOT / ".github/workflows/checks.yml").read_text()

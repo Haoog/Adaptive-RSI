@@ -121,6 +121,9 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.store.one('SELECT count(*) AS n FROM runs')['n'], 0)
 
     def test_shutdown_cancels_unstarted_worker_and_requeues_claimed_task(self):
+        # 被取消的 future 从未运行，workers 阶段没有可等待对象，close() 会毫秒级
+        # 穿过 workers → maintenance → storage → completed；轮询 phase 只能采样到
+        # 瞬时值，CPU 争用时必然错过。这里等待关闭线程结束后断言稳定终态。
         gate = threading.Event()
         blockers = [self.runtime.pool.submit(gate.wait, 5) for _ in range(4)]
         try:
@@ -131,13 +134,10 @@ class RuntimeHandoffTest(unittest.TestCase):
             self.assertIsNotNone(run)
             closer = threading.Thread(target=self.runtime.close)
             closer.start()
-            limit = time.monotonic() + 2
-            while self.runtime.shutdown_status()['phase'] != 'workers' and time.monotonic() < limit:
-                time.sleep(.01)
-            self.assertEqual(self.runtime.shutdown_status()['phase'], 'workers')
-            gate.set()
             closer.join(5)
             self.assertFalse(closer.is_alive())
+            # 断言关闭结束后的稳定终态，而不是轮询期间的瞬时 phase。
+            self.assertEqual(self.runtime.shutdown_status()['phase'], 'completed')
             saved = self.store.one('SELECT state,ended FROM runs WHERE id=?', (run['id'],))
             self.assertEqual(saved['state'], 'interrupted')
             self.assertIsNotNone(saved['ended'])
@@ -1170,6 +1170,171 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.store.setting('postprocess:' + run['id'])['state'], 'completed')
         self.assertEqual(self.store.one("SELECT value FROM settings WHERE key='postprocess:corrupt'")['value'], '{')
 
+    def test_orphan_concurrent_observers_emit_one_event(self):
+        identifier = 'missing-concurrent-run'
+        key = 'postprocess:' + identifier
+        record = {'state': 'pending', 'steps': [], 'created': time.time()}
+        self.store.put_setting(key, record)
+        barrier = threading.Barrier(2)
+        original = self.store.one
+        def synchronized(sql, args=()):
+            result = original(sql, args)
+            if sql == 'SELECT * FROM runs WHERE id=?' and tuple(args) == (identifier,):
+                barrier.wait(timeout=5)
+            return result
+        with patch.object(self.store, 'one', side_effect=synchronized):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
+                futures = [workers.submit(self.runtime._postprocess_run, key, identifier, dict(record))
+                           for _ in range(2)]
+                for future in futures:
+                    future.result(timeout=10)
+        self.assertEqual(self.store.setting(key)['state'], 'obsolete')
+        events = self.store.query("SELECT kind FROM events WHERE kind='postprocess_orphaned' AND run=?",
+                                  (identifier,))
+        self.assertEqual(len(events), 1)
+
+    def test_orphan_transition_does_not_replace_a_newer_receipt(self):
+        identifier = 'missing-receipt-race'
+        key = 'postprocess:' + identifier
+        pending = {'state': 'pending', 'steps': [], 'created': time.time()}
+        completed = {'state': 'completed', 'steps': ['delivery'], 'ended': time.time()}
+        self.store.put_setting(key, pending)
+        original = self.store.one
+        def update_after_read(sql, args=()):
+            row = original(sql, args)
+            if sql == 'SELECT * FROM runs WHERE id=?' and tuple(args) == (identifier,):
+                self.store.put_setting(key, completed)
+            return row
+        with patch.object(self.store, 'one', side_effect=update_after_read):
+            self.runtime._postprocess_run(key, identifier, dict(pending))
+        self.assertEqual(self.store.setting(key), completed)
+        self.assertEqual(self.store.query("SELECT kind FROM events WHERE kind='postprocess_orphaned' AND run=?",
+                                          (identifier,)), [])
+
+    def test_orphan_transition_rechecks_a_newly_restored_run(self):
+        identifier = 'restored-run-race'
+        task = self.runtime.goal(self.project, 'Restored task')
+        key = 'postprocess:' + identifier
+        pending = {'state': 'pending', 'steps': [], 'created': time.time()}
+        self.store.put_setting(key, pending)
+        original = self.store.one
+        def restore_after_read(sql, args=()):
+            row = original(sql, args)
+            if sql == 'SELECT * FROM runs WHERE id=?' and tuple(args) == (identifier,):
+                self.store.execute("INSERT INTO runs(id,task,project,state,config,started) VALUES (?,?,?,?,?,?)",
+                                   (identifier, task, self.project, 'planning', '{}', time.time()))
+            return row
+        with patch.object(self.store, 'one', side_effect=restore_after_read):
+            self.runtime._postprocess_run(key, identifier, dict(pending))
+        self.assertEqual(self.store.setting(key), pending)
+        self.assertEqual(self.store.query("SELECT kind FROM events WHERE kind='postprocess_orphaned' AND run=?",
+                                          (identifier,)), [])
+
+    def test_orphan_transient_failure_cannot_resurrect_completed_transition(self):
+        identifier = 'orphan-failure-race'
+        key, marker = 'postprocess:' + identifier, 'postprocess-pending:' + identifier
+        record = {'state': 'pending', 'steps': [], 'created': time.time()}
+        self.store.put_setting(key, record)
+        self.store.put_setting(marker, {'created': time.time()})
+        began, completed = threading.Event(), threading.Event()
+        original = self.runtime._postprocess_run
+        errors = []
+        def simulate_failure(key_arg, identifier_arg, receipt):
+            if threading.current_thread().name == 'orphan-failure':
+                began.set()
+                if not completed.wait(5):
+                    raise AssertionError('concurrent transition did not complete')
+                raise sqlite3.OperationalError('simulated transient event failure')
+            return original(key_arg, identifier_arg, receipt)
+        def drain(name):
+            try:
+                self.runtime._drain_postprocess_record(key, identifier, encode(record), marker)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                if name == 'success':
+                    completed.set()
+        with patch.object(self.runtime, '_postprocess_run', side_effect=simulate_failure):
+            failure = threading.Thread(target=drain, args=('failure',), name='orphan-failure')
+            success = threading.Thread(target=drain, args=('success',), name='orphan-success')
+            failure.start()
+            self.assertTrue(began.wait(5))
+            success.start()
+            success.join(8);failure.join(8)
+        self.assertFalse(failure.is_alive())
+        self.assertFalse(success.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.store.setting(key)['state'], 'obsolete')
+        self.assertIsNone(self.store.setting(marker))
+        self.assertEqual(len(self.store.query("SELECT kind FROM events WHERE kind='postprocess_orphaned' AND run=?",
+                                              (identifier,))), 1)
+
+    def test_orphan_transition_retains_newer_pending_progress(self):
+        identifier = 'orphan-progress-race'
+        key = 'postprocess:' + identifier
+        pending = {'state': 'pending', 'steps': [], 'created': time.time(), 'attempts': 0}
+        newer = {**pending, 'steps': ['observation'], 'attempts': 2}
+        self.store.put_setting(key, pending)
+        original = self.store.one
+        def update_after_read(sql, args=()):
+            row = original(sql, args)
+            if sql == 'SELECT * FROM runs WHERE id=?' and tuple(args) == (identifier,):
+                self.store.put_setting(key, newer)
+            return row
+        with patch.object(self.store, 'one', side_effect=update_after_read):
+            self.runtime._postprocess_run(key, identifier, dict(pending))
+        result = self.store.setting(key)
+        self.assertEqual(result['state'], 'obsolete')
+        self.assertEqual(result['steps'], ['observation'])
+        self.assertEqual(result['attempts'], 2)
+
+    def test_postprocess_error_counts_from_latest_durable_progress(self):
+        identifier = 'failure-progress-race'
+        key = 'postprocess:' + identifier
+        pending = {'state': 'pending', 'steps': [], 'created': time.time(), 'attempts': 0}
+        newer = {**pending, 'steps': ['observation'], 'attempts': 2}
+        self.store.put_setting(key, pending)
+        def fail_after_progress(*_args):
+            self.store.put_setting(key, newer)
+            raise sqlite3.OperationalError('transient failure')
+        with patch.object(self.runtime, '_postprocess_run', side_effect=fail_after_progress):
+            self.runtime._drain_postprocess_record(key, identifier, encode(pending))
+        result = self.store.setting(key)
+        self.assertEqual(result['state'], 'pending')
+        self.assertEqual(result['steps'], ['observation'])
+        self.assertEqual(result['attempts'], 3)
+
+    def test_postprocess_recovers_when_delivery_marker_write_fails_after_effect(self):
+        project = self.runtime.add_project(fixture(self.root / 'delivery-marker-failure'))
+        self.runtime.configure({'delivery': {'mode': 'pr'}, 'evolution': {'enabled': False}}, project)
+        self.runtime.pause(project, False)
+        self.runtime.goal(project, 'Delivery marker persistence failure')
+        run = self.store.claim(project, self.runtime.config(project))
+        self.runtime.queue_postprocess(run)
+        self.store.transition(run['id'], 'awaiting_approval', {
+            'summary': 'Verified outcome', 'evaluation': {'decision': 'pass'},
+            'review': {'decision': 'pass'}}, True)
+        key = 'postprocess:' + run['id']
+        original = self.store.put_setting
+        failures = []
+        def fail_marker_once(setting_key, value):
+            if setting_key == key and 'delivery' in value.get('steps', []) and not failures:
+                failures.append(True)
+                raise sqlite3.OperationalError('delivery marker write failed')
+            return original(setting_key, value)
+        with patch.object(self.store, 'put_setting', side_effect=fail_marker_once):
+            self.runtime.drain_postprocess()
+        self.assertEqual(failures, [True])
+        self.assertEqual(self.store.setting(key)['state'], 'pending')
+        publish = self.store.query('SELECT id FROM tasks WHERE project=? AND fingerprint=?',
+                                   (project, 'publish:' + run['id']))
+        self.assertEqual(len(publish), 1)
+        with patch.object(self.runtime, 'deliver', side_effect=AssertionError('delivery repeated')):
+            self.runtime.drain_postprocess()
+        self.assertEqual(self.store.setting(key)['state'], 'completed')
+        self.assertEqual(len(self.store.query('SELECT id FROM tasks WHERE project=? AND fingerprint=?',
+                                              (project, 'publish:' + run['id']))), 1)
+
     def test_orphan_receipt_event_failure_keeps_receipt_pending_for_retry(self):
         identifier = 'missing-run'
         key = 'postprocess:' + identifier
@@ -1595,6 +1760,63 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.store.one('SELECT count(*) AS n FROM runs WHERE task=?', (task,))['n'], 2)
         self.assertEqual(self.store.one('SELECT state,attempts FROM tasks WHERE id=?', (task,)),
                          {'state': 'planning', 'attempts': before['attempts'] + 1})
+
+    def test_fair_ledger_write_failure_does_not_leak_the_claimed_run(self):
+        # claim() 已经自增 attempts、把任务置为 planning、插入 runs 行；其后三次账本写入
+        # 是纯排序数据。一次瞬时写失败若逃出去，run 会永久停在 planning 且项目在
+        # recover() 前领不到普通任务，所以这里必须继续提交并且留下结构化事件。
+        self.runtime.pause(self.project, False)
+        task = self.runtime.goal(self.project, 'Ledger write fails after the claim')
+        config = self.runtime.config(self.project)
+        original = self.store.put_setting
+
+        def failing(key, value):
+            if key == 'fair-service':
+                raise sqlite3.OperationalError('database is locked')
+            return original(key, value)
+
+        processed = []
+
+        def work(run):
+            processed.append(run['id'])
+            self.store.transition(run['id'], 'interrupted', {'reason': 'test worker finished'}, True,
+                                  task_fields={'state': 'queued', 'available': 0})
+
+        with patch.object(self.store, 'put_setting', side_effect=failing), \
+                patch.object(self.runtime, 'process', side_effect=work):
+            self.runtime.dispatch([(self.runtime.project(self.project), config)])
+            for future in tuple(self.runtime.futures):
+                future.result(timeout=5)
+        run = self.store.one('SELECT * FROM runs WHERE task=?', (task,))
+        self.assertEqual(processed, [run['id']])
+        self.assertEqual(run['state'], 'interrupted')
+        self.assertIsNotNone(run['ended'])
+        self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (task,))['state'], 'queued')
+        event = self.store.one("SELECT * FROM events WHERE run=? AND kind='fair_ledger_skipped'", (run['id'],))
+        self.assertIsNotNone(event)
+        self.assertEqual(json.loads(event['data'])['error'], 'OperationalError')
+        # 项目没有被冻结：run 收尾后同项目的下一条普通任务仍能领取到新的 run。
+        self.assertIsNotNone(self.store.claim(self.project, config))
+
+    def test_corrupt_fair_ledger_is_discarded_instead_of_blocking_the_claim(self):
+        self.runtime.pause(self.project, False)
+        task = self.runtime.goal(self.project, 'Corrupt ledger entries must not block dispatch')
+        config = self.runtime.config(self.project)
+        self.store.put_setting('fair-service', {'stale-project': 'not-a-number'})
+        self.store.put_setting('fair-waiting', {'stale-project': 'never'})
+        self.store.put_setting('fair-clock', 'soon')
+        with patch.object(self.runtime, 'process', side_effect=lambda run: None):
+            self.runtime.dispatch([(self.runtime.project(self.project), config)])
+        self.assertEqual(self.store.one('SELECT count(*) AS n FROM runs WHERE task=?', (task,))['n'], 1)
+        self.assertEqual(len(self.runtime.futures), 1)
+        self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (task,))['state'], 'planning')
+        event = self.store.one("SELECT * FROM events WHERE kind='fair_ledger_repaired'")
+        self.assertIsNotNone(event)
+        self.assertEqual(json.loads(event['data'])['dropped'],
+                         ['fair-clock', 'fair-service:stale-project', 'fair-waiting:stale-project'])
+        self.assertEqual(self.store.setting('fair-service'), {self.project: 1.0})
+        # 坏时钟按清洗值回写：否则每个调度节拍都会重新判定损坏并重复记录事件。
+        self.assertIsInstance(self.store.setting('fair-clock'), (int, float))
 
     def test_auto_evolution_skips_unchanged_failed_inputs_until_inputs_change(self):
         from adaptive_rsi.evolution import Evolution

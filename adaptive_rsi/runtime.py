@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .adapters import detect
 from .agent import CodexAgent
-from .config import BUILTIN_PROVIDERS, DEFAULTS, compatibility, fingerprint, merge, relative_path, validate, within_hours
+from .config import BUILTIN_PROVIDERS, DEFAULTS, InvalidDeploymentHealth, compatibility, fingerprint, merge, relative_path, validate, validate_legacy_schedule, within_hours
 from .evaluator import Evaluator, check_identity
 from .gitops import changes, git, origin_repository, repository, snapshot
 from .process import Cancelled, checked
@@ -97,6 +97,23 @@ DEAD_DEPENDENCY_STATES = ("failed", "cancelled", "expired", "obsolete", "rejecte
                           "pr_closed", "unverified_merge", "reverted", "superseded")
 
 
+def _fair_ledger(value):
+    """公平账本只参与排序：形状或数值损坏的条目丢弃并报告，不能让一次调度失败。
+
+    与 `rotation`、`postprocess-pending-cursor` 等设置读取的防御一致；返回
+    (清洗后的账本, 被丢弃的键)。
+    """
+    if not isinstance(value, dict):
+        return {}, ["<%s>" % type(value).__name__]
+    cleaned, dropped = {}, []
+    for key, entry in value.items():
+        if isinstance(entry, bool) or not isinstance(entry, (int, float)):
+            dropped.append(str(key))
+        else:
+            cleaned[key] = entry
+    return cleaned, dropped
+
+
 def _clock_lock(run):
     """Return the lock that guards one run's deadline clock fields.
 
@@ -111,6 +128,25 @@ def _clock_lock(run):
     if lock is None:
         lock = run.setdefault('_deadline_lock', threading.Lock())
     return lock
+
+
+def _literal_pathspec(path):
+    """只有普通相对路径才能与一次全量 diff 的结果做字面比较。
+
+    glob（`*?[`）、排除（`!`/`^`）、pathspec 魔法（`:`）、`.`/`..` 段以及空路径
+    在 git 里有各自的匹配语义，交由 git 逐条判定，避免改变唤醒结论。
+    """
+    if not isinstance(path, str) or not path or path.startswith(("/", "!", "^", ":")):
+        return False
+    segments = path.rstrip("/").split("/")
+    return all(segment not in ("", ".", "..") for segment in segments) and \
+        not any(character in path for character in "*?[")
+
+
+def _diff_touches(changed, path):
+    """路径本身或其目录前缀出现在变更集里，等价于 git pathspec 命中。"""
+    path = path.rstrip("/")
+    return any(name == path or name.startswith(path + "/") for name in changed)
 
 
 class IssueSyncCorruptPending(ValueError):
@@ -477,28 +513,68 @@ class Runtime(Maintenance):
             raise ValueError("Parallel project limit is a global setting; select global defaults")
         if project and "updates" in values:
             raise ValueError("Software updates are a global setting")
-        previous = json.loads(self.project(project)["config"]) if project else self.store.setting("config", {})
-        projects = [self.project(project)] if project else self.store.query("SELECT * FROM projects")
+
+        global_config = self.store.setting("config", {})
+        if project:
+            project_row = self.project(project)
+            projects = [project_row]
+            previous = json.loads(project_row["config"])
+        else:
+            projects = self.store.query("SELECT * FROM projects")
+            previous = global_config
+
         schedules = {}
+        previously_valid = set()
+        invalid_health = set()
         for row in projects:
             try:
-                schedules[row["id"]] = self.config(row["id"])["schedule"]
-            except (ValueError, TypeError, KeyError, AttributeError):
-                if project:
+                override = previous if project else json.loads(row["config"])
+                old_effective = validate(merge(DEFAULTS, global_config, override))
+                schedules[row["id"]] = old_effective["schedule"]
+                previously_valid.add(row["id"])
+            except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                if project and not isinstance(exc, InvalidDeploymentHealth):
                     raise
+                if isinstance(exc, InvalidDeploymentHealth):
+                    # Schedule fields have already passed validation before the
+                    # health-URL check, so preserve their existing due times.
+                    old_raw = merge(DEFAULTS, global_config, previous if project else override)
+                    schedules[row["id"]] = old_raw["schedule"]
+                    invalid_health.add(row["id"])
+
         updated = copy.deepcopy(values) if replacement else merge(previous, values)
         for path in inherit:
             group, key = path.split(".")
             section = updated.get(group)
             if isinstance(section, dict):
                 section.pop(key, None)
-        validate(merge(self.store.setting("config", {}) if project else {}, updated))
-        if not project:
-            # Global changes must also remain valid for every existing project override.
+
+        effective_configs = {}
+        if project:
+            # Project saves remain strict: repairing an invalid project must produce a fully valid config.
+            effective_configs[project] = validate(merge(global_config, updated))["schedule"]
+        else:
+            validate(updated)
+            # Preflight every previously valid project strictly. For a project whose old config
+            # failed specifically on a health URL port, validate the entire candidate config
+            # while ignoring only that legacy URL-port exception. The helper returns only its
+            # schedule, so the result cannot authorize deployment or make the project valid.
             for row in projects:
+                try:
+                    override = json.loads(row["config"])
+                    candidate = merge(updated, override)
+                    if row["id"] in invalid_health:
+                        candidate_schedule = validate_legacy_schedule(candidate)
+                    else:
+                        candidate_schedule = validate(candidate)["schedule"]
+                except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                    # A formerly valid project must stay valid. A formerly health-invalid
+                    # project must pass every other check before a global write is allowed.
+                    if row["id"] in previously_valid or row["id"] in invalid_health:
+                        raise
+                    continue
                 if row["id"] in schedules:
-                    # 写入侧校验：行数据损坏时直接暴露错误，不静默降级通过验证。
-                    validate(merge(updated, json.loads(row["config"])))
+                    effective_configs[row["id"]] = candidate_schedule
         revision_key = "config-revision:" + (project or "global")
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -526,14 +602,16 @@ class Runtime(Maintenance):
                          data=revision_data)
         if "schedule" in values or inherit or replacement:
             for row in projects:
-                if row["id"] not in schedules:
+                project_id = row["id"]
+                if project_id not in schedules or project_id not in effective_configs:
                     continue
-                effective = self.config(row["id"])
+                effective = effective_configs[project_id]
                 for kind in ["light", "issues", "deep"]:
-                    if effective["schedule"][kind + "_minutes"] == schedules[row["id"]][kind + "_minutes"]:
+                    if effective[kind + "_minutes"] == schedules[project_id][kind + "_minutes"]:
                         continue
                     self.store.execute("UPDATE schedules SET due=? WHERE project=? AND kind=?",
-                                       (time.time() + effective["schedule"][kind + "_minutes"] * 60, row["id"], kind))
+                                       (time.time() + effective[kind + "_minutes"] * 60,
+                                        project_id, kind))
         self.wake.set()
         return {"saved": True, "revision": next_revision}
 
@@ -573,9 +651,9 @@ class Runtime(Maintenance):
         from .release import resolve
         return resolve(self, project, run, kind, workflow_run_id, target, source="console")
 
-    def workflow_choices(self, project):
+    def workflow_choices(self, project, refresh=False):
         from .release import workflow_choices
-        return workflow_choices(self, project)
+        return workflow_choices(self, project, refresh=refresh)
 
     def authorize_workflow(self, project, kind, workflow):
         from .release import authorize_workflow
@@ -1190,6 +1268,22 @@ class Runtime(Maintenance):
             candidate = boundary
 
     def reassess_deferred(self, project, config, head):
+        # 同一 base 的暂缓任务共享一次 base→head 变更集：逐条 git diff 会把完全相同的区间
+        # 重复 fork/exec N 次，而 related_paths 只是各自的过滤条件。
+        changes_by_base = {}
+
+        def changes_for(base):
+            if base not in changes_by_base:
+                try:
+                    # --no-renames 让重命名两侧的旧路径也出现在集合里，与逐条 pathspec 查询一致。
+                    output = git(self.project(project)["path"], "diff", "--name-only", "-z",
+                                 "--no-renames", base, head)
+                    changes_by_base[base] = {path for path in output.split("\0") if path}
+                except RuntimeError:
+                    # base 已不存在等情况：该 base 的任务按「无法判定」保持唤醒，与逐条 diff 一致。
+                    changes_by_base[base] = None
+            return changes_by_base[base]
+
         for task in self.store.query("SELECT * FROM tasks WHERE project=? AND state='deferred'", (project,)):
             decision = self.store.one("SELECT data FROM task_decisions WHERE task=?", (task["id"],))
             run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC,rowid DESC LIMIT 1", (task["id"],)) if not decision else None
@@ -1222,8 +1316,15 @@ class Runtime(Maintenance):
                 try:
                     for path in paths:
                         relative_path(path)
-                    changed = git(self.project(project)["path"], "diff", "--name-only", prior["base"], head, "--", *paths).strip()
-                    if not changed:
+                    if all(_literal_pathspec(path) for path in paths):
+                        changed = changes_for(prior["base"])
+                        # 无法取得变更集（base 已失效）时保持原结论：唤醒并重新评估。
+                        touched = True if changed is None else any(_diff_touches(changed, path) for path in paths)
+                    else:
+                        # glob、排除或 "." 等 pathspec 语法不能按字面比较，退回逐条查询。
+                        touched = bool(git(self.project(project)["path"], "diff", "--name-only",
+                                           prior["base"], head, "--", *paths).strip())
+                    if not touched:
                         baseline_changed = False
                         self.store.execute("INSERT OR REPLACE INTO task_decisions VALUES (?,?,?)",
                                            (task["id"], encode({**prior, "base": head}), time.time()))
@@ -1409,9 +1510,27 @@ class Runtime(Maintenance):
                         (now, now, now - 86400, project["id"], now - 86400))["seconds"]
             if not ready:
                 return
-            services = self.store.setting("fair-service", {})
+            services, dropped = _fair_ledger(self.store.setting("fair-service", {}))
+            dropped = ["fair-service:" + key for key in dropped]
             clock = self.store.setting("fair-clock", max(services.values(), default=0))
-            waiting = self.store.setting("fair-waiting", {})
+            if isinstance(clock, bool) or not isinstance(clock, (int, float)):
+                dropped.append("fair-clock")
+                clock = max(services.values(), default=0)
+            waiting, waiting_dropped = _fair_ledger(self.store.setting("fair-waiting", {}))
+            dropped += ["fair-waiting:" + key for key in waiting_dropped]
+            if dropped:
+                # 账本只影响排序：坏条目在内存里丢弃后按清洗值回写并记录一次，避免每个
+                # 调度节拍重复报告；回写或事件失败时继续用清洗后的内存值调度。
+                try:
+                    self.store.put_setting("fair-service", services)
+                    self.store.put_setting("fair-waiting", waiting)
+                    if "fair-clock" in dropped:
+                        self.store.put_setting("fair-clock", clock)
+                    self.store.event("fair_ledger_repaired",
+                                     "Discarded corrupt fair ledger entries",
+                                     data={"dropped": sorted(set(dropped))})
+                except Exception:
+                    logging.getLogger(__name__).warning("Fair ledger repair failed", exc_info=True)
             active = {p["id"] for p, _ in ready}
             waiting = {key: value for key, value in waiting.items() if key in active}
             for key in active:
@@ -1451,11 +1570,27 @@ class Runtime(Maintenance):
                     run = None if self.updates.is_busy() else self.store.claim(project["id"], config)
                     if not run:
                         return
-                    services[project["id"]] += 1 / max(1, config["schedule"].get("weight", 1))
-                    self.store.put_setting("fair-service", services)
-                    self.store.put_setting("fair-clock", max(clock, min(services[key] for key in active)))
-                    waiting[project["id"]] = now
-                    self.store.put_setting("fair-waiting", waiting)
+                    # 账本只服务下一次调度的排序，claim 却已经改写任务与 runs 行；若这里
+                    # 让一次瞬时写失败（database is locked / 磁盘满）逃出去，run 会永久
+                    # 停在 planning、任务停在 planning，同项目的普通任务在 recover() 前
+                    # 全部领不到。记账失败只告警并继续提交，run 由 worker 正常收尾。
+                    try:
+                        services[project["id"]] = (services.get(project["id"], clock) +
+                                                   1 / max(1, config["schedule"].get("weight", 1)))
+                        self.store.put_setting("fair-service", services)
+                        self.store.put_setting("fair-clock", max(clock, min(services[key] for key in active)))
+                        waiting[project["id"]] = now
+                        self.store.put_setting("fair-waiting", waiting)
+                    except Exception as exc:
+                        logging.getLogger(__name__).warning(
+                            "Fair ledger update failed for %s: %s", project["id"], exc)
+                        try:
+                            self.store.event("fair_ledger_skipped",
+                                             "Fair ledger update failed; dispatching the claimed run anyway",
+                                             run["project"], run["id"], {"error": type(exc).__name__})
+                        except Exception:
+                            logging.getLogger(__name__).warning(
+                                "Fair ledger failure event could not be recorded", exc_info=True)
                     try:
                         future = self.pool.submit(self.process, run)
                     except Exception:
@@ -1547,22 +1682,46 @@ class Runtime(Maintenance):
             try:
                 self._postprocess_run(key, identifier, record)
             except Exception as exc:
-                attempts += 1
-                record.update(attempts=attempts, last_error=str(exc)[:400], last_failed=time.time())
-                if attempts >= POSTPROCESS_MAX_ATTEMPTS:
-                    # 终态逃逸：损坏/确定性失败的回执不再每 5 秒热循环，摘除待办索引并
-                    # 记录放弃原因；原始回执连同 attempts/last_error 保留在 postprocess: 命名空间。
-                    record.update(state='failed', ended=time.time(),
-                                  reason='Postprocessing abandoned after %d attempts' % attempts)
-                    self.store.put_setting(key, record)
-                    if marker:
-                        self.store.execute('DELETE FROM settings WHERE key=?', (marker,))
+                abandoned = None
+                with self.store.connect() as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+                    if row is None:
+                        return
+                    try:
+                        record = json.loads(row['value'])
+                    except (TypeError, ValueError):
+                        return
+                    if (not isinstance(record, dict)
+                            or record.get('state') != 'pending'
+                            or not isinstance(record.get('steps'), list)):
+                        return
+
+                    attempts = record.get('attempts', 0)
+                    if not isinstance(attempts, int) or attempts < 0:
+                        attempts = 0
+                    attempts += 1
+                    last_error = str(exc)[:400]
+                    record.update(attempts=attempts, last_error=last_error, last_failed=time.time())
+                    if attempts >= POSTPROCESS_MAX_ATTEMPTS:
+                        # 终态逃逸：损坏/确定性失败的回执不再每 5 秒热循环，摘除待办索引并
+                        # 记录放弃原因；原始回执连同 attempts/last_error 保留在 postprocess: 命名空间。
+                        record.update(state='failed', ended=time.time(),
+                                      reason='Postprocessing abandoned after %d attempts' % attempts)
+                        abandoned = (attempts, last_error)
+
+                    db.execute('UPDATE settings SET value=? WHERE key=?',
+                               (encode(record), key))
+                    if abandoned is not None and marker:
+                        db.execute('DELETE FROM settings WHERE key=?', (marker,))
+
+                if abandoned is not None:
+                    attempts, last_error = abandoned
                     self.store.event('postprocess_abandoned',
                                      'Postprocessing gave up after %d attempts: %s' % (attempts, str(exc)[:300]),
                                      run=identifier, data={'key': key, 'attempts': attempts,
-                                                          'last_error': str(exc)[:400]})
+                                                          'last_error': last_error})
                     return
-                self.store.put_setting(key, record)
                 raise
         # 成功/obsolete 后移除索引；瞬时失败仍保持 pending 与索引，下一轮重试。
         if marker:
@@ -1592,11 +1751,23 @@ class Runtime(Maintenance):
             # 回执指向的 run 行已在备份恢复或手工清理中消失。此前这里直接返回，回执
             # 保持 pending、attempts 永不增加，孤儿会永久占用每轮的有界批次且无任何
             # 事件痕迹；这里落到终态，让待办索引按 completed/obsolete 规则摘除。
-            terminal = {**record, 'state': 'obsolete',
-                        'reason': 'Run record is missing; postprocessing terminated', 'ended': time.time()}
             # 回执与事件必须同时提交；失败时保留 pending，交由现有重试逻辑处理。
             with self.store.connect() as db:
                 db.execute('BEGIN IMMEDIATE')
+                current_run = db.execute('SELECT 1 FROM runs WHERE id=?', (identifier,)).fetchone()
+                latest_row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+                if current_run is not None or latest_row is None:
+                    return
+                try:
+                    latest_receipt = json.loads(latest_row['value'])
+                except (TypeError, ValueError):
+                    return
+                if (not isinstance(latest_receipt, dict)
+                        or latest_receipt.get('state') != 'pending'
+                        or not isinstance(latest_receipt.get('steps'), list)):
+                    return
+                terminal = {**latest_receipt, 'state': 'obsolete',
+                            'reason': 'Run record is missing; postprocessing terminated', 'ended': time.time()}
                 db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, encode(terminal)))
                 db.execute('INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)',
                            (None, identifier, 'postprocess_orphaned',
