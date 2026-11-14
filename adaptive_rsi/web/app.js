@@ -1428,7 +1428,7 @@ const updateChannels={desktop:'桌面应用',pip:'Python 包（建议用 pip 升
 let desktopUpdate=null,desktopUpdateTimer=null,desktopCheckError=false;
 function stopDesktopUpdatePolling(){clearInterval(desktopUpdateTimer);desktopUpdateTimer=null;}
 async function checkDesktopUpdate(force=false){
- if(window.RSINativeUpdate){await window.RSINativeUpdate.run('check');desktopCheckError=false;return;}
+ if(window.RSINativeUpdate){await (force?window.RSINativeUpdate.run('check'):window.RSINativeUpdate.tick());desktopCheckError=false;return;}
  if(!window.RSIDesktop?.invoke)return;
  try{const info=await window.RSIDesktop.invoke('check_desktop_update',{force});desktopUpdate=info&&info.version?info:null;desktopCheckError=!!(info&&info.check_error);}catch{desktopUpdate=null;desktopCheckError=true;}
  // 下载可能先于本次页面会话开始（刷新界面或切换运行机器后加载）：恢复轮询直到完成或失败。
@@ -1489,7 +1489,9 @@ function renderUpdate(){if(!state)return;const update=state.update||{state:'unch
 $('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop&&window.RSINativeUpdate){await window.RSINativeUpdate.run('check');return;}if(window.RSIDesktop){await checkDesktopUpdate(true);if(desktopCheckError){toast(t('检查更新失败，请稍后重试。'),true);return;}if(!desktopUpdate)toast(t('已是最新稳定版'));return;}const result=await api('updates/check',{});if(result.update){state.update=result.update;renderUpdate();}else await refresh();if(result.started)toast(t('已开始检查更新'));}));
 $('apply-update').addEventListener('click',()=>safe(async()=>{if(!(await uiConfirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？'))))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));
 safe(async()=>{if(window.RSIDesktop){await window.RSIDesktop.ready;restoreRuntimeNavigation();if(window.RSIDesktop.invoke)window.RSIDesktop.invoke('set_native_language',{language}).catch(()=>{});}await refresh();});
-if(window.RSIDesktop)safe(checkDesktopUpdate);
+// native-update.js 在本脚本之后加载，启动检查要等到 DOMContentLoaded 才会走带节流的 tick()；
+// 直接在这里调用会落到旧的 check_desktop_update 命令，每次刷新都请求远端发布源。
+if(window.RSIDesktop)document.addEventListener('DOMContentLoaded',()=>safe(checkDesktopUpdate));
 $('language-select').addEventListener('change',()=>safe(async()=>{
  language=$('language-select').value;
  localWrite('rsi-language',language);
