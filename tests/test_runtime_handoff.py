@@ -290,6 +290,51 @@ class RuntimeHandoffTest(unittest.TestCase):
         # 已按超时收尾的尝试不再把额度带给下一次人工重试。
         self.assertIsNone(store.setting('stage-budget:' + task))
 
+    def test_stage_budget_write_failure_leaves_structured_evidence(self):
+        """落盘失败不能只留一行 warning：事件与计数要让下一次尝试的满额度可解释。"""
+        task, run = self.claim()
+        run['_stage_used'] = {'preparation': 5.0, 'evaluation': 0.0}
+        error = sqlite3.OperationalError('database or disk is full')
+        with patch.object(self.store, 'put_setting', side_effect=error):
+            self.runtime._save_stage_budget(run, 1000.0, True)
+        event = self.store.one("SELECT * FROM events WHERE kind='stage_budget_persist_failed'")
+        self.assertIsNotNone(event)
+        self.assertEqual(event['run'], run['id'])
+        data = json.loads(event['data'])
+        self.assertEqual((data['run'], data['task']), (run['id'], task))
+        self.assertIn('database or disk is full', data['error'])
+        self.assertEqual(self.runtime.shutdown_status()['budget_persist_failures'], 1)
+
+    def test_corrupt_stage_budget_is_reported_and_treated_as_unused(self):
+        """键存在但不可解析时按 0 处理，但不能静默当成一次成功载入。"""
+        task, run = self.claim()
+        self.store.put_setting('stage-budget:' + task, 'not-a-ledger')
+        self.assertEqual(self.runtime._load_stage_budget(run),
+                         {'preparation': 0.0, 'evaluation': 0.0})
+        event = self.store.one("SELECT * FROM events WHERE kind='stage_budget_corrupt'")
+        self.assertIsNotNone(event)
+        self.assertEqual(event['run'], run['id'])
+        self.assertEqual(json.loads(event['data'])['task'], task)
+        # 无法解析的 JSON 同样按 0 处理，并且同样留痕。
+        self.store.execute('DELETE FROM settings WHERE key=?', ('stage-budget:' + task,))
+        self.store.execute('INSERT INTO settings VALUES (?,?)',
+                           ('stage-budget:' + task, '{not json'))
+        self.assertEqual(self.runtime._load_stage_budget(run),
+                         {'preparation': 0.0, 'evaluation': 0.0})
+        count = self.store.one("SELECT COUNT(*) AS n FROM events WHERE kind='stage_budget_corrupt'")
+        self.assertEqual(count['n'], 2)
+
+    def test_successful_stage_budget_write_records_no_failure_evidence(self):
+        """正常落盘不产生失败事件，计数器保持 0。"""
+        task, run = self.claim()
+        run['_stage_used'] = {'preparation': 5.0, 'evaluation': 1.0}
+        self.runtime._save_stage_budget(run, 1000.0, True)
+        self.assertEqual(self.store.setting('stage-budget:' + task),
+                         {'preparation': 5.0, 'evaluation': 1.0, 'run': run['id']})
+        self.assertIsNone(self.store.one(
+            "SELECT * FROM events WHERE kind IN ('stage_budget_persist_failed','stage_budget_corrupt')"))
+        self.assertEqual(self.runtime.shutdown_status()['budget_persist_failures'], 0)
+
     def test_stage_budget_checkpoint_charges_preparation_during_model_call(self):
         """模型调用在途时的检查点仍计入准备阶段，硬崩溃不会丢掉整段准备耗时。"""
         from adaptive_rsi.process import Cancelled
