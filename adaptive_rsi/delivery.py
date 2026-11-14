@@ -807,8 +807,9 @@ def _recovery_due(outcome, now):
     return now - last >= (wait if isinstance(wait, (int, float)) and wait > 0 else 3600)
 
 
-def _abandon_recovery(store, run, now, reason):
-    """Mark recovery terminal so the run leaves the candidate query and its keys age out."""
+def _block_recovery(store, run, now, reason):
+    """Back off while preserving evidence until preconditions can be repaired."""
+    detail = 'recovery preconditions unavailable: ' + reason
     with store.connect() as db:
         db.execute('BEGIN IMMEDIATE')
         row = db.execute('SELECT state,result FROM runs WHERE id=?', (run['id'],)).fetchone()
@@ -817,11 +818,14 @@ def _abandon_recovery(store, run, now, reason):
         outcome = parsed_result(row)
         if outcome.get('pr') or outcome.get('delivery_recovery_abandoned'):
             return
-        outcome['delivery_recovery_abandoned'] = reason
+        changed = outcome.get('delivery_recovery_blocked') != detail
+        outcome['delivery_recovery_blocked'] = detail
         outcome['delivery_recovery_at'] = now
+        outcome['delivery_recovery_retry'] = 3600
         db.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run['id']))
-    store.event('recovery_abandoned', 'Superseded delivery reconciliation stopped: ' + reason,
-                run['project'], run['id'])
+    if changed:
+        store.event('recovery_blocked', 'Superseded delivery reconciliation blocked: ' + detail,
+                    run['project'], run['id'])
 
 
 def _stamp_recovery(store, run_id, now, wait):
@@ -834,13 +838,18 @@ def _stamp_recovery(store, run_id, now, wait):
         outcome = parsed_result(row)
         if outcome.get('pr') or outcome.get('delivery_recovery_abandoned'):
             return
-        outcome['delivery_recovery_at'] = now
-        outcome['delivery_recovery_retry'] = wait
+        outcome.pop('delivery_recovery_blocked', None)
         attempts = outcome.get('delivery_recovery_attempts', 0)
-        outcome['delivery_recovery_attempts'] = (attempts if isinstance(attempts, int) else 0) + 1
-        abandoned = outcome['delivery_recovery_attempts'] >= RECOVERY_ATTEMPT_LIMIT
+        attempts = attempts if isinstance(attempts, int) and attempts >= 0 else 0
+        abandoned = attempts >= RECOVERY_ATTEMPT_LIMIT
         if abandoned:
-            outcome['delivery_recovery_abandoned'] = 'exhausted %s attempts without a matching PR' % RECOVERY_ATTEMPT_LIMIT
+            # The previous attempt may have failed to read GitHub; do not claim
+            # that a matching PR was absent. Allow the last attempt to run first.
+            outcome['delivery_recovery_abandoned'] = 'exhausted %s attempts; matching PR not confirmed' % RECOVERY_ATTEMPT_LIMIT
+        else:
+            outcome['delivery_recovery_at'] = now
+            outcome['delivery_recovery_retry'] = wait
+            outcome['delivery_recovery_attempts'] = attempts + 1
         db.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run_id))
         return outcome, abandoned
 
@@ -848,29 +857,25 @@ def _stamp_recovery(store, run_id, now, wait):
 def _recover_superseded_receipt(runtime, project, run, config, now):
     """Observe a journaled publication without relying on its workspace."""
     store = runtime.store
-    # 失败的远端读取同样要退避，否则每个调度周期都会重新发起查询。
-    stamped = _stamp_recovery(store, run['id'], now, 900)
-    if stamped is None:
-        return
-    outcome, abandoned = stamped
-    if abandoned:
-        store.event('recovery_abandoned',
-                    'Superseded delivery reconciliation stopped: ' + outcome['delivery_recovery_abandoned'],
-                    project['id'], run['id'])
-        return
     intent_key = 'delivery-push:' + run['id']
     intent = store.setting(intent_key)
     if not isinstance(intent, dict):
         row = store.one('SELECT value FROM settings WHERE key=?', (intent_key,))
         if row is not None:
-            # 日志存在但不可解析：损坏的意图永远匹配不到回执，重试只会按退避
-            # 无限刷写；落终态并停止查询远端。
-            _abandon_recovery(store, run, now, 'push journal is not a readable object')
+            # 损坏的意图暂时匹配不到回执；保留日志并退避，允许修复后恢复。
+            _block_recovery(store, run, now, 'push journal unreadable')
         return
     identity = store.setting('run-baseline:' + run['id'])
     task = store.one('SELECT source FROM tasks WHERE id=? AND project=?', (run['task'], run['project']))
     repo = config['github']['repository']
-    if not isinstance(identity, dict) or not task or not isinstance(repo, str):
+    if not isinstance(identity, dict):
+        _block_recovery(store, run, now, 'missing baseline identity')
+        return
+    if not task:
+        _block_recovery(store, run, now, 'missing task row')
+        return
+    if not isinstance(repo, str):
+        _block_recovery(store, run, now, 'missing repository')
         return
     prefix = 'fix' if task['source'] in ['issue', 'rollback', 'inspection'] else 'feat'
     branch = prefix + '/rsi-' + re.sub(r'[^a-zA-Z0-9._-]', '-', run['id'])
@@ -880,8 +885,21 @@ def _recover_superseded_receipt(runtime, project, run, config, now):
             not isinstance(base_branch, str) or not base_branch or
             intent.get('branch') != branch or intent.get('repository') != repo or
             intent.get('base') != run['base'] or identity != {
-                'repository': repo, 'branch': base_branch, 'sha': run['base']} or
-            repo.lower() != origin_repository(project['path']).lower()):
+                'repository': repo, 'branch': base_branch, 'sha': run['base']}):
+        _block_recovery(store, run, now, 'push journal does not match the run baseline')
+        return
+    if repo.lower() != origin_repository(project['path']).lower():
+        _block_recovery(store, run, now, 'repository mismatch')
+        return
+    # 前置条件齐全后才计次：先落盘再远端读，失败的查询同样按退避重试。
+    stamped = _stamp_recovery(store, run['id'], now, 900)
+    if stamped is None:
+        return
+    outcome, abandoned = stamped
+    if abandoned:
+        store.event('recovery_abandoned',
+                    'Superseded delivery reconciliation stopped: ' + outcome['delivery_recovery_abandoned'],
+                    project['id'], run['id'])
         return
     records = json.loads(checked(['gh', 'pr', 'list', '--repo', repo, '--state', 'all',
         '--head', branch, '--limit', '100', '--json',
