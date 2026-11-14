@@ -202,6 +202,10 @@ class Runtime(Maintenance):
         self.futures = set()
         self._futures_lock = threading.Lock()
         self._future_runs = {}
+        # 排空超时后仍在执行的 future：不能随 reconcile 一起被抹掉。它们继续计入
+        # shutdown_status().remaining_workers，并让状态目录锁保留到最后一个退出。
+        self._stuck_futures = set()
+        self._lockfile_lock = threading.Lock()
         self._scheduler_failures = {}
         self._scheduler_failures_lock = threading.Lock()
         self.automation_receipt_failures = {}
@@ -976,7 +980,24 @@ class Runtime(Maintenance):
             raise
 
     def shutdown_status(self):
-        return {**self._shutdown, 'remaining_workers': sum(not f.done() for f in tuple(self.futures)),
+        """Shutdown progress plus the handoff state of the state directory.
+
+        ``phase='completed'`` only means ``close()`` returned. ``handoff_complete``
+        also requires no live worker, a released state-directory lock, and no
+        unreconciled claimed run; a timed-out worker keeps the lock so a second
+        runtime cannot take over while it may still write run rows.
+        """
+        with self._futures_lock:
+            tracked = set(self.futures) | self._stuck_futures
+            remaining = sum(not future.done() for future in tracked)
+            stuck = sorted({self._future_runs[future] for future in self._stuck_futures
+                            if not future.done() and future in self._future_runs})
+            locked = self.lockfile is not None and not self.lockfile.closed
+        return {**self._shutdown, 'remaining_workers': remaining,
+                'stuck_workers': stuck,
+                'state_dir_locked': locked,
+                'handoff_complete': bool(self._closed and not remaining and not locked
+                                         and not self._shutdown['reconcile_failed']),
                 'remaining_operations': len(self.operations.active),
                 'operations_timed_out': self.operations.timed_out,
                 'maintenance_running': bool(self.maintenance_thread and self.maintenance_thread.is_alive())}
@@ -998,6 +1019,8 @@ class Runtime(Maintenance):
             self._closed = True
             # completed 只表示关闭流程走完；reconcile_failed>0 表示仍有已领取的
             # run 未能落终态，必须等下一次启动的 store.recover() 修复。
+            # 超时未退出的 worker 由 handoff_complete=False 单独暴露（并继续持有
+            # 状态目录锁），不能仅凭 phase=completed 判定可以接班。
             self._shutdown.update(phase='completed', ended=time.time())
 
     def _close(self):
@@ -1042,16 +1065,56 @@ class Runtime(Maintenance):
         self._shutdown['phase'] = 'storage'
         # 关闭数据层空闲连接；已借出的连接由各自的 with 块负责。
         self.store.close()
-        if self.lockfile:
-            self.lockfile.close()
+        # 超时仍未退出的 worker 仍可能写这个状态目录：保留 flock，由最后一个
+        # worker 的 done callback 释放；否则新进程会在旧 worker 还活着时接管。
+        # 队列里任何未完成的 future 都覆盖到，避免排空步骤自身失败时提前放锁。
+        with self._futures_lock:
+            pending = {future for future in (self.futures | self._stuck_futures)
+                       if not future.done()}
+            self._stuck_futures.update(pending)
+            registered = set(self._stuck_futures)
+        # Register only after storage cleanup: a finished future invokes its
+        # callback synchronously and must not release ownership during close().
+        for future in registered:
+            future.add_done_callback(self._stuck_worker_done)
+        if not pending:
+            self._release_state_dir_lock()
+
+    def _release_state_dir_lock(self):
+        """Release the state-directory flock once nobody owns the directory anymore."""
+        with self._lockfile_lock:
+            lock, self.lockfile = self.lockfile, None
+            if lock is not None:
+                try:
+                    lock.close()
+                except OSError:
+                    logging.getLogger(__name__).exception(
+                        'Failed to release the state directory lock')
+
+    def _stuck_worker_done(self, future):
+        """Forget a timed-out worker; release the lock when the last one exits."""
+        with self._futures_lock:
+            self._stuck_futures.discard(future)
+            self.futures.discard(future)
+            self._future_runs.pop(future, None)
+            remaining = any(not item.done() for item in self._stuck_futures)
+        self.wake.set()
+        if remaining:
+            return
+        logging.getLogger(__name__).warning(
+            'Timed-out worker finished after shutdown; handing off the state directory')
+        self._release_state_dir_lock()
 
     def _shutdown_workers(self):
         """Drain workers within WORKER_DRAIN_TIMEOUT, then record still-running runs.
 
         Queued work is cancelled for ``_reconcile_unstarted_workers``; the rest
         gets a bounded wait. A run stuck in a blocking call that never polls
-        ``stop`` would otherwise pin ``close`` in the workers phase; its open
-        row is recovered by ``store.recover()`` on the next start.
+        ``stop`` would otherwise pin ``close`` in the workers phase. Its future
+        is kept as handoff evidence: it still counts in ``remaining_workers``
+        and the runtime keeps the state-directory lock until it really exits, so
+        a second runtime cannot recover the open row while the worker may still
+        write it.
         """
         with self._futures_lock:
             unfinished_runs = {future: run for future, run in self._future_runs.items()
@@ -1077,6 +1140,10 @@ class Runtime(Maintenance):
         if not running:
             return
         self._shutdown['workers_timed_out'] = True
+        # 这些 future 在 close() 返回后仍会执行：登记为 stuck，交给 reconcile 之后的
+        # 状态与锁交接使用；最后一个退出时才释放状态目录锁。
+        with self._futures_lock:
+            self._stuck_futures.update(running)
         runs = sorted(unfinished_runs[future] for future in running if future in unfinished_runs)
         logging.getLogger(__name__).warning(
             "Worker threads did not stop within %ss; proceeding with shutdown (runs: %s)",
@@ -1099,12 +1166,25 @@ class Runtime(Maintenance):
         A failed write must surface as shutdown evidence (``reconcile_failed``),
         not only as a process log line: ``phase='completed'`` no longer implies
         every claimed run reached a terminal state.
+
+        Futures that outlived the drain timeout are kept in ``_stuck_futures``
+        and stay tracked in ``_future_runs``: they still own a worker thread and
+        the state-directory lock, so clearing them here would under-report
+        ``remaining_workers`` and release ownership too early.
         """
         with self._futures_lock:
-            pending = list(self._future_runs.items())
-            self._future_runs.clear()
-            for future, _ in pending:
-                self.futures.discard(future)
+            pending, retained = [], []
+            for future, run in list(self._future_runs.items()):
+                if future.cancelled() or (future.done() and future not in self._stuck_futures):
+                    pending.append((future, run))
+                    self.futures.discard(future)
+                    self._future_runs.pop(future, None)
+                elif not future.done() and future not in self._stuck_futures:
+                    retained.append(future)
+        if retained:
+            logging.getLogger(__name__).warning(
+                "Shutdown left %s tracked worker(s) without a drain timeout record",
+                len(retained))
         reconciled, failed = 0, []
         for future, run in pending:
             if not future.cancelled():

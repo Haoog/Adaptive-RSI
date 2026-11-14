@@ -1,6 +1,7 @@
 """Offline regression evidence for runtime handoff boundaries."""
 import concurrent.futures
 import datetime
+import fcntl
 import json
 import os
 import sqlite3
@@ -77,14 +78,89 @@ class RuntimeHandoffTest(unittest.TestCase):
                 elapsed = time.monotonic() - started
             status = self.runtime.shutdown_status()
             self.assertLess(elapsed, 1)
+            # phase=completed 只表示 close() 返回；超时 worker 仍是交接证据。
             self.assertEqual(status['phase'], 'completed')
             self.assertTrue(status['workers_timed_out'])
             self.assertFalse(status['operations_timed_out'])
+            self.assertEqual(status['remaining_workers'], 1)
+            self.assertEqual(status['stuck_workers'], [run['id']])
+            self.assertFalse(status['handoff_complete'])
             events = self.store.query("SELECT data FROM events WHERE kind='shutdown_workers_timed_out'")
             self.assertEqual(len(events), 1)
             self.assertEqual(json.loads(events[0]['data'])['runs'], [run['id']])
         finally:
             gate.set()
+        limit = time.monotonic() + 5
+        while self.runtime.shutdown_status()['remaining_workers'] and time.monotonic() < limit:
+            time.sleep(.01)
+        status = self.runtime.shutdown_status()
+        self.assertEqual((status['remaining_workers'], status['stuck_workers']), (0, []))
+
+    def test_worker_finishing_during_storage_cleanup_keeps_lock(self):
+        gate, began = threading.Event(), threading.Event()
+        self.runtime.lockfile = (self.store.root / 'runtime.lock').open('a+')
+        fcntl.flock(self.runtime.lockfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        def wedged():
+            began.set()
+            gate.wait(10)
+        future = self.runtime.pool.submit(wedged)
+        with self.runtime._futures_lock:
+            self.runtime.futures.add(future)
+        self.assertTrue(began.wait(1))
+        original_close = self.store.close
+        def close_storage():
+            gate.set()
+            future.result(timeout=5)
+            with self.assertRaisesRegex(RuntimeError, 'Another runtime already owns this state directory'):
+                Runtime(self.store).start()
+            original_close()
+        try:
+            with patch('adaptive_rsi.runtime.WORKER_DRAIN_TIMEOUT', .01), patch.object(self.store, 'close', side_effect=close_storage):
+                self.runtime.close()
+        finally:
+            gate.set()
+        self.assertTrue(self.runtime.shutdown_status()['handoff_complete'])
+
+    def test_shutdown_keeps_state_dir_owned_until_stuck_worker_exits(self):
+        """超时 worker 仍在执行时保留 flock：第二次启动被拒绝，退出后才交接。"""
+        gate, began = threading.Event(), threading.Event()
+        _, run = self.claim()
+        self.runtime.lockfile = (self.store.root / 'runtime.lock').open('a+')
+        fcntl.flock(self.runtime.lockfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def wedged():
+            began.set()
+            gate.wait(10)
+
+        future = self.runtime.pool.submit(wedged)
+        with self.runtime._futures_lock:
+            self.runtime.futures.add(future)
+            self.runtime._future_runs[future] = run['id']
+        self.assertTrue(began.wait(1))
+        try:
+            with patch('adaptive_rsi.runtime.WORKER_DRAIN_TIMEOUT', .2):
+                self.runtime.close()
+            status = self.runtime.shutdown_status()
+            self.assertEqual(status['remaining_workers'], 1)
+            self.assertEqual(status['stuck_workers'], [run['id']])
+            self.assertTrue(status['state_dir_locked'])
+            self.assertFalse(status['handoff_complete'])
+            # 旧 worker 还可能写 run 记录，同一状态目录的第二次启动必须被拒绝。
+            with self.assertRaisesRegex(RuntimeError, 'Another runtime already owns this state directory'):
+                Runtime(self.store).start()
+            self.assertTrue(self.runtime.shutdown_status()['state_dir_locked'])
+        finally:
+            gate.set()
+        limit = time.monotonic() + 5
+        while self.runtime.shutdown_status()['state_dir_locked'] and time.monotonic() < limit:
+            time.sleep(.01)
+        status = self.runtime.shutdown_status()
+        self.assertEqual((status['remaining_workers'], status['stuck_workers']), (0, []))
+        self.assertFalse(status['state_dir_locked'])
+        self.assertTrue(status['handoff_complete'])
+        # 最后一个 worker 退出后锁释放，生产入口可以再次接管同一状态目录。
+        reopened = Runtime.open(self.store.root)
+        self.addCleanup(reopened.close)
 
     def test_operations_close_bounds_a_wedged_operation(self):
         gate, began = threading.Event(), threading.Event()
