@@ -150,6 +150,26 @@ class AuditRound3Test(unittest.TestCase):
                       observed[0]["protected"])
         self.assertTrue(_changed_harness([fixture.as_posix()], [], baseline))
 
+    def test_candidate_stage_keeps_added_fixtures_when_materializing_directory_symlink(self):
+        baseline = self.root / "added-fixture-baseline"
+        candidate = self.root / "added-fixture-candidate"
+        shared = Path("shared/fixtures")
+        (baseline / shared).mkdir(parents=True)
+        (baseline / shared / "expected.json").write_text("baseline")
+        (baseline / "pkg").mkdir()
+        (baseline / "pkg" / "testdata").symlink_to("../shared/fixtures", target_is_directory=True)
+        shutil.copytree(baseline, candidate, symlinks=True)
+        # 候选把符号链接换成真实目录：基线内容照旧，外加一个候选新增夹具。
+        (candidate / "pkg" / "testdata").unlink()
+        (candidate / "pkg" / "testdata").mkdir()
+        (candidate / "pkg" / "testdata" / "expected.json").write_text("candidate")
+        (candidate / "pkg" / "testdata" / "added.json").write_text("added")
+        target = self.root / "added-fixture-stage"
+        shutil.copytree(candidate, target, symlinks=True)
+        freeze_harness(baseline, target)
+        self.assertEqual((target / "pkg" / "testdata" / "expected.json").read_text(), "baseline")
+        self.assertEqual((target / "pkg" / "testdata" / "added.json").read_text(), "added")
+
     def test_candidate_stage_rejects_fixture_symlink_into_protected_state(self):
         project = self.root / "state-link-project"
         state = self.root / "protected-state"

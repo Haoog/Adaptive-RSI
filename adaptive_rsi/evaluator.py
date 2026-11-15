@@ -752,10 +752,16 @@ def freeze_harness(baseline, target, checks=(), state=None):
                 if os.readlink(dst) != os.readlink(src):
                     raise RuntimeError("Candidate symlink overlaps protected harness")
                 dst.unlink()
-            if dst.is_dir():
-                shutil.rmtree(dst)
-            elif dst.exists():
+            if dst.exists() and not dst.is_dir():
                 dst.unlink()
+            if dst.is_dir():
+                # 候选把同一路径做成真实目录时按普通目录路径处理：只覆盖基线拥有的
+                # 内容，保留候选新增的夹具文件，否则引用这些新夹具的回归会在冻结阶段
+                # 假失败。目录内出现符号链接仍然拒绝，避免写穿到候选选择的位置。
+                for child_parent, child_dirs, child_files in os.walk(dst, followlinks=False):
+                    for entry in list(child_dirs) + list(child_files):
+                        if (Path(child_parent) / entry).is_symlink():
+                            raise RuntimeError("Candidate symlink overlaps protected harness")
             dst.parent.mkdir(parents=True, exist_ok=True)
             _copy_frozen_fixture(resolved, dst, baseline, state)
             for child_parent, _, child_files in os.walk(dst, followlinks=False):
