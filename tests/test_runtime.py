@@ -529,8 +529,8 @@ class RuntimeTest(unittest.TestCase):
         self.assertFalse(closer.is_alive())
         self.assertEqual(errors, [])
         self.assertTrue(self.runtime._closed)
-        self.assertIsNotNone(self.runtime.lockfile)
-        self.assertTrue(self.runtime.lockfile.closed)
+        # 关闭后状态目录锁已释放：lockfile 置空（#404 的交接语义）或保持已关闭对象。
+        self.assertTrue(self.runtime.lockfile is None or self.runtime.lockfile.closed)
         self.assertFalse(self.runtime.thread.is_alive())
 
     def test_start_is_idempotent_and_keeps_one_scheduler_thread(self):
