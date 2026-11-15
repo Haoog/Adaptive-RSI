@@ -1285,6 +1285,383 @@ class AuthSessionTests(unittest.TestCase):
         self.gate.set()
         self.assertFalse((self.root / "codex/auth.json").exists())
 
+    def test_expiry_write_failure_after_reservation_consumed_releases_capacity(self):
+        manager = AuthSessions(self.root / "expiry-write-failure", factory=self.factory, ttl=10, now=lambda: 100.0)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        with patch.object(manager, "now", side_effect=[109.0, 111.0, 111.0, 111.0, 111.0]), \
+             patch.object(manager, "_thread") as launch_thread, \
+             patch("adaptive_rsi.auth_sessions._write_json", side_effect=OSError(28, "synthetic full disk")):
+            with self.assertRaises(OSError):
+                manager.launch(session["id"])
+            result = manager.status(session["id"])
+            self.assertEqual((result["state"], result["error"]), ("expired", "auth_expired"))
+            self.assertEqual(manager.busy, 0)
+            launch_thread.assert_not_called()
+        self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "starting")
+
+    def test_launch_abort_memoryerror_does_not_mask_thread_error_or_leave_busy(self):
+        manager = AuthSessions(self.root / "abort-memoryerror", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        with patch.object(manager, "_thread", side_effect=RuntimeError("synthetic thread failure")), \
+             patch("adaptive_rsi.auth_sessions._write_json", side_effect=MemoryError("synthetic disk writer memory error")):
+            with self.assertRaises(AuthError) as caught:
+                manager.launch(session["id"])
+            self.assertEqual(caught.exception.code, "auth_protocol_error")
+            result = manager.status(session["id"])
+            self.assertEqual((result["state"], result["error"]), ("failed", "process_interrupted"))
+            self.assertEqual(manager.busy, 0)
+        self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "starting")
+
+    def test_worker_base_exception_is_propagated_and_releases_session(self):
+        manager = AuthSessions(self.root / "worker-base-error", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        failures = []
+        def run():
+            try:
+                manager._run(session["id"], 0, None)
+            except BaseException as error:
+                failures.append(error)
+        with patch.object(manager, "factory", side_effect=SystemExit("synthetic worker exit")):
+            thread = threading.Thread(target=run)
+            thread.start()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], SystemExit)
+        result = manager.status(session["id"])
+        self.assertEqual((result["state"], result["error"]), ("failed", "process_interrupted"))
+        self.assertEqual(manager.busy, 0)
+        self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "failed")
+
+    def test_memory_write_failure_stops_actual_running_worker(self):
+        for action in ("cancel", "close"):
+            with self.subTest(action=action):
+                entered, stopped, closed = threading.Event(), threading.Event(), threading.Event()
+                class Worker:
+                    def start(self, *args):
+                        return {"verification_url": "https://example.test/", "user_code": "TEST", "method": "auto", "instructions": ""}
+                    def wait(self, stop, deadline):
+                        entered.set()
+                        if not stop.wait(3):
+                            raise AssertionError("worker stop was not signalled")
+                        stopped.set()
+                        return False
+                    def close(self):
+                        closed.set()
+                manager = AuthSessions(self.root / ("running-" + action), factory=lambda backend: Worker(), ttl=600)
+                self.addCleanup(manager.close)
+                session = manager.reserve("codex")
+                manager.launch(session["id"])
+                self.assertTrue(entered.wait(3), "worker did not start")
+                try:
+                    with patch("adaptive_rsi.auth_sessions._write_json", side_effect=MemoryError("synthetic writer failure")):
+                        if action == "cancel":
+                            with self.assertRaises(MemoryError):
+                                manager.cancel(session["id"])
+                        else:
+                            manager.close()
+                        self.assertTrue(stopped.wait(3))
+                        self.assertTrue(closed.wait(3))
+                        self.assertEqual(manager.status(session["id"])["state"], "cancelled" if action == "cancel" else "interrupted")
+                        self.assertEqual(manager.busy, 0)
+                finally:
+                    manager.close()
+
+    def test_running_cancel_memory_write_stops_worker_and_publishes_terminal(self):
+        manager = AuthSessions(self.root / "cancel-running-memory-write", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        stopped = threading.Event()
+        closed = []
+        worker = types.SimpleNamespace(close=lambda: closed.append(True))
+        manager.workers[session["id"]] = (worker, stopped)
+        try:
+            with patch("adaptive_rsi.auth_sessions._write_json", side_effect=MemoryError("synthetic writer failure")):
+                try:
+                    manager.cancel(session["id"])
+                except MemoryError:
+                    pass
+                self.assertTrue(stopped.is_set())
+                self.assertEqual(closed, [True])
+                self.assertEqual(manager.status(session["id"])["state"], "cancelled")
+                self.assertEqual(manager.busy, 0)
+        finally:
+            manager.workers.pop(session["id"], None)
+
+    def test_close_memory_write_still_stops_workers_and_publishes_terminal(self):
+        manager = AuthSessions(self.root / "close-memory-write", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        stopped = threading.Event()
+        closed = []
+        worker = types.SimpleNamespace(close=lambda: closed.append(True))
+        manager.workers[session["id"]] = (worker, stopped)
+        try:
+            with patch("adaptive_rsi.auth_sessions._write_json", side_effect=MemoryError("synthetic writer failure")):
+                manager.close()
+                self.assertTrue(stopped.is_set())
+                self.assertEqual(closed, [True])
+                self.assertEqual(manager.status(session["id"])["state"], "interrupted")
+                self.assertEqual(manager.busy, 0)
+                self.assertIsInstance(manager._close_error, MemoryError)
+        finally:
+            manager.workers.pop(session["id"], None)
+
+    def test_worker_persistence_base_exception_propagates_after_cleanup(self):
+        manager = AuthSessions(self.root / "worker-persistence-exit", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        primary = SystemExit("synthetic writer interruption")
+        def fail_start(*args):
+            raise ValueError("synthetic worker failure")
+        worker = types.SimpleNamespace(start=fail_start, close=lambda: None)
+        with patch.object(manager, "factory", return_value=worker), \
+             patch("adaptive_rsi.auth_sessions._write_json", side_effect=primary):
+            with self.assertRaises(SystemExit) as caught:
+                manager._run(session["id"], 0, None)
+            self.assertIs(caught.exception, primary)
+            self.assertEqual(manager.status(session["id"])["state"], "failed")
+            self.assertNotIn(session["id"], manager.workers)
+            self.assertEqual(manager.busy, 0)
+
+    def test_worker_base_exception_survives_worker_close_failure(self):
+        manager = AuthSessions(self.root / "worker-close-base", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        primary = SystemExit("synthetic primary")
+        def fail_start(*args):
+            raise primary
+        def fail_close():
+            raise RuntimeError("synthetic cleanup")
+        worker = types.SimpleNamespace(start=fail_start, close=fail_close)
+        with patch.object(manager, "factory", return_value=worker):
+            with self.assertRaises(SystemExit) as caught:
+                manager._run(session["id"], 0, None)
+        self.assertIs(caught.exception, primary)
+        result = manager.status(session["id"])
+        self.assertEqual((result["state"], result["error"]), ("failed", "process_interrupted"))
+        self.assertNotIn(session["id"], manager.workers)
+        self.assertEqual(manager.busy, 0)
+
+    def test_terminal_worker_write_memory_failure_is_published(self):
+        manager = AuthSessions(self.root / "worker-terminal-memory-write", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        worker = types.SimpleNamespace(
+            start=lambda *args: {"verification_url": "https://example.test/", "user_code": "TEST", "method": "auto", "instructions": ""},
+            wait=lambda *args: False, close=lambda: None)
+        write = auth_sessions._write_json
+        writes = []
+        def fail_second(*args, **kwargs):
+            writes.append(True)
+            if len(writes) > 1:
+                raise MemoryError("synthetic writer failure")
+            return write(*args, **kwargs)
+        with patch.object(manager, "factory", return_value=worker), \
+             patch("adaptive_rsi.auth_sessions._write_json", side_effect=fail_second):
+            manager._run(session["id"], 0, None)
+            self.assertEqual(manager.status(session["id"])["state"], "failed")
+            self.assertEqual(manager.busy, 0)
+            self.assertNotIn(session["id"], manager.workers)
+
+    def test_worker_exception_with_memory_write_failure_publishes_terminal(self):
+        manager = AuthSessions(self.root / "worker-error-write", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        def fail_start(*args):
+            raise ValueError("synthetic worker failure")
+        worker = types.SimpleNamespace(start=fail_start, close=lambda: None)
+        with patch.object(manager, "factory", return_value=worker), \
+             patch("adaptive_rsi.auth_sessions._write_json", side_effect=MemoryError("synthetic writer failure")):
+            manager._run(session["id"], 0, None)
+            result = manager.status(session["id"])
+            self.assertEqual((result["state"], result["error"]), ("failed", "auth_protocol_error"))
+            self.assertEqual(manager.busy, 0)
+            self.assertNotIn(session["id"], manager.workers)
+            self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "starting")
+
+    def test_cancel_write_failure_during_launch_preserves_published_cancel(self):
+        manager = AuthSessions(self.root / "launch-cancel-write", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+        def fail_thread(_target):
+            entered.set()
+            if not release.wait(3):
+                raise AssertionError("cancel interleaving timed out")
+            raise RuntimeError("synthetic start failure")
+        def launch():
+            try:
+                manager.launch(session["id"])
+            except BaseException as error:
+                errors.append(error)
+        with patch.object(manager, "_thread", side_effect=fail_thread), \
+             patch("adaptive_rsi.auth_sessions._write_json", side_effect=MemoryError("synthetic writer failure")):
+            t = threading.Thread(target=launch)
+            t.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                with self.assertRaises(MemoryError):
+                    manager.cancel(session["id"])
+            finally:
+                release.set()
+                t.join(3)
+            self.assertFalse(t.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], AuthError)
+            self.assertEqual(errors[0].code, "auth_protocol_error")
+            self.assertEqual(manager.status(session["id"])["state"], "cancelled")
+            self.assertEqual(manager.busy, 0)
+            self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "starting")
+
+    def test_launch_cleanup_failure_does_not_mask_expected_error(self):
+        for started, code in ((False, "service_closed"), (RuntimeError("synthetic thread"), "auth_protocol_error")):
+            with self.subTest(code=code):
+                manager = AuthSessions(self.root / ("cleanup-fail-" + code), factory=self.factory, ttl=600)
+                self.addCleanup(manager.close)
+                session = manager.reserve("codex")
+                failure = {"return_value": False} if started is False else {"side_effect": started}
+                with patch.object(manager, "_thread", **failure), \
+                     patch.object(manager, "_abort_launch", side_effect=MemoryError("synthetic cleanup")):
+                    with self.assertRaises(AuthError) as caught:
+                        manager.launch(session["id"])
+                self.assertEqual(caught.exception.code, code)
+
+    def test_launch_after_completed_close_rejects_terminal_session(self):
+        manager = AuthSessions(self.root / "launch-after-close", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        manager.close()
+        with self.assertRaises(AuthError) as caught:
+            manager.launch(session["id"])
+        self.assertEqual(caught.exception.code, "invalid_auth_state")
+        self.assertEqual(manager.status(session["id"])["state"], "interrupted")
+        self.assertEqual(self.created, [])
+
+    def test_launch_failure_after_deadline_records_expiry(self):
+        for sweep in (False, True):
+            with self.subTest(sweep=sweep):
+                clock = [100.0]
+                manager = AuthSessions(self.root / ("launch-ttl-" + str(sweep)), factory=self.factory, ttl=10, now=lambda: clock[0])
+                self.addCleanup(manager.close)
+                session = manager.reserve("codex")
+                def fail(_callback):
+                    clock[0] = 111.0
+                    if sweep:
+                        manager.status(session["id"])
+                    raise RuntimeError("synthetic thread startup failure")
+                with patch.object(manager, "_thread", side_effect=fail):
+                    with self.assertRaises(AuthError):
+                        manager.launch(session["id"])
+                result = manager.status(session["id"])
+                self.assertEqual((result["state"], result["error"]), ("expired", "auth_expired"))
+                self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "expired")
+
+    def test_launch_abort_persist_failure_recovers_on_restart(self):
+        root = self.root / "launch-abort-io"
+        manager = AuthSessions(root, factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        write = auth_sessions._write_json
+        def fail_state(path, value):
+            if Path(path) == manager.file:
+                raise OSError(28, "synthetic state write failure")
+            return write(path, value)
+        with patch.object(manager, "_thread", side_effect=RuntimeError("synthetic start failure")), patch("adaptive_rsi.auth_sessions._write_json", side_effect=fail_state):
+            with self.assertRaises(AuthError) as caught:
+                manager.launch(session["id"])
+            self.assertEqual(caught.exception.code, "auth_protocol_error")
+            self.assertEqual(manager.status(session["id"])["state"], "failed")
+            self.assertEqual(manager.busy, 0)
+            self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "starting")
+        manager.close()
+        restarted = AuthSessions(root, factory=self.factory, ttl=600)
+        self.addCleanup(restarted.close)
+        result = restarted.status(session["id"])
+        self.assertEqual((result["state"], result["error"]), ("interrupted", "process_interrupted"))
+        self.assertEqual(restarted.busy, 0)
+        self.assertEqual(json.loads(restarted.file.read_text())[session["id"]]["state"], "interrupted")
+
+    def test_launch_thread_failure_marks_session_failed_and_frees_backend(self):
+        # 低内存下 thread.start() 会抛 RuntimeError("can't start new thread")：worker
+        # 从未运行，会话不能留在 starting 把同后端锁到 TTL 到期。
+        self.manager.ttl = 600
+
+        def refuse(_thread):
+            raise RuntimeError("can't start new thread")
+        with patch.object(threading.Thread, "start", refuse):
+            with self.assertRaises(AuthError) as caught:
+                self.manager.start("codex")
+        # AuthError 继承 RuntimeError，这里要确认真实类型而不是裸 RuntimeError。
+        self.assertIs(type(caught.exception), AuthError)
+        self.assertEqual(caught.exception.code, "auth_protocol_error")
+        [session] = self.manager.public_sessions.values()
+        self.assertEqual((session["state"], session["error"]), ("failed", "process_interrupted"))
+        self.assertEqual(self.manager.busy, 0)
+        self.assertEqual(self.created, [])
+        rows = json.loads(self.manager.file.read_text())
+        self.assertEqual((rows[session["id"]]["state"], rows[session["id"]]["error"]),
+                         ("failed", "process_interrupted"))
+        # 终态行不占名额：同一后端可以立即重新登录，不必等 TTL。
+        retry = self.manager.reserve("codex")
+        self.assertEqual(retry["state"], "starting")
+        self.assertEqual(self.manager.busy, 1)
+
+    def test_close_waits_for_registered_thread_to_start(self):
+        session = self.manager.reserve("codex")
+        entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+        original_start = threading.Thread.start
+        def delayed_start(thread):
+            if threading.current_thread() is launcher:
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test timed out")
+            return original_start(thread)
+        def launch():
+            try:
+                self.manager.launch(session["id"])
+            except Exception as exc:
+                errors.append(exc)
+        def close():
+            try:
+                self.manager.close()
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                closed.set()
+        launcher = threading.Thread(target=launch)
+        closer = threading.Thread(target=close)
+        with patch.object(threading.Thread, "start", delayed_start):
+            original_start(launcher)
+            try:
+                self.assertTrue(entered.wait(2))
+                original_start(closer)
+                self.assertFalse(closed.wait(.1))
+            finally:
+                release.set()
+                launcher.join(5)
+                if closer.ident is not None:
+                    closer.join(5)
+        self.assertTrue(closed.is_set())
+        self.assertFalse(launcher.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_launch_after_close_reports_service_closed_instead_of_starting(self):
+        session = self.manager.reserve("codex")
+        # 模拟 close() 与 launch() 的竞争：closed 已置位，该行还没被 close() 收成终态。
+        self.manager.closed = True
+        with self.assertRaises(AuthError) as caught:
+            self.manager.launch(session["id"])
+        self.assertEqual(caught.exception.code, "service_closed")
+        state = self.manager.status(session["id"])
+        self.assertEqual((state["state"], state["error"]), ("interrupted", "process_interrupted"))
+        self.assertEqual(self.created, [])
+
     def test_restart_marks_active_session_interrupted_without_restarting_cli(self):
         session = self.manager.start("codex")
         self.wait_state(session, "awaiting_authorization")
