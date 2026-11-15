@@ -7,6 +7,7 @@ import shutil
 import signal
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import webbrowser
@@ -113,6 +114,81 @@ def api(root, path, data=None):
         raise RuntimeError(f"HTTP Error {exc.code}") from None
 
 
+def legal_hold(root, run_ids=(), project_ids=(), off=False):
+    """Set, clear, or list legal holds; only the legal-hold keys are writable.
+
+    Ids are checked before any write, so an unknown id cannot leave a partial
+    hold, repeats are idempotent, and each change records an audit event.
+    """
+    root = Path(root).expanduser().resolve()
+    if not (root / "state.sqlite3").is_file():
+        raise ValueError("No state database at " + str(root))
+    store = Store(root)
+    try:
+        entries, missing, seen = [], [], set()
+        for scope, values, prefix in (
+                ("run", run_ids, "legal-hold:"),
+                ("project", project_ids, "legal-hold-project:")):
+            for value in values:
+                if not isinstance(value, str) or not value.strip() or value != value.strip() or len(value) > 200:
+                    raise ValueError("Invalid " + scope + " id")
+                if (scope, value) in seen:
+                    continue
+                seen.add((scope, value))
+                if scope == "run":
+                    row = store.one("SELECT project FROM runs WHERE id=?", (value,))
+                    project = row["project"] if row else None
+                else:
+                    row = store.one("SELECT id FROM projects WHERE id=?", (value,))
+                    project = value
+                if row is None:
+                    missing.append(scope + " id " + value)
+                else:
+                    entries.append((prefix + value, scope, value, project))
+        if missing:
+            raise ValueError("Unknown " + ", ".join(missing) + "; no legal hold was written")
+        changed = []
+        if entries:
+            now = time.time()
+            with store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                for key, scope, value, project in entries:
+                    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+                    if off:
+                        if row is None:
+                            continue
+                        db.execute("DELETE FROM settings WHERE key=?", (key,))
+                    elif row is not None and row[0] == "true":
+                        continue
+                    else:
+                        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, "true"))
+                    changed.append(key)
+                    db.execute("INSERT INTO events(project,run,kind,message,data,created) "
+                               "VALUES (?,?,?,?,?,?)",
+                               (project, value if scope == "run" else None, "legal_hold",
+                                "Legal hold cleared" if off else "Legal hold set",
+                                json.dumps({"scope": scope, "id": value}), now))
+        holds = []
+        for row in store.query("SELECT key, value FROM settings WHERE key LIKE 'legal-hold:%' "
+                               "OR key LIKE 'legal-hold-project:%' ORDER BY key"):
+            key = row["key"]
+            if key.startswith("legal-hold-project:"):
+                scope, value = "project", key[len("legal-hold-project:"):]
+            elif key.startswith("legal-hold:"):
+                scope, value = "run", key[len("legal-hold:"):]
+            else:
+                continue
+            try:
+                active = json.loads(row["value"]) is not False
+            except (TypeError, ValueError):
+                active = True
+            if active:
+                holds.append({"scope": scope, "id": value, "key": key})
+        return {"changed": changed, "holds": holds}
+    finally:
+        store.close()
+
+
 def main(argv=None):
     arguments = sys.argv[1:] if argv is None else argv
     if arguments == ["internal-native-transport"]:
@@ -140,6 +216,15 @@ def main(argv=None):
     sub.add_parser("doctor")
     sub.add_parser("open")
     sub.add_parser("status")
+    hold = sub.add_parser(
+        "hold", help="Set, clear, or list legal holds that block artifact cleanup",
+        description="Legal holds keep a run's or project's artifacts through automatic and manual "
+                    "retention cleanup. With no --run or --project, current holds are listed.",
+        epilog="Examples: adaptive-rsi hold --run <run-id> | adaptive-rsi hold --project <project-id> | "
+               "adaptive-rsi hold --run <run-id> --off")
+    hold.add_argument("--run", action="append", default=[], metavar="ID", help="Run id to hold (repeatable)")
+    hold.add_argument("--project", action="append", default=[], metavar="ID", help="Project id to hold (repeatable)")
+    hold.add_argument("--off", action="store_true", help="Clear the hold instead of setting it")
     sub.add_parser("desktop-runtime", help=argparse.SUPPRESS)
     add = sub.add_parser("add")
     add.add_argument("path")
@@ -194,6 +279,10 @@ def main(argv=None):
             print(json.dumps(doctor(), indent=2, ensure_ascii=False))
             return
         root = args.state_dir.expanduser().resolve()
+        if args.command == "hold":
+            print(json.dumps(legal_hold(root, args.run, args.project, args.off),
+                             ensure_ascii=False, indent=2))
+            return
         if args.command == "recover-diagnostics":
             from .recovery_diagnostics import inspect_database
             print(json.dumps(inspect_database(args.file, timeout=args.timeout, max_mb=args.max_mb)))
