@@ -88,7 +88,28 @@ window.RSIAuth = (() => {
     if(!providers&&!providerLoading)return;
     try{await fetchProviders(sessionRequiredRelevant);}catch(error){if(error?.code==='session_required')throw error;}
   }
-  async function mutate(path,body){const providerMutation=body?.backend==='opencode'||(!body?.backend&&Array.from(sessions.values()).some(session=>session.id===body?.id&&session.backend==='opencode'));if(providerMutation){if(providerLoading||!['key','logout'].includes(path))providerNeedsRefresh=true;providerCountsFresh=false;providerRequest++;providerChanging++;}pending=true;render();try{return await api('auth/'+path,body);}catch(error){error.message=authMessage(error.code,error.message);throw error;}finally{pending=false;if(providerMutation){providerChanging--;providerCountsFresh=false;providerRequest++;if(!providerChanging&&providerNeedsRefresh){providerNeedsRefresh=false;if(!['key','logout'].includes(path))safe(providers?refreshProviders:getProviders);}if(providers===null&&context?.backend==='opencode')safe(getProviders);}render();}}
+  async function mutate(path,body){
+    const providerMutation=body?.backend==='opencode'||(!body?.backend&&Array.from(sessions.values()).some(session=>session.id===body?.id&&session.backend==='opencode'));
+    let succeeded=false;
+    if(providerMutation){providerNeedsRefresh=true;providerCountsFresh=false;providerRequest++;providerChanging++;}
+    pending=true;render();
+    try{const result=await api('auth/'+path,body);succeeded=true;return result;}
+    catch(error){error.message=authMessage(error.code,error.message);throw error;}
+    finally{
+      pending=false;
+      if(providerMutation){
+        providerChanging--;providerCountsFresh=false;providerRequest++;
+        let refreshStarted=false;
+        if(!providerChanging&&providerNeedsRefresh){
+          providerNeedsRefresh=false;
+          // Successful key/logout handlers refresh only after the status check.
+          if(!succeeded||!['key','logout'].includes(path)){safe(providers?refreshProviders:getProviders);refreshStarted=true;}
+        }
+        if(!refreshStarted&&providers===null&&context?.backend==='opencode')safe(getProviders);
+      }
+      render();
+    }
+  }
   function schedule(){clearTimeout(timer);if(!pollingStopped&&[...sessions.values()].some(s=>!terminal.has(s.state)||s.refreshStage)){const delay=document.visibilityState==='hidden'?30000:1500;timer=setTimeout(()=>safe(poll),delay);}}
   async function refreshCompleted(id,session){
     if(session.refreshing||sessions.get(id)!==session)return;session.refreshing=true;

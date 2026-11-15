@@ -3844,6 +3844,21 @@ for(const startFails of [false,true])test(`OpenCode OAuth ${startFails?'failed':
   assert.equal(providerCalls,2);assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
 });
 
+for(const operation of ['key','logout'])test(`failed OpenCode ${operation} refreshes hidden counts`,async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let providerCalls=0;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:['example']}});
+    if(url.includes('/api/auth/providers?'))return response([{id:'example',name:'Example',connected:true,connection_count:++providerCalls===1?1:2,methods:[{index:0,type:'api',label:'API key',supported:true}]}]);
+    if(url.endsWith('/api/auth/'+operation))return response({},503);
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}',page.context);vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/1 个账号/);
+  if(operation==='key'){const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});}
+  else{const logout=walk(page.node('mc-auth')).find(node=>node.textContent==='退出账号');logout.handlers.click();}
+  await tick();await tick();assert.equal(providerCalls,2);assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
+});
+
 test('completed auth console expiry stays actionable and stops refresh retries',async()=>{
   const run=await authCompletionPage({failure:'session_required'});await run.finish();
   assert.match(run.text(),/控制台登录已失效/);assert.equal(run.calls.catalog,0);
