@@ -110,6 +110,44 @@ class AuditEvolutionTest(unittest.TestCase):
                 self.assertEqual(case_stratum(legacy), ('unknown', 'small'))
                 self.assertEqual(select_cases([legacy], 1, 'seed'), [legacy])
 
+    def test_ambiguous_duplicate_source_keys_are_excluded_before_sampling(self):
+        args = self.setup_proposal()
+        # SQLite's json_type reads the first member; json.loads uses the last.
+        # Both orders must be treated as ambiguous rather than sampled.
+        for split, first, last in (('validation', 'real', {}), ('holdout', {}, 'real')):
+            spec = json.loads(self.store.one('SELECT spec FROM cases WHERE id=?', (split,))['spec'])
+            spec['source'] = first
+            raw = json.dumps(spec)[:-1] + ', "source": ' + json.dumps(last) + '}'
+            self.store.execute('UPDATE cases SET spec=? WHERE id=?', (raw, split))
+        self.assertEqual(self.evolution.eligible_cases('p', self.config['evolution']['max_holdout_uses']), [])
+        result = self.evolution.propose_and_evaluate(*args, force=True)
+        self.assertEqual(result['status'], 'insufficient_evidence')
+        self.assertEqual(self.calls, {'proposal': 0, 'trial': 0})
+
+    def test_escaped_duplicate_source_is_ambiguous_but_nested_source_is_not(self):
+        self.setup_proposal()
+        validation = json.loads(self.store.one('SELECT spec FROM cases WHERE id=?', ('validation',))['spec'])
+        validation['extra'] = {'source': {'nested': True}}
+        self.store.execute('UPDATE cases SET spec=? WHERE id=?', (encode(validation), 'validation'))
+        holdout = json.loads(self.store.one('SELECT spec FROM cases WHERE id=?', ('holdout',))['spec'])
+        raw = json.dumps(holdout).replace('"source":', '"\\u0073ource":', 1)[:-1] + ', "source": {}}'
+        self.assertEqual(json.loads(raw)['source'], {})
+        self.store.execute('UPDATE cases SET spec=? WHERE id=?', (raw, 'holdout'))
+        cases = self.evolution.eligible_cases('p', self.config['evolution']['max_holdout_uses'])
+        self.assertEqual({case['id'] for case in cases}, {'validation'})
+
+    def test_unique_escaped_source_uses_decoded_key_for_validation(self):
+        self.setup_proposal()
+        for source in ({}, None, 'real', ''):
+            with self.subTest(source=source):
+                spec = json.loads(self.store.one('SELECT spec FROM cases WHERE id=?', ('validation',))['spec'])
+                spec['source'] = source
+                raw = json.dumps(spec).replace('"source":', '"\\u0073ource":', 1)
+                self.assertEqual(json.loads(raw)['source'], source)
+                self.store.execute('UPDATE cases SET spec=? WHERE id=?', (raw, 'validation'))
+                ids = {case['id'] for case in self.evolution.eligible_cases('p', self.config['evolution']['max_holdout_uses'])}
+                self.assertEqual('validation' in ids, isinstance(source, str))
+
     def test_manifest_failure_leaves_no_holdout_reservation(self):
         args = self.setup_proposal()
         with patch('adaptive_rsi.evolution.git', side_effect=RuntimeError('repository unavailable')):

@@ -485,14 +485,15 @@ class Evolution:
     def eligible_cases(self, project, limit):
         """Fresh-enough cases for one experiment, filtered inside SQLite in one query.
 
-        与逐行 json.loads 过滤完全同义：损坏 spec 与缺失/空/假值字段的行被跳过；
+        通常与逐行 json.loads 过滤等价：损坏 spec 与缺失/空/假值字段的行被跳过；
         available/active 缺省视为 True，标量、对象或 "0" 这类非布尔值视为不可用。
-        CASE WHEN json_valid 先行，保证 json_type/json_each 永不求值于损坏 JSON。
+        CASE WHEN json_valid 先行，保证 json_type/json_each 永不求值于损坏 JSON；有效对象中的重复顶层 source 键也被刻意排除。
         """
         condition = ("CASE WHEN json_valid(spec) THEN (json_type(spec)='object' "
                      "AND json_type(spec,'$.task')='text' AND json_type(spec,'$.repository')='text' "
                      "AND json_type(spec,'$.base')='text' "
-                     "AND (json_type(spec,'$.source') IS NULL OR json_type(spec,'$.source')='text') "
+                     "AND (SELECT COUNT(*)=0 OR (COUNT(*)=1 AND MIN(type)='text') "
+                     "FROM json_each(spec) WHERE key='source') "
                      "AND (json_type(spec,'$.available') IS NULL OR (EXISTS(SELECT 1 FROM json_each(spec,'$.available')) "
                      "AND json_extract(spec,'$.available') NOT IN (0,''))) "
                      "AND (json_type(spec,'$.active') IS NULL OR (EXISTS(SELECT 1 FROM json_each(spec,'$.active')) "
