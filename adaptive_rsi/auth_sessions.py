@@ -31,6 +31,8 @@ from .process import docker_mount, run_process
 ACTIVE = {"starting", "awaiting_authorization", "completing"}
 TERMINAL = {"completed", "cancelled", "expired", "failed", "interrupted"}
 MAX_BYTES = 1024 * 1024
+# 连续多少行非 JSON 杂项输出后才判定读取流结束；CLI 的 banner/日志不应等同进程死亡。
+MAX_INVALID_LINES = 5
 # providers 发现结果要完整启动一个 worker（Docker 模式下是一个容器），缓存短 TTL 内的重复查询。
 PROVIDERS_CACHE_TTL = 25
 # 容器就绪探测（docker image inspect）同为子进程级成本；授权面板 1.5s 轮询期间不能每次重跑。
@@ -356,6 +358,10 @@ class CodexAuth(_Process):
         self.messages = queue.Queue(maxsize=128)
         self.notifications = []
         self.request_id = 0
+        # 读线程唯一的结束信号；原因只保留有界枚举，不带 CLI 原始输出。
+        self.reader_done = threading.Event()
+        self.reader_lock = threading.Lock()
+        self.read_end = None
         # account/read 的载荷只留在进程内；对外快照只取收敛后的 label/plan。
         self.account = {}
         try:
@@ -382,21 +388,47 @@ class CodexAuth(_Process):
         return self.home / ".codex/auth.json"
 
     def _read(self):
+        # 读线程是唯一的生产者：流结束、超长行、坏行与队列写满都必须留下
+        # 有界原因并置位 reader_done；不再向有界队列塞可能塞不进去的哨兵。
+        end = "eof"
+        invalid = 0
         try:
             while True:
                 line = self.process.stdout.readline(MAX_BYTES + 1)
-                if not line or len(line) > MAX_BYTES:
+                if not line:
+                    end = "eof"
                     break
-                message = json.loads(line)
+                if len(line) > MAX_BYTES:
+                    end = "oversize"
+                    break
+                try:
+                    message = json.loads(line)
+                except (ValueError, RecursionError):
+                    message = None
                 if not isinstance(message, dict):
-                    break
-                self.messages.put_nowait(message)
-        except (OSError, ValueError, queue.Full):
-            pass
-        try:
-            self.messages.put_nowait(None)
-        except queue.Full:
-            pass
+                    # CLI 的 banner/日志等杂项输出有限跳过，连续过多才判流结束。
+                    invalid += 1
+                    if invalid >= MAX_INVALID_LINES:
+                        end = "invalid_json"
+                        break
+                    continue
+                invalid = 0
+                with self.reader_lock:
+                    try:
+                        self.messages.put_nowait(message)
+                    except queue.Full:
+                        end = "queue_full"
+                        self.read_end = end
+                        self.reader_done.set()
+                        break
+        except (OSError, ValueError):
+            end = "eof"
+        finally:
+            with self.reader_lock:
+                self.read_end = end
+                self.reader_done.set()
+            if end != "eof":
+                logging.getLogger(__name__).warning("Codex auth reader stopped: %s", end)
 
     def _send(self, message):
         try:
@@ -413,14 +445,35 @@ class CodexAuth(_Process):
         while True:
             if self.cancel.is_set():
                 raise AuthError("service_closed")
+            if self.reader_done.is_set() and self.read_end == "queue_full":
+                raise AuthError("process_interrupted", detail={"read_end": "queue_full"}) from None
+            if time.monotonic() >= deadline:
+                raise AuthError("auth_timeout") from None
             try:
-                message = self.messages.get(timeout=min(0.25, max(0, deadline - time.monotonic())))
+                message = self.messages.get_nowait()
             except queue.Empty:
+                if self.reader_done.is_set():
+                    # Producer may have enqueued between the empty check and
+                    # setting reader_done. Once set, a second check is stable.
+                    try:
+                        message = self.messages.get_nowait()
+                    except queue.Empty:
+                        raise AuthError("process_interrupted", detail={"read_end": self.read_end}) from None
+                else:
+                    try:
+                        message = self.messages.get(timeout=min(0.25, max(0, deadline - time.monotonic())))
+                    except queue.Empty:
+                        if self.reader_done.is_set():
+                            continue
+                        if time.monotonic() >= deadline:
+                            raise AuthError("auth_timeout") from None
+                        continue
+            # Overflow published before acceptance wins; later overflow is not retroactive.
+            with self.reader_lock:
+                if self.read_end == "queue_full":
+                    raise AuthError("process_interrupted", detail={"read_end": "queue_full"}) from None
                 if time.monotonic() >= deadline:
                     raise AuthError("auth_timeout") from None
-                continue
-            if message is None:
-                raise AuthError("process_interrupted")
             if message.get("id") == request_id:
                 if "error" in message:
                     raise AuthError("device_auth_unavailable" if method == "account/login/start" else "auth_protocol_error")
@@ -451,11 +504,18 @@ class CodexAuth(_Process):
                 message = self.notifications.pop(0)
             else:
                 try:
-                    message = self.messages.get(timeout=min(0.25, max(0, deadline - time.time())))
+                    message = self.messages.get_nowait()
                 except queue.Empty:
-                    continue
-            if message is None:
-                raise AuthError("process_interrupted")
+                    if self.reader_done.is_set():
+                        try:
+                            message = self.messages.get_nowait()
+                        except queue.Empty:
+                            raise AuthError("process_interrupted", detail={"read_end": self.read_end}) from None
+                    else:
+                        try:
+                            message = self.messages.get(timeout=min(0.25, max(0, deadline - time.time())))
+                        except queue.Empty:
+                            continue
             if message.get("method") == "account/login/completed":
                 params = message.get("params", {})
                 if params.get("loginId") == self.login_id:

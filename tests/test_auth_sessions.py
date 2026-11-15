@@ -3,6 +3,7 @@ import contextlib
 import io
 import os
 from pathlib import Path
+import queue
 import subprocess
 import sys
 import tempfile
@@ -3320,3 +3321,175 @@ class OpenCodeV2AuthProtocolTests(unittest.TestCase):
         imported.assert_not_called()
         self.assertEqual(stored["provider"]["refresh"], "private-refresh")
         self.assertEqual(exported, [])
+
+
+class CodexReadThreadTests(unittest.TestCase):
+    """读线程必须以有界原因结束，并让等待方立即失败而不是耗尽超时。"""
+
+    def make_worker(self, data, maxsize=128):
+        worker = object.__new__(CodexAuth)
+        worker.messages = queue.Queue(maxsize=maxsize)
+        worker.notifications = []
+        worker.request_id = 0
+        worker.cancel = threading.Event()
+        worker.reader_done = threading.Event()
+        worker.reader_lock = threading.Lock()
+        worker.read_end = None
+        worker.process = types.SimpleNamespace(stdout=io.BytesIO(data), stdin=io.BytesIO())
+        return worker
+
+    def run_reader(self, worker):
+        threading.Thread(target=worker._read, daemon=True).start()
+
+    def test_message_queued_between_empty_check_and_reader_done_is_consumed(self):
+        for waiting in (False, True):
+            with self.subTest(waiting=waiting):
+                worker = self.make_worker(b"")
+                worker.login_id = "login"
+                message = ({"method": "account/login/completed", "params": {"loginId": "login", "success": True}}
+                           if waiting else {"id": 1, "result": {"ok": True}})
+                original = worker.messages.get_nowait
+                def race():
+                    worker.messages.get_nowait = original
+                    worker.messages.put_nowait(message)
+                    worker.read_end = "eof"
+                    worker.reader_done.set()
+                    raise queue.Empty
+                worker.messages.get_nowait = race
+                if waiting:
+                    worker.request = lambda *args, **kwargs: {"account": {"type": "chatgpt"}}
+                    self.assertTrue(worker.wait(threading.Event(), time.time() + 1))
+                else:
+                    self.assertEqual(worker.request("account/read", {}, timeout=1), {"ok": True})
+
+    def test_detected_overflow_is_published_before_matching_response_can_succeed(self):
+        worker = self.make_worker(b"{}\n", maxsize=1)
+        worker.messages.put_nowait({"id": 1, "result": {"account": {"type": "chatgpt"}}})
+        original = worker.messages.put_nowait
+        detected, release, started, finished = (threading.Event() for _ in range(4))
+        result = []
+        def delayed_overflow(message):
+            try:
+                return original(message)
+            except queue.Full:
+                detected.set()
+                if not release.wait(3):
+                    raise AssertionError("overflow release timed out")
+                raise
+        worker.messages.put_nowait = delayed_overflow
+        self.run_reader(worker)
+        self.assertTrue(detected.wait(2))
+        def request():
+            started.set()
+            try:
+                result.append(worker.request("account/read", {}, timeout=2))
+            except BaseException as exc:
+                result.append(exc)
+            finally:
+                finished.set()
+        thread = threading.Thread(target=request)
+        thread.start()
+        try:
+            self.assertTrue(started.wait(1))
+            self.assertFalse(finished.wait(0.2), "response escaped while overflow was being recorded")
+        finally:
+            release.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], AuthError)
+        self.assertEqual(result[0].code, "process_interrupted")
+        self.assertEqual(result[0].detail, {"read_end": "queue_full"})
+
+    def test_matching_response_after_deadline_is_rejected(self):
+        worker = self.make_worker(b"")
+        worker.messages.put_nowait({"id": 1, "result": {"ok": True}})
+        elapsed = [0.0]
+        get = worker.messages.get_nowait
+        def delayed_get():
+            item = get()
+            elapsed[0] = 1.0
+            return item
+        with patch.object(worker.messages, "get_nowait", side_effect=delayed_get), \
+             patch("adaptive_rsi.auth_sessions.time.monotonic", side_effect=lambda: elapsed[0]):
+            with self.assertRaises(AuthError) as caught:
+                worker.request("account/read", {}, timeout=1)
+        self.assertEqual(caught.exception.code, "auth_timeout")
+
+    def test_queue_overflow_cannot_accept_matching_queued_response(self):
+        worker = self.make_worker(b"{}\n", maxsize=1)
+        worker.messages.put_nowait({"id": 1, "result": {"account": {"type": "chatgpt"}}})
+        self.run_reader(worker)
+        self.assertTrue(worker.reader_done.wait(1))
+        self.assertEqual(worker.read_end, "queue_full")
+        with self.assertRaises(AuthError) as caught:
+            worker.request("account/read", {}, timeout=1)
+        self.assertEqual(caught.exception.code, "process_interrupted")
+        self.assertEqual(caught.exception.detail, {"read_end": "queue_full"})
+
+    def test_request_deadline_applies_while_unrelated_messages_keep_arriving(self):
+        worker = self.make_worker(b"")
+        for _ in range(10):
+            worker.messages.put_nowait({"id": 999, "result": {}})
+        worker.messages.put_nowait({"id": 1, "result": {"ok": True}})
+        elapsed = [0.0]
+        get = worker.messages.get_nowait
+        def step():
+            elapsed[0] += 0.3
+            return get()
+        with patch.object(worker.messages, "get_nowait", side_effect=step), \
+             patch("adaptive_rsi.auth_sessions.time.monotonic", side_effect=lambda: elapsed[0]):
+            with self.assertRaises(AuthError) as caught:
+                worker.request("account/read", {}, timeout=1)
+        self.assertEqual(caught.exception.code, "auth_timeout")
+        self.assertLessEqual(elapsed[0], 1.5)
+
+    def test_full_queue_is_reported_and_request_fails_fast(self):
+        worker = self.make_worker(json.dumps({"params": {}}).encode() + b"\n")
+        for _ in range(worker.messages.maxsize):
+            worker.messages.put_nowait({"params": {}})
+        self.run_reader(worker)
+        self.assertTrue(worker.reader_done.wait(1))
+        self.assertEqual(worker.read_end, "queue_full")
+        started = time.monotonic()
+        with self.assertRaises(AuthError) as caught:
+            worker.request("account/read", {}, timeout=25)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(caught.exception.code, "process_interrupted")
+        self.assertEqual(caught.exception.detail, {"read_end": "queue_full"})
+
+    def test_noise_line_does_not_kill_reader(self):
+        response = {"id": 1, "result": {"account": {"type": "chatgpt"}}}
+        worker = self.make_worker(b"SENSITIVE-NOISE\n" + json.dumps(response).encode() + b"\n")
+        self.run_reader(worker)
+        result = worker.request("account/read", {}, timeout=5)
+        self.assertEqual(result, {"account": {"type": "chatgpt"}})
+        self.assertNotIn("SENSITIVE", json.dumps(result))
+
+    def test_repeated_noise_lines_end_reader_as_invalid_json(self):
+        worker = self.make_worker(b"SENSITIVE-NOISE\n" * auth_sessions.MAX_INVALID_LINES)
+        self.run_reader(worker)
+        self.assertTrue(worker.reader_done.wait(1))
+        self.assertEqual(worker.read_end, "invalid_json")
+
+    def test_oversize_line_ends_reader_without_leaking_cli_text(self):
+        data = b"SENSITIVE-OVERSIZE" * (auth_sessions.MAX_BYTES // 18 + 2)
+        worker = self.make_worker(data)
+        self.run_reader(worker)
+        self.assertTrue(worker.reader_done.wait(1))
+        self.assertEqual(worker.read_end, "oversize")
+        started = time.monotonic()
+        with self.assertRaises(AuthError) as caught:
+            worker.request("initialize", {}, timeout=25)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(caught.exception.code, "process_interrupted")
+        self.assertEqual(caught.exception.detail, {"read_end": "oversize"})
+        self.assertNotIn("SENSITIVE", str(caught.exception))
+        from adaptive_rsi.server import Handler
+        handler = object.__new__(Handler)
+        responses = []
+        handler.respond = lambda payload, status=200: responses.append((payload, status))
+        handler.api_error(caught.exception)
+        self.assertNotIn("SENSITIVE", json.dumps(responses))
+        self.assertEqual(responses, [({"error": "Request failed: process_interrupted",
+                                       "error_code": "process_interrupted"}, 400)])
