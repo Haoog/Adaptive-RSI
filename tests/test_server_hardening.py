@@ -8,6 +8,7 @@ import io
 import json
 import os
 import sqlite3
+import socket
 import tempfile
 import threading
 import time
@@ -160,6 +161,176 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertNotIn(b"/private/path", payload)
         self.assertEqual(before, (self.server.token, self.server.csrf, self.server.url))
         self.assertEqual(self.request()[0], 200)
+        self.assertEqual(self.request("/api/session/rotate", "POST")[0], 200)
+
+    def test_concurrent_rotation_does_not_hold_dispatch_lock_and_returns_matching_sessions(self):
+        first_response_entered, first_response_finished = threading.Event(), threading.Event()
+        waiting_for_session = threading.Event()
+        original_respond = Handler.respond
+
+        class ObservedLock:
+            def __init__(self, lock):
+                self.lock = lock
+                self.guard = threading.Lock()
+                self.owner = None
+                self.depth = 0
+
+            def acquire(self):
+                identity = threading.get_ident()
+                with self.guard:
+                    if self.owner is not None and self.owner != identity:
+                        waiting_for_session.set()
+                acquired = self.lock.acquire()
+                if acquired:
+                    with self.guard:
+                        self.owner = identity
+                        self.depth += 1
+                return acquired
+
+            def release(self):
+                with self.guard:
+                    self.depth -= 1
+                    if not self.depth:
+                        self.owner = None
+                self.lock.release()
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, *_):
+                self.release()
+
+        session_lock = ObservedLock(self.server._session_lock)
+        self.server._session_lock = session_lock
+        self.runtime.pause = lambda project, paused: {"project": project, "paused": paused}
+
+        def slow_first_response(handler, *args, **kwargs):
+            if handler.path == "/api/session/rotate" and not first_response_entered.is_set():
+                first_response_entered.set()
+                if not first_response_finished.wait(5):
+                    raise TimeoutError("test did not release the first rotation response")
+            return original_respond(handler, *args, **kwargs)
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        try:
+            with patch.object(Handler, "respond", slow_first_response):
+                first = pool.submit(self.request, "/api/session/rotate", "POST")
+                self.assertTrue(first_response_entered.wait(2), "first rotation did not reach response write")
+                second = pool.submit(self.request, "/api/session/rotate", "POST")
+                self.assertTrue(waiting_for_session.wait(2), "second rotation did not wait for the session lock")
+
+                connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=1)
+                started = time.monotonic()
+                try:
+                    connection.request("POST", "/api/pause", body=json.dumps({"project": "p", "paused": True}),
+                                       headers={"Cookie": self.server.cookie + "=" + self.server.token,
+                                                "Origin": self.server.local_origin,
+                                                "X-RSI-CSRF": self.server.csrf,
+                                                "Content-Type": "application/json"})
+                    response = connection.getresponse()
+                    status, body = response.status, response.read()
+                except (TimeoutError, socket.timeout):
+                    self.fail("a concurrent rotation blocked an unrelated write")
+                finally:
+                    connection.close()
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body), {"saved": True})
+                self.assertLess(time.monotonic() - started, 1.0)
+                first_response_finished.set()
+                first_result = first.result(timeout=5)
+                second_result = second.result(timeout=5)
+        finally:
+            first_response_finished.set()
+            pool.shutdown(wait=True)
+
+        for status, headers, payload in (first_result, second_result):
+            self.assertEqual(status, 200)
+            result = json.loads(payload)
+            token = result["url"].split("token=", 1)[1]
+            self.assertTrue(headers["Set-Cookie"].startswith(self.server.cookie + "=" + token + ";"))
+            self.assertTrue(result["csrf"])
+        first_session, second_session = json.loads(first_result[2]), json.loads(second_result[2])
+        self.assertNotEqual(first_session["url"], second_session["url"])
+        self.assertEqual(second_session["url"], self.server.url)
+        self.assertEqual(second_session["csrf"], self.server.csrf)
+
+    def test_post_response_does_not_hold_dispatch_lock_during_slow_socket_write(self):
+        lock = self.runtime.dispatch_lock
+        admission_lock_states, write_lock_states = [], []
+        response_entered, response_finished = threading.Event(), threading.Event()
+        self.runtime.updates.require_ready = lambda: admission_lock_states.append(lock._is_owned())
+
+        def archive(project, confirmation):
+            write_lock_states.append(lock._is_owned())
+            return {"payload": "x" * (8 * 1024 * 1024)}
+
+        self.runtime.archive_project = archive
+        original_setup, original_respond = Handler.setup, Handler.respond
+
+        class ObservedWriter:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def write(self, data):
+                if len(data) > 1024 * 1024:
+                    response_entered.set()
+                return self.stream.write(data)
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+        def small_socket_buffer(handler):
+            original_setup(handler)
+            handler.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            handler.connection.settimeout(.25)
+            handler.wfile = ObservedWriter(handler.wfile)
+
+        def observe_response(handler, *args, **kwargs):
+            try:
+                return original_respond(handler, *args, **kwargs)
+            finally:
+                if handler.path == "/api/project/archive":
+                    response_finished.set()
+
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.settimeout(5)
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        client.connect(("127.0.0.1", self.server.server_port))
+        body = b'{"project":"p"}'
+        request = (b"POST /api/project/archive HTTP/1.1\r\n"
+                   + f"Host: 127.0.0.1:{self.server.server_port}\r\n".encode()
+                   + f"Cookie: {self.server.cookie}={self.server.token}\r\n".encode()
+                   + f"Origin: {self.server.local_origin}\r\n".encode()
+                   + f"X-RSI-CSRF: {self.server.csrf}\r\n".encode()
+                   + b"Content-Type: application/json\r\nConnection: close\r\n"
+                   + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        try:
+            with patch.object(Handler, "setup", small_socket_buffer), \
+                    patch.object(Handler, "respond", observe_response):
+                client.sendall(request)
+                self.assertTrue(response_entered.wait(5), "POST 响应未开始")
+                self.assertFalse(response_finished.wait(.1), "大响应没有形成慢客户端背压")
+                acquired = lock.acquire(timeout=.5)
+                if acquired:
+                    lock.release()
+                self.assertTrue(acquired, "响应传输期间 dispatch_lock 仍被占用")
+                self.assertTrue(response_finished.wait(5), "慢客户端响应没有按 socket timeout 收尾")
+        finally:
+            client.close()
+            self.assertTrue(response_finished.wait(5), "断开客户端后响应处理线程未结束")
+
+        self.assertEqual(admission_lock_states, [True])
+        self.assertEqual(write_lock_states, [True])
+        rows = []
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            rows = self.store.query("SELECT status,error_code FROM request_log WHERE path='/api/project/archive'")
+            if rows:
+                break
+            time.sleep(.01)
+        self.assertEqual([(row["status"], row["error_code"]) for row in rows],
+                         [(500, "response_interrupted")])
 
     def test_concurrent_rotation_has_complete_private_final_file(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
