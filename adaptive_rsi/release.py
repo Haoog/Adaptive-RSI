@@ -1285,7 +1285,9 @@ def abandon(runtime, project_id, run_id, kind, reason, target="operation", sourc
     ``ABANDON_GRACE_SECONDS`` is equally unbound: the request likely never
     reached GitHub. This is the single operator exit: it requires a written
     reason, re-reads GitHub first and refuses whenever a run is still visible,
-    then records ``failed`` plus an audit entry. It never dispatches or reruns.
+    then records ``failed`` plus an audit entry. An unconfirmed rerun request is
+    discarded with the operation, so ``retry`` cannot revive a closed receipt.
+    It never dispatches or reruns.
     """
     note = reason.strip()[:500] if isinstance(reason, str) else ""
     if not note:
@@ -1324,8 +1326,17 @@ def abandon(runtime, project_id, run_id, kind, reason, target="operation", sourc
                          "candidate_run_ids": reconciliation.get("candidate_run_ids", [])},
         })
         audit.update(outcome="failed", reason=note, visibility=visibility)
+        had_rerun = bool(target_data.get("rerun_pending") or target_data.get("rerun_receipt") or
+                         target_data.get("state") in {"rerunning", "rerun_unknown"})
         target_data["operator_abandon"] = audit
         target_data["state"] = "failed"
+        # 重跑请求随人工关闭一起作废：残留的 rerun_pending 会让下一次 retry 走进
+        # reconcile 的 rerun 分支，把已经收口的终态改回 rerun_unknown。
+        target_data.pop("rerun_pending", None)
+        target_data.pop("rerun_requested_at", None)
+        if had_rerun:
+            target_data["rerun_receipt"] = "abandoned"
+            target_data["rerun_abandoned_at"] = now
         if visibility == "workflow_not_visible":
             target_data["error"] = WORKFLOW_NOT_VISIBLE_REASON
             closed = "GitHub no longer exposes its workflow"
@@ -2328,6 +2339,10 @@ def retry(runtime, project_id, run_id, kind):
         data, raw = _read_automation(runtime, run_id, kind)
         if data and data.get("receipt_error"):
             raise ReconciliationRejected(data["error"])
+        if data and (data.get("operator_abandon") or data.get("rerun_receipt") == "abandoned"):
+            # 人工放弃已经收口这次操作；接受重试会撤销该决定并把回执拉回未确认重跑，
+            # 因此只允许新建操作，不再读取 GitHub 或重放任何请求。
+            raise ValueError("This operation was abandoned; open a new operation instead of retrying")
         if data and data.get("state") == "failed" and data.get("dispatch_receipt") == "preflight_error":
             # 派发前的永久失败从未写出任何远端副作用：清零连续失败预算并放回待发，
             # 下一次调度只做一次新的派发尝试；目标归属与 compare 仍由 advance 复核。
