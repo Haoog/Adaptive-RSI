@@ -719,6 +719,7 @@ const english = {
   "粘贴官方页面返回的授权码": "Paste the authorization code from the official page",
   "完成授权": "Complete authorization",
   "取消登录": "Cancel sign-in",
+  "停止等待": "Stop waiting",
   "退出账号": "Sign out",
   "前往 Codex 官方登录": "Sign in with Codex",
   "API 密钥": "API key",

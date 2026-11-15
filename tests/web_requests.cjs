@@ -3859,6 +3859,49 @@ for(const operation of ['key','logout'])test(`failed OpenCode ${operation} refre
   await tick();await tick();assert.equal(providerCalls,2);assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
 });
 
+test('completed login keeps restart controls while status refresh is held',async()=>{
+  const run=await authCompletionPage({hold:'status'});await run.finish();
+  const nodes=run.walk(run.page.node('mc-auth'));
+  assert.ok(nodes.some(node=>node.tagName==='FORM'),'completed login allows starting again');
+  assert.ok(nodes.some(node=>node.textContent==='停止等待'),'completed login can stop the pending refresh');
+  assert.ok(!nodes.some(node=>node.textContent==='取消登录'),'completed login is not shown as cancellable');
+  nodes.find(node=>node.textContent==='停止等待').handlers.click();await run.page.context.lastAction;
+  run.release();await run.tick();await run.tick();assert.equal(run.calls.catalog,0);
+});
+
+for(const mode of ['stop','restart'])test(`${mode} invalidates a completed login's delayed status`,async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let releaseStatus,statusCalls=0,sessionCalls=0;
+  const held=new Promise(resolve=>{releaseStatus=resolve;}),initial={id:'old-login',backend:'codex',provider:null,state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){const n=++statusCalls;if(n===2){await held;return response({sessions:[],codex:{available:true,state:'authenticated'}});}return response({sessions:n===1?[initial]:[],codex:{available:true,state:'signed_out'}});}
+    if(url.includes('/api/auth/session?id=')){sessionCalls++;return response(url.includes('new-login')?{...initial,id:'new-login',state:'completed'}:sessionCalls===1?initial:{...initial,state:'completed'});}
+    if(url.endsWith('/api/auth/start'))return response({...initial,id:'new-login',state:'starting'});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('openai',async()=>{});await tick();await tick();page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,2);
+  if(mode==='stop'){const stop=walk(page.node('mc-auth')).find(node=>node.textContent==='停止等待');assert.ok(stop);stop.handlers.click();await tick();}
+  const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');assert.ok(form);form.handlers.submit({preventDefault(){}});await tick();await tick();
+  page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,3,'new session must not join the old hung status request');
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/尚未登录/);
+  releaseStatus();await tick();await tick();assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/尚未登录/);
+});
+
+test('logout invalidates delayed completion status before refreshing account state',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let releaseStatus,statusCalls=0,sessionCalls=0;
+  const held=new Promise(resolve=>{releaseStatus=resolve;}),initial={id:'old-login',backend:'codex',provider:null,state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){const n=++statusCalls;if(n===2){await held;return response({sessions:[],codex:{available:true,state:'authenticated'}});}return response({sessions:n===1?[initial]:[],codex:{available:true,state:n===1?'authenticated':'signed_out'}});}
+    if(url.includes('/api/auth/session?id='))return response(++sessionCalls===1?initial:{...initial,state:'completed'});
+    if(url.endsWith('/api/auth/logout'))return response({});
+    if(url.includes('/api/auth/providers?'))return response([]);
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('openai',async()=>{});await tick();await tick();page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,2);
+  const logout=walk(page.node('mc-auth')).find(node=>node.textContent==='退出账号');assert.ok(logout);logout.handlers.click();await tick();await tick();assert.equal(statusCalls,3);
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/尚未登录/);
+  releaseStatus();await tick();await tick();assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/尚未登录/);
+});
+
 test('completed auth console expiry stays actionable and stops refresh retries',async()=>{
   const run=await authCompletionPage({failure:'session_required'});await run.finish();
   assert.match(run.text(),/控制台登录已失效/);assert.equal(run.calls.catalog,0);
@@ -3884,7 +3927,7 @@ test('completed auth bounds catalog retries for a persistent transient failure',
 for(const hold of ['status','catalog'])for(const restart of [false,true]){
   test(`completion ${hold} pending cannot revive auth after ${restart?'restart':'cancel or logout'}`,async()=>{
     const run=await authCompletionPage({hold,failure:hold==='status'?'session_required':'catalog'});await run.finish();
-    const button=run.walk(run.page.node('mc-auth')).find(node=>node.textContent===(hold==='status'?'取消登录':'退出账号'));
+    const button=run.walk(run.page.node('mc-auth')).find(node=>node.textContent===(hold==='status'?'停止等待':'退出账号'));
     assert.ok(button);button.handlers.click();await run.page.context.lastAction;
     if(restart){
       run.walk(run.page.node('mc-auth')).find(node=>node.tagName==='FORM').handlers.submit({preventDefault(){}});await run.page.context.lastAction;

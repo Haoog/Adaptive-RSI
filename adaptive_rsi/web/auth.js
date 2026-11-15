@@ -1,6 +1,6 @@
 'use strict';
 window.RSIAuth = (() => {
-  let snapshot=null,providers=null,providerCountsFresh=false,context=null,providerQuery='',loading=null,pending=false,polling=false,pollingStopped=false,timer=null;
+  let snapshot=null,providers=null,providerCountsFresh=false,context=null,providerQuery='',loading=null,pending=false,polling=false,pollingStopped=false,timer=null,statusRequest=0,pollRequest=0;
   const sessions=new Map(),selections=new Map();
   // 记住每个后端上次的供应商选择，重开页面后不必重新查找。
   try{for(const [backend,provider] of Object.entries(JSON.parse(localStorage.getItem('rsi-auth-selection')||'{}')))selections.set(backend,provider);}catch{}
@@ -40,12 +40,13 @@ window.RSIAuth = (() => {
   }
   async function status(force=false){
     if(loading)return loading;if(snapshot&&!force)return;
-    loading=(async()=>{snapshot=await api('auth/status');
-      for(const metadata of snapshot.sessions||[]){const id=metadata.backend+':'+(metadata.provider||'');if(terminal.has(metadata.state)||sessions.get(id)?.id===metadata.id)continue;
-        const recovered=await api('auth/session?id='+encodeURIComponent(metadata.id)),refresh=context?.backend===metadata.backend?context.refresh:()=>api('model-center/fetch',{provider:metadata.backend==='codex'?'openai':'opencode',project:null});const recoveredSession={...recovered,refresh,...(recovered.state==='completed'?{refreshStage:'status'}:{})};if(recovered.state==='completed'&&metadata.backend==='opencode'){providerCountsFresh=false;providerRequest++;}sessions.set(id,recoveredSession);
+    const request=++statusRequest;
+    loading=(async()=>{try{const nextSnapshot=await api('auth/status');if(request!==statusRequest)return;snapshot=nextSnapshot;
+      for(const metadata of snapshot.sessions||[]){if(request!==statusRequest)return;const id=metadata.backend+':'+(metadata.provider||''),existing=sessions.get(id);if(terminal.has(metadata.state)||existing?.id===metadata.id)continue;
+        const recovered=await api('auth/session?id='+encodeURIComponent(metadata.id));if(request!==statusRequest)return;if(sessions.get(id)!==existing)continue;const refresh=context?.backend===metadata.backend?context.refresh:()=>api('model-center/fetch',{provider:metadata.backend==='codex'?'openai':'opencode',project:null});const recoveredSession={...recovered,refresh,...(recovered.state==='completed'?{refreshStage:'status'}:{})};if(recovered.state==='completed'&&metadata.backend==='opencode'){providerCountsFresh=false;providerRequest++;}sessions.set(id,recoveredSession);
         if(context?.backend===metadata.backend&&!context.provider&&metadata.provider){context.provider=metadata.provider;selections.set(metadata.backend,metadata.provider);}
-      }selectPreferredProvider();render();schedule();
-    })().finally(()=>loading=null);return loading;
+      }if(request!==statusRequest)return;selectPreferredProvider();render();schedule();
+    }finally{if(request===statusRequest)loading=null;}})();return loading;
   }
   let providerRequest=0,providerLoading=0,providerChanging=0,providerNeedsRefresh=false;
   function validateProviders(result){
@@ -155,14 +156,16 @@ window.RSIAuth = (() => {
     }finally{session.refreshing=false;}
   }
   async function poll(){
-    if(polling||pollingStopped)return;polling=true;
+    if(polling||pollingStopped)return;polling=true;const request=++pollRequest;
     try{for(const [id,session] of sessions){
-      if(session.refreshStage){await refreshCompleted(id,session);continue;}
+      if(request!==pollRequest)return;
+      if(session.refreshStage){await refreshCompleted(id,session);if(request!==pollRequest)return;continue;}
       if(terminal.has(session.state))continue;
-      try{const next=await api('auth/session?id='+encodeURIComponent(session.id));if(sessions.get(id)!==session)continue;
+      try{const next=await api('auth/session?id='+encodeURIComponent(session.id));if(request!==pollRequest)return;if(sessions.get(id)!==session)continue;
         const updated={...next,refresh:session.refresh,pollMessage:'',refreshStage:next.state==='completed'?'status':''};sessions.set(id,updated);
-        if(updated.refreshStage){if(updated.backend==='opencode'){providerCountsFresh=false;providerRequest++;render();}await refreshCompleted(id,updated);}
+        if(updated.refreshStage){if(updated.backend==='opencode'){providerCountsFresh=false;providerRequest++;}render();await refreshCompleted(id,updated);if(request!==pollRequest)return;}
       }catch(error){
+        if(request!==pollRequest)return;
         if(sessions.get(id)!==session)continue;
         if(error.code==='session_required'){pollingStopped=true;sessions.set(id,{...session,pollMessage:'控制台登录已失效，请重新打开控制台后继续授权。'});continue;}
         const terminalState={auth_expired:'expired',auth_timeout:'expired',process_interrupted:'interrupted',unknown_session:'interrupted',invalid_auth_state:'interrupted',authorization_failed:'failed'}[error.code];
@@ -170,15 +173,20 @@ window.RSIAuth = (() => {
         if(error instanceof TypeError||error.name==='AbortError'||error.status>=500){sessions.set(id,{...session,pollMessage:'暂时无法连接，授权状态已保留，正在重试。'});continue;}
         sessions.set(id,{...session,state:'failed',error:error.code||'authorization_failed',pollMessage:''});
       }
-    }}finally{polling=false;render();schedule();}
+    }}finally{if(request===pollRequest){polling=false;render();schedule();}}
   }
   async function completeSession(id,session,code){
     const next=await mutate('complete',{id:session.id,code,attempt_generation:session.attempt_generation});if(sessions.get(id)!==session)return;
     const updated={...next,refresh:session.refresh,refreshStage:next.state==='completed'?'status':''};sessions.set(id,updated);
-    if(updated.refreshStage)await refreshCompleted(id,updated);render();schedule();
+    if(updated.refreshStage){render();await refreshCompleted(id,updated);}render();schedule();
+  }
+  function stopCompletedStatus(id,session){
+    if(sessions.get(id)!==session||session?.state!=='completed'||session.refreshStage!=='status')return;
+    statusRequest++;loading=null;pollRequest++;polling=false;sessions.delete(id);render();
   }
   async function start(method,inputs={}){
-    if(pending||!context)return;const current={...context},existing=sessions.get(current.backend+':'+(current.provider||''));if(existing&&!terminal.has(existing.state))return;
+    if(pending||!context)return;const current={...context},id=current.backend+':'+(current.provider||''),existing=sessions.get(id);if(existing&&!terminal.has(existing.state))return;
+    stopCompletedStatus(id,existing);
     const session=await mutate('start',{backend:current.backend,provider:current.backend==='codex'?null:current.provider,method:method.index,inputs});
     sessions.set(current.backend+':'+(current.provider||''),{...session,refresh:current.refresh});render();schedule();
   }
@@ -230,7 +238,7 @@ window.RSIAuth = (() => {
       if(!providers)box.append(action(t('读取可连接的供应商'),()=>getProviders(),'text-button'));
       if(!context.provider)return;
     }
-    const running=session&&(!terminal.has(session.state)||session.state==='completed'&&session.refreshStage==='status');
+    const running=session&&!terminal.has(session.state);
     if(session){
       const feedback=text('p',labels[session.state]||session.state,session.state==='failed'?'mc-error':'mc-secondary');feedback.setAttribute('role','status');box.append(feedback);
       if(session.pollMessage)box.append(el('p',t(session.pollMessage),'mc-secondary'));
@@ -246,10 +254,11 @@ window.RSIAuth = (() => {
         }
         const cancel=action(t('取消登录'),async()=>{const next=await mutate('cancel',{id:session.id});sessions.set(sessionKey,{...next,refresh:session.refresh});render();},'text-button');cancel.disabled=pending;box.append(cancel);
       }
+      if(session.state==='completed'&&session.refreshStage==='status')box.append(action(t('停止等待'),()=>stopCompletedStatus(sessionKey,session),'text-button'));
       if(session.error)box.append(el('p',session.error==='authorization_failed'&&session.state==='awaiting_authorization'?t('授权未完成，请打开新的授权页面后重试。'):authMessage(session.error,session.error),'mc-error'));
     }
     if(running)return;
-    if(connected){const logout=action(t('退出账号'),async()=>{const current={...context};await mutate('logout',{backend:current.backend,provider:current.backend==='codex'?null:current.provider});readinessCache.clear();sessions.delete(current.backend+':'+(current.provider||''));await status(true);safe(()=>refreshProviders());},'text-button');logout.disabled=pending;box.append(logout);}
+    if(connected){const logout=action(t('退出账号'),async()=>{const current={...context};stopCompletedStatus(sessionKey,session);await mutate('logout',{backend:current.backend,provider:current.backend==='codex'?null:current.provider});readinessCache.clear();sessions.delete(current.backend+':'+(current.provider||''));await status(true);safe(()=>refreshProviders());},'text-button');logout.disabled=pending;box.append(logout);}
     const methods=backend==='codex'?[{index:0,type:'oauth',supported:true,label:t('前往 Codex 官方登录')}]:providers?.find(p=>p.id===context.provider)?.methods||[];
     for(const method of methods){
       if(method.type==='api'){
