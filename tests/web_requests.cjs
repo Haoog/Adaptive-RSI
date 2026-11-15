@@ -2361,6 +2361,66 @@ test('reason and schedule drafts survive detail rebuilds, clear on save, and sta
   assert.equal(current.repeat.value, '');
 });
 
+for (const kind of ['schedule', 'reason']) {
+  for (const rebuild of [false, true]) {
+    test(`${kind} acknowledgement preserves edits made while the request is pending${rebuild ? ' after detail rebuild' : ''}`, async () => {
+      const page = experiencePage(), task = fixtureTask('race-task', 'queued');
+      let metadata = {...task, dependency: null, revisions: []}, release, posted;
+      page.context.fetch = async (url, options) => {
+        if (options?.method === 'POST') {
+          posted = JSON.parse(options.body);
+          return new Promise(resolve => { release = () => resolve(response({saved: true})); });
+        }
+        if (url.includes('/task-runs?')) return response([]);
+        if (url.includes('/state?')) return response({tasks: []});
+        return response(metadata);
+      };
+      const fields = () => {
+        const body = page.node('detail-body'), form = supplementForm(body);
+        const box = descendants(body).find(node => node.className === 'task-schedule-editor');
+        return {form, reason: form.children[1].children[0],
+          time: descendants(box).find(node => node.type === 'datetime-local'),
+          zone: descendants(box).find(node => node.type === 'text'), box};
+      };
+      await openExperienceTask(page, task);
+      let current = fields();
+      if (kind === 'schedule') {
+        current.time.value = '2027-11-07T01:30'; current.time.handlers.input();
+        current.zone.value = 'Asia/Shanghai'; current.zone.handlers.input();
+        descendants(current.box).find(node => node.tagName === 'BUTTON' && node.textContent === '预约').handlers.click();
+      } else {
+        current.form.children[0].children[0].value = '补充正文';
+        current.reason.value = '提交的原因'; current.reason.handlers.input();
+        current.form.onsubmit({preventDefault() {}});
+      }
+      const pending = page.context.lastAction;
+      await waitFor(() => !!release);
+      if (rebuild) {
+        metadata = {...metadata, title: '更新后的标题', updated: 2};
+        page.fireTimer(5000);
+        await waitFor(() => page.node('detail-title').textContent === '更新后的标题');
+        await new Promise(setImmediate);
+        current = fields();
+      }
+      if (kind === 'schedule') {
+        current.time.value = '2027-11-08T02:30'; current.time.handlers.input();
+        assert.equal(posted.local_time, '2027-11-07T01:30');
+      } else {
+        current.reason.value = '新的原因'; current.reason.handlers.input();
+        assert.equal(posted.reason, '提交的原因');
+      }
+      release(); await pending;
+      const saved = vm.runInContext(`draftStore.get('task-${kind}', 'race-task')`, page.context);
+      if (kind === 'schedule') assert.equal(saved.time, '2027-11-08T02:30');
+      else assert.equal(saved, '新的原因');
+      await openExperienceTask(page, task);
+      current = fields();
+      assert.equal(kind === 'schedule' ? current.time.value : current.reason.value,
+        kind === 'schedule' ? '2027-11-08T02:30' : '新的原因');
+    });
+  }
+}
+
 test('server schedule rejections reach the console with localized guidance', async () => {
   const page = browser();
   page.context.fetch = async () => ({...response({error: 'Scheduled local time is nonexistent',
@@ -3067,6 +3127,38 @@ for (const editTiming of ['after acknowledgement', 'during save']) {
     assert.equal(rebuilt.children[1].children[0].checked, false);
   });
 }
+
+test('queue acknowledgement rebases a reopened editor before later undo and rebuild', async () => {
+  const page = experiencePage(), task = fixtureTask('runless', 'deferred');
+  let metadata = task, acknowledge;
+  page.context.fetch = async (url, options) => {
+    if (url.endsWith('/task/schedule')) {
+      const submitted = JSON.parse(options.body);
+      return new Promise(resolve => { acknowledge = () => {
+        metadata = {...metadata, dependency: {dependency: submitted.dependency}, urgency: submitted.urgency};
+        resolve(response({saved: true}));
+      }; });
+    }
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({tasks: [fixtureTask('parent')]});
+    return response(metadata);
+  };
+  const controls = await openExperienceTask(page, task);
+  const form = editorForm(controls, 'task-queue-editor');
+  form.children[0].children[0].value = 'parent'; form.children[1].children[0].checked = true;
+  form.onsubmit({preventDefault() {}}); const pending = page.context.lastAction;
+  await new Promise(setImmediate);
+  page.context.closeTaskDetail();
+  await openExperienceTask(page, task);
+  acknowledge(); await pending;
+  const reopened = queueForm(page);
+  reopened.children[0].children[0].value = ''; reopened.children[1].children[0].checked = false;
+  metadata = {...metadata, state: 'queued'};
+  page.fireTimer(5000); await new Promise(setImmediate); await page.context.lastAction;
+  const rebuilt = queueForm(page);
+  assert.equal(rebuilt.children[0].children[0].value, '');
+  assert.equal(rebuilt.children[1].children[0].checked, false);
+});
 
 for (const navigation of ['close', 'project', 'other-task']) {
   test(`a queue save acknowledgement cannot affect ${navigation} navigation`, async () => {

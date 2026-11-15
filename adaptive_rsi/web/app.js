@@ -771,8 +771,9 @@ function taskOutcome(data){
  }
  outcome.append(stageProgress(data));return outcome;
 }
+const valueFeedbackPending=new Map();
 function valueFeedback(data){
- const key=(data.project||'')+':'+(data.id||''),draft=valueFeedbackDrafts.get(key);
+ const key=JSON.stringify([data.project||'',data.id||'']),draft=valueFeedbackDrafts.get(key);
  const form=el('form',undefined,'value-feedback'),heading=el('h4',t('这次改进有帮助吗？')),hint=el('p',t('评价可选，仅用于观察，不会自动改变排序或策略。'),'muted'),select=el('select'),note=el('textarea'),status=el('p');
  const label=el('label',t('价值评价')),noteLabel=el('label',t('评价说明（可选）'));
  for(const [value,text] of [['','未评价'],['helpful','有帮助'],['unnecessary','没必要'],['false_positive','误报']]){const option=el('option',t(text));option.value=value;select.append(option);}
@@ -782,11 +783,14 @@ function valueFeedback(data){
  const remember=()=>{valueFeedbackDrafts.set(key,{rating:select.value,note:note.value});};
  select.addEventListener('change',remember);note.addEventListener('input',remember);
  const button=el('button',t('保存评价'),'text-button');button.type='submit';
+ const pending=valueFeedbackPending.get(key);if(pending){button.disabled=true;pending.add(button);}
  form.append(heading,hint,label,noteLabel,button,status);
  form.addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
-  button.disabled=true;status.textContent='';
-  try{await api('task/value-feedback',{project:data.project,task:data.task,run:data.id,rating:select.value||null,note:note.value});valueFeedbackDrafts.delete(key);if(form.isConnected)status.textContent=t('评价已保存');}
-  finally{button.disabled=false;}
+  if(valueFeedbackPending.has(key))return;
+  const buttons=new Set([button]);valueFeedbackPending.set(key,buttons);button.disabled=true;status.textContent='';
+  const submittedDraft=valueFeedbackDrafts.get(key),submitted={project:data.project,task:data.task,run:data.id,rating:select.value||null,note:note.value};
+  try{await api('task/value-feedback',submitted);if(valueFeedbackDrafts.get(key)===submittedDraft)valueFeedbackDrafts.delete(key);if(form.isConnected)status.textContent=t('评价已保存');}
+  finally{valueFeedbackPending.delete(key);for(const current of buttons)current.disabled=false;}
  },form);});return form;
 }
 function runPageRows(page){return Array.isArray(page)?page:(Array.isArray(page?.runs)?page.runs:[]);}
@@ -886,8 +890,8 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
   if(plan.affected.length){preview.append(el('p',t('以下后继任务依赖本任务；默认只取消当前任务。')));for(const item of plan.affected)preview.append(el('p',item.title+' · '+t(statusNames[item.state]||item.state)));if(!plan.truncated){const label=el('label',t('同时取消可取消的后继任务'));label.prepend(cascade);preview.append(label);}}
   if(plan.truncated)preview.append(el('p',t('后继过多，预览仅展示前 999 项；本次只能取消当前任务。')));
   const reasonLabel=el('label',t('干预原因（可选，保留原文）'));reasonLabel.append(reason);preview.append(reasonLabel);
-  if(!(await uiConfirm(t('确认取消任务及所选后继？'),preview)))return;
-  await api('cancel',{task:task.id,cascade:cascade.checked,revision:plan.revision,reason:reason.value});closeTaskDetail();await refresh();}));
+  if(!(await uiConfirm(t('确认取消任务及所选后继？'),preview))||!stillCurrent())return;
+  await api('cancel',{task:task.id,cascade:cascade.checked,revision:plan.revision,reason:reason.value});if(stillCurrent())closeTaskDetail();await refresh();}));
   if(task.state==='queued'){
    // 预约授权一个绝对时刻：时区与重复小时一起提交，由后端拒绝缺失/歧义时刻。
    const scheduleBox=el('div',undefined,'task-schedule-editor'),time=el('input'),zone=el('input'),repeat=el('select'),draft=draftStore.get('task-schedule',task.id);
@@ -903,10 +907,12 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
    const repeatLabel=el('label',t('重复小时'));repeatLabel.append(repeat);
    scheduleBox.append(el('p',t('安排检查：此任务将在指定时刻开始运行。')),localLabel,zoneLabel,repeatLabel,
     action(t('预约'),async()=>{if(!time.value||!zone.value.trim()){toast(t('请填写本地时间和时区。'),true);return;}
-     await api('task/schedule-time',{task:task.id,local_time:time.value,timezone:zone.value.trim(),
-      fold:repeat.value===''?undefined:Number(repeat.value)});
-     draftStore.remove('task-schedule',task.id);
-     toast(t('预约已保存'));closeTaskDetail();await refresh();},'button primary'));
+     const submitted={time:time.value,zone:zone.value,repeat:repeat.value};
+     await api('task/schedule-time',{task:task.id,local_time:submitted.time,timezone:submitted.zone.trim(),
+      fold:submitted.repeat===''?undefined:Number(submitted.repeat)});
+     const saved=draftStore.get('task-schedule',task.id);
+     if(saved&&saved.time===submitted.time&&saved.zone===submitted.zone&&saved.repeat===submitted.repeat)draftStore.remove('task-schedule',task.id);
+     toast(t('预约已保存'));if(stillCurrent())closeTaskDetail();await refresh();},'button primary'));
    secondary.append(el('summary',t('安排检查')),scheduleBox);}
   body.append(secondary);}
  restore?.(body);
