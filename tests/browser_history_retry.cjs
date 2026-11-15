@@ -23,11 +23,16 @@ const {chromium} = require('playwright');
     await page.waitForLoadState('networkidle');
     await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor({timeout:15000});
     await page.locator('[data-task-filter="active"]').click();
-    let mode='fail', failures=0, held=0, releaseRetry;
+    let mode='fail', failures=0, held=0, heldTask=null, releaseRetry;
     const waitRetry = new Promise(resolve => {releaseRetry=resolve;});
     await page.route('**/api/task-runs?*', async route => {
       if (mode==='fail') {failures++;return route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'temporary outage'})});}
-      if (mode==='hold') {mode='pass';held++;await waitRetry;}
+      if (mode==='hold') {
+        const task=new URL(route.request().url()).searchParams.get('task');
+        const retryPending=task===heldTask&&await page.evaluate(() => [...document.querySelectorAll('#detail-body .detail-section button')].some(button => button.textContent==='重试' && button.disabled));
+        if(!retryPending)return route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'temporary outage'})});
+        mode='pass';held++;await waitRetry;
+      }
       await route.continue();
     });
     // A background history request can race the selected task's first request.
@@ -48,7 +53,10 @@ const {chromium} = require('playwright');
     const urgent=page.locator('.task-queue-editor input[type=checkbox]');
     await urgent.check();
     const retry=failed.getByRole('button',{name:'重试',exact:true});
-    mode='hold';await retry.click();
+    heldTask=await page.evaluate(() => detailTask.id);mode='hold';
+    assert.equal(await page.evaluate(() => fetch('/api/task-runs?task=background-probe').then(response => response.status)),503);
+    assert.equal(held,0,'an unrelated request cannot consume the held retry');
+    await retry.click();
     await page.waitForFunction(() => [...document.querySelectorAll('#detail-body .detail-section button')].some(x => x.textContent === '重试' && x.disabled), null, {timeout:5000});
     await reason.fill('重试期间继续输入的干预原因');
     releaseRetry();
