@@ -7,7 +7,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from adaptive_rsi.auth_sessions import AuthError, AuthSessions
 from adaptive_rsi.dashboard import records
@@ -97,7 +97,10 @@ class RelatedWorkTest(unittest.TestCase):
                     raise RuntimeError("Provider timeout")
                 return super().invoke(role, *args, **kwargs)
 
-        with tempfile.TemporaryDirectory() as directory:
+        # This test covers related-work cache invalidation; do not make it
+        # depend on a live Docker daemon during readiness probing.
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("adaptive_rsi.readiness.Sandbox.backend", return_value="docker"):
             root = Path(directory).resolve()
             store = Store(root / "state")
             runtime = Runtime(store, Outage())
@@ -255,6 +258,19 @@ class ConnectionAndReleaseRoutesTest(unittest.TestCase):
             self.assertEqual(denied.exception.code, 403)
             denied.exception.close()
         self.auth.start.assert_not_called()
+
+    def test_auth_storage_failure_is_reported_without_private_details(self):
+        self.auth.set_api_key.side_effect = AuthError("auth_storage_failed", {"path": "/synthetic/private", "errno": 5})
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            self.request("/api/auth/key", {"backend": "opencode", "provider": "example", "key": "synthetic-key"})
+        self.assertEqual(denied.exception.code, 400)
+        payload = json.load(denied.exception)
+        denied.exception.close()
+        self.assertEqual(payload["error_code"], "auth_storage_failed")
+        serialized = json.dumps(payload)
+        self.assertNotIn("synthetic-key", serialized)
+        self.assertNotIn("/synthetic/private", serialized)
+        self.assertNotIn("errno", serialized)
 
     def test_dynamic_login_parameters_are_passed_without_task_or_event_storage(self):
         with self.request("/api/auth/start", {"backend": "opencode", "provider": "example", "method": 2,
