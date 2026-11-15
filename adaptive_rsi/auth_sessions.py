@@ -256,6 +256,8 @@ class _Process:
         self.control = None
         self.close_lock = threading.RLock()
         self.is_closed = False
+        # close() 中吞掉的清理异常留作诊断；单项失败不能阻断其余 fd/目录回收。
+        self.close_errors = []
         self.config = config or {}
         self.container = self.config.get("sandbox", {}).get("backend") == "docker" or not shutil.which(backend)
         self.container_name = "adaptive-rsi-auth-" + secrets.token_hex(12) if self.container else ""
@@ -331,7 +333,11 @@ class _Process:
                 except (OSError, subprocess.TimeoutExpired):
                     pass
             if self.control is not None:
-                os.close(self.control)
+                try:
+                    os.close(self.control)
+                except OSError as exc:
+                    # fd 可能已被继承方或系统关闭（EBADF）；不能阻断后续进程/目录回收。
+                    self.close_errors.append(exc)
                 self.control = None
             if self.process:
                 if self.process.poll() is None:
@@ -348,8 +354,18 @@ class _Process:
                     pass
                 for stream in (self.process.stdin, self.process.stdout):
                     if stream:
-                        stream.close()
-            self.directory.cleanup()
+                        try:
+                            stream.close()
+                        except (OSError, ValueError) as exc:
+                            # 子进程已退出且 stdin 仍有未 flush 的缓冲时，close() 会再
+                            # flush 一次并抛 BrokenPipeError；fd 已释放，目录清理必须继续。
+                            self.close_errors.append(exc)
+            try:
+                self.directory.cleanup()
+            except (OSError, ValueError) as exc:
+                # 临时 Home 落在坏盘/NFS 上时删除失败不应中断服务关闭；
+                # 进程与容器已回收，残留目录交给系统或下次启动清理。
+                self.close_errors.append(exc)
 
 
 class CodexAuth(_Process):
@@ -2098,8 +2114,17 @@ class AuthSessions:
         for worker, stop in workers:
             stop.set()
             if worker:
-                worker.close()
+                try:
+                    worker.close()
+                except BaseException as exc:
+                    # 单个 worker 关闭失败（如 stdin 残留缓冲 + 子进程已死）不能中止
+                    # 关停：其余 worker、发现任务与线程回收仍必须执行，异常只留作诊断。
+                    first_error = first_error or exc
         for worker in discoveries:
-            worker.close()
+            try:
+                worker.close()
+            except BaseException as exc:
+                first_error = first_error or exc
         for thread in threads:
             thread.join(timeout=2)
+        self._close_error = first_error
