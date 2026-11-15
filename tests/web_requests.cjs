@@ -3779,6 +3779,41 @@ test('provider expiry invalidated by another provider mutation remains visible f
   assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/控制台登录已失效/);
 });
 
+test('later expiry from current completion remains visible after newer provider success',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let providerCalls=0,statusCalls=0,sessionCalls=0,releaseProviders;
+  const held=new Promise(resolve=>{releaseProviders=resolve;}),session={id:'codex-late-expiry',backend:'codex',provider:null,state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){statusCalls++;return response({sessions:statusCalls===1?[session]:[],codex:{available:true,state:statusCalls>1?'authenticated':'signed_out'},opencode:{available:true,authenticated_providers:['example']}});}
+    if(url.includes('/api/auth/session?id='))return response({...session,state:++sessionCalls>1?'completed':'awaiting_authorization'});
+    if(url.includes('/api/auth/providers?')){if(++providerCalls===2){await held;return response({},401);}return response([{id:'example',name:'Example',connected:true,connection_count:1,methods:[{index:0,type:'api',label:'API key',supported:true}]}]);}
+    if(url.endsWith('/api/auth/key'))return response({ok:true});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}',page.context);vm.runInContext(authSource,page.context);
+  page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();page.context.window.RSIAuth.show('openai',async()=>{});await tick();await tick();
+  page.fireTimer(1500);await tick();await tick();assert.equal(providerCalls,2);
+  page.context.window.RSIAuth.show('opencode',async()=>{});await tick();const select=walk(page.node('mc-auth')).find(node=>node.tagName==='SELECT');select.value='example';select.handlers.change();
+  const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});await tick();await tick();assert.equal(providerCalls,3);
+  releaseProviders();await tick();await tick();page.context.window.RSIAuth.show('openai',async()=>{});await tick();
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/控制台登录已失效/);
+});
+
+test('Codex completion preserves an in-flight OpenCode count refresh',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let providerCalls=0,statusCalls=0,sessionCalls=0,releaseProviders;
+  const held=new Promise(resolve=>{releaseProviders=resolve;}),session={id:'codex-during-count',backend:'codex',provider:null,state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){statusCalls++;return response({sessions:statusCalls===1?[session]:[],codex:{available:true,state:statusCalls>2?'authenticated':'signed_out'},opencode:{available:true,authenticated_providers:['example']}});}
+    if(url.includes('/api/auth/session?id='))return response({...session,state:++sessionCalls>1?'completed':'awaiting_authorization'});
+    if(url.includes('/api/auth/providers?')){const n=++providerCalls;if(n===2)await held;if(n>2)return response({},503);return response([{id:'example',name:'Example',connected:true,connection_count:n===1?1:2,methods:[{index:0,type:'api',label:'API key',supported:true}]}]);}
+    if(url.endsWith('/api/auth/key'))return response({ok:true});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+  const select=walk(page.node('mc-auth')).find(node=>node.tagName==='SELECT');select.value='example';select.handlers.change();const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});await tick();await tick();assert.equal(providerCalls,2);
+  page.fireTimer(1500);await tick();await tick();releaseProviders();await tick();await tick();
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
+});
+
 test('completed auth console expiry stays actionable and stops refresh retries',async()=>{
   const run=await authCompletionPage({failure:'session_required'});await run.finish();
   assert.match(run.text(),/控制台登录已失效/);assert.equal(run.calls.catalog,0);

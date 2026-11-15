@@ -47,7 +47,7 @@ window.RSIAuth = (() => {
       }selectPreferredProvider();render();schedule();
     })().finally(()=>loading=null);return loading;
   }
-  let providerRequest=0,lastProviderSuccess=0,providerLoading=0,providerChanging=0;
+  let providerRequest=0,providerLoading=0,providerChanging=0;
   function validateProviders(result){
     const list=Array.isArray(result)?result:result&&typeof result==='object'?result.providers:null;
     const isObject=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
@@ -63,7 +63,7 @@ window.RSIAuth = (() => {
     const request=++providerRequest;providerLoading++;providerCountsFresh=false;render();
     try{
       const result=await api('auth/providers?backend=opencode');if(request!==providerRequest)return;
-      providers=validateProviders(result);lastProviderSuccess=Math.max(lastProviderSuccess,request);
+      providers=validateProviders(result);
       const selected=context?.backend==='opencode'?context.provider:selections.get('opencode');
       if(selected&&!providers.some(provider=>provider.id===selected)){
         const session=sessions.get('opencode:'+selected);
@@ -76,7 +76,7 @@ window.RSIAuth = (() => {
         }
       }
       selectPreferredProvider();if(providerChanging===0)providerCountsFresh=true;render();
-    }catch(error){if(request===providerRequest||error?.code==='session_required'&&typeof sessionRequiredRelevant==='function'&&sessionRequiredRelevant()&&lastProviderSuccess<request)throw error;}
+    }catch(error){if(request===providerRequest||error?.code==='session_required'&&typeof sessionRequiredRelevant==='function'&&sessionRequiredRelevant())throw error;}
     finally{providerLoading--;if(request!==providerRequest&&!providers&&!providerLoading&&!providerChanging&&context?.backend==='opencode')safe(getProviders);}
   }
   async function getProviders(){
@@ -95,7 +95,7 @@ window.RSIAuth = (() => {
     try{
       if(session.refreshStage==='status'){
         readinessCache.clear();await status(true);if(sessions.get(id)!==session)return;
-        safe(async()=>{
+        if(session.backend==='opencode'||!providerLoading)safe(async()=>{
           try{await refreshProviders(()=>sessions.get(id)===session);}
           catch(error){
             if(error.code!=='session_required')throw error;
@@ -140,7 +140,7 @@ window.RSIAuth = (() => {
       if(terminal.has(session.state))continue;
       try{const next=await api('auth/session?id='+encodeURIComponent(session.id));if(sessions.get(id)!==session)continue;
         const updated={...next,refresh:session.refresh,pollMessage:'',refreshStage:next.state==='completed'?'status':''};sessions.set(id,updated);
-        if(updated.refreshStage){providerCountsFresh=false;providerRequest++;render();await refreshCompleted(id,updated);}
+        if(updated.refreshStage){if(updated.backend==='opencode'){providerCountsFresh=false;providerRequest++;render();}await refreshCompleted(id,updated);}
       }catch(error){
         if(sessions.get(id)!==session)continue;
         if(error.code==='session_required'){pollingStopped=true;sessions.set(id,{...session,pollMessage:'控制台登录已失效，请重新打开控制台后继续授权。'});continue;}
