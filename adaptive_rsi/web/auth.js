@@ -182,7 +182,7 @@ window.RSIAuth = (() => {
   }
   function stopCompletedStatus(id,session){
     if(sessions.get(id)!==session||session?.state!=='completed'||session.refreshStage!=='status')return;
-    statusRequest++;loading=null;pollRequest++;polling=false;sessions.delete(id);render();
+    statusRequest++;loading=null;pollRequest++;polling=false;sessions.delete(id);render();schedule();
   }
   async function start(method,inputs={}){
     if(pending||!context)return;const current={...context},id=current.backend+':'+(current.provider||''),existing=sessions.get(id);if(existing&&!terminal.has(existing.state))return;

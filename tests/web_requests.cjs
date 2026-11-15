@@ -3902,6 +3902,21 @@ test('logout invalidates delayed completion status before refreshing account sta
   releaseStatus();await tick();await tick();assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/尚未登录/);
 });
 
+test('stopping one completed login continues polling other active logins',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let releaseStatus,statusCalls=0,codexCalls=0,otherCalls=0;
+  const held=new Promise(resolve=>{releaseStatus=resolve;}),codex={id:'codex-login',backend:'codex',provider:null,state:'awaiting_authorization',method:'auto'},other={id:'other-login',backend:'opencode',provider:'example',state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){if(++statusCalls===2){await held;return response({sessions:[],codex:{available:true,state:'authenticated'}});}return response({sessions:[codex,other],codex:{available:true,state:'signed_out'}});}
+    if(url.includes('auth/session?id=codex-login'))return response(++codexCalls===1?codex:{...codex,state:'completed'});
+    if(url.includes('auth/session?id=other-login')){otherCalls++;return response(other);}
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('openai',async()=>{});await tick();await tick();assert.equal(otherCalls,1);
+  page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,2);
+  const stop=walk(page.node('mc-auth')).find(node=>node.textContent==='停止等待');assert.ok(stop);stop.handlers.click();await tick();
+  page.fireTimer(1500);await tick();await tick();assert.equal(otherCalls,2,'other active login remains polled');releaseStatus();await tick();
+});
+
 test('completed auth console expiry stays actionable and stops refresh retries',async()=>{
   const run=await authCompletionPage({failure:'session_required'});await run.finish();
   assert.match(run.text(),/控制台登录已失效/);assert.equal(run.calls.catalog,0);
