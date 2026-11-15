@@ -843,7 +843,9 @@ def _remote_runs(repo, data, force=False):
             total = payload.get("total_count")
             if type(total) is int and 0 < total <= scanned:
                 break
-        if since and not found and _unfiltered_fallback_ready(data, force):
+        # 只有「过滤后一页都没满」才值得再花一次无过滤读：满页说明 created
+        # 窗口里已经有大量 run，时钟偏差不足以把目标排除在外。
+        if since and not found and not full_page and _unfiltered_fallback_ready(data, force):
             # A no-match filtered page can still contain unrelated runs. Because
             # the lower bound comes from this host's clock, re-read the newest
             # page without it before declaring the target invisible.

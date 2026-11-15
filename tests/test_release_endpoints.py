@@ -2360,8 +2360,10 @@ class ManualReconciliationTest(_ManualReconciliationFixture):
         # The own run sits behind 1,000 runs from another head_sha: only the
         # server-side filter makes it visible inside GitHub's 1,000-result cap.
         self.assertEqual(result["state"], "workflow_succeeded")
-        self.assertEqual(len(calls), 1)
-        query = urllib.parse.parse_qs(urllib.parse.urlsplit(calls[0]).query)
+        # 匹配后还会读一次作业级耗时；这里只数列表请求。
+        listings = [url for url in calls if "/runs?" in url]
+        self.assertEqual(len(listings), 1)
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(listings[0]).query)
         self.assertEqual(query["head_sha"], [self.TRUSTED])
         self.assertEqual(query["event"], ["workflow_dispatch"])
         self.assertNotIn("created", query)
