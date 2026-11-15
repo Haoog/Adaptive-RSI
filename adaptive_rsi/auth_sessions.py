@@ -154,6 +154,22 @@ def _read_json(path):
         raise AuthError("invalid_credentials") from None
 
 
+def _read_json_for_storage(path):
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return {}
+    if size > MAX_BYTES:
+        raise AuthError("invalid_credentials")
+    try:
+        value = json.loads(path.read_text())
+    except (ValueError, RecursionError):
+        raise AuthError("invalid_credentials") from None
+    if not isinstance(value, dict):
+        raise AuthError("invalid_credentials")
+    return value
+
+
 def _write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = None
@@ -183,8 +199,7 @@ def _quarantine_invalid(path):
     except FileNotFoundError:
         return None
     except OSError:
-        # 留档失败时保持原有失败语义，绝不覆盖可能仍可人工恢复的原始字节。
-        raise AuthError("invalid_credentials") from None
+        raise AuthError("auth_storage_failed") from None
     try:
         backup.chmod(0o600)
     except OSError:
@@ -195,9 +210,18 @@ def _quarantine_invalid(path):
 def _read_json_for_write(path):
     """写路径读取：损坏的旧文件先留档再视为空，用户仍可覆盖或退出登录。"""
     try:
-        return _read_json(path)
-    except AuthError:
-        _quarantine_invalid(path)
+        return _read_json_for_storage(path)
+    except OSError:
+        raise AuthError("auth_storage_failed") from None
+    except AuthError as exc:
+        if getattr(exc, "code", None) != "invalid_credentials":
+            raise
+        try:
+            backup = _quarantine_invalid(path)
+        except OSError:
+            raise AuthError("auth_storage_failed") from None
+        if backup is None:
+            raise AuthError("auth_storage_failed")
         return {}
 
 
@@ -695,6 +719,10 @@ class OpenCodeAuth(_Process):
                            if isinstance(connection, dict) and connection.get("type") == "credential"
                            ] if isinstance(connections, list) else []
             connected = provider in host_connected or bool(credentials)
+            # container 模式凭据可能只存在于 host 侧导出文件；merge_auth_export 按
+            # integrationID 去重，每个 provider 至多一条，因此只在 worker 侧没有连接时补 1，
+            # 保证 connection_count > 0 与 connected 始终一致。
+            host_only = provider in host_connected and not credentials
             items = []
             for index, method in enumerate(integration.get("methods", [])):
                 if not isinstance(method, dict) or method.get("type") not in {"key", "oauth"}:
@@ -721,7 +749,7 @@ class OpenCodeAuth(_Process):
             if items:
                 result.append({"id": provider, "name": str(integration.get("name", provider))[:160],
                                "methods": items, "connected": connected,
-                               "connection_count": len(credentials)})
+                               "connection_count": len(credentials) + int(host_only)})
         self._v2_methods = methods_by_index
         result.sort(key=lambda row: (not row["connected"], row["name"].casefold()))
         return result
@@ -963,6 +991,8 @@ class AuthSessions:
         self.closed = False
         # close() 期间状态文件写失败时保留首个异常，供排查；不向调用方抛出。
         self._close_error = None
+        # 构造时整理旧文件的写盘失败（只读目录、磁盘满）只记录，不阻断服务启动。
+        self._persist_error = None
         self.shutdown = threading.Event()
         self.ttl = ttl
         self.config = config
@@ -997,7 +1027,13 @@ class AuthSessions:
                     item.update(state="interrupted", error="process_interrupted")
                 self.sessions[session_id] = item
         if previous:
-            self._persist()
+            try:
+                self._persist()
+            except OSError as exc:
+                # 状态目录只读/磁盘满时原文件仍完好：保留已加载会话继续启动，
+                # 等目录恢复可写后由下一次 reserve/_update 正常落盘。
+                self._persist_error = exc
+                self._publish_sessions()
         else:
             self._publish_sessions()
 
@@ -1353,14 +1389,14 @@ class AuthSessions:
                     self.threads.discard(threading.current_thread())
         thread = threading.Thread(target=run, daemon=True)
         with self.threads_lock:
-            # 与 close() 的 closed 置位+快照同锁：先于 start() 登记，让 close() 能看到
-            # 即将启动的线程；已关闭时不再启动新线程。start 失败则摘除，否则 close()
-            # 会对一个从未启动的线程 join() 而抛 RuntimeError。
+            # 登记与 start() 必须同锁原子完成：只有已经启动的线程才会留在
+            # self.threads 里，close() 在 threads_lock 下取到的快照因此不会包含
+            # 未启动线程（对其 join() 会抛 RuntimeError 并中断整段关闭流程）。
+            # 已关闭时不再启动新线程；start 失败则摘除登记。
             if self.closed:
                 return
             self.threads.add(thread)
             try:
-                # close() must not snapshot a thread before start() succeeds.
                 thread.start()
             except BaseException:
                 self.threads.discard(thread)
@@ -1455,7 +1491,14 @@ class AuthSessions:
             if not item.pop("_reserved", False):
                 raise AuthError("invalid_auth_state")
             if item["state"] in ACTIVE and self.now() >= item["expires_at"]:
-                self._update(session_id, state="expired", error="auth_expired")
+                try:
+                    self._update(session_id, state="expired", error="auth_expired")
+                except BaseException:
+                    try:
+                        self._abort_launch(session_id, state="expired")
+                    except BaseException:
+                        pass
+                    raise
             if item["state"] == "expired":
                 return self._public(item)
             if item["state"] != "starting":
@@ -1466,33 +1509,48 @@ class AuthSessions:
             # 低内存下 thread.start() 会抛 RuntimeError("can't start new thread")，
             # 而 _reserved 已被消费、worker 从未运行：不释放这条行就会让同后端在
             # TTL 内持续 auth_busy，桌面更新与自动更新也被挡在 authentication 上。
-            self._abort_launch(session_id)
+            try:
+                self._abort_launch(session_id)
+            except BaseException as cleanup_exc:
+                logging.getLogger(__name__).warning(
+                    "Auth launch cleanup failed: %s", type(cleanup_exc).__name__)
             raise AuthError("auth_protocol_error") from None
         except BaseException:
-            self._abort_launch(session_id)
+            try:
+                self._abort_launch(session_id)
+            except BaseException:
+                pass
             raise
         if not started:
             # _thread() 在 close() 置位后静默不启动；这里同样不能留下 starting 行。
-            self._abort_launch(session_id, state="interrupted")
+            try:
+                self._abort_launch(session_id, state="interrupted")
+            except BaseException as cleanup_exc:
+                logging.getLogger(__name__).warning(
+                    "Auth launch cleanup failed: %s", type(cleanup_exc).__name__)
             raise AuthError("service_closed")
         return self.status(session_id)
 
     def _abort_launch(self, session_id, state="failed"):
-        """worker 未能启动时把会话落成终态，写盘失败按 _run() 的内存兜底释放 busy。"""
-        values = {"state": state, "error": "process_interrupted"}
-        try:
-            self._update(session_id, **values)
-        except AuthError:
-            # 会话已被并发路径移除，没有需要释放的 busy 行。
-            return
-        except OSError:
-            with self.lock:
-                item = self.sessions.get(session_id)
-                if item is None:
-                    return
-                if item["state"] in ACTIVE:
-                    self._terminate(item, **values)
-                    self._publish_sessions()
+        """worker 未启动时保留已过期或并发终态；写盘失败时在内存释放 busy。"""
+        with self.lock:
+            item = self.sessions.get(session_id)
+            if item is None:
+                return
+            if item["state"] not in ACTIVE:
+                # 持久化异常可能发生在状态已变更、公开视图尚未发布之间。
+                self._publish_sessions()
+                return
+            if state == "expired" or self.now() >= item["expires_at"]:
+                values = {"state": "expired", "error": "auth_expired"}
+            else:
+                values = {"state": state, "error": "process_interrupted"}
+            try:
+                self._update(session_id, **values)
+            except BaseException:
+                # 终态落盘失败后 worker 不会运行，仍需更新公开内存视图。
+                self._terminate(item, **values)
+                self._publish_sessions()
 
     @staticmethod
     def _terminate(item, **values):
@@ -1522,6 +1580,8 @@ class AuthSessions:
             return True
 
     def _run(self, session_id, method, inputs):
+        import sys
+
         worker = None
         try:
             item = self.status(session_id)
@@ -1618,26 +1678,55 @@ class AuthSessions:
             values = {"state": "expired" if expired else "failed",
                       "error": "auth_expired" if expired else exc.code if isinstance(exc, AuthError) else "auth_protocol_error"}
             try:
-                self._update(session_id, **values)
-            except OSError:
-                # worker 将退出，已不能重试；写盘失败也必须释放内存中的 busy 会话。
-                # 下次成功写盘会保存该终态，进程重启则沿用 interrupted 恢复规则。
+                if not self._update(session_id, **values):
+                    # Another terminal transition may have changed the in-memory
+                    # row before a failed write could publish its snapshot.
+                    with self.lock:
+                        self._publish_sessions()
+            except BaseException as update_exc:
+                # worker 将退出，已不能重试；失败后发布内存终态以释放 busy 会话。
+                # 保留已存在的终态；磁盘可能仍是旧状态。
                 with self.lock:
                     item = self.sessions.get(session_id)
                     if item is None:
-                        return
-                    if item["state"] in ACTIVE:
-                        self._terminate(item, **values)
-                        self._publish_sessions()
+                        if isinstance(update_exc, Exception):
+                            return
+                    else:
+                        if item["state"] in ACTIVE:
+                            self._terminate(item, **values)
+                        try:
+                            self._publish_sessions()
+                        except BaseException:
+                            if not isinstance(update_exc, Exception):
+                                raise update_exc
+                            raise
+                if not isinstance(update_exc, Exception):
+                    raise update_exc
+        except BaseException:
+            try:
+                self._abort_launch(session_id)
+            except BaseException:
+                pass
+            raise
         finally:
             with self.lock:
                 self.workers.pop(session_id, None)
             if worker:
-                worker.close()
+                active_exception = sys.exc_info()[0] is not None
+                try:
+                    worker.close()
+                except BaseException as cleanup_exc:
+                    if not active_exception:
+                        raise
+                    logging.getLogger(__name__).warning(
+                        "Auth worker cleanup failed: %s", type(cleanup_exc).__name__)
 
     def _save(self, worker, backend, provider, session_id, stop):
         if backend == "codex":
-            data = _read_json(worker.credentials)
+            try:
+                data = _read_json_for_storage(worker.credentials)
+            except OSError:
+                raise AuthError("auth_storage_failed") from None
             if not isinstance(data.get("tokens"), dict) or not data["tokens"].get("refresh_token"):
                 raise AuthError("invalid_credentials")
         else:
@@ -1647,7 +1736,10 @@ class AuthSessions:
                 if not isinstance(value, list) or not value:
                     raise AuthError("invalid_credentials")
             else:
-                data = _read_json(worker.credentials)
+                try:
+                    data = _read_json_for_storage(worker.credentials)
+                except OSError:
+                    raise AuthError("auth_storage_failed") from None
                 value = data.get(provider)
                 if not isinstance(value, dict) or value.get("type") not in {"oauth", "api"}:
                     raise AuthError("invalid_credentials")
@@ -1671,18 +1763,20 @@ class AuthSessions:
                 if self.now() >= current_session["expires_at"]:
                     self._update(session_id, state="expired", error="auth_expired")
                     return
-                if backend == "codex":
-                    # 与 opencode 分支一致：合并写回，保留用户手放的 OPENAI_API_KEY
-                    # 和新版 CLI 写入的未知字段，只覆盖凭据本身的同名字段。
-                    merged = _read_json_for_write(_codex_path())
-                    merged.update(data)
-                    _write_json(_codex_path(), merged)
-                elif modern:
+                if backend != "codex" and modern:
                     worker.install_credential(provider, value)
                 else:
-                    current = _read_json_for_write(auth_path())
-                    current[provider] = value
-                    _write_json(auth_path(), current)
+                    try:
+                        if backend == "codex":
+                            merged = _read_json_for_write(_codex_path())
+                            merged.update(data)
+                            _write_json(_codex_path(), merged)
+                        else:
+                            current = _read_json_for_write(auth_path())
+                            current[provider] = value
+                            _write_json(auth_path(), current)
+                    except OSError as exc:
+                        raise AuthError("auth_storage_failed", {"errno": exc.errno}) from None
                 # 授权期间的状态/供应商查询可能重新填充旧缓存，保存凭据后再次失效。
                 self._invalidate_caches(backend)
                 self._update(session_id, state="completed")
@@ -1742,9 +1836,32 @@ class AuthSessions:
 
     def cancel(self, session_id):
         self.status(session_id)
+        memory_error = None
         with self.lock:
-            self._update(session_id, state="cancelled")
+            try:
+                self._update(session_id, state="cancelled")
+            except MemoryError as exc:
+                memory_error = exc
+                try:
+                    item = self.sessions.get(session_id)
+                    if item is not None and item["state"] in ACTIVE:
+                        self._terminate(item, state="cancelled")
+                    self._publish_sessions()
+                except BaseException:
+                    pass
             worker = self.workers.get(session_id)
+        if memory_error is not None:
+            if worker:
+                try:
+                    worker[1].set()
+                except BaseException:
+                    pass
+                if worker[0]:
+                    try:
+                        worker[0].close()
+                    except BaseException:
+                        pass
+            raise memory_error
         if worker:
             worker[1].set()
             if worker[0]:
@@ -1885,15 +2002,19 @@ class AuthSessions:
                 if item["state"] in ACTIVE:
                     try:
                         self._update(key, state="interrupted", error="process_interrupted")
-                    except OSError as exc:
+                    except (OSError, MemoryError) as exc:
                         # 状态文件不可写不能中断关闭：内存就地落到终态（worker 确实被中断），
                         # 磁盘旧记录交给下次启动把 ACTIVE 归一化为 interrupted。
                         first_error = first_error or exc
                         self._terminate(item, state="interrupted", error="process_interrupted")
-                        self._publish_sessions()
+                        try:
+                            self._publish_sessions()
+                        except MemoryError:
+                            pass
             self._close_error = first_error
-            # closed 已在上面置位；此后 _thread() 不再启动新线程，这里只需在
-            # threads_lock 下取快照，避免漏掉刚登记、尚未 start 的线程。
+            # closed 已在上面置位；此后 _thread() 不再启动新线程。快照在
+            # threads_lock 下取，且 _thread() 的登记与 start() 同锁完成，
+            # 因此这里只会拿到已启动的线程，join() 不会抛 RuntimeError。
             with self.threads_lock:
                 threads = list(self.threads)
         for worker, stop in workers:

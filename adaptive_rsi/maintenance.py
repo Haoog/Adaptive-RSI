@@ -27,6 +27,7 @@ RETENTION_REJECT_REVALIDATE_SECONDS = 6 * 3600
 
 # 归档校验报告的有效期：过期后才重新解压验证，每轮最多验证一个归档。
 ARCHIVE_VERIFICATION_SECONDS = 7 * 86400
+ARCHIVE_VERIFICATION_READ_BATCH_SIZE = 128
 
 # 保留删除只把页移入 freelist；库以 auto_vacuum=0 创建，不 VACUUM 文件永不缩小。
 # 空闲页达到四分之一且磁盘留足重写整库的余量（VACUUM 峰值约需一份库文件）时
@@ -173,22 +174,24 @@ def _merged_monitoring_completed(result):
     return isinstance(parsed, dict) and bool(parsed.get("monitoring_completed"))
 
 
-def _archive_verification_due(store, key, now):
+_ARCHIVE_VERIFICATION_MISSING = object()
+
+
+def _archive_verification_due(value, now):
     """Return (due, previous_type) for one stored archive verification report.
 
     Settings are untrusted input: a restored backup or a hand edit can leave a
-    string, list or NaN under ``checked_at``.  The old subtraction raised
-    TypeError at the end of every pass, so ``maintenance-last`` never advanced
-    and each retry re-ran the whole retention sweep.  Unusable records count as
-    expired so the archive is verified again and the report overwritten; the
-    second item names the original shape (never its content) for the repair
-    event, and is None when no record existed or the stored one is usable.
+    string, list or NaN under ``checked_at``. The missing sentinel distinguishes
+    an absent row from a present SQL NULL; absent rows have no previous shape,
+    while SQL NULL is unreadable. Unusable records count as expired so the
+    archive is verified again and the report overwritten; the second item names
+    the original shape (never its content) for the repair event, and is None
+    when no record existed or the stored one is usable.
     """
-    row = store.one("SELECT value FROM settings WHERE key=?", (key,))
-    if row is None:
+    if value is _ARCHIVE_VERIFICATION_MISSING:
         return True, None
     try:
-        previous = json.loads(row["value"])
+        previous = json.loads(value)
     except (ValueError, TypeError):
         return True, "unreadable"
     checked_at = previous.get("checked_at") if isinstance(previous, dict) else None
@@ -788,26 +791,63 @@ class Maintenance:
         # Passive checkpoint yields to readers; archive checks are capped per cycle.
         self.store.wal_diagnostics(checkpoint=True)
         from .storage_tools import verify_archive
-        for path in sorted((self.store.root / "archives").glob("*.sqlite3.gz")):
-            if path.is_symlink():
-                continue
-            key = "archive-verification:" + path.name
-            due, previous_type = _archive_verification_due(self.store, key, now)
-            if not due:
-                continue
-            if previous_type is not None:
-                # 只报形状，不回显原值：损坏内容可能是任意手工写入的文本。
+        prefix = 'archive-verification:'
+        archive_paths = sorted((self.store.root / 'archives').glob('*.sqlite3.gz'))
+        for offset in range(0, len(archive_paths), ARCHIVE_VERIFICATION_READ_BATCH_SIZE):
+            batch = archive_paths[offset:offset + ARCHIVE_VERIFICATION_READ_BATCH_SIZE]
+            initially_regular_paths = [path for path in batch if not path.is_symlink()]
+            keys = [prefix + path.name for path in initially_regular_paths]
+            initially_regular_keys = set(keys)
+            verification_status = {}
+            status_read_succeeded = False
+            if keys:
+                placeholders = ','.join('?' for _ in keys)
+                sql = 'SELECT key,value FROM settings WHERE key IN (%s)' % placeholders
                 try:
-                    self.store.event("archive_verification_repaired",
-                                     "Replaced unusable archive verification record: %s" % key,
-                                     data={"key": key, "previous_type": previous_type})
+                    rows = self.store.query(sql, tuple(keys))
                 except Exception:
-                    logging.getLogger(__name__).exception(
-                        "Archive verification repair event persistence failed: %s", key)
-            try:
-                report = verify_archive(path, timeout=5)
-            except (OSError, ValueError, TimeoutError, sqlite3.Error, EOFError, zlib.error) as exc:
-                report = {"valid": False, "checked_at": now, "error_type": type(exc).__name__}
-            self.store.put_setting(key, report)
+                    # If every queried archive became a symlink, the old per-path
+                    # loop would have skipped its status read. Any path that is
+                    # regular when visited still gets an exact read below.
+                    if any(not path.is_symlink() for path in initially_regular_paths):
+                        raise
+                else:
+                    verification_status = {row['key']: row['value'] for row in rows}
+                    status_read_succeeded = True
+
+            for path in batch:
+                key = prefix + path.name
+                if path.is_symlink():
+                    continue
+                if key in initially_regular_keys and status_read_succeeded:
+                    status_value = verification_status.get(
+                        key, _ARCHIVE_VERIFICATION_MISSING)
+                else:
+                    # This includes paths that were symlinks at enumeration time
+                    # but became regular before their turn in the sorted pass.
+                    row = self.store.one(
+                        'SELECT value FROM settings WHERE key=?', (key,))
+                    status_value = (row['value'] if row is not None
+                                    else _ARCHIVE_VERIFICATION_MISSING)
+                due, previous_type = _archive_verification_due(status_value, now)
+                if not due:
+                    continue
+                if previous_type is not None:
+                    # 只报形状，不回显原值：损坏内容可能是任意手工写入的文本。
+                    try:
+                        self.store.event('archive_verification_repaired',
+                                         'Replaced unusable archive verification record: %s' % key,
+                                         data={'key': key, 'previous_type': previous_type})
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            'Archive verification repair event persistence failed: %s', key)
+                try:
+                    report = verify_archive(path, timeout=5)
+                except (OSError, ValueError, TimeoutError, sqlite3.Error, EOFError, zlib.error) as exc:
+                    report = {'valid': False, 'checked_at': now, 'error_type': type(exc).__name__}
+                self.store.put_setting(key, report)
+                break
+            else:
+                continue
             break
         self.store.put_setting("maintenance-last", now)
