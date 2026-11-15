@@ -20,7 +20,7 @@ from adaptive_rsi.config import DEFAULTS, compatibility, fingerprint, merge, val
 from adaptive_rsi.evaluator import Evaluator, empty_test_run
 from adaptive_rsi.evolution import Evolution
 from adaptive_rsi.gitops import git, snapshot
-from adaptive_rsi.process import _PROBE_CACHE, _PROBE_INFLIGHT, Sandbox, _cached_probe, checked, run_process
+from adaptive_rsi.process import Cancelled, _PROBE_CACHE, _PROBE_INFLIGHT, Sandbox, _cached_probe, checked, run_process
 from adaptive_rsi.review import enforce_review, risk_review_required
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.server import Handler, Server
@@ -957,6 +957,322 @@ class RuntimeTest(unittest.TestCase):
         self.assertFalse((self.store.root / "runs" / run["id"] / "candidate.patch").exists())
         self.assertNotIn("review", [role for role, _ in self.runtime.agent.roles])
 
+    def test_acceptance_baseline_future_cancellation_during_implementation_stays_interrupted(self):
+        """实现期间 Future 以 CancelledError 结束时，不得误判为环境故障。"""
+        baseline_done = threading.Event()
+
+        class HighRisk(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                if role == "implementation":
+                    self_test.assertTrue(baseline_done.wait(5), "baseline should cancel during implementation")
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == "planning":
+                    result["risk"] = "high"
+                return result
+
+        self_test = self
+        self.runtime.agent = HighRisk()
+
+        def baseline(*args, **kwargs):
+            baseline_done.set()
+            raise concurrent.futures.CancelledError("Acceptance baseline cancelled")
+
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline", side_effect=baseline), \
+             patch.object(self.runtime.evaluator, "evaluate") as candidate_evaluate:
+            task, run = self.claim("acceptance baseline cancelled during implementation")
+            self.runtime.process(run)
+
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "interrupted", row["result"])
+        self.assertNotIn("failure", json.loads(row["result"]))
+        candidate_evaluate.assert_not_called()
+        self.assertNotIn("review", [role for role, _ in self.runtime.agent.roles])
+
+    def test_acceptance_baseline_failure_after_implementation_is_environment_failure(self):
+        """实现返回及其最终取消检查完成后，基线异常仍按环境故障收尾。"""
+        baseline_started = threading.Event()
+        implementation_returned = threading.Event()
+
+        def baseline(*args, **kwargs):
+            baseline_started.set()
+            self_test.assertTrue(implementation_returned.wait(5),
+                                 "baseline must fail only after implementation returns")
+            raise RuntimeError("acceptance evaluator internal failure")
+
+        class HighRisk(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                if role == "implementation":
+                    self_test.assertTrue(baseline_started.wait(5), "baseline should start during implementation")
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == "planning":
+                    result["risk"] = "high"
+                return result
+
+        self_test = self
+        self.runtime.agent = HighRisk()
+        real_invoke = self.runtime.invoke
+
+        def invoke(role, *args, **kwargs):
+            result = real_invoke(role, *args, **kwargs)
+            if role == "implementation":
+                # Runtime.invoke has completed its final cancellation check before
+                # releasing the worker, so this cannot take the in-flight Cancelled path.
+                implementation_returned.set()
+            return result
+
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch.object(self.runtime, "invoke", side_effect=invoke), \
+             patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline", side_effect=baseline), \
+             patch.object(self.runtime.evaluator, "evaluate") as candidate_evaluate:
+            task, run = self.claim()
+            self.runtime.process(run)
+
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        result = json.loads(row["result"])
+        self.assertEqual(row["state"], "insufficient_evidence", row["result"])
+        self.assertEqual(result["failure"], {"code": "environment", "action": "check_readiness",
+                                             "stage": "acceptance_baseline",
+                                             "detail": "Acceptance baseline evaluation failed: "
+                                                       "acceptance evaluator internal failure"})
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("implementation"), 1)
+        candidate_evaluate.assert_not_called()
+        self.assertNotIn("review", [role for role, _ in self.runtime.agent.roles])
+        saved = self.store.one("SELECT data FROM stages WHERE run=? AND stage='implementation'", (run['id'],))
+        self.assertIsNotNone(saved, 'verified implementation checkpoint was lost')
+        self.assertTrue(json.loads(saved['data'])['patch'])
+
+    def test_late_baseline_failure_wins_over_empty_patch(self):
+        ready = threading.Event()
+        returned = threading.Event()
+        baseline_done = threading.Event()
+        self_test = self
+        class EmptyHighRisk(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                if role == 'implementation':
+                    self.roles.append((role, kwargs.get('config', {})))
+                    self_test.assertTrue(ready.wait(5))
+                    return {'summary': 'No change'}
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == 'planning': result['risk'] = 'high'
+                return result
+        class RecordingExecutor(concurrent.futures.ThreadPoolExecutor):
+            def submit(self, *args, **kwargs):
+                future = super().submit(*args, **kwargs)
+                future.add_done_callback(lambda unused: baseline_done.set())
+                return future
+        def baseline(*args, **kwargs):
+            ready.set()
+            self_test.assertTrue(returned.wait(5))
+            return {'decision': 'insufficient_evidence', 'reason': 'synthetic setup failure'}
+        self.runtime.agent = EmptyHighRisk()
+        invoke = self.runtime.invoke
+        def wrapped(role, *args, **kwargs):
+            result = invoke(role, *args, **kwargs)
+            if role == 'implementation':
+                returned.set()
+                self_test.assertTrue(baseline_done.wait(5))
+            return result
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch('adaptive_rsi.pipeline.concurrent.futures.ThreadPoolExecutor', RecordingExecutor), \
+             patch.object(self.runtime, 'invoke', side_effect=wrapped), \
+             patch.object(self.runtime.evaluator, 'evaluate_acceptance_baseline', side_effect=baseline), \
+             patch.object(self.runtime.evaluator, 'evaluate') as evaluate:
+            task, run = self.claim('empty patch and failed baseline')
+            self.runtime.process(run)
+        row = self.store.one('SELECT state,result FROM runs WHERE id=?', (run['id'],))
+        self.assertEqual(row['state'], 'insufficient_evidence', row['result'])
+        self.assertEqual(json.loads(row['result'])['failure']['stage'], 'acceptance_baseline')
+        evaluate.assert_not_called()
+
+    def test_failed_baseline_wins_over_scope_validation_error(self):
+        started, returned, baseline_done = threading.Event(), threading.Event(), threading.Event()
+        self_test = self
+        class OutOfScopeHighRisk(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                if role == 'implementation': self_test.assertTrue(started.wait(5))
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == 'planning': result['risk'] = 'high'
+                if role == 'implementation': (workspace / 'unrelated.txt').write_text('out of scope')
+                return result
+        class RecordingExecutor(concurrent.futures.ThreadPoolExecutor):
+            def submit(self, *args, **kwargs):
+                future = super().submit(*args, **kwargs)
+                future.add_done_callback(lambda unused: baseline_done.set())
+                return future
+        def baseline(*args, **kwargs):
+            started.set()
+            self_test.assertTrue(returned.wait(5))
+            raise RuntimeError('synthetic scope-case baseline failure')
+        self.runtime.agent = OutOfScopeHighRisk()
+        invoke = self.runtime.invoke
+        def wrapped(role, *args, **kwargs):
+            result = invoke(role, *args, **kwargs)
+            if role == 'implementation':
+                returned.set()
+                self_test.assertTrue(baseline_done.wait(5))
+            return result
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch('adaptive_rsi.pipeline.concurrent.futures.ThreadPoolExecutor', RecordingExecutor), \
+             patch.object(self.runtime, 'invoke', side_effect=wrapped), \
+             patch.object(self.runtime.evaluator, 'evaluate_acceptance_baseline', side_effect=baseline), \
+             patch.object(self.runtime.evaluator, 'evaluate') as evaluate:
+            task, run = self.claim('failed baseline and scope error')
+            self.runtime.process(run)
+        row = self.store.one('SELECT state,result FROM runs WHERE id=?', (run['id'],))
+        self.assertEqual(row['state'], 'insufficient_evidence', row['result'])
+        self.assertEqual(json.loads(row['result'])['failure']['stage'], 'acceptance_baseline')
+        self.assertIsNone(self.store.one("SELECT data FROM stages WHERE run=? AND stage='implementation'", (run['id'],)))
+        evaluate.assert_not_called()
+
+    def test_user_pause_is_not_reclassified_by_concurrent_baseline_failure(self):
+        ready = threading.Event()
+        fail = threading.Event()
+        baseline_done = threading.Event()
+        self_test = self
+        class HighRisk(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == 'planning': result['risk'] = 'high'
+                return result
+        class RecordingExecutor(concurrent.futures.ThreadPoolExecutor):
+            def submit(self, *args, **kwargs):
+                future = super().submit(*args, **kwargs)
+                future.add_done_callback(lambda unused: baseline_done.set())
+                return future
+        def baseline(*args, **kwargs):
+            ready.set()
+            self_test.assertTrue(fail.wait(5))
+            raise RuntimeError('synthetic baseline failure')
+        self.runtime.agent = HighRisk()
+        invoke = self.runtime.invoke
+        def wrapped(role, *args, **kwargs):
+            if role == 'implementation':
+                self_test.assertTrue(ready.wait(5))
+                self.runtime.pause(self.project, True)
+                fail.set()
+                self_test.assertTrue(baseline_done.wait(5))
+                raise Cancelled('User paused project')
+            return invoke(role, *args, **kwargs)
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch('adaptive_rsi.pipeline.concurrent.futures.ThreadPoolExecutor', RecordingExecutor), \
+             patch.object(self.runtime, 'invoke', side_effect=wrapped), \
+             patch.object(self.runtime.evaluator, 'evaluate_acceptance_baseline', side_effect=baseline):
+            task, run = self.claim('pause and baseline failure')
+            self.runtime.process(run)
+        row = self.store.one('SELECT state,result FROM runs WHERE id=?', (run['id'],))
+        self.assertEqual(row['state'], 'interrupted', row['result'])
+        self.assertNotIn('failure', json.loads(row['result']))
+
+    def test_cancelled_baseline_future_stops_implementation_and_stays_interrupted(self):
+        class CancelledExecutor:
+            def __init__(self, *args, **kwargs): pass
+            def submit(self, *args, **kwargs):
+                future = concurrent.futures.Future()
+                assert future.cancel()
+                return future
+            def shutdown(self, *args, **kwargs): pass
+        class PollingHighRisk(FakeAgent):
+            def invoke(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):
+                if role == 'implementation':
+                    if not cancel(): raise AssertionError('cancelled baseline did not stop implementation')
+                    raise Cancelled('Baseline cancelled')
+                result = super().invoke(role, prompt, workspace, project, run, config, cancel, protected)
+                if role == 'planning': result['risk'] = 'high'
+                return result
+        self.runtime.agent = PollingHighRisk()
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch('adaptive_rsi.pipeline.concurrent.futures.ThreadPoolExecutor', CancelledExecutor), \
+             patch.object(self.runtime.evaluator, 'evaluate') as evaluate:
+            task, run = self.claim('cancelled acceptance future')
+            self.runtime.process(run)
+        row = self.store.one('SELECT state,result FROM runs WHERE id=?', (run['id'],))
+        self.assertEqual(row['state'], 'interrupted', row['result'])
+        self.assertNotIn('failure', json.loads(row['result']))
+        evaluate.assert_not_called()
+
+    def test_pause_at_baseline_failure_transition_does_not_record_failure(self):
+        baseline_started = threading.Event()
+        implementation_returned = threading.Event()
+        self_test = self
+        class HighRisk(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == 'planning': result['risk'] = 'high'
+                return result
+        def baseline(*args, **kwargs):
+            baseline_started.set()
+            self_test.assertTrue(implementation_returned.wait(5))
+            raise RuntimeError('synthetic baseline failure')
+        self.runtime.agent = HighRisk()
+        invoke, transition = self.runtime.invoke, self.store.transition
+        def wrapped_invoke(role, *args, **kwargs):
+            if role == 'implementation': self_test.assertTrue(baseline_started.wait(5))
+            result = invoke(role, *args, **kwargs)
+            if role == 'implementation': implementation_returned.set()
+            return result
+        def pause_at_transition(run_id, state, result=None, *args, **kwargs):
+            if state == 'insufficient_evidence' and (result or {}).get('failure', {}).get('stage') == 'acceptance_baseline':
+                self.runtime.pause(self.project, True)
+            return transition(run_id, state, result, *args, **kwargs)
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch.object(self.runtime, 'invoke', side_effect=wrapped_invoke), \
+             patch.object(self.runtime.evaluator, 'evaluate_acceptance_baseline', side_effect=baseline), \
+             patch.object(self.store, 'transition', side_effect=pause_at_transition):
+            task, run = self.claim('pause at failure transition')
+            self.runtime.process(run)
+        row = self.store.one('SELECT state,result FROM runs WHERE id=?', (run['id'],))
+        self.assertEqual(row['state'], 'interrupted', row['result'])
+        self.assertNotIn('failure', json.loads(row['result']))
+
+    def test_acceptance_baseline_cancellation_after_implementation_stays_interrupted(self):
+        """实现返回后验收 worker 的主动取消仍按用户暂停语义收尾。"""
+        self_test = self
+        cancellations = (Cancelled("User paused project"),
+                         concurrent.futures.CancelledError("Acceptance baseline cancelled"))
+        for cancellation in cancellations:
+            with self.subTest(cancellation=type(cancellation).__name__):
+                baseline_started = threading.Event()
+                implementation_returned = threading.Event()
+
+                def baseline(*args, **kwargs):
+                    baseline_started.set()
+                    self_test.assertTrue(implementation_returned.wait(5),
+                                         "baseline cancellation must follow implementation return")
+                    raise cancellation
+
+                class HighRisk(FakeAgent):
+                    def invoke(self, role, prompt, workspace, *args, **kwargs):
+                        if role == "implementation":
+                            self_test.assertTrue(baseline_started.wait(5),
+                                                 "baseline should start during implementation")
+                        result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                        if role == "planning":
+                            result["risk"] = "high"
+                        return result
+
+                self.runtime.agent = HighRisk()
+                real_invoke = self.runtime.invoke
+
+                def invoke(role, *args, **kwargs):
+                    result = real_invoke(role, *args, **kwargs)
+                    if role == "implementation":
+                        implementation_returned.set()
+                    return result
+
+                with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+                     patch.object(self.runtime, "invoke", side_effect=invoke), \
+                     patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline", side_effect=baseline), \
+                     patch.object(self.runtime.evaluator, "evaluate") as candidate_evaluate:
+                    task, run = self.claim("acceptance baseline cancellation " + type(cancellation).__name__)
+                    self.runtime.process(run)
+
+                row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+                self.assertEqual(row["state"], "interrupted", row["result"])
+                self.assertNotIn("failure", json.loads(row["result"]))
+                candidate_evaluate.assert_not_called()
+                self.assertNotIn("review", [role for role, _ in self.runtime.agent.roles])
+
     def test_acceptance_baseline_pass_lets_implementation_finish(self):
         """基线正常通过时取消谓词不得误触发：实现照旧完成并进入评估。"""
         class HighRisk(FakeAgent):
@@ -980,6 +1296,49 @@ class RuntimeTest(unittest.TestCase):
         row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
         self.assertEqual(row["state"], "awaiting_approval", row["result"])
         self.assertEqual([role for role, _ in self.runtime.agent.roles].count("implementation"), 1)
+
+    def test_acceptance_baseline_check_failure_still_evaluates_candidate(self):
+        """基线验收断言失败是有效证据，不能误当环境故障跳过候选评估。"""
+        baseline_started = threading.Event()
+
+        class HighRisk(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                if role == "implementation":
+                    self_test.assertTrue(baseline_started.wait(5), "baseline should finish during implementation")
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == "planning":
+                    result["risk"] = "high"
+                return result
+
+        self_test = self
+        self.runtime.agent = HighRisk()
+        baseline = {"decision": "fail", "reason": "Baseline acceptance check failed",
+                    "rows": [{"name": "new behavior", "passed": False}],
+                    "execution_environment": None}
+        candidate_evaluation = {"decision": "fail", "reason": "Candidate acceptance check failed",
+                                "checks": {"acceptance": [{"name": "new behavior", "passed": False}]}}
+
+        def evaluate_baseline(*args, **kwargs):
+            baseline_started.set()
+            return baseline
+
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch.object(self.runtime.evaluator, "execution_identity", return_value=None), \
+             patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline", side_effect=evaluate_baseline), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value=candidate_evaluation) as evaluate:
+            task, run = self.claim("acceptance baseline assertion failure")
+            self.runtime.process(run)
+
+        evaluate.assert_called_once()
+        self.assertEqual(evaluate.call_args.kwargs["acceptance_baseline"], baseline)
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("implementation"), 1)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        result = json.loads(row["result"])
+        self.assertEqual(row["state"], "failed", row["result"])
+        self.assertEqual(result["failure"]["code"], "checks")
+        self.assertNotEqual(result["failure"]["code"], "environment")
+        self.assertEqual(result["reason"], "Candidate acceptance check failed")
+        self.assertNotIn("review", [role for role, _ in self.runtime.agent.roles])
 
     def test_environment_setup_rewriting_tracked_file_stops_before_planning(self):
         """准备命令改写 tracked 文件时点名 setup，并在任何付费调用前收尾。"""

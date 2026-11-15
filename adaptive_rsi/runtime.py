@@ -2350,7 +2350,8 @@ class Runtime(Maintenance):
                     'failure': {'code': 'deadline', 'action': 'inspect_details', 'stage': stage}}, True)
             else:
                 self.store.transition(run["id"], "insufficient_evidence",
-                                      {"reason": str(exc), "failure": exc.failure()}, True)
+                                      {"reason": str(exc), "failure": exc.failure()}, True,
+                                      clear_failure_on_stop=True)
         except Cancelled as exc:
             if run.get('_timed_out_stage') and not self.stop.is_set():
                 stage = run['_timed_out_stage']

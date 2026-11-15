@@ -1358,7 +1358,7 @@ class Store:
         db.commit()
         return applied
 
-    def transition(self, run, state, result=None, terminal=False, task_fields=None):
+    def transition(self, run, state, result=None, terminal=False, task_fields=None, clear_failure_on_stop=False):
         """Persist a transition, resolving stop requests atomically; return whether a write occurred."""
         now = time.time()
         with self.connect() as db:
@@ -1372,11 +1372,14 @@ class Store:
             issue_revision_key = "issue-revision-pending:" + run
             issue_revision_pending = db.execute("SELECT 1 FROM settings WHERE key=?", (issue_revision_key,)).fetchone()
             # 已发出的远端操作保留事实；其余状态和自动重试必须服从同事务读取的停止请求。
+            stop_requested = False
             if state not in ["merged", "pr_open"]:
                 if task and task["state"] == "cancelled":
+                    stop_requested = True
                     state, terminal, task_fields = "cancelled", True, None
                     result = {**(result or {}), "reason": "Task cancellation requested"}
                 elif db.execute("SELECT 1 FROM settings WHERE key=?", ("run-stop:" + run,)).fetchone():
+                    stop_requested = True
                     state, terminal, task_fields = "interrupted", True, None
                     result = {**(result or {}), "reason": "Project pause requested; retry creates a fresh run"}
                 elif revision_pending or issue_revision_pending:
@@ -1400,6 +1403,10 @@ class Store:
                 previous = None
             if not isinstance(previous, dict):
                 previous = {}
+            if clear_failure_on_stop and stop_requested:
+                previous.pop("failure", None)
+                result = {**(result or {})}
+                result.pop("failure", None)
             phase = (result or {}).get("stage", state)
             active_phase = db.execute("SELECT phase FROM phase_times WHERE run=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (run,)).fetchone()
             if not active_phase or active_phase["phase"] != phase or terminal:
