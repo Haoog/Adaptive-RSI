@@ -1478,6 +1478,191 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual(replacement["state"], "starting")
         self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "failed")
 
+    def test_credential_read_io_failure_preserves_destination(self):
+        for backend in ("codex", "opencode"):
+            with self.subTest(backend=backend):
+                target = auth_sessions._codex_path() if backend == "codex" else auth_sessions.auth_path()
+                target.parent.mkdir(parents=True, exist_ok=True)
+                original = json.dumps({"OPENAI_API_KEY": "fixture-original", "other-provider": {"type": "api", "key": "fixture"}}).encode()
+                target.write_bytes(original)
+                manager = AuthSessions(self.root / ("read-" + backend), factory=self.factory, ttl=600)
+                self.addCleanup(manager.close)
+                session = manager.reserve(backend, "openai" if backend == "opencode" else None)
+                self.gate.set()
+                read_text = Path.read_text
+                failed = []
+                def read(path, *args, **kwargs):
+                    if path == target and not failed:
+                        failed.append(True)
+                        raise OSError(5, "synthetic storage failure")
+                    return read_text(path, *args, **kwargs)
+                with patch.object(Path, "read_text", read):
+                    manager._run(session["id"], 0, None)
+                result = manager.status(session["id"])
+                self.assertEqual(result["state"], "failed")
+                self.assertEqual(result["error"], "auth_storage_failed")
+                self.assertEqual(target.read_bytes(), original)
+                self.assertEqual(list(target.parent.glob(target.name + ".invalid-*")), [])
+
+    def test_worker_credential_read_io_failure_uses_storage_error(self):
+        for backend in ("codex", "opencode"):
+            with self.subTest(backend=backend):
+                manager = AuthSessions(self.root / ("worker-read-" + backend), factory=self.factory, ttl=600)
+                self.addCleanup(manager.close)
+                session = manager.reserve(backend, "openai" if backend == "opencode" else None)
+                self.gate.set()
+                read_text = Path.read_text
+                def read(path, *args, **kwargs):
+                    if self.created and path == self.created[-1].credentials:
+                        raise OSError(5, "synthetic worker read error")
+                    return read_text(path, *args, **kwargs)
+                with patch.object(Path, "read_text", read):
+                    manager._run(session["id"], 0, None)
+                result = manager.status(session["id"])
+                self.assertEqual(result["state"], "failed")
+                self.assertEqual(result["error"], "auth_storage_failed")
+
+    def test_destination_missing_between_stat_and_read_is_not_overwritten(self):
+        target = auth_sessions._codex_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        original = b'{"OPENAI_API_KEY":"fixture-preserved"}'
+        target.write_bytes(original)
+        manager = AuthSessions(self.root / "lost-after-stat", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        self.gate.set()
+        read_text = Path.read_text
+        def read(path, *args, **kwargs):
+            if path == target:
+                raise FileNotFoundError(2, "synthetic lost after stat")
+            return read_text(path, *args, **kwargs)
+        with patch.object(Path, "read_text", read):
+            manager._run(session["id"], 0, None)
+        result = manager.status(session["id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "auth_storage_failed")
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(list(target.parent.glob(target.name + ".invalid-*")), [])
+
+    def test_quarantine_io_failure_preserves_invalid_original(self):
+        target = auth_sessions._codex_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        original = b"{synthetic invalid json"
+        target.write_bytes(original)
+        manager = AuthSessions(self.root / "quarantine-read", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        self.gate.set()
+        replace = os.replace
+        def failing_replace(src, dst):
+            if Path(src) == target:
+                raise PermissionError(13, "synthetic quarantine error")
+            return replace(src, dst)
+        with patch("adaptive_rsi.auth_sessions.os.replace", side_effect=failing_replace):
+            manager._run(session["id"], 0, None)
+        result = manager.status(session["id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "auth_storage_failed")
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(list(target.parent.glob(target.name + ".invalid-*")), [])
+
+    def test_invalid_credential_disappearing_during_quarantine_does_not_overwrite(self):
+        target = auth_sessions._codex_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        original = b"{synthetic invalid json"
+        target.write_bytes(original)
+        manager = AuthSessions(self.root / "quarantine-missing", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        self.gate.set()
+        replace = os.replace
+        def failing_replace(src, dst):
+            if Path(src) == target:
+                raise FileNotFoundError(2, "synthetic disappearing source")
+            return replace(src, dst)
+        with patch("adaptive_rsi.auth_sessions.os.replace", side_effect=failing_replace):
+            manager._run(session["id"], 0, None)
+        result = manager.status(session["id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "auth_storage_failed")
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_credential_storage_failure_uses_dedicated_error_code(self):
+        manager = AuthSessions(self.root / "credential-storage", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        real = auth_sessions._write_json
+
+        def write(path, value):
+            if Path(path) == auth_sessions._codex_path():
+                raise OSError(28, "No space left on device")
+            return real(path, value)
+
+        self.gate.set()
+        with patch("adaptive_rsi.auth_sessions._write_json", side_effect=write):
+            manager._run(session["id"], 0, None)
+        result = manager.status(session["id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "auth_storage_failed")
+        # 会话行与快照只保留错误码；errno、路径和异常文本都不能离开进程。
+        for payload in (result, manager.snapshot()):
+            serialized = json.dumps(payload)
+            self.assertNotIn("errno", serialized)
+            self.assertNotIn("No space left", serialized)
+            self.assertNotIn(str(self.root), serialized)
+
+    def test_credential_install_subprocess_failure_stays_protocol_error(self):
+        def factory(backend):
+            worker = FakeAuth(backend, self.gate)
+            worker.capabilities = types.SimpleNamespace(modern=True)
+            worker.export_credential = lambda provider: [{"integrationID": provider}]
+
+            def install(provider, credentials):
+                raise RuntimeError("OpenCode credential import failed")
+
+            worker.install_credential = install
+            self.created.append(worker)
+            return worker
+
+        manager = AuthSessions(self.root / "install-failure", factory=factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("opencode", "openai")
+        self.gate.set()
+        manager._run(session["id"], 0, None)
+        result = manager.status(session["id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "auth_protocol_error")
+
+    def test_untrusted_exception_attributes_are_not_logged(self):
+        class UntrustedError(Exception):
+            code = "SECRET-CODE"
+            errno = "SECRET-ERRNO"
+        def factory(_backend):
+            raise UntrustedError("SECRET-MESSAGE")
+        manager = AuthSessions(self.root / "unsafe-exception", factory=factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        with self.assertLogs("adaptive_rsi.auth_sessions", level="WARNING") as captured:
+            manager._run(session["id"], 0, None)
+        self.assertNotIn("SECRET", " ".join(captured.output))
+        self.assertEqual(manager.status(session["id"])["error"], "auth_protocol_error")
+
+    def test_credential_install_oserror_stays_protocol_error(self):
+        def factory(backend):
+            worker = FakeAuth(backend, self.gate)
+            worker.capabilities = types.SimpleNamespace(modern=True)
+            worker.export_credential = lambda provider: [{"integrationID": provider}]
+            def install(provider, credentials):
+                raise OSError(2, "missing executable")
+            worker.install_credential = install
+            return worker
+        manager = AuthSessions(self.root / "install-oserror", factory=factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("opencode", "openai")
+        self.gate.set()
+        manager._run(session["id"], 0, None)
+        self.assertEqual(manager.status(session["id"])["error"], "auth_protocol_error")
+
     def test_failed_state_write_does_not_abort_close(self):
         manager = AuthSessions(self.root / "state", factory=self.factory, ttl=600)
         self.addCleanup(manager.close)
@@ -1550,6 +1735,50 @@ class AuthSessionTests(unittest.TestCase):
                 self.manager._thread(lambda: None)
         self.assertEqual(len(self.manager.threads), 0)
         self.manager.close()  # 必须幂等通过，不因泄漏线程抛错
+
+    def test_close_does_not_join_registered_but_unstarted_thread(self):
+        # 固定「已登记、尚未 start」的窗口：阻塞 Thread.start，让 close() 在线程
+        # 真正启动前尝试取 threads 快照。join 未启动线程会抛 RuntimeError，
+        # 进而中断 Runtime._close() 的后续阶段，因此 close() 不能看到该窗口。
+        real_start = threading.Thread.start
+        entered, release, ran = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+
+        def blocked_start(thread):
+            if thread in self.manager.threads:
+                entered.set()
+                self.assertTrue(release.wait(5), "start() 未被放行")
+            real_start(thread)
+
+        def start_worker():
+            try:
+                self.manager._thread(ran.set)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def close_manager():
+            try:
+                self.manager.close()
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(threading.Thread, "start", blocked_start):
+            starter = threading.Thread(target=start_worker, daemon=True)
+            starter.start()
+            self.assertTrue(entered.wait(2), "登记后的线程未进入 start()")
+            closer = threading.Thread(target=close_manager, daemon=True)
+            closer.start()
+            deadline = time.monotonic() + 2
+            while not self.manager.closed and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertTrue(self.manager.closed, "close() 未置位 closed")
+            release.set()
+            starter.join(3)
+            closer.join(3)
+        # start() 已放行的线程可以执行一次，但不能让关闭流程抛错。
+        self.assertEqual(errors, [])
+        self.assertTrue(ran.wait(2))
+        self.assertEqual(self.manager.threads, set())
 
     def test_launch_rejects_unknown_or_terminal_sessions(self):
         with self.assertRaisesRegex(AuthError, "unknown_session"):
@@ -1889,6 +2118,40 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual((rows["missing"]["connected"], rows["missing"]["connection_count"]), (False, 0))
         self.assertEqual((rows["empty"]["connected"], rows["empty"]["connection_count"]), (False, 0))
         self.assertEqual((rows["two"]["connected"], rows["two"]["connection_count"]), (True, 2))
+
+    def test_v2_connection_count_counts_host_export_only_provider(self):
+        worker = object.__new__(OpenCodeAuth)
+        worker.container = True
+        worker.capabilities = None
+        worker._v2_integrations = lambda: [
+            {"id": "host-only", "name": "Host only", "methods": [{"type": "key"}], "connections": []}]
+        with patch("adaptive_rsi.auth_sessions.load_auth_export",
+                   return_value=[{"integrationID": "host-only", "value": {"type": "key"}}]), patch(
+                "adaptive_rsi.auth_sessions.shutil.which", return_value=None):
+            rows = {row["id"]: row for row in worker._v2_providers()}
+        self.assertIs(rows["host-only"]["connected"], True)
+        self.assertEqual(rows["host-only"]["connection_count"], 1)
+
+    def test_v2_connection_count_does_not_double_count_worker_credentials(self):
+        worker = object.__new__(OpenCodeAuth)
+        worker.container = True
+        worker.capabilities = None
+        worker._v2_integrations = lambda: [
+            {"id": "shared", "name": "Shared", "methods": [{"type": "key"}],
+             "connections": [{"type": "credential", "id": "one"},
+                             {"type": "credential", "id": "two"}]},
+            {"id": "host-only", "name": "Host only", "methods": [{"type": "key"}]},
+            {"id": "missing", "name": "Missing", "methods": [{"type": "key"}]}]
+        host_export = [{"integrationID": "shared", "value": {"type": "key"}},
+                       {"integrationID": "host-only", "value": {"type": "key"}}]
+        with patch("adaptive_rsi.auth_sessions.load_auth_export", return_value=host_export), patch(
+                "adaptive_rsi.auth_sessions.shutil.which", return_value=None):
+            rows = {row["id"]: row for row in worker._v2_providers()}
+        self.assertEqual(rows["shared"]["connection_count"], 2)
+        self.assertEqual(rows["host-only"]["connection_count"], 1)
+        self.assertEqual(rows["missing"]["connection_count"], 0)
+        for row in rows.values():
+            self.assertEqual(row["connected"], row["connection_count"] > 0, row["id"])
 
 
 class OpenCodeServeTests(unittest.TestCase):
