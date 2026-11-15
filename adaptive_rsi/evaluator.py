@@ -14,7 +14,7 @@ from .adapters import detect, test_path
 from .build import BUILD_ID
 from .config import fingerprint
 from .gitops import copy_source, git
-from .process import Sandbox, run_process
+from .process import Cancelled, Sandbox, run_process
 from .store import encode
 from .workflow import (_go_test_options, environment_failure, node_test_options, npm_test_runner,
                        unittest_discovery_options, pytest_options)
@@ -420,6 +420,63 @@ def clarity_test_summary(text):
     return summary
 
 
+# pytest -q drops the ``=`` rule and ends with a bare ``2 skipped in 0.01s``.
+# Line length is bounded because the summary is short; a run ending in a huge
+# unterminated line must not make this scan backtrack across megabytes.
+_QUIET_SUMMARY_LINE = re.compile(r"(?m)^[ \t]*([^\n]{1,200}?) in [\d.]+s(?: \([^)]*\))?[ \t]*$")
+_QUIET_SUMMARY_FIELD = re.compile(
+    r"^(\d+) (passed|failed|skipped|xfailed|xpassed|error|errors|warning|warnings|deselected)$")
+_QUIET_SUMMARY_FIELDS = {"passed": "passed", "failed": "failed", "skipped": "skipped",
+                         "xfailed": "xfailed", "xpassed": "xpassed",
+                         "error": "error", "errors": "error",
+                         "warning": "warning", "warnings": "warning",
+                         "deselected": "deselected"}
+_QUIET_SUMMARY_OUTCOMES = {"passed", "failed", "skipped", "xfailed", "xpassed",
+                           "error", "deselected"}
+
+
+def _pytest_quiet_summary(text):
+    """Read pytest's quiet-mode summary line for the empty-run gate only.
+
+    ``pytest -q`` ends with ``2 skipped in 0.01s`` or
+    ``1 passed, 1 skipped in 0.01s`` instead of the decorated
+    ``===== 2 skipped in 0.01s =====`` form. Only a line made up entirely of
+    ``<count> <field>`` tokens is accepted, and one test-outcome field is
+    required, so a build log line such as ``3 warnings in 2.1s`` stays
+    unrecognized. ``clarity_test_summary`` deliberately keeps requiring the
+    decorated form so quiet output never becomes ``test_summary`` evidence.
+
+    Every recognized line contributes to the totals: a wrapper script that
+    runs several suites prints one summary per suite, and any suite that
+    executed a test body must keep the whole check non-empty. Only the
+    zero/nonzero split of the totals drives the gate, so summing repeated or
+    ordered summaries cannot turn a skip-only run into executed evidence.
+    ``xfailed``/``xpassed`` outcomes ran their bodies too, so they are
+    execution evidence; only ``skipped`` (and collection bookkeeping such as
+    errors/deselected/warnings) stays out of ``executed``.
+    """
+    totals = {"passed": 0, "failed": 0, "skipped": 0, "xfailed": 0, "xpassed": 0}
+    recognized = False
+    for match in _QUIET_SUMMARY_LINE.finditer(text):
+        fields = {}
+        for token in match.group(1).split(","):
+            field = _QUIET_SUMMARY_FIELD.match(token.strip())
+            if field is None:
+                fields = {}
+                break
+            fields[_QUIET_SUMMARY_FIELDS[field.group(2)]] = int(field.group(1))
+        if not fields or not (_QUIET_SUMMARY_OUTCOMES & set(fields)):
+            continue
+        recognized = True
+        for name in totals:
+            totals[name] += fields.get(name, 0)
+    if not recognized:
+        return None
+    return {"format": "pytest_quiet",
+            "executed": (totals["passed"] + totals["failed"]
+                         + totals["xfailed"] + totals["xpassed"]), **totals}
+
+
 # empty_test_run 处理的是命令原始输出，verbose 运行可达数十 MB；零计数/空跑/计数/
 # 通过四个正则各扫一遍约 1 s/MB。没有空跑线索时结论必然是「非空」，所以先用子串
 # 短路：这些 cue 是 empty 正则的可靠超集（"no test" 覆盖 no tests ran/found/to
@@ -479,13 +536,15 @@ def _skip_only_test_run(text, lowered):
     """Return True when tests were collected but none executed (all skipped).
 
     Exit code 0 alone cannot distinguish this: unittest prints
-    ``Ran 2 tests ... OK (skipped=2)``, node prints ``# pass 0 / # skipped 2``
-    and pytest prints ``===== 2 skipped in 0.01s =====``; all three exit 0
-    without running a single test body. TAP stays excluded on purpose: it
-    counts skipped test points as executed (``ok 1 - x # SKIP``). Mixed runs
-    with at least one executed test must stay non-empty.
+    ``Ran 2 tests ... OK (skipped=2)``, node prints ``# pass 0 / # skipped 2``,
+    pytest prints ``===== 2 skipped in 0.01s =====`` (or, with ``-q``, a bare
+    ``2 skipped in 0.01s``) and cargo prints ``test result: ok. 0 passed; ...
+    5 ignored``; all of them exit 0 without running a single test body. TAP
+    stays excluded on purpose: it counts skipped test points as executed
+    (``ok 1 - x # SKIP``). Mixed runs with at least one executed test must
+    stay non-empty.
     """
-    if "skipped" not in lowered:
+    if "skipped" not in lowered and "ignored" not in lowered:
         return False
     empty = executed = False
     # unittest: ``Ran N tests`` counts collected tests; ``OK (skipped=N)`` is
@@ -513,13 +572,28 @@ def _skip_only_test_run(text, lowered):
                 empty = True
             else:
                 executed = True
-    if "==" in text and " in " in lowered:
-        summary = clarity_test_summary(text)
-        if summary is not None:
-            if summary["executed"] == 0 and summary["skipped"] > 0:
-                empty = True
-            else:
+    summary = clarity_test_summary(text) if "==" in text and " in " in lowered else None
+    if summary is None:
+        # pytest -q omits the ``=`` rule; recognize the bare form only for the
+        # empty-run gate, never as ``test_summary`` evidence.
+        summary = _pytest_quiet_summary(text)
+    if summary is not None:
+        if summary["executed"] == 0 and summary["skipped"] > 0:
+            empty = True
+        else:
+            executed = True
+    # cargo test: ``test result: ok. 0 passed; 0 failed; 5 ignored; ...`` exits
+    # 0 and says ok without running any test body when every case is ignored.
+    # A binary with an executed case keeps the whole run non-empty.
+    if "test result:" in lowered and "ignored" in lowered:
+        for match in re.finditer(
+                r"(?m)^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored\b",
+                text):
+            passed, failed, ignored = (int(match.group(number)) for number in (1, 2, 3))
+            if passed or failed:
                 executed = True
+            elif ignored:
+                empty = True
     report = junit_test_summary(text)
     if report is not None:
         if (report["skipped"] > 0 and report["skipped"] >= report["tests"]
@@ -904,6 +978,7 @@ def _report_output_location(directory, trail):
 def _bounded_report_row(row, directory, trail):
     """Copy one result row, moving oversized streams to files next to the report."""
     import hashlib
+    import uuid
     location, name = _report_output_location(directory, trail)
     item = dict(row)
     for stream, suffix in (("stdout", "out"), ("stderr", "err")):
@@ -917,8 +992,21 @@ def _bounded_report_row(row, directory, trail):
         if len(raw) <= REPORT_STREAM_LIMIT:
             continue
         location.mkdir(parents=True, exist_ok=True)
-        path = location / (name + "." + suffix)
-        path.write_bytes(raw)
+        # Publish complete, content-addressed streams without ever replacing a
+        # file referenced by an earlier report; checkpoints can reuse them.
+        path = location / (name + "." + item[stream + "_sha256"] + "." + suffix)
+        temporary = location / ("." + uuid.uuid4().hex + ".tmp")
+        try:
+            with temporary.open("xb") as output:
+                output.write(raw)
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                if hashlib.sha256(path.read_bytes()).hexdigest() != item[stream + "_sha256"]:
+                    raise OSError("Existing report output does not match its digest")
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
         item[stream] = raw[-REPORT_STREAM_LIMIT:].decode("utf-8", "replace")
         item[stream + "_path"] = path.relative_to(directory).as_posix()
     return item
@@ -948,12 +1036,24 @@ def _bounded_report_node(node, directory, trail=(), memo=None):
 
 
 def write_evaluation_report(directory, data):
-    """Persist the evaluation report without inlining multi-megabyte logs."""
+    """Persist the evaluation report without inlining multi-megabyte logs.
+
+    The payload is written to a sibling temporary file and swapped in with
+    ``os.replace``: a crash, a full disk or a failed write can no longer leave a
+    truncated ``report.json`` standing in for evidence, and a failed write keeps
+    the previous complete report before re-raising ``OSError``.
+    """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     document = _bounded_report_node(data, directory)
-    (directory / "report.json").write_text(json.dumps(document, ensure_ascii=False, indent=2),
-                                           encoding="utf-8")
+    temporary = directory / ("report.json." + str(os.getpid()) + "." + str(time.time_ns()) + ".tmp")
+    try:
+        temporary.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, directory / "report.json")
+    except OSError:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise
 
 
 class Evaluator:
@@ -1320,19 +1420,32 @@ class Evaluator:
         return {"rows": rows}
 
     @staticmethod
-    def _run_stages(stages, limit, stop=None):
+    def _run_stages(stages, limit, stop=None, on_result=None):
+        """Run stages, handing each finished outcome to ``on_result`` at once.
+
+        The callback runs in the calling thread, so callers persist partial
+        evidence before a later stage fails or is cancelled.
+        """
         if not stages:
             return {}
         workers = min(3, max(1, limit), len(stages))
         if workers == 1 or len(stages) == 1:
-            return {label: task() for label, task in stages.items()}
+            results = {}
+            for label, task in stages.items():
+                results[label] = task()
+                if on_result:
+                    on_result(label, results[label])
+            return results
         results = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
                                                    thread_name_prefix="rsi-eval") as pool:
             futures = {pool.submit(task): label for label, task in stages.items()}
             try:
                 for future in concurrent.futures.as_completed(futures):
-                    results[futures[future]] = future.result()
+                    label = futures[future]
+                    results[label] = future.result()
+                    if on_result:
+                        on_result(label, results[label])
             except Exception:
                 if stop:
                     stop.set()
@@ -1377,16 +1490,48 @@ class Evaluator:
     def _evaluate(self, baseline, candidate, checks, directory, config, cancel=None, overlay=None, seeds=None,
                   acceptance=None, acceptance_baseline=None, cache_scope=None, cache_base=None,
                   environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None):
+        """Persist one report for every exit path, then hand the decision back.
+
+        Early refusals and stage-ledger failures used to return without writing
+        anything; one write point keeps every return inspectable.
+        """
+        report_state = {"checks": {}, "execution_environment": None}
+        try:
+            data = self._evaluate_stages(baseline, candidate, checks, directory, config, cancel, overlay, seeds,
+                                         acceptance, acceptance_baseline, cache_scope, cache_base,
+                                         environment_digest, test_first, test_first_kind, changed_files,
+                                         report_state=report_state)
+        except Exception as exc:
+            try:
+                write_evaluation_report(directory, {
+                    "decision": "insufficient_evidence",
+                    "reason": "Evaluation cancelled" if isinstance(exc, Cancelled)
+                    else "Evaluation interrupted: " + str(exc),
+                    "interrupted": True, **report_state})
+            except OSError:
+                pass
+            raise
+        # 取消/中断路径自己在写盘前标 true；其余出口（含早退）一律标 false。
+        data.setdefault("interrupted", False)
+        write_evaluation_report(directory, data)
+        return data
+
+    def _evaluate_stages(self, baseline, candidate, checks, directory, config, cancel=None, overlay=None, seeds=None,
+                         acceptance=None, acceptance_baseline=None, cache_scope=None, cache_base=None,
+                         environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None,
+                         report_state=None):
         stage_stop = threading.Event()
         original_cancel = cancel
         cancel = lambda: stage_stop.is_set() or bool(original_cancel and original_cancel())
         if not checks:
             return {"decision": "insufficient_evidence",
                     "reason": "No executable acceptance checks. Configure checks before delivery.", "checks": {}}
-        results = {}
+        results = report_state["checks"] if report_state is not None else {}
         hidden = [row["path"] for row in self.store.query("SELECT path FROM projects")]
         execution_config, execution_identity = (
             self._execution_environment(config) if cache_scope and cache_base else (config, None))
+        if report_state is not None:
+            report_state["execution_environment"] = execution_identity
         if changed_files is None:
             changed_files = _changed_files(candidate)
             if changed_files is None:
@@ -1504,11 +1649,9 @@ class Evaluator:
                 results["acceptance_baseline"] = cached_acceptance
         if (acceptance and acceptance_identity_matches and
                 acceptance_baseline.get("decision") == "insufficient_evidence"):
-            data = {"decision": "insufficient_evidence", "reason": acceptance_baseline["reason"],
+            return {"decision": "insufficient_evidence", "reason": acceptance_baseline["reason"],
                     "setup": acceptance_baseline.get("setup"), "checks": results,
                     "execution_environment": execution_identity}
-            write_evaluation_report(directory, data)
-            return data
         stages = {}
         if "baseline" not in results:
             stages["baseline"] = lambda: self._standard_stage(
@@ -1536,20 +1679,38 @@ class Evaluator:
                 seeds, hidden)
         # Benchmarks have exclusive process-wide access; ordinary checks share
         # the global execution capacity while retaining stage concurrency.
+        interim_failures = []
+
+        def checkpoint_stage(label, stage_outcome):
+            # 每个阶段一完成就刷新报告：后续阶段被取消或崩溃时，已完成的证据
+            # 仍在磁盘上；最终的完整报告会覆盖这份 interim 文档。
+            if "setup" in stage_outcome:
+                return
+            results[label] = stage_outcome["rows"]
+            if "test_first_rows" in stage_outcome:
+                results["test_first_" + label] = stage_outcome["test_first_rows"]
+            try:
+                write_evaluation_report(directory, {
+                    "decision": "insufficient_evidence", "reason": "Evaluation in progress",
+                    "interrupted": False, "checks": results,
+                    "execution_environment": execution_identity})
+            except OSError as exc:
+                # 中间快照尽力而为：磁盘满不能中止仍在产出证据的阶段。
+                interim_failures.append(type(exc).__name__ + ": " + str(exc))
+
         outcomes = self._run_stages(stages, 1 if acceptance and acceptance.get("change_kind") == "performance"
-                                    else int(config.get("limits", {}).get("concurrency", 1)), stop=stage_stop)
+                                    else int(config.get("limits", {}).get("concurrency", 1)),
+                                    stop=stage_stop, on_result=checkpoint_stage)
         for label in ["baseline", "acceptance_baseline", "candidate", "candidate_full", "acceptance_candidate"]:
             if label not in outcomes:
                 continue
             outcome = outcomes[label]
             if "setup" in outcome:
-                data = {"decision": "insufficient_evidence",
+                return {"decision": "insufficient_evidence",
                         "reason": "Independent acceptance environment preparation failed"
                         if label.startswith("acceptance") else "Isolated dependency preparation failed",
                         "setup": outcome["setup"], "checks": results,
                         "execution_environment": execution_identity}
-                write_evaluation_report(directory, data)
-                return data
             results[label] = outcome["rows"]
             if "test_first_rows" in outcome:
                 results["test_first_" + label] = outcome["test_first_rows"]
@@ -1581,6 +1742,10 @@ class Evaluator:
                 "harness_hash": fingerprint(checks), "candidate_full_reused": reuse_full, "checks": results,
                 "execution_environment": execution_identity,
                 "host_tools": host_tool_versions(checks, execution_identity)}
+        if interim_failures:
+            # Interim snapshots are best effort; keep the failed writes visible
+            # on the complete report instead of only in the process log.
+            data["report_write"] = {"state": "failed", "reason": "; ".join(interim_failures)}
         if cache_failures:
             # The baseline cache only accelerates later runs; record the failed
             # write so it stays observable without changing the decision.
@@ -1646,5 +1811,4 @@ class Evaluator:
             else:
                 data["controls"] = {"decision": "not_run", "reason": "Candidate checks did not pass",
                                     "controls": []}
-        write_evaluation_report(directory, data)
         return data

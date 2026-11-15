@@ -54,8 +54,62 @@ test('oversized patch errors are found by error code and localized in both conso
   assert.match(page.context.t(localized),/2 MiB preview limit/);
   assert.match(page.context.t(localized),/download it from the run directory/);
 });
+test('workflow inspection retry errors reach the UI in both languages', async()=>{
+  const message='Unable to inspect this workflow right now; retry after the GitHub request succeeds';
+  const page=browser();
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  vm.runInContext(i18n.slice(0,i18n.indexOf('const staticText =')),page.context);
+  page.context.fetch=async()=>response({error:message,error_code:'validation_error'},400);
+  for(const [locale,expected] of [
+    ['zh-CN','暂时无法读取此工作流。请等待 GitHub 请求恢复后重试。'],
+    ['en','This workflow could not be inspected temporarily. Wait for GitHub requests to recover, then try again.']
+  ]){
+    vm.runInContext(`language=${JSON.stringify(locale)}`,page.context);
+    await assert.rejects(page.context.api('release-authorize',{project:'a',kind:'release',workflow:'.github/workflows/deploy.yml'}),error=>{
+      assert.equal(error.code,'validation_error');
+      assert.equal(error.message,expected);
+      assert.notEqual(error.message,'Invalid request');
+      return true;
+    });
+  }
+});
+test('refreshing workflow choices bypasses cached disabled state and explains why it is unavailable', async()=>{
+  const page=browser(),calls=[];
+  page.node('config-scope').value='project';
+  let enabled=false;
+  page.context.fetch=async url=>{
+    calls.push(url);
+    return response({workflows:[
+      {workflow:'.github/workflows/deploy.yml',name:'Deploy',compatible:enabled,
+        reason_code:enabled?'':'workflow_disabled'},
+      {workflow:'.github/workflows/legacy.yml',name:'Legacy',compatible:false,reason_code:'workflow_incompatible'}
+    ]});
+  };
+  const refresh=page.node('release-workflows-refresh').handlers.click;
+  assert.equal(typeof refresh,'function');
+  await refresh();
+  let option=page.node('release-workflow-list').children.find(item=>item.value==='.github/workflows/deploy.yml');
+  assert.ok(option.disabled);
+  assert.match(option.textContent,/工作流已禁用/);
+  const incompatible=page.node('release-workflow-list').children.find(item=>item.value==='.github/workflows/legacy.yml');
+  assert.ok(incompatible.disabled);
+  assert.match(incompatible.textContent,/工作流不符合自动交付要求/);
+  enabled=true;
+  await refresh();
+  option=page.node('release-workflow-list').children.find(item=>item.value==='.github/workflows/deploy.yml');
+  assert.equal(option.disabled,false);
+  assert.ok(calls.every(url=>url.includes('refresh=true')));
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  const translations=vm.runInNewContext(i18n.slice(0,i18n.indexOf('const staticText ='))+
+    ';["工作流已禁用，请在 GitHub 仓库中启用后刷新。","暂时无法检查此工作流，请刷新重试。","工作流不符合自动交付要求，请检查所需输入。"].map(key=>english[key])');
+  assert.deepEqual(JSON.parse(JSON.stringify(translations)),[
+    'This workflow is disabled. Enable it in the GitHub repository, then refresh.',
+    'This workflow could not be inspected temporarily. Refresh and try again.',
+    'This workflow is incompatible with automatic delivery. Check its required inputs.'
+  ]);
+});
 function descendants(node) {
-  return (node.children || []).flatMap(child => [child, ...descendants(child)]);
+  return (node.children || []).flatMap(child => child.isConnected === false ? [] : [child, ...descendants(child)]);
 }
 
 function editorForm(controls, className) {
@@ -987,6 +1041,43 @@ test('task run history loads and appends earlier pages with a visible count', as
   assert.equal(more.hidden, true, 'the entry disappears when no further page remains');
 });
 
+test('a failed first task-runs request keeps a retry entry and renders one outcome after retry', async () => {
+  const page = browser(), requests = [];
+  let fail = true;
+  page.context.fetch = async url => {
+    if (url.includes('task-runs?')) {
+      requests.push(url);
+      if (fail) { fail = false; return response({error: 'temporary outage'}, 500); }
+      return response({runs: [{id: 'r1', task: 'a', project: 'a'}], has_more: false, next_before: null});
+    }
+    if (url.includes('run?id=')) return response({state: 'failed', ended: 1, config: {models: {}},
+      result: {reason: 'fixture', summary: '重试后的结果'}});
+    return response({});
+  };
+  const task = {id: 'a', project: 'a', title: 'Task a', body: '', evidence: '[]', state: 'failed'};
+  await page.context.showTask(task);
+  const body = page.node('detail-body');
+  const has = text => descendants(body).some(node => node.tagName === 'P' && node.textContent === text);
+  assert.ok(has('运行记录加载失败。'), 'the dialog shows the failure instead of staying blank');
+  const retry = descendants(body).find(node => node.tagName === 'BUTTON' && node.textContent === '重试');
+  assert.ok(retry, 'the failure exposes a retry entry');
+  assert.equal(descendants(body).filter(node => node.id === 'live-task-outcome').length, 0,
+    'a failed first page must not fabricate an outcome');
+  await retry.handlers.click();
+  assert.equal(requests.length, 2, 'the retry issues exactly one more history request');
+  const outcomes = descendants(body).filter(node => node.id === 'live-task-outcome');
+  assert.equal(outcomes.length, 1, 'the retry inserts a single outcome');
+  assert.ok(outcomes[0].children.some(node => node.tagName === 'P' && node.textContent === '重试后的结果'));
+  assert.deepEqual(body.children.filter(node => node.className === 'detail-section' && node.dataset.run)
+    .map(node => node.dataset.run), ['r1'], 'the retry renders the run history');
+  assert.equal(has('运行记录加载失败。'), false, 'the error entry disappears after a successful retry');
+  page.context.closeTaskDetail();
+  await page.context.showTask(task);
+  assert.equal(requests.length, 3);
+  assert.equal(descendants(body).filter(node => node.id === 'live-task-outcome').length, 1,
+    'reopening the detail still renders a single outcome');
+});
+
 test('closing task details while a response waits keeps the dialog closed', async () => {
   const page = browser();
   page.context.initialState.runs = [{id: 'ra', task: 'a', project: 'a'}];
@@ -1468,6 +1559,225 @@ test('temporary auth polling failures preserve authorization; explicit expiry st
   const terminalText=terminal.visibleText(terminal.page.node('mc-auth'));
   assert.match(terminalText,/登录已中断/);
   assert.equal(terminal.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
+});
+
+test('provider metadata refreshes after saving a key and after signing out', async () => {
+  const page=browser();let providerCalls=0,connected=false;
+  page.context.safe=page.context.originalSafe;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/providers?backend=opencode')){
+      providerCalls++;
+      return response({providers:[{id:'open-go',name:'OpenCode Go',connected,connection_count:connected?2:0,methods:[{index:0,type:'api',supported:true,label:'API Key'}]}]});
+    }
+    if(url.endsWith('/api/auth/key')){connected=true;return response({});}
+    if(url.endsWith('/api/auth/logout')){connected=false;return response({});}
+    return response({});
+  };
+  vm.runInContext(authSource,page.context);
+  page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  await waitFor(()=>providerCalls===1);
+  const currentSelect=()=>descendants(page.node('mc-auth')).find(node=>node.tagName==='SELECT');
+  const options=()=>currentSelect().children.map(option=>option.textContent||'');
+  await waitFor(()=>options().length>1);
+  assert.doesNotMatch(options().join(' '),/已连接/);
+  currentSelect().value='open-go';currentSelect().handlers.change();
+  const key=descendants(page.node('mc-auth')).find(node=>node.dataset?.authField==='key:open-go');
+  key.value='secret-key';
+  descendants(page.node('mc-auth')).find(node=>node.tagName==='FORM').handlers.submit({preventDefault(){}});
+  await waitFor(()=>/已连接/.test(options().join(' ')));
+  assert.equal(providerCalls,2,'saving a key must refresh the provider list without a page reload');
+  descendants(page.node('mc-auth')).find(node=>node.textContent==='退出账号').handlers.click();
+  await waitFor(()=>!/已连接/.test(options().join(' ')));
+  assert.equal(providerCalls,3,'signing out must drop the stale connection count');
+});
+
+
+test('late logout provider response cannot overwrite later successful login',async()=>{
+  const page=browser();let providerCalls=0,connected=true,releaseLogout;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/providers?backend=opencode')){
+      providerCalls++;const captured=connected;
+      if(providerCalls===2)await new Promise(resolve=>{releaseLogout=resolve;});
+      return response({providers:[{id:'open-go',name:'OpenCode Go',connected:captured,methods:[{index:0,type:'api',supported:true,label:'API Key'}]}]});
+    }
+    if(url.endsWith('/api/auth/key')){connected=true;return response({});}
+    if(url.endsWith('/api/auth/logout')){connected=false;return response({});}
+    return response({});
+  };
+  vm.runInContext(authSource,page.context);
+  page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  const nodes=()=>descendants(page.node('mc-auth'));
+  const options=()=>nodes().find(n=>n.tagName==='SELECT')?.children.map(n=>n.textContent||'').join(' ')||'';
+  await waitFor(()=>providerCalls===1&&nodes().some(n=>n.textContent==='退出账号'));
+  nodes().find(n=>n.textContent==='退出账号').handlers.click();const loggingOut=page.context.lastAction;
+  await waitFor(()=>providerCalls===2&&typeof releaseLogout==='function');
+  const input=nodes().find(n=>n.dataset?.authField==='key:open-go');assert.ok(input);input.value='dummy';
+  nodes().find(n=>n.tagName==='FORM').handlers.submit({preventDefault(){}});await page.context.lastAction;
+  assert.equal(providerCalls,3);assert.match(options(),/已连接/);
+  releaseLogout();await loggingOut;await new Promise(setImmediate);await new Promise(setImmediate);
+  assert.match(options(),/已连接/,'older logout response must not overwrite newer login metadata');
+});
+
+
+for(const invalid of [{providers:{}},{},null,{providers:[null]},{providers:[{id:'open-go',name:'OpenCode Go',methods:{}}]},{providers:[{id:'open-go',name:'OpenCode Go',methods:[{}]}]},{providers:[{id:'open-go',name:'OpenCode Go',methods:[{index:0,type:'oauth',label:'test',prompts:[{}]}]}]}])test(`invalid provider refresh preserves cached list: ${JSON.stringify(invalid)}`,async()=>{
+  const page=browser();let calls=0,connected=false;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;return response(calls===1?{providers:[{id:'open-go',name:'OpenCode Go',methods:[{index:0,type:'api',supported:true,label:'API Key'}]}]}:invalid);}
+    if(url.endsWith('/api/auth/key')){connected=true;return response({});}return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&nodes().some(n=>n.tagName==='SELECT'&&n.children.length>1));
+  const select=nodes().find(n=>n.tagName==='SELECT');select.value='open-go';select.handlers.change();
+  const input=nodes().find(n=>n.dataset?.authField==='key:open-go');input.value='dummy';
+  nodes().find(n=>n.tagName==='FORM').handlers.submit({preventDefault(){}});await page.context.lastAction;
+  await waitFor(()=>calls===2);await new Promise(setImmediate);
+  assert.doesNotThrow(()=>page.context.window.RSIAuth.translate());
+  assert.ok(nodes().some(n=>n.tagName==='SELECT'&&n.children.some(o=>o.value==='open-go')),'cached provider remains usable');
+  assert.ok(nodes().some(n=>n.dataset?.authField==='key:open-go'),'cached authentication method remains usable');
+});
+
+test('stalled provider refresh cannot delay catalog after key save',async()=>{
+  const page=browser();let calls=0,connected=false,release,catalog=0;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;if(calls===2)await new Promise(resolve=>{release=resolve;});return response({providers:[{id:'open-go',name:'OpenCode Go',connected,methods:[{index:0,type:'api',supported:true,label:'API Key'}]}]});}
+    if(url.endsWith('/api/auth/key')){connected=true;return response({});}return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>{catalog++;return Promise.resolve();});
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&nodes().some(n=>n.tagName==='SELECT'&&n.children.length>1));
+  const select=nodes().find(n=>n.tagName==='SELECT');select.value='open-go';select.handlers.change();const input=nodes().find(n=>n.dataset?.authField==='key:open-go');input.value='dummy';
+  nodes().find(n=>n.tagName==='FORM').handlers.submit({preventDefault(){}});const saving=page.context.lastAction;await waitFor(()=>calls===2&&typeof release==='function');
+  await new Promise(setImmediate);try{assert.equal(catalog,1,'catalog refresh starts without waiting for provider metadata');}finally{release();await saving;}
+});
+
+
+test('OAuth completion refreshes while the initial provider request is still pending',async()=>{
+  const page=browser(),session={id:'opencode-A',backend:'opencode',provider:'open-go',state:'awaiting_authorization',method:'auto'};
+  let providerCalls=0,sessionCalls=0,connected=false,releaseInitial,catalog=0;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:connected?[]:[session],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/session?id=')){sessionCalls++;if(sessionCalls===1)return response(session);connected=true;return response({...session,state:'completed'});}
+    if(url.includes('/api/auth/providers?backend=opencode')){providerCalls++;const captured=connected;if(providerCalls===1)await new Promise(resolve=>{releaseInitial=resolve;});return response({providers:[{id:'open-go',name:'OpenCode Go',connected:captured,methods:[]}]});}
+    return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>{catalog++;return Promise.resolve();});
+  await waitFor(()=>providerCalls===1&&typeof releaseInitial==='function'&&page.timers.some(t=>t.active&&t.delay===1500));
+  page.fireTimer(1500);for(let i=0;i<5;i++)await new Promise(setImmediate);
+  try{assert.equal(providerCalls,2,'successful completion must request current metadata even before first fetch resolves');assert.equal(catalog,1);}
+  finally{releaseInitial();for(let i=0;i<5;i++)await new Promise(setImmediate);}
+  const options=descendants(page.node('mc-auth')).find(n=>n.tagName==='SELECT').children.map(n=>n.textContent).join(' ');
+  assert.match(options,/已连接/,'late initial response cannot replace post-login metadata');
+});
+
+
+test('provider refresh clears a selected provider that disappears',async()=>{
+  const page=browser();let calls=0,connected=false;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;return response({providers:calls===1?[{id:'open-go',name:'OpenCode Go',methods:[{index:0,type:'api',supported:true,label:'API Key'}]}]:[{id:'other',name:'Other',methods:[]}]});}
+    if(url.endsWith('/api/auth/key')){connected=true;return response({});}return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&nodes().some(n=>n.tagName==='SELECT'&&n.children.length>1));
+  const select=nodes().find(n=>n.tagName==='SELECT');select.value='open-go';select.handlers.change();nodes().find(n=>n.dataset?.authField==='key:open-go').value='dummy';
+  nodes().find(n=>n.tagName==='FORM').handlers.submit({preventDefault(){}});await waitFor(()=>calls===2);await new Promise(setImmediate);
+  assert.equal(nodes().find(n=>n.tagName==='SELECT').value,'');
+  assert.ok(!nodes().some(n=>n.textContent==='退出账号'),'must not expose logout for a hidden provider');
+});
+
+test('provider refresh console expiry is reported without blocking catalog',async()=>{
+  const page=browser();let calls=0,connected=false,catalog=0;page.context.safe=page.context.originalSafe;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;return calls===1?response({providers:[{id:'open-go',name:'OpenCode Go',methods:[{index:0,type:'api',supported:true,label:'API Key'}]}]}):response({},401);}
+    if(url.endsWith('/api/auth/key')){connected=true;return response({});}return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>{catalog++;return Promise.resolve();});
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&nodes().some(n=>n.tagName==='SELECT'&&n.children.length>1));
+  const select=nodes().find(n=>n.tagName==='SELECT');select.value='open-go';select.handlers.change();nodes().find(n=>n.dataset?.authField==='key:open-go').value='dummy';
+  nodes().find(n=>n.tagName==='FORM').handlers.submit({preventDefault(){}});await waitFor(()=>calls===2&&/登录已失效/.test(page.node('toast').textContent));
+  assert.equal(catalog,1);assert.equal(page.node('toast').hidden,false);
+});
+
+
+test('stale provider expiry response cannot warn after a newer successful request',async()=>{
+  const page=browser();let calls=0,connected=true,release;page.context.safe=page.context.originalSafe;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;if(calls===2){await new Promise(resolve=>{release=resolve;});return response({},401);}return response({providers:[{id:'open-go',name:'OpenCode Go',connected,methods:[{index:0,type:'api',supported:true,label:'API Key'}]}]});}
+    if(url.endsWith('/api/auth/logout')){connected=false;return response({});}if(url.endsWith('/api/auth/key')){connected=true;return response({});}return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&nodes().some(n=>n.textContent==='退出账号'));
+  nodes().find(n=>n.textContent==='退出账号').handlers.click();await waitFor(()=>calls===2&&typeof release==='function');
+  const input=nodes().find(n=>n.dataset?.authField==='key:open-go');assert.ok(input);input.value='dummy';nodes().find(n=>n.tagName==='FORM').handlers.submit({preventDefault(){}});
+  await waitFor(()=>calls===3&&nodes().some(n=>n.textContent==='退出账号'));await new Promise(setImmediate);
+  release();await new Promise(setImmediate);await new Promise(setImmediate);
+  assert.doesNotMatch(page.node('toast').textContent,/登录已失效/,'obsolete expiry must not warn after successful newer refresh');
+});
+
+test('manual provider retry is possible while an obsolete initial request is pending',async()=>{
+  const page=browser(),session={id:'opencode-A',backend:'opencode',provider:'open-go',state:'awaiting_authorization',method:'auto'};
+  let calls=0,sessionCalls=0,connected=false,release;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:connected?[]:[session],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/session?id=')){sessionCalls++;if(sessionCalls===1)return response(session);connected=true;return response({...session,state:'completed'});}
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;if(calls===1)await new Promise(resolve=>{release=resolve;});if(calls===2)return response({},503);return response({providers:[{id:'open-go',name:'OpenCode Go',connected,methods:[]}]});}
+    return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&typeof release==='function'&&page.timers.some(t=>t.active&&t.delay===1500));
+  page.fireTimer(1500);await waitFor(()=>calls===2);await new Promise(setImmediate);await new Promise(setImmediate);
+  const retry=nodes().find(n=>n.textContent==='读取可连接的供应商');assert.ok(retry);retry.handlers.click();
+  for(let i=0;i<5;i++)await new Promise(setImmediate);
+  try{assert.equal(calls,3,'user can retry without waiting for a superseded provider request');}
+  finally{release();for(let i=0;i<3;i++)await new Promise(setImmediate);}
+  assert.ok(nodes().some(n=>n.tagName==='SELECT'&&n.children.some(o=>o.value==='open-go')));
+});
+
+
+test('provider disappearance keeps an active OAuth session visible and cancellable',async()=>{
+  const page=browser(),session={id:'opencode-A',backend:'opencode',provider:'open-go',state:'awaiting_authorization',method:'auto'};
+  let calls=0,codexConnected=true;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[session],codex:{available:true,state:codexConnected?'authenticated':'signed_out'},opencode:{available:true,authenticated_providers:[]}});
+    if(url.includes('/api/auth/session?id='))return response(session);
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;return response({providers:calls===1?[{id:'open-go',name:'OpenCode Go',methods:[]}]:[{id:'other',name:'Other',methods:[]}]});}
+    if(url.endsWith('/api/auth/logout')){codexConnected=false;return response({});}
+    if(url.endsWith('/api/auth/cancel'))return response({...session,state:'cancelled'});return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&nodes().some(n=>n.textContent==='取消登录'));
+  page.context.window.RSIAuth.show('openai',()=>Promise.resolve());await waitFor(()=>nodes().some(n=>n.textContent==='退出账号'));
+  nodes().find(n=>n.textContent==='退出账号').handlers.click();await waitFor(()=>calls===2);await new Promise(setImmediate);
+  page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());await new Promise(setImmediate);
+  assert.ok(nodes().some(n=>n.tagName==='SELECT'&&n.value==='open-go'),'active session provider remains visibly selected');
+  const cancel=nodes().find(n=>n.textContent==='取消登录');assert.ok(cancel,'active session can still be canceled');cancel.handlers.click();await page.context.lastAction;
+  assert.ok(!nodes().some(n=>n.textContent==='取消登录'));
+});
+
+
+test('all missing provider sessions remain selectable and cancellable',async()=>{
+  const page=browser(),a={id:'session-A',backend:'opencode',provider:'alpha',state:'awaiting_authorization',method:'auto'},b={id:'session-B',backend:'opencode',provider:'beta',state:'awaiting_authorization',method:'auto'};
+  let calls=0,codexConnected=true,cancelled='';
+  page.context.fetch=async(url,options={})=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[codexConnected?a:b],codex:{available:true,state:codexConnected?'authenticated':'signed_out'},opencode:{available:true,authenticated_providers:[]}});
+    if(url.includes('/api/auth/session?id='))return response(url.includes('session-A')?a:b);
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;return response({providers:calls===1?[{id:'alpha',name:'Alpha',methods:[]},{id:'beta',name:'Beta',methods:[]}]:[]});}
+    if(url.endsWith('/api/auth/logout')){codexConnected=false;return response({});}
+    if(url.endsWith('/api/auth/cancel')){cancelled=JSON.parse(options.body).id;return response({...b,state:'cancelled'});}return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&nodes().some(n=>n.textContent==='取消登录'));
+  page.context.window.RSIAuth.show('openai',()=>Promise.resolve());await waitFor(()=>nodes().some(n=>n.textContent==='退出账号'));
+  nodes().find(n=>n.textContent==='退出账号').handlers.click();await waitFor(()=>calls===2);await new Promise(setImmediate);
+  page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());await new Promise(setImmediate);
+  const select=nodes().find(n=>n.tagName==='SELECT'),option=select.children.find(n=>n.value==='beta');
+  assert.ok(option&&!option.disabled,'other missing active session has a selectable option');select.value='beta';select.handlers.change();
+  const cancel=nodes().find(n=>n.textContent==='取消登录');assert.ok(cancel);cancel.handlers.click();await page.context.lastAction;assert.equal(cancelled,'session-B');
 });
 
 test('non JSON errors give recovery instructions rather than a parser exception', async () => {
@@ -2115,6 +2425,173 @@ test('an oversized Issue composition explains the 30000-character limit in the f
 function queueForm(page) {
   return editorForm(page.node('detail-body'), 'task-queue-editor');
 }
+test('history retry preserves queue edits and intervention reason in the live controls', async () => {
+  const page = experiencePage(), task = fixtureTask('child', 'queued'), posts = [];
+  let historyRequests = 0;
+  const metadata = {...task, dependency:null, urgency:0, available:0, revisions:[]};
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') {posts.push({url, body:JSON.parse(options.body)}); return response({saved:true});}
+    if (url.includes('/task-runs?')) return ++historyRequests === 1 ? response({error:'temporary outage'},500) : response([]);
+    if (url.includes('/state?')) return response({tasks:[fixtureTask('parent'), fixtureTask('newer')]});
+    if (url.includes('id=parent&')) return response(fixtureTask('parent'));
+    if (url.includes('id=newer&')) return response(fixtureTask('newer'));
+    return response(metadata);
+  };
+  await page.context.showTask(task, undefined, {dependencies:['parent'], urgency:true});
+  await waitFor(() => !!queueForm(page) && !!supplementForm(page.node('detail-body')));
+  const queue = queueForm(page), supplement = supplementForm(page.node('detail-body'));
+  queue.children[0].children[0].value = 'newer';
+  queue.children[1].children[0].checked = false;
+  supplement.children[0].children[0].value = 'Keep the added requirement';
+  supplement.children[1].children[0].value = 'Keep the intervention reason';
+  const retry = descendants(page.node('detail-body')).find(node => node.tagName === 'BUTTON' && node.textContent === '重试');
+  assert.ok(retry); await retry.handlers.click();
+  await waitFor(() => !!queueForm(page) && !!supplementForm(page.node('detail-body')));
+  const currentQueue = queueForm(page), currentSupplement = supplementForm(page.node('detail-body'));
+  assert.equal(currentQueue.children[0].children[0].value, 'newer');
+  assert.equal(currentQueue.children[1].children[0].checked, false);
+  assert.equal(currentSupplement.children[1].children[0].value, 'Keep the intervention reason');
+  assert.equal(historyRequests, 2);
+  currentQueue.onsubmit({preventDefault(){}}); await page.context.lastAction;
+  assert.deepEqual(posts.find(post => post.url.endsWith('/task/schedule')).body,
+                   {task:'child', dependency:'newer', urgency:0});
+});
+
+test('history retry retains an unsaved reason through eventual submission', async () => {
+  const page = experiencePage(), task = fixtureTask('child', 'failed'), posts = [];
+  let requests = 0;
+  const metadata = {...task, available:0, revisions:[]};
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') {posts.push({url, body:JSON.parse(options.body)}); return response({saved:true});}
+    if (url.includes('/task-runs?')) return ++requests === 1 ? response({error:'outage'},500) : response([]);
+    return response(metadata);
+  };
+  await page.context.showTask(task); await waitFor(() => !!supplementForm(page.node('detail-body')));
+  const form = supplementForm(page.node('detail-body'));
+  form.children[0].children[0].value = 'An added requirement';
+  form.children[0].children[0].handlers.input();
+  form.children[1].children[0].value = 'The unsaved reason';
+  const retry = descendants(page.node('detail-body')).find(node => node.tagName === 'BUTTON' && node.textContent === '重试');
+  assert.ok(retry); await retry.handlers.click();
+  await waitFor(() => !!supplementForm(page.node('detail-body')));
+  const after = supplementForm(page.node('detail-body'));
+  assert.equal(after.children[0].children[0].value, 'An added requirement');
+  assert.equal(after.children[1].children[0].value, 'The unsaved reason');
+  after.onsubmit({preventDefault(){}}); await page.context.lastAction;
+  assert.deepEqual(posts.find(post => post.url.endsWith('/task/revise')).body,
+                   {task:'child', supplement:'An added requirement', reason:'The unsaved reason'});
+});
+
+test('a history retry keeps asynchronously loading task controls and later edits', async () => {
+  const page = experiencePage(), task = fixtureTask('child', 'failed');
+  let historyRequests = 0, metadataRequests = 0, finishMetadata, finishRetry;
+  page.context.fetch = async url => {
+    if (url.includes('/task-runs?')) {
+      if (++historyRequests === 1) return response({error:'outage'},500);
+      return new Promise(resolve => {finishRetry = () => resolve(response([]));});
+    }
+    if (url.includes('/task?')) {
+      metadataRequests++;
+      if (metadataRequests === 1) return new Promise(resolve => {finishMetadata = () => resolve(response({...task,available:0,revisions:[]}));});
+      return response({...task,available:0,revisions:[]});
+    }
+    return response({tasks:[]});
+  };
+  await page.context.showTask(task);
+  await waitFor(() => !!finishMetadata);
+  const retry = descendants(page.node('detail-body')).find(node => node.tagName === 'BUTTON' && node.textContent === '重试');
+  assert.ok(retry); const pending = retry.handlers.click(); await waitFor(() => !!finishRetry);
+  finishMetadata(); await waitFor(() => !!supplementForm(page.node('detail-body')));
+  const before = supplementForm(page.node('detail-body'));
+  before.children[1].children[0].value = 'Typed during history retry';
+  finishRetry(); await pending;
+  assert.equal(metadataRequests, 1, 'retry must not restart the task controls request');
+  assert.equal(supplementForm(page.node('detail-body')), before);
+  assert.equal(before.children[1].children[0].value, 'Typed during history retry');
+});
+
+test('history retry stops offering a stale retry after authentication expires', async () => {
+  const page = browser(), task = {id:'a',project:'a',title:'Task a',body:'',evidence:'[]',state:'failed'};
+  let requests = 0;
+  page.context.fetch = async url => {
+    if (url.includes('task-runs?')) return ++requests === 1 ? response({error:'outage'},500) : response({error:'expired'},401);
+    return response({});
+  };
+  await page.context.showTask(task);
+  const body = page.node('detail-body');
+  const retry = descendants(body).find(node => node.tagName === 'BUTTON' && node.textContent === '重试');
+  assert.ok(retry);
+  await assert.rejects(retry.handlers.click(), error => error.code === 'session_required');
+  assert.equal(descendants(body).filter(node => node.tagName === 'BUTTON' && node.textContent === '重试').length, 0);
+  await retry.handlers.click();
+  assert.equal(requests, 2, 'the detached retry callback cannot bypass expired authentication');
+});
+
+test('history retry keeps one failure control across repeated outages', async () => {
+  const page = browser(), task = {id:'a',project:'a',title:'Task a',body:'',evidence:'[]',state:'failed'};
+  let requests = 0;
+  page.context.fetch = async url => url.includes('task-runs?') && ++requests <= 2 ? response({error:'outage'},500) : response([]);
+  await page.context.showTask(task);
+  const body = page.node('detail-body');
+  const retry = descendants(body).find(node => node.tagName === 'BUTTON' && node.textContent === '重试');
+  assert.ok(retry); await retry.handlers.click();
+  assert.equal(descendants(body).filter(node => node.tagName === 'BUTTON' && node.textContent === '重试').length, 1);
+  await retry.handlers.click();
+  assert.equal(descendants(body).filter(node => node.tagName === 'BUTTON' && node.textContent === '重试').length, 0);
+  await retry.handlers.click();
+  assert.equal(requests, 3, 'detached successful retry must not fetch again');
+});
+
+test('slow history retry ignores extra clicks and cannot reopen a closed task', async () => {
+  const page = browser(), task = {id:'a', project:'a', title:'Task a', body:'', evidence:'[]', state:'failed'};
+  let requests = 0, finish;
+  page.context.fetch = async url => {
+    if (url.includes('task-runs?')) {
+      requests++;
+      if (requests === 1) return response({error:'temporary outage'},500);
+      return new Promise(resolve => {finish = () => resolve(response({runs:[{id:'old',task:'a',project:'a'}],has_more:false}));});
+    }
+    return response({state:'failed',config:{models:{}},result:{reason:'stale'}});
+  };
+  await page.context.showTask(task);
+  const body = page.node('detail-body');
+  const retry = descendants(body).find(node => node.tagName === 'BUTTON' && node.textContent === '重试');
+  assert.ok(retry); const pending = retry.handlers.click(); const duplicate = retry.handlers.click();
+  assert.equal(requests, 2, 'a pending retry cannot issue an extra request');
+  page.context.closeTaskDetail();
+  finish(); await Promise.all([pending, duplicate]);
+  assert.equal(page.node('detail-dialog').open, false);
+  assert.equal(descendants(body).filter(node => node.id === 'live-task-outcome').length, 0);
+});
+
+for (const changed of ['task', 'project']) {
+  for (const status of [200, 500, 401]) {
+    test(`stale history retry ${status} cannot mutate a newer ${changed} view`, async () => {
+      const page = browser(), task = {id:'a',project:'a',title:'Task a',body:'',evidence:'[]',state:'failed'};
+      let calls=0, finish;
+      page.context.fetch = async url => {
+        if (url.includes('task-runs?task=a')) {
+          if (++calls === 1) return response({error:'outage'},500);
+          return new Promise(resolve => {finish=()=>resolve(response(status===200?[]:{error:'stale failure'},status));});
+        }
+        if (url.includes('task-runs?task=b')) return response([]);
+        return response({});
+      };
+      await page.context.showTask(task);
+      const body=page.node('detail-body');
+      const retry=descendants(body).find(node => node.tagName==='BUTTON' && node.textContent==='重试');
+      const pending=retry.handlers.click();
+      if(changed==='task') await page.context.showTask({...task,id:'b',title:'Task b'});
+      else vm.runInContext('projectId="b"',page.context);
+      const title=page.node('detail-title').textContent, children=[...body.children];
+      finish(); await pending;
+      assert.equal(page.node('detail-title').textContent,title);
+      assert.deepEqual(body.children,children);
+      assert.equal(page.node('toast').textContent,'');
+    });
+  }
+}
+
 function changeDetailLanguage(page, language = 'en') {
   Object.assign(page.context, {language: 'zh-CN', english: {}, translateStatic() {}});
   page.node('language-select').value = language;
@@ -3052,8 +3529,8 @@ for(const fails of [false,true])test(`catalog callback ${fails?'failure':'succes
   assert.equal(page.node('mc-feedback').textContent,'Provider B feedback');
 });
 
-async function authCompletionPage({failure='',direct=false,hold=''}={}) {
-  const page=browser(),calls={status:0,session:0,catalog:0,start:0,complete:0},walk=node=>[node,...(node.children||[]).flatMap(walk)];
+async function authCompletionPage({failure='',direct=false,hold='',preloadProviders=false,catalogFailAfterHold=false,catalogFailImmediate=0,catalogFailFirst=0}={}) {
+  const page=browser(),calls={status:0,session:0,catalog:0,start:0,complete:0,providers:0},walk=node=>[node,...(node.children||[]).flatMap(walk)];
   const tick=()=>new Promise(setImmediate),session={id:'completion-A',backend:'codex',provider:null,state:'awaiting_authorization',method:direct?'code':'auto'};
   let release,held=false;
   const waitHeld=async stage=>{if(hold===stage&&!held){held=true;await new Promise(resolve=>{release=resolve;});}};
@@ -3067,16 +3544,21 @@ async function authCompletionPage({failure='',direct=false,hold=''}={}) {
     if(url.endsWith('/api/auth/cancel'))return response({...session,state:'cancelled'});
     if(url.endsWith('/api/auth/start')){calls.start++;return response({...session,id:'completion-B',state:'starting'});}
     if(url.endsWith('/api/auth/logout'))return response({ok:true});
+    if(url.includes('/api/auth/providers?')){const providerCall=++calls.providers;if(providerCall>1)await waitHeld('providers');if(failure==='provider401'&&providerCall===2)return response({},401);return response({providers:[]});}
     throw new Error('Unexpected request '+url);
   };
   vm.runInContext(authSource,page.context);
   page.context.window.RSIAuth.show('openai',async()=>{
     calls.catalog++;await waitHeld('catalog');
+    if(catalogFailFirst&&calls.catalog===1)throw Object.assign(new Error('Catalog unavailable'),{status:catalogFailFirst});
+    if(catalogFailImmediate)throw Object.assign(new Error('Catalog unavailable'),{status:catalogFailImmediate});
+    if(catalogFailAfterHold)throw Object.assign(new Error('Catalog unavailable'),{status:503});
     if(failure==='catalog'&&calls.catalog===1)throw Object.assign(new Error('Catalog unavailable'),{status:503});
     if(failure==='catalog503')throw Object.assign(new Error('Catalog unavailable'),{status:503});
     if(failure==='catalog400')throw Object.assign(new Error('Catalog rejected'),{status:400});
   });
   await tick();await tick();
+  if(preloadProviders){page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();page.context.window.RSIAuth.show('openai',async()=>{});await tick();}
   return {page,calls,tick,walk,release:()=>release(),text:()=>walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),
     activeTimers:()=>page.timers.filter(timer=>timer.active&&timer.delay===1500).length,
     async finish(){
@@ -3139,6 +3621,78 @@ for(const hold of ['status','catalog'])for(const restart of [false,true]){
     else assert.equal(run.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
   });
 }
+
+test('completion catalog starts while provider refresh is pending and does not repeat after logout',async()=>{
+  const run=await authCompletionPage({hold:'providers',preloadProviders:true});await run.finish();
+  assert.equal(run.calls.providers,2);
+  assert.equal(run.calls.catalog,1,'provider refresh must not hold the catalog update');
+  const logout=run.walk(run.page.node('mc-auth')).find(node=>node.textContent==='退出账号');
+  assert.ok(logout);logout.handlers.click();await run.page.context.lastAction;
+  run.release();await run.tick();await run.tick();
+  assert.equal(run.calls.catalog,1,'releasing a stale provider request cannot repeat the catalog callback');
+});
+
+
+test('current OAuth provider expiry remains visible even when catalog succeeds',async()=>{
+  const run=await authCompletionPage({failure:'provider401',preloadProviders:true});run.page.context.safe=run.page.context.originalSafe;
+  await run.finish();await run.tick();await run.tick();
+  assert.equal(run.calls.providers,2);assert.equal(run.calls.catalog,1);
+  assert.match(run.text(),/控制台登录已失效/,'current OAuth session records console expiry');
+  assert.equal(run.activeTimers(),0);
+});
+
+
+test('OAuth provider expiry is not erased by a later catalog success',async()=>{
+  const run=await authCompletionPage({failure:'provider401',preloadProviders:true,hold:'catalog'});run.page.context.safe=run.page.context.originalSafe;
+  await run.finish();await run.tick();await run.tick();
+  assert.match(run.text(),/控制台登录已失效/);assert.equal(run.calls.catalog,1);
+  run.release();await run.tick();await run.tick();
+  assert.match(run.text(),/控制台登录已失效/,'later catalog success cannot erase the console expiry');assert.equal(run.activeTimers(),0);
+});
+
+test('old OAuth provider expiry is ignored after logout and newer provider success',async()=>{
+  const run=await authCompletionPage({failure:'provider401',preloadProviders:true,hold:'providers'});run.page.context.safe=run.page.context.originalSafe;
+  await run.finish();assert.equal(run.calls.providers,2);
+  const logout=run.walk(run.page.node('mc-auth')).find(node=>node.textContent==='退出账号');assert.ok(logout);logout.handlers.click();
+  await run.tick();await run.tick();assert.equal(run.calls.providers,3);
+  run.release();await run.tick();await run.tick();
+  assert.doesNotMatch(run.text(),/控制台登录已失效/);assert.doesNotMatch(run.page.node('toast').textContent,/登录已失效/);
+});
+
+
+test('catalog rejection after provider expiry remains visible and ends refresh stage',async()=>{
+  const run=await authCompletionPage({failure:'provider401',preloadProviders:true,hold:'catalog',catalogFailAfterHold:true});run.page.context.safe=run.page.context.originalSafe;
+  await run.finish();await run.tick();await run.tick();assert.match(run.text(),/控制台登录已失效/);
+  run.release();await run.tick();await run.tick();
+  assert.match(run.text(),/控制台登录已失效/);assert.match(run.text(),/模型目录刷新失败/,'catalog failure remains visible');assert.equal(run.activeTimers(),0);
+});
+
+
+test('provider expiry remains visible after switching auth views',async()=>{
+  const run=await authCompletionPage({failure:'provider401',preloadProviders:true,hold:'providers'});run.page.context.safe=run.page.context.originalSafe;
+  await run.finish();assert.equal(run.calls.providers,2);run.page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  run.release();await run.tick();await run.tick();
+  assert.match(run.page.node('toast').textContent,/登录已失效/,'session expiry is visible even when another provider is selected');
+  assert.equal(run.page.node('toast').hidden,false);
+});
+
+
+for(const status of [503,400])test(`catalog ${status} failure before provider expiry is not lost`,async()=>{
+  const run=await authCompletionPage({failure:'provider401',preloadProviders:true,hold:'providers',catalogFailImmediate:status});run.page.context.safe=run.page.context.originalSafe;
+  await run.finish();await run.tick();await run.tick();assert.equal(run.calls.providers,2);assert.equal(run.calls.catalog,1);
+  run.release();await run.tick();await run.tick();
+  assert.match(run.text(),/控制台登录已失效/);assert.match(run.text(),/模型目录刷新失败/,'expiry must not hide a catalog failure');assert.equal(run.activeTimers(),0);
+});
+
+
+test('catalog success before provider expiry clears the earlier retry failure',async()=>{
+  const run=await authCompletionPage({failure:'provider401',preloadProviders:true,hold:'providers',catalogFailFirst:503});run.page.context.safe=run.page.context.originalSafe;
+  await run.finish();await run.tick();await run.tick();assert.equal(run.calls.providers,2);assert.equal(run.calls.catalog,1);
+  assert.match(run.text(),/更新失败，正在重试/);assert.doesNotMatch(run.text(),/模型目录刷新失败/);
+  run.page.fireTimer(1500);await run.tick();await run.tick();assert.equal(run.calls.catalog,2);
+  run.release();await run.tick();await run.tick();
+  assert.match(run.text(),/控制台登录已失效/);assert.doesNotMatch(run.text(),/模型目录刷新失败/,'successful retry clears the previous catalog failure');
+});
 
 test('pending completion catalog refresh cannot invoke duplicate callbacks',async()=>{
   const run=await authCompletionPage({hold:'catalog'});await run.finish();
@@ -3596,4 +4150,47 @@ test('returning to the page refreshes once via visibilitychange; focus no longer
   page.listeners.get('visibilitychange')();
   assert.equal(states.length, 2, 'hiding the page does not refresh');
   assert.equal(page.timers.filter(timer => timer.active && timer.delay === 60000).length, 1, 'hidden polling keeps the slow cadence');
+});
+
+test('hidden pages prefix the title with the attention count and keep the project context', () => {
+  const page = browser();
+  Object.assign(page.context.initialState, {
+    projects: [{id: 'a', name: 'Alpha', path: '/work/alpha', paused: true}],
+    selected_project: 'a', tasks: [], runs: [], task_counts: [{state: 'awaiting_approval', count: 2}],
+    schedules: [], events: [], usage: [],
+  });
+  page.node('config-scope').value = 'project';
+  page.document.visibilityState = 'hidden';
+  vm.runInContext('state=initialState;projectId="a";view="overview";language="zh-CN";renderNavigation()', page.context);
+  assert.equal(page.document.title, '● 2 · 需要处理的任务 · Alpha · /work/alpha · Adaptive RSI · 控制台');
+  assert.equal(page.context.window.RSIExperience, undefined, 'the title hint works without the optional notification module or permission');
+  vm.runInContext('state.task_counts=[];renderNavigation()', page.context);
+  assert.equal(page.document.title, 'Alpha · /work/alpha · Adaptive RSI · 控制台', 'zero attention restores the plain title');
+});
+
+test('visibility changes update the title without extra requests and translate its fragment', async () => {
+  const page = browser(), requests = [];
+  Object.assign(page.context.initialState, {
+    projects: [{id: 'a', name: 'Alpha', paused: true}],
+    selected_project: 'a', tasks: [], runs: [], task_counts: [{state: 'awaiting_approval', count: 3}],
+    schedules: [], events: [], usage: [],
+  });
+  page.node('config-scope').value = 'project';
+  page.context.fetch = async url => { requests.push(url); return response({tasks: [], runs: []}); };
+  page.document.visibilityState = 'visible';
+  vm.runInContext('state=initialState;projectId="a";view="overview";language="zh-CN";renderNavigation()', page.context);
+  assert.equal(page.document.title, 'Alpha · Adaptive RSI · 控制台');
+  page.document.visibilityState = 'hidden';
+  page.listeners.get('visibilitychange')();
+  assert.equal(requests.length, 0, 'hiding the page updates the title without a request');
+  assert.match(page.document.title, /^● 3/);
+  page.context.t = value => ({'需要处理的任务': 'Tasks needing attention', 'Adaptive RSI · 控制台': 'Adaptive RSI · Console'}[value] ?? value);
+  page.context.language = 'en';
+  vm.runInContext('renderNavigation()', page.context);
+  assert.equal(page.document.title, '● 3 · Tasks needing attention · Alpha · Adaptive RSI · Console', 'the fragment translates while the project name and suffix stay intact');
+  page.document.visibilityState = 'visible';
+  page.listeners.get('visibilitychange')();
+  assert.equal(requests.length, 1, 'becoming visible keeps the existing single refresh');
+  await page.context.lastAction;
+  assert.equal(page.document.title, 'Alpha · Adaptive RSI · Console');
 });
