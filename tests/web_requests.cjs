@@ -3917,6 +3917,42 @@ test('stopping one completed login continues polling other active logins',async(
   page.fireTimer(1500);await tick();await tick();assert.equal(otherCalls,2,'other active login remains polled');releaseStatus();await tick();
 });
 
+test('saving API key waits for account status requested after the key mutation',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let releaseStatus,statusCalls=0,sessionCalls=0,keyCalls=0;
+  const held=new Promise(resolve=>{releaseStatus=resolve;}),session={id:'opencode-login',backend:'opencode',provider:'example',state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){const n=++statusCalls;if(n===2){await held;return response({sessions:[],opencode:{available:true,authenticated_providers:[]}});}return response({sessions:n===1?[session]:[],opencode:{available:true,authenticated_providers:n===1?[]:['example']}});}
+    if(url.includes('auth/session?id=opencode-login'))return response(++sessionCalls===1?session:{...session,state:'completed'});
+    if(url.includes('/api/auth/providers?'))return response([{id:'example',name:'Example',connected:true,methods:[{index:0,type:'api',label:'API key',supported:true}]}]);
+    if(url.endsWith('/api/auth/key')){keyCalls++;return response({});}
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,2);
+  const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');assert.ok(form);form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});await tick();await tick();
+  assert.equal(keyCalls,1);assert.equal(statusCalls,3,'key save must request status after the mutation even while an older status hangs');
+  assert.ok(walk(page.node('mc-auth')).some(node=>node.textContent==='退出账号'));
+  releaseStatus();await tick();await tick();assert.ok(walk(page.node('mc-auth')).some(node=>node.textContent==='退出账号'),'older signed-out snapshot must be ignored');
+});
+
+test('stopping one completed login does not strand another shared status refresh',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let releaseStatus,statusCalls=0,codexCalls=0;
+  const held=new Promise(resolve=>{releaseStatus=resolve;}),codex={id:'codex-shared',backend:'codex',provider:null,state:'awaiting_authorization',method:'auto'},other={id:'other-shared',backend:'opencode',provider:'example',state:'awaiting_authorization',method:'code',attempt_generation:1};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){const n=++statusCalls;if(n===2){await held;return response({sessions:[],codex:{available:true,state:'authenticated'}});}return response({sessions:n===1?[codex,other]:[],codex:{available:true,state:n===1?'signed_out':'authenticated'},opencode:{available:true,authenticated_providers:[]}});}
+    if(url.includes('auth/session?id=codex-shared'))return response(++codexCalls===1?codex:{...codex,state:'completed'});
+    if(url.includes('auth/session?id=other-shared'))return response(other);
+    if(url.endsWith('/api/auth/complete'))return response({...other,state:'completed'});
+    if(url.includes('/api/auth/providers?'))return response([{id:'example',name:'Example',connected:true,methods:[{index:0,type:'api',label:'API key',supported:true}]}]);
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('openai',async()=>{});await tick();await tick();page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,2);
+  page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+  const code=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');assert.ok(code);code.children[0].children[0].value='fixture';code.handlers.submit({preventDefault(){}});await tick();await tick();
+  const stop=walk(page.node('mc-auth')).find(node=>node.textContent==='停止等待');assert.ok(stop);stop.handlers.click();await tick();await tick();
+  page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,3,'other completed login should retry instead of joining the stopped request');
+  assert.equal(page.context.window.RSIAuth.isConnected('openai'),true);releaseStatus();await tick();await tick();
+});
+
 test('completed auth console expiry stays actionable and stops refresh retries',async()=>{
   const run=await authCompletionPage({failure:'session_required'});await run.finish();
   assert.match(run.text(),/控制台登录已失效/);assert.equal(run.calls.catalog,0);

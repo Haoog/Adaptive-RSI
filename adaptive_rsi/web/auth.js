@@ -1,6 +1,6 @@
 'use strict';
 window.RSIAuth = (() => {
-  let snapshot=null,providers=null,providerCountsFresh=false,context=null,providerQuery='',loading=null,pending=false,polling=false,pollingStopped=false,timer=null,statusRequest=0,pollRequest=0;
+  let snapshot=null,providers=null,providerCountsFresh=false,context=null,providerQuery='',loading=null,pending=false,polling=false,pollingStopped=false,timer=null,statusRequest=0,pollRequest=0,statusCancel=null;
   const sessions=new Map(),selections=new Map();
   // 记住每个后端上次的供应商选择，重开页面后不必重新查找。
   try{for(const [backend,provider] of Object.entries(JSON.parse(localStorage.getItem('rsi-auth-selection')||'{}')))selections.set(backend,provider);}catch{}
@@ -38,15 +38,23 @@ window.RSIAuth = (() => {
     if(!preferred)return false;
     context.provider=preferred.id;selections.set(context.backend,preferred.id);return true;
   }
+  function invalidateStatus(){
+    statusRequest++;const cancel=statusCancel;statusCancel=null;loading=null;if(cancel)cancel(false);
+  }
   async function status(force=false){
-    if(loading)return loading;if(snapshot&&!force)return;
+    if(loading)return loading;if(snapshot&&!force)return true;
     const request=++statusRequest;
-    loading=(async()=>{try{const nextSnapshot=await api('auth/status');if(request!==statusRequest)return;snapshot=nextSnapshot;
-      for(const metadata of snapshot.sessions||[]){if(request!==statusRequest)return;const id=metadata.backend+':'+(metadata.provider||''),existing=sessions.get(id);if(terminal.has(metadata.state)||existing?.id===metadata.id)continue;
-        const recovered=await api('auth/session?id='+encodeURIComponent(metadata.id));if(request!==statusRequest)return;if(sessions.get(id)!==existing)continue;const refresh=context?.backend===metadata.backend?context.refresh:()=>api('model-center/fetch',{provider:metadata.backend==='codex'?'openai':'opencode',project:null});const recoveredSession={...recovered,refresh,...(recovered.state==='completed'?{refreshStage:'status'}:{})};if(recovered.state==='completed'&&metadata.backend==='opencode'){providerCountsFresh=false;providerRequest++;}sessions.set(id,recoveredSession);
+    const work=(async()=>{const nextSnapshot=await api('auth/status');if(request!==statusRequest)return false;snapshot=nextSnapshot;
+      for(const metadata of snapshot.sessions||[]){if(request!==statusRequest)return false;const id=metadata.backend+':'+(metadata.provider||''),existing=sessions.get(id);if(terminal.has(metadata.state)||existing?.id===metadata.id)continue;
+        const recovered=await api('auth/session?id='+encodeURIComponent(metadata.id));if(request!==statusRequest)return false;if(sessions.get(id)!==existing)continue;const refresh=context?.backend===metadata.backend?context.refresh:()=>api('model-center/fetch',{provider:metadata.backend==='codex'?'openai':'opencode',project:null});const recoveredSession={...recovered,refresh,...(recovered.state==='completed'?{refreshStage:'status'}:{})};if(recovered.state==='completed'&&metadata.backend==='opencode'){providerCountsFresh=false;providerRequest++;}sessions.set(id,recoveredSession);
         if(context?.backend===metadata.backend&&!context.provider&&metadata.provider){context.provider=metadata.provider;selections.set(metadata.backend,metadata.provider);}
-      }if(request!==statusRequest)return;selectPreferredProvider();render();schedule();
-    }finally{if(request===statusRequest)loading=null;}})();return loading;
+      }if(request!==statusRequest)return false;selectPreferredProvider();render();schedule();return true;
+    })();
+    const cancelled=new Promise(resolve=>{statusCancel=resolve;});
+    loading=Promise.race([work,cancelled]).finally(()=>{if(request===statusRequest){loading=null;statusCancel=null;}});return loading;
+  }
+  async function freshStatus(){
+    invalidateStatus();while(await status(true)===false){}
   }
   let providerRequest=0,providerLoading=0,providerChanging=0,providerNeedsRefresh=false;
   function validateProviders(result){
@@ -116,7 +124,7 @@ window.RSIAuth = (() => {
     if(session.refreshing||sessions.get(id)!==session)return;session.refreshing=true;
     try{
       if(session.refreshStage==='status'){
-        readinessCache.clear();await status(true);if(sessions.get(id)!==session)return;
+        readinessCache.clear();if(await status(true)===false||sessions.get(id)!==session)return;
         if(session.backend==='opencode'||!providerLoading)safe(async()=>{
           try{await refreshProviders(()=>sessions.get(id)===session);}
           catch(error){
@@ -182,7 +190,7 @@ window.RSIAuth = (() => {
   }
   function stopCompletedStatus(id,session){
     if(sessions.get(id)!==session||session?.state!=='completed'||session.refreshStage!=='status')return;
-    statusRequest++;loading=null;pollRequest++;polling=false;sessions.delete(id);render();schedule();
+    invalidateStatus();pollRequest++;polling=false;sessions.delete(id);render();schedule();
   }
   async function start(method,inputs={}){
     if(pending||!context)return;const current={...context},id=current.backend+':'+(current.provider||''),existing=sessions.get(id);if(existing&&!terminal.has(existing.state))return;
@@ -258,13 +266,13 @@ window.RSIAuth = (() => {
       if(session.error)box.append(el('p',session.error==='authorization_failed'&&session.state==='awaiting_authorization'?t('授权未完成，请打开新的授权页面后重试。'):authMessage(session.error,session.error),'mc-error'));
     }
     if(running)return;
-    if(connected){const logout=action(t('退出账号'),async()=>{const current={...context};stopCompletedStatus(sessionKey,session);await mutate('logout',{backend:current.backend,provider:current.backend==='codex'?null:current.provider});readinessCache.clear();sessions.delete(current.backend+':'+(current.provider||''));await status(true);safe(()=>refreshProviders());},'text-button');logout.disabled=pending;box.append(logout);}
+    if(connected){const logout=action(t('退出账号'),async()=>{const current={...context};stopCompletedStatus(sessionKey,session);await mutate('logout',{backend:current.backend,provider:current.backend==='codex'?null:current.provider});readinessCache.clear();sessions.delete(current.backend+':'+(current.provider||''));await freshStatus();safe(()=>refreshProviders());},'text-button');logout.disabled=pending;box.append(logout);}
     const methods=backend==='codex'?[{index:0,type:'oauth',supported:true,label:t('前往 Codex 官方登录')}]:providers?.find(p=>p.id===context.provider)?.methods||[];
     for(const method of methods){
       if(method.type==='api'){
         if(method.supported===false){box.append(el('p',authMessage(method.unsupported_reason,'此登录方式暂不支持远程页面，请使用供应商密钥。'),'mc-secondary'));continue;}
         const form=el('form'),label=text('label','API 密钥'),input=el('input');input.type='password';input.dataset.authField='key:'+context.provider;input.autocomplete='new-password';input.required=true;input.maxLength=8192;label.append(input);const submit=text('button','保存供应商密钥','button');submit.type='submit';submit.disabled=pending;form.append(label,submit);
-        form.addEventListener('submit',event=>{event.preventDefault();const current={...context};safe(async()=>{const secret=input.value;input.value='';await mutate('key',{backend:'opencode',provider:current.provider,key:secret});readinessCache.clear();await status(true);safe(()=>refreshProviders());await current.refresh();});});box.append(form);continue;
+        form.addEventListener('submit',event=>{event.preventDefault();const current={...context};safe(async()=>{const secret=input.value;input.value='';await mutate('key',{backend:'opencode',provider:current.provider,key:secret});readinessCache.clear();await freshStatus();safe(()=>refreshProviders());await current.refresh();});});box.append(form);continue;
       }
       const form=el('form'),fields=new Map();
       const updatePrompts=()=>{for(const prompt of method.prompts||[]){const field=fields.get(prompt.key),condition=prompt.when,show=!condition||(condition.op==='neq'?fields.get(condition.key)?.input.value!==condition.value:fields.get(condition.key)?.input.value===condition.value);field.label.hidden=!show;field.input.disabled=!show;field.input.required=show;}};
