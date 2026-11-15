@@ -782,6 +782,37 @@ class AuthSessionTests(unittest.TestCase):
                 finally:
                     manager.close()
 
+    def test_container_readiness_timeout_is_not_reported_as_missing_image(self):
+        manager = AuthSessions(self.root / 'readiness-timeout', config={'sandbox': {'backend': 'docker'}})
+        # run_process 在超时/输出超限时的真实返回形状（见 process.py），docker daemon
+        # 卡住时不能再引导用户重装镜像。
+        failures = ({'exit_code': -9, 'error': 'Command timed out', 'error_kind': 'timeout'},
+                    {'exit_code': -9, 'error': 'Command output limit exceeded', 'error_kind': 'output_limit'})
+        try:
+            with patch('adaptive_rsi.auth_sessions.shutil.which',
+                       side_effect=lambda name: '/fixture/docker' if name == 'docker' else None), \
+                 patch('adaptive_rsi.auth_sessions.detect_opencode',
+                       return_value=OpenCodeCapabilities('1.19.3', (1, 19, 3))), \
+                 patch('adaptive_rsi.auth_sessions.auth_providers', return_value=[]):
+                for inspected in failures:
+                    with self.subTest(error_kind=inspected['error_kind']):
+                        with manager.cache_lock:
+                            manager.container_cache.clear()
+                        with patch('adaptive_rsi.auth_sessions.run_process',
+                                   return_value=dict(inspected)) as inspect:
+                            key = ('/fixture/docker', 'adaptive-rsi-worker:local')
+                            self.assertEqual(manager._inspect_container(key), 'auth_container_unavailable')
+                            first = manager.snapshot()
+                            second = manager.snapshot()
+                            # 探测失败也按 25s 缓存：重复快照与两个 backend 共用一次 inspect。
+                            self.assertEqual(inspect.call_count, 1)
+                        for result in (first, second):
+                            for backend in ('codex', 'opencode'):
+                                self.assertFalse(result[backend]['available'])
+                                self.assertEqual(result[backend]['error'], 'auth_container_unavailable')
+        finally:
+            manager.close()
+
     def test_container_readiness_probe_is_cached_and_invalidated(self):
         manager = AuthSessions(self.root / 'readiness-cache', config={'sandbox': {'backend': 'docker'}})
         try:

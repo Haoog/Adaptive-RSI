@@ -1561,6 +1561,225 @@ test('temporary auth polling failures preserve authorization; explicit expiry st
   assert.equal(terminal.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
 });
 
+test('provider metadata refreshes after saving a key and after signing out', async () => {
+  const page=browser();let providerCalls=0,connected=false;
+  page.context.safe=page.context.originalSafe;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/providers?backend=opencode')){
+      providerCalls++;
+      return response({providers:[{id:'open-go',name:'OpenCode Go',connected,connection_count:connected?2:0,methods:[{index:0,type:'api',supported:true,label:'API Key'}]}]});
+    }
+    if(url.endsWith('/api/auth/key')){connected=true;return response({});}
+    if(url.endsWith('/api/auth/logout')){connected=false;return response({});}
+    return response({});
+  };
+  vm.runInContext(authSource,page.context);
+  page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  await waitFor(()=>providerCalls===1);
+  const currentSelect=()=>descendants(page.node('mc-auth')).find(node=>node.tagName==='SELECT');
+  const options=()=>currentSelect().children.map(option=>option.textContent||'');
+  await waitFor(()=>options().length>1);
+  assert.doesNotMatch(options().join(' '),/已连接/);
+  currentSelect().value='open-go';currentSelect().handlers.change();
+  const key=descendants(page.node('mc-auth')).find(node=>node.dataset?.authField==='key:open-go');
+  key.value='secret-key';
+  descendants(page.node('mc-auth')).find(node=>node.tagName==='FORM').handlers.submit({preventDefault(){}});
+  await waitFor(()=>/已连接/.test(options().join(' ')));
+  assert.equal(providerCalls,2,'saving a key must refresh the provider list without a page reload');
+  descendants(page.node('mc-auth')).find(node=>node.textContent==='退出账号').handlers.click();
+  await waitFor(()=>!/已连接/.test(options().join(' ')));
+  assert.equal(providerCalls,3,'signing out must drop the stale connection count');
+});
+
+
+test('late logout provider response cannot overwrite later successful login',async()=>{
+  const page=browser();let providerCalls=0,connected=true,releaseLogout;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/providers?backend=opencode')){
+      providerCalls++;const captured=connected;
+      if(providerCalls===2)await new Promise(resolve=>{releaseLogout=resolve;});
+      return response({providers:[{id:'open-go',name:'OpenCode Go',connected:captured,methods:[{index:0,type:'api',supported:true,label:'API Key'}]}]});
+    }
+    if(url.endsWith('/api/auth/key')){connected=true;return response({});}
+    if(url.endsWith('/api/auth/logout')){connected=false;return response({});}
+    return response({});
+  };
+  vm.runInContext(authSource,page.context);
+  page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  const nodes=()=>descendants(page.node('mc-auth'));
+  const options=()=>nodes().find(n=>n.tagName==='SELECT')?.children.map(n=>n.textContent||'').join(' ')||'';
+  await waitFor(()=>providerCalls===1&&nodes().some(n=>n.textContent==='退出账号'));
+  nodes().find(n=>n.textContent==='退出账号').handlers.click();const loggingOut=page.context.lastAction;
+  await waitFor(()=>providerCalls===2&&typeof releaseLogout==='function');
+  const input=nodes().find(n=>n.dataset?.authField==='key:open-go');assert.ok(input);input.value='dummy';
+  nodes().find(n=>n.tagName==='FORM').handlers.submit({preventDefault(){}});await page.context.lastAction;
+  assert.equal(providerCalls,3);assert.match(options(),/已连接/);
+  releaseLogout();await loggingOut;await new Promise(setImmediate);await new Promise(setImmediate);
+  assert.match(options(),/已连接/,'older logout response must not overwrite newer login metadata');
+});
+
+
+for(const invalid of [{providers:{}},{},null,{providers:[null]},{providers:[{id:'open-go',name:'OpenCode Go',methods:{}}]},{providers:[{id:'open-go',name:'OpenCode Go',methods:[{}]}]},{providers:[{id:'open-go',name:'OpenCode Go',methods:[{index:0,type:'oauth',label:'test',prompts:[{}]}]}]}])test(`invalid provider refresh preserves cached list: ${JSON.stringify(invalid)}`,async()=>{
+  const page=browser();let calls=0,connected=false;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;return response(calls===1?{providers:[{id:'open-go',name:'OpenCode Go',methods:[{index:0,type:'api',supported:true,label:'API Key'}]}]}:invalid);}
+    if(url.endsWith('/api/auth/key')){connected=true;return response({});}return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&nodes().some(n=>n.tagName==='SELECT'&&n.children.length>1));
+  const select=nodes().find(n=>n.tagName==='SELECT');select.value='open-go';select.handlers.change();
+  const input=nodes().find(n=>n.dataset?.authField==='key:open-go');input.value='dummy';
+  nodes().find(n=>n.tagName==='FORM').handlers.submit({preventDefault(){}});await page.context.lastAction;
+  await waitFor(()=>calls===2);await new Promise(setImmediate);
+  assert.doesNotThrow(()=>page.context.window.RSIAuth.translate());
+  assert.ok(nodes().some(n=>n.tagName==='SELECT'&&n.children.some(o=>o.value==='open-go')),'cached provider remains usable');
+  assert.ok(nodes().some(n=>n.dataset?.authField==='key:open-go'),'cached authentication method remains usable');
+});
+
+test('stalled provider refresh cannot delay catalog after key save',async()=>{
+  const page=browser();let calls=0,connected=false,release,catalog=0;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;if(calls===2)await new Promise(resolve=>{release=resolve;});return response({providers:[{id:'open-go',name:'OpenCode Go',connected,methods:[{index:0,type:'api',supported:true,label:'API Key'}]}]});}
+    if(url.endsWith('/api/auth/key')){connected=true;return response({});}return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>{catalog++;return Promise.resolve();});
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&nodes().some(n=>n.tagName==='SELECT'&&n.children.length>1));
+  const select=nodes().find(n=>n.tagName==='SELECT');select.value='open-go';select.handlers.change();const input=nodes().find(n=>n.dataset?.authField==='key:open-go');input.value='dummy';
+  nodes().find(n=>n.tagName==='FORM').handlers.submit({preventDefault(){}});const saving=page.context.lastAction;await waitFor(()=>calls===2&&typeof release==='function');
+  await new Promise(setImmediate);try{assert.equal(catalog,1,'catalog refresh starts without waiting for provider metadata');}finally{release();await saving;}
+});
+
+
+test('OAuth completion refreshes while the initial provider request is still pending',async()=>{
+  const page=browser(),session={id:'opencode-A',backend:'opencode',provider:'open-go',state:'awaiting_authorization',method:'auto'};
+  let providerCalls=0,sessionCalls=0,connected=false,releaseInitial,catalog=0;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:connected?[]:[session],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/session?id=')){sessionCalls++;if(sessionCalls===1)return response(session);connected=true;return response({...session,state:'completed'});}
+    if(url.includes('/api/auth/providers?backend=opencode')){providerCalls++;const captured=connected;if(providerCalls===1)await new Promise(resolve=>{releaseInitial=resolve;});return response({providers:[{id:'open-go',name:'OpenCode Go',connected:captured,methods:[]}]});}
+    return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>{catalog++;return Promise.resolve();});
+  await waitFor(()=>providerCalls===1&&typeof releaseInitial==='function'&&page.timers.some(t=>t.active&&t.delay===1500));
+  page.fireTimer(1500);for(let i=0;i<5;i++)await new Promise(setImmediate);
+  try{assert.equal(providerCalls,2,'successful completion must request current metadata even before first fetch resolves');assert.equal(catalog,1);}
+  finally{releaseInitial();for(let i=0;i<5;i++)await new Promise(setImmediate);}
+  const options=descendants(page.node('mc-auth')).find(n=>n.tagName==='SELECT').children.map(n=>n.textContent).join(' ');
+  assert.match(options,/已连接/,'late initial response cannot replace post-login metadata');
+});
+
+
+test('provider refresh clears a selected provider that disappears',async()=>{
+  const page=browser();let calls=0,connected=false;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;return response({providers:calls===1?[{id:'open-go',name:'OpenCode Go',methods:[{index:0,type:'api',supported:true,label:'API Key'}]}]:[{id:'other',name:'Other',methods:[]}]});}
+    if(url.endsWith('/api/auth/key')){connected=true;return response({});}return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&nodes().some(n=>n.tagName==='SELECT'&&n.children.length>1));
+  const select=nodes().find(n=>n.tagName==='SELECT');select.value='open-go';select.handlers.change();nodes().find(n=>n.dataset?.authField==='key:open-go').value='dummy';
+  nodes().find(n=>n.tagName==='FORM').handlers.submit({preventDefault(){}});await waitFor(()=>calls===2);await new Promise(setImmediate);
+  assert.equal(nodes().find(n=>n.tagName==='SELECT').value,'');
+  assert.ok(!nodes().some(n=>n.textContent==='退出账号'),'must not expose logout for a hidden provider');
+});
+
+test('provider refresh console expiry is reported without blocking catalog',async()=>{
+  const page=browser();let calls=0,connected=false,catalog=0;page.context.safe=page.context.originalSafe;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;return calls===1?response({providers:[{id:'open-go',name:'OpenCode Go',methods:[{index:0,type:'api',supported:true,label:'API Key'}]}]}):response({},401);}
+    if(url.endsWith('/api/auth/key')){connected=true;return response({});}return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>{catalog++;return Promise.resolve();});
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&nodes().some(n=>n.tagName==='SELECT'&&n.children.length>1));
+  const select=nodes().find(n=>n.tagName==='SELECT');select.value='open-go';select.handlers.change();nodes().find(n=>n.dataset?.authField==='key:open-go').value='dummy';
+  nodes().find(n=>n.tagName==='FORM').handlers.submit({preventDefault(){}});await waitFor(()=>calls===2&&/登录已失效/.test(page.node('toast').textContent));
+  assert.equal(catalog,1);assert.equal(page.node('toast').hidden,false);
+});
+
+
+test('stale provider expiry response cannot warn after a newer successful request',async()=>{
+  const page=browser();let calls=0,connected=true,release;page.context.safe=page.context.originalSafe;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;if(calls===2){await new Promise(resolve=>{release=resolve;});return response({},401);}return response({providers:[{id:'open-go',name:'OpenCode Go',connected,methods:[{index:0,type:'api',supported:true,label:'API Key'}]}]});}
+    if(url.endsWith('/api/auth/logout')){connected=false;return response({});}if(url.endsWith('/api/auth/key')){connected=true;return response({});}return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&nodes().some(n=>n.textContent==='退出账号'));
+  nodes().find(n=>n.textContent==='退出账号').handlers.click();await waitFor(()=>calls===2&&typeof release==='function');
+  const input=nodes().find(n=>n.dataset?.authField==='key:open-go');assert.ok(input);input.value='dummy';nodes().find(n=>n.tagName==='FORM').handlers.submit({preventDefault(){}});
+  await waitFor(()=>calls===3&&nodes().some(n=>n.textContent==='退出账号'));await new Promise(setImmediate);
+  release();await new Promise(setImmediate);await new Promise(setImmediate);
+  assert.doesNotMatch(page.node('toast').textContent,/登录已失效/,'obsolete expiry must not warn after successful newer refresh');
+});
+
+test('manual provider retry is possible while an obsolete initial request is pending',async()=>{
+  const page=browser(),session={id:'opencode-A',backend:'opencode',provider:'open-go',state:'awaiting_authorization',method:'auto'};
+  let calls=0,sessionCalls=0,connected=false,release;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:connected?[]:[session],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/session?id=')){sessionCalls++;if(sessionCalls===1)return response(session);connected=true;return response({...session,state:'completed'});}
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;if(calls===1)await new Promise(resolve=>{release=resolve;});if(calls===2)return response({},503);return response({providers:[{id:'open-go',name:'OpenCode Go',connected,methods:[]}]});}
+    return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&typeof release==='function'&&page.timers.some(t=>t.active&&t.delay===1500));
+  page.fireTimer(1500);await waitFor(()=>calls===2);await new Promise(setImmediate);await new Promise(setImmediate);
+  const retry=nodes().find(n=>n.textContent==='读取可连接的供应商');assert.ok(retry);retry.handlers.click();
+  for(let i=0;i<5;i++)await new Promise(setImmediate);
+  try{assert.equal(calls,3,'user can retry without waiting for a superseded provider request');}
+  finally{release();for(let i=0;i<3;i++)await new Promise(setImmediate);}
+  assert.ok(nodes().some(n=>n.tagName==='SELECT'&&n.children.some(o=>o.value==='open-go')));
+});
+
+
+test('provider disappearance keeps an active OAuth session visible and cancellable',async()=>{
+  const page=browser(),session={id:'opencode-A',backend:'opencode',provider:'open-go',state:'awaiting_authorization',method:'auto'};
+  let calls=0,codexConnected=true;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[session],codex:{available:true,state:codexConnected?'authenticated':'signed_out'},opencode:{available:true,authenticated_providers:[]}});
+    if(url.includes('/api/auth/session?id='))return response(session);
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;return response({providers:calls===1?[{id:'open-go',name:'OpenCode Go',methods:[]}]:[{id:'other',name:'Other',methods:[]}]});}
+    if(url.endsWith('/api/auth/logout')){codexConnected=false;return response({});}
+    if(url.endsWith('/api/auth/cancel'))return response({...session,state:'cancelled'});return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&nodes().some(n=>n.textContent==='取消登录'));
+  page.context.window.RSIAuth.show('openai',()=>Promise.resolve());await waitFor(()=>nodes().some(n=>n.textContent==='退出账号'));
+  nodes().find(n=>n.textContent==='退出账号').handlers.click();await waitFor(()=>calls===2);await new Promise(setImmediate);
+  page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());await new Promise(setImmediate);
+  assert.ok(nodes().some(n=>n.tagName==='SELECT'&&n.value==='open-go'),'active session provider remains visibly selected');
+  const cancel=nodes().find(n=>n.textContent==='取消登录');assert.ok(cancel,'active session can still be canceled');cancel.handlers.click();await page.context.lastAction;
+  assert.ok(!nodes().some(n=>n.textContent==='取消登录'));
+});
+
+
+test('all missing provider sessions remain selectable and cancellable',async()=>{
+  const page=browser(),a={id:'session-A',backend:'opencode',provider:'alpha',state:'awaiting_authorization',method:'auto'},b={id:'session-B',backend:'opencode',provider:'beta',state:'awaiting_authorization',method:'auto'};
+  let calls=0,codexConnected=true,cancelled='';
+  page.context.fetch=async(url,options={})=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[codexConnected?a:b],codex:{available:true,state:codexConnected?'authenticated':'signed_out'},opencode:{available:true,authenticated_providers:[]}});
+    if(url.includes('/api/auth/session?id='))return response(url.includes('session-A')?a:b);
+    if(url.includes('/api/auth/providers?backend=opencode')){calls++;return response({providers:calls===1?[{id:'alpha',name:'Alpha',methods:[]},{id:'beta',name:'Beta',methods:[]}]:[]});}
+    if(url.endsWith('/api/auth/logout')){codexConnected=false;return response({});}
+    if(url.endsWith('/api/auth/cancel')){cancelled=JSON.parse(options.body).id;return response({...b,state:'cancelled'});}return response({});
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  const nodes=()=>descendants(page.node('mc-auth'));await waitFor(()=>calls===1&&nodes().some(n=>n.textContent==='取消登录'));
+  page.context.window.RSIAuth.show('openai',()=>Promise.resolve());await waitFor(()=>nodes().some(n=>n.textContent==='退出账号'));
+  nodes().find(n=>n.textContent==='退出账号').handlers.click();await waitFor(()=>calls===2);await new Promise(setImmediate);
+  page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());await new Promise(setImmediate);
+  const select=nodes().find(n=>n.tagName==='SELECT'),option=select.children.find(n=>n.value==='beta');
+  assert.ok(option&&!option.disabled,'other missing active session has a selectable option');select.value='beta';select.handlers.change();
+  const cancel=nodes().find(n=>n.textContent==='取消登录');assert.ok(cancel);cancel.handlers.click();await page.context.lastAction;assert.equal(cancelled,'session-B');
+});
+
 test('non JSON errors give recovery instructions rather than a parser exception', async () => {
   const page=browser();
   page.context.fetch=async()=>({ok:false,status:502,json:async()=>{throw new SyntaxError('HTML error page');}});
@@ -3310,8 +3529,8 @@ for(const fails of [false,true])test(`catalog callback ${fails?'failure':'succes
   assert.equal(page.node('mc-feedback').textContent,'Provider B feedback');
 });
 
-async function authCompletionPage({failure='',direct=false,hold=''}={}) {
-  const page=browser(),calls={status:0,session:0,catalog:0,start:0,complete:0},walk=node=>[node,...(node.children||[]).flatMap(walk)];
+async function authCompletionPage({failure='',direct=false,hold='',preloadProviders=false,catalogFailAfterHold=false,catalogFailImmediate=0,catalogFailFirst=0}={}) {
+  const page=browser(),calls={status:0,session:0,catalog:0,start:0,complete:0,providers:0},walk=node=>[node,...(node.children||[]).flatMap(walk)];
   const tick=()=>new Promise(setImmediate),session={id:'completion-A',backend:'codex',provider:null,state:'awaiting_authorization',method:direct?'code':'auto'};
   let release,held=false;
   const waitHeld=async stage=>{if(hold===stage&&!held){held=true;await new Promise(resolve=>{release=resolve;});}};
@@ -3325,16 +3544,21 @@ async function authCompletionPage({failure='',direct=false,hold=''}={}) {
     if(url.endsWith('/api/auth/cancel'))return response({...session,state:'cancelled'});
     if(url.endsWith('/api/auth/start')){calls.start++;return response({...session,id:'completion-B',state:'starting'});}
     if(url.endsWith('/api/auth/logout'))return response({ok:true});
+    if(url.includes('/api/auth/providers?')){const providerCall=++calls.providers;if(providerCall>1)await waitHeld('providers');if(failure==='provider401'&&providerCall===2)return response({},401);return response({providers:[]});}
     throw new Error('Unexpected request '+url);
   };
   vm.runInContext(authSource,page.context);
   page.context.window.RSIAuth.show('openai',async()=>{
     calls.catalog++;await waitHeld('catalog');
+    if(catalogFailFirst&&calls.catalog===1)throw Object.assign(new Error('Catalog unavailable'),{status:catalogFailFirst});
+    if(catalogFailImmediate)throw Object.assign(new Error('Catalog unavailable'),{status:catalogFailImmediate});
+    if(catalogFailAfterHold)throw Object.assign(new Error('Catalog unavailable'),{status:503});
     if(failure==='catalog'&&calls.catalog===1)throw Object.assign(new Error('Catalog unavailable'),{status:503});
     if(failure==='catalog503')throw Object.assign(new Error('Catalog unavailable'),{status:503});
     if(failure==='catalog400')throw Object.assign(new Error('Catalog rejected'),{status:400});
   });
   await tick();await tick();
+  if(preloadProviders){page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();page.context.window.RSIAuth.show('openai',async()=>{});await tick();}
   return {page,calls,tick,walk,release:()=>release(),text:()=>walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),
     activeTimers:()=>page.timers.filter(timer=>timer.active&&timer.delay===1500).length,
     async finish(){
@@ -3397,6 +3621,78 @@ for(const hold of ['status','catalog'])for(const restart of [false,true]){
     else assert.equal(run.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
   });
 }
+
+test('completion catalog starts while provider refresh is pending and does not repeat after logout',async()=>{
+  const run=await authCompletionPage({hold:'providers',preloadProviders:true});await run.finish();
+  assert.equal(run.calls.providers,2);
+  assert.equal(run.calls.catalog,1,'provider refresh must not hold the catalog update');
+  const logout=run.walk(run.page.node('mc-auth')).find(node=>node.textContent==='退出账号');
+  assert.ok(logout);logout.handlers.click();await run.page.context.lastAction;
+  run.release();await run.tick();await run.tick();
+  assert.equal(run.calls.catalog,1,'releasing a stale provider request cannot repeat the catalog callback');
+});
+
+
+test('current OAuth provider expiry remains visible even when catalog succeeds',async()=>{
+  const run=await authCompletionPage({failure:'provider401',preloadProviders:true});run.page.context.safe=run.page.context.originalSafe;
+  await run.finish();await run.tick();await run.tick();
+  assert.equal(run.calls.providers,2);assert.equal(run.calls.catalog,1);
+  assert.match(run.text(),/控制台登录已失效/,'current OAuth session records console expiry');
+  assert.equal(run.activeTimers(),0);
+});
+
+
+test('OAuth provider expiry is not erased by a later catalog success',async()=>{
+  const run=await authCompletionPage({failure:'provider401',preloadProviders:true,hold:'catalog'});run.page.context.safe=run.page.context.originalSafe;
+  await run.finish();await run.tick();await run.tick();
+  assert.match(run.text(),/控制台登录已失效/);assert.equal(run.calls.catalog,1);
+  run.release();await run.tick();await run.tick();
+  assert.match(run.text(),/控制台登录已失效/,'later catalog success cannot erase the console expiry');assert.equal(run.activeTimers(),0);
+});
+
+test('old OAuth provider expiry is ignored after logout and newer provider success',async()=>{
+  const run=await authCompletionPage({failure:'provider401',preloadProviders:true,hold:'providers'});run.page.context.safe=run.page.context.originalSafe;
+  await run.finish();assert.equal(run.calls.providers,2);
+  const logout=run.walk(run.page.node('mc-auth')).find(node=>node.textContent==='退出账号');assert.ok(logout);logout.handlers.click();
+  await run.tick();await run.tick();assert.equal(run.calls.providers,3);
+  run.release();await run.tick();await run.tick();
+  assert.doesNotMatch(run.text(),/控制台登录已失效/);assert.doesNotMatch(run.page.node('toast').textContent,/登录已失效/);
+});
+
+
+test('catalog rejection after provider expiry remains visible and ends refresh stage',async()=>{
+  const run=await authCompletionPage({failure:'provider401',preloadProviders:true,hold:'catalog',catalogFailAfterHold:true});run.page.context.safe=run.page.context.originalSafe;
+  await run.finish();await run.tick();await run.tick();assert.match(run.text(),/控制台登录已失效/);
+  run.release();await run.tick();await run.tick();
+  assert.match(run.text(),/控制台登录已失效/);assert.match(run.text(),/模型目录刷新失败/,'catalog failure remains visible');assert.equal(run.activeTimers(),0);
+});
+
+
+test('provider expiry remains visible after switching auth views',async()=>{
+  const run=await authCompletionPage({failure:'provider401',preloadProviders:true,hold:'providers'});run.page.context.safe=run.page.context.originalSafe;
+  await run.finish();assert.equal(run.calls.providers,2);run.page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  run.release();await run.tick();await run.tick();
+  assert.match(run.page.node('toast').textContent,/登录已失效/,'session expiry is visible even when another provider is selected');
+  assert.equal(run.page.node('toast').hidden,false);
+});
+
+
+for(const status of [503,400])test(`catalog ${status} failure before provider expiry is not lost`,async()=>{
+  const run=await authCompletionPage({failure:'provider401',preloadProviders:true,hold:'providers',catalogFailImmediate:status});run.page.context.safe=run.page.context.originalSafe;
+  await run.finish();await run.tick();await run.tick();assert.equal(run.calls.providers,2);assert.equal(run.calls.catalog,1);
+  run.release();await run.tick();await run.tick();
+  assert.match(run.text(),/控制台登录已失效/);assert.match(run.text(),/模型目录刷新失败/,'expiry must not hide a catalog failure');assert.equal(run.activeTimers(),0);
+});
+
+
+test('catalog success before provider expiry clears the earlier retry failure',async()=>{
+  const run=await authCompletionPage({failure:'provider401',preloadProviders:true,hold:'providers',catalogFailFirst:503});run.page.context.safe=run.page.context.originalSafe;
+  await run.finish();await run.tick();await run.tick();assert.equal(run.calls.providers,2);assert.equal(run.calls.catalog,1);
+  assert.match(run.text(),/更新失败，正在重试/);assert.doesNotMatch(run.text(),/模型目录刷新失败/);
+  run.page.fireTimer(1500);await run.tick();await run.tick();assert.equal(run.calls.catalog,2);
+  run.release();await run.tick();await run.tick();
+  assert.match(run.text(),/控制台登录已失效/);assert.doesNotMatch(run.text(),/模型目录刷新失败/,'successful retry clears the previous catalog failure');
+});
 
 test('pending completion catalog refresh cannot invoke duplicate callbacks',async()=>{
   const run=await authCompletionPage({hold:'catalog'});await run.finish();
