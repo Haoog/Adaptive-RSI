@@ -200,7 +200,10 @@ class Runtime(Maintenance):
         self.evaluator = Evaluator(store)
         self._shutdown = {"phase": "running", "started": None, "ended": None,
                           "scheduler_timed_out": False, "maintenance_timed_out": False,
-                          "workers_timed_out": False, "reconcile_failed": 0, "errors": []}
+                          "workers_timed_out": False, "reconcile_failed": 0,
+                          "budget_persist_failures": 0, "errors": []}
+        # 预算落盘由 worker 与 trial 轮询并发触发，失败计数必须原子累加。
+        self._budget_persist_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._closed = False
         # 领取与关闭的共同边界：close 先关闭准入，再排空线程池；竞态下不会留下已领取
@@ -2043,6 +2046,16 @@ class Runtime(Maintenance):
         写库（含 DB busy 等待）必须在锁外完成，否则一次慢写会占住整把时钟锁，
         把同一 run 的 begin_phase/invoke 与取消轮询一起拖住。
         """
+    def _stage_budget_evidence(self, kind, message, run, data):
+        """预算账本失败的尽力证据：事件自身失败只退回日志，不递归、不打断 run。"""
+        try:
+            self.store.event(kind, message, run.get('project'), run.get('id'),
+                             {'run': run.get('id'), **data})
+        except Exception:
+            logging.getLogger(__name__).warning(
+                'Could not record %s for run %s (%s)', kind, run.get('id'), data.get('error'),
+                exc_info=True)
+
         used, task = run.get('_stage_used'), run.get('task')
         if not task or not isinstance(used, dict):
             return None
@@ -2134,6 +2147,13 @@ class Runtime(Maintenance):
                 logger.info('Dropped stage budget checkpoint for %s: %s', run_id, error)
             else:
                 logger.warning('Could not persist stage budget for %s', run_id, exc_info=True)
+                with self._budget_persist_lock:
+                    self._shutdown['budget_persist_failures'] += 1
+                self._stage_budget_evidence(
+                    'stage_budget_persist_failed',
+                    'Stage budget could not be saved or cleared; a retry may start with a full allowance',
+                    {'id': run_id}, {'key': key,
+                                     'error': f'{type(error).__name__}: {error}'[:200]})
         finally:
             _stage_budget_write_lock.release()
 
@@ -2168,9 +2188,21 @@ class Runtime(Maintenance):
     def _load_stage_budget(self, run):
         """载入同一任务上一尝试的额度；不属于未结尝试的残留直接丢弃。"""
         key = self._stage_budget_key(run.get('task'))
-        stored = self.store.setting(key, {})
-        if not isinstance(stored, dict):
-            stored = {}
+        stored, detail = {}, None
+        row = self.store.one('SELECT value FROM settings WHERE key=?', (key,))
+        if row:
+            try:
+                stored = json.loads(row['value'])
+            except (ValueError, TypeError):
+                stored, detail = None, 'not valid JSON'
+            if not isinstance(stored, dict):
+                # 键存在但账本不可解析：按 0 处理，但不能静默当成一次成功载入。
+                detail = detail or type(stored).__name__
+                stored = {}
+                self._stage_budget_evidence(
+                    'stage_budget_corrupt',
+                    'Stage budget setting is not a JSON object; treating it as unused',
+                    run, {'task': run.get('task'), 'error': f'stage budget is {detail}'})
         owner = stored.get('run')
         if owner and owner != run.get('id'):
             row = self.store.one('SELECT state,ended FROM runs WHERE id=?', (owner,))

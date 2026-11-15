@@ -1584,13 +1584,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.api_error(exc)
         finally:
-<<<<<<< HEAD
             if response_lock is not None:
                 response_lock.release()
-            if urlparse(self.path).path.startswith("/api/"):
-=======
             if urlparse(self.path).path.startswith("/api/") and not getattr(self, "_request_log_skipped", False):
->>>>>>> 276bbdef3e6341547d302970a7b41d99e9072fbb
                 try:
                     status = getattr(self, "_response_status", 500)
                     self.server.runtime.store.record_request(
