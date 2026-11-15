@@ -17,7 +17,8 @@ const {chromium} = require('playwright');
       server.once('exit', code => {clearTimeout(timeout); reject(Error('Fixture exited: '+code));});
     });
     browser = await chromium.launch();
-    const page = await browser.newPage(), errors=[];
+    // Route-controlled outages must not depend on service-worker activation timing.
+    const page = await browser.newPage({serviceWorkers:'block'}), errors=[];
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(url);
     await page.waitForLoadState('networkidle');
@@ -25,7 +26,7 @@ const {chromium} = require('playwright');
     await page.locator('[data-task-filter="active"]').click();
     let mode='fail', failures=0, held=0, heldTask=null, releaseRetry;
     const waitRetry = new Promise(resolve => {releaseRetry=resolve;});
-    await page.route('**/api/task-runs?*', async route => {
+    await page.route(url => url.pathname === '/api/task-runs', async route => {
       if (mode==='fail') {failures++;return route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'temporary outage'})});}
       if (mode==='hold') {
         const task=new URL(route.request().url()).searchParams.get('task');
