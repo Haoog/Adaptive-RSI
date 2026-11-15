@@ -3830,6 +3830,20 @@ test('starting another OpenCode login replaces an invalidated key count refresh'
   assert.ok(providerCalls>=3,'an invalidated provider refresh must be replaced');assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
 });
 
+for(const startFails of [false,true])test(`OpenCode OAuth ${startFails?'failed':'pending'} start refreshes visible counts`,async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let providerCalls=0;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:['example']}});
+    if(url.includes('/api/auth/providers?'))return response([{id:'example',name:'Example',connected:true,connection_count:++providerCalls===1?1:2,methods:[{index:0,type:'oauth',label:'OAuth',supported:true}]}]);
+    if(url.endsWith('/api/auth/start'))return startFails?response({},503):response({id:'new-oauth',backend:'opencode',provider:'example',state:'awaiting_authorization',method:'auto'});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}',page.context);vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/1 个账号/);
+  const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.handlers.submit({preventDefault(){}});await tick();await tick();
+  assert.equal(providerCalls,2);assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
+});
+
 test('completed auth console expiry stays actionable and stops refresh retries',async()=>{
   const run=await authCompletionPage({failure:'session_required'});await run.finish();
   assert.match(run.text(),/控制台登录已失效/);assert.equal(run.calls.catalog,0);
