@@ -81,7 +81,8 @@ class RuntimeHandoffTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'cannot schedule new futures after shutdown'):
             self.runtime.pool.submit(lambda: None)
         self.assertGreater(self.store._pool_generation, generation)
-        self.assertTrue(self.runtime.lockfile.closed)
+        # 释放后 lockfile 置空；仍持有对象时必须是已关闭的。
+        self.assertTrue(self.runtime.lockfile is None or self.runtime.lockfile.closed)
 
     def test_close_reports_worker_and_reconcile_failures_separately(self):
         with patch.object(self.runtime, '_shutdown_workers', side_effect=OSError('worker failed')), \
@@ -109,7 +110,8 @@ class RuntimeHandoffTest(unittest.TestCase):
         status = self.runtime.shutdown_status()
         self.assertEqual([(item['phase'], item['target']) for item in status['errors']],
                          [('storage', 'store')])
-        self.assertTrue(self.runtime.lockfile.closed)
+        # 释放后 lockfile 置空；仍持有对象时必须是已关闭的。
+        self.assertTrue(self.runtime.lockfile is None or self.runtime.lockfile.closed)
 
     def test_shutdown_bounds_non_cancellable_worker(self):
         gate, began = threading.Event(), threading.Event()
@@ -424,8 +426,19 @@ class RuntimeHandoffTest(unittest.TestCase):
         task, run = self.claim()
         run['_stage_used'] = {'preparation': 5.0, 'evaluation': 0.0}
         error = sqlite3.OperationalError('database or disk is full')
-        with patch.object(self.store, 'put_setting', side_effect=error):
-            self.runtime._save_stage_budget(run, 1000.0, True)
+        real_connect, calls = self.store.connect, {'n': 0}
+
+        def flaky_connect():
+            # 只让账本写入的那次连接失败；随后的事件落盘必须走真实连接。
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise error
+            return real_connect()
+
+        with patch.object(self.store, 'connect', side_effect=flaky_connect):
+            self.runtime._persist_stage_budget('stage-budget:' + task,
+                                               {'preparation': 5.0, 'evaluation': 0.0},
+                                               run['id'], True)
         event = self.store.one("SELECT * FROM events WHERE kind='stage_budget_persist_failed'")
         self.assertIsNotNone(event)
         self.assertEqual(event['run'], run['id'])
@@ -457,7 +470,8 @@ class RuntimeHandoffTest(unittest.TestCase):
         """正常落盘不产生失败事件，计数器保持 0。"""
         task, run = self.claim()
         run['_stage_used'] = {'preparation': 5.0, 'evaluation': 1.0}
-        self.runtime._save_stage_budget(run, 1000.0, True)
+        snapshot = self.runtime._stage_budget_snapshot(run, 1000.0, True)
+        self.runtime._persist_stage_budget(*snapshot, keep=True)
         self.assertEqual(self.store.setting('stage-budget:' + task),
                          {'preparation': 5.0, 'evaluation': 1.0, 'run': run['id']})
         self.assertIsNone(self.store.one(

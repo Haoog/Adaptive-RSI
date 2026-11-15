@@ -2046,16 +2046,6 @@ class Runtime(Maintenance):
         写库（含 DB busy 等待）必须在锁外完成，否则一次慢写会占住整把时钟锁，
         把同一 run 的 begin_phase/invoke 与取消轮询一起拖住。
         """
-    def _stage_budget_evidence(self, kind, message, run, data):
-        """预算账本失败的尽力证据：事件自身失败只退回日志，不递归、不打断 run。"""
-        try:
-            self.store.event(kind, message, run.get('project'), run.get('id'),
-                             {'run': run.get('id'), **data})
-        except Exception:
-            logging.getLogger(__name__).warning(
-                'Could not record %s for run %s (%s)', kind, run.get('id'), data.get('error'),
-                exc_info=True)
-
         used, task = run.get('_stage_used'), run.get('task')
         if not task or not isinstance(used, dict):
             return None
@@ -2066,6 +2056,16 @@ class Runtime(Maintenance):
         values = {name: self._stage_seconds(values.get(name))
                   for name in ('preparation', 'evaluation')}
         return self._stage_budget_key(task), values, run.get('id')
+
+    def _stage_budget_evidence(self, kind, message, run, data):
+        """预算账本失败的尽力证据：事件自身失败只退回日志，不递归、不打断 run。"""
+        try:
+            self.store.event(kind, message, run.get('project'), run.get('id'),
+                             {'run': run.get('id'), **data})
+        except Exception:
+            logging.getLogger(__name__).warning(
+                'Could not record %s for run %s (%s)', kind, run.get('id'), data.get('error'),
+                exc_info=True)
 
     def _persist_stage_budget(self, key, values, run_id, keep):
         """落盘或清除任务已耗的阶段时间：只有中断把额度交接给下一次尝试。
@@ -2152,8 +2152,9 @@ class Runtime(Maintenance):
                 self._stage_budget_evidence(
                     'stage_budget_persist_failed',
                     'Stage budget could not be saved or cleared; a retry may start with a full allowance',
-                    {'id': run_id}, {'key': key,
-                                     'error': f'{type(error).__name__}: {error}'[:200]})
+                    {'id': run_id},
+                    {'task': key.split(':', 1)[1] if ':' in key else None, 'key': key,
+                     'error': f'{type(error).__name__}: {error}'[:200]})
         finally:
             _stage_budget_write_lock.release()
 
