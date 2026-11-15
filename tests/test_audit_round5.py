@@ -142,6 +142,7 @@ class AuditRound5Test(unittest.TestCase):
         fake = SimpleNamespace(store=self.store, stop=threading.Event(), dispatch_lock=threading.RLock(),
             scheduler_scope=lambda *a, **k: contextlib.nullcontext(), config=lambda p: {"providers": []},
             model_center=SimpleNamespace(cleanup_credentials=lambda: None, key=lambda *a: "unused"))
+        fake._record_maintenance_degraded = lambda failures, now: Maintenance._record_maintenance_degraded(fake, failures, now)
         Maintenance.maintenance(fake)
         self.assertIsNone(self.store.setting("triage-state:200"))
 
@@ -153,6 +154,7 @@ class AuditRound5Test(unittest.TestCase):
         fake = SimpleNamespace(store=self.store, stop=threading.Event(), dispatch_lock=threading.RLock(),
             scheduler_scope=lambda *a, **k: contextlib.nullcontext(), config=lambda p: {"providers": []},
             model_center=SimpleNamespace(cleanup_credentials=lambda: None, key=lambda *a: "unused"))
+        fake._record_maintenance_degraded = lambda failures, now: Maintenance._record_maintenance_degraded(fake, failures, now)
         Maintenance.maintenance(fake)
         self.assertIsNone(self.store.one("SELECT value FROM settings WHERE key='task-proof:old'"))
         self.assertIsNotNone(self.store.one("SELECT value FROM settings WHERE key='run-baseline:bad'"))

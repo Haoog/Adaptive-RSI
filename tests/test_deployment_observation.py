@@ -206,6 +206,42 @@ class DeploymentObservationTest(unittest.TestCase):
         self.assertEqual(result['state'], 'workflow_succeeded')
         self.assertNotIn('health_started_at', result)
 
+    def test_every_unknown_observation_consumes_a_configured_round(self):
+        """A timeout consumes one round, so all five configured probes really happen."""
+        self.policy.update(health_consecutive_successes=1)
+        probes = []
+        def probe(url, sha):
+            probes.append(sha)
+            return {'healthy': None, 'sha': sha, 'error': 'endpoint timed out'}
+        states = []
+        for now in (0, 60, 120, 180, 240):
+            with patch('adaptive_rsi.release.time.time', return_value=now), \
+                 patch('adaptive_rsi.release.health_check', side_effect=probe):
+                self.data = deployment_health(self.runtime, self.project, self.run, self.data, self.policy, None)
+            states.append(self.data['state'])
+            if now < 240:
+                self.assertEqual(self.data['health_gate'], {'required_consecutive': 1, 'observed_consecutive': 0,
+                                                            'round_limit': 5, 'rounds': len(probes)})
+        self.assertEqual(states, ['workflow_succeeded'] * 4 + ['health_unconfirmed'])
+        self.assertEqual(len(probes), 5)
+        self.assertEqual(self.data['health_attempts'], 5)
+        self.assertEqual(self.data['health_gate'], {'required_consecutive': 1, 'observed_consecutive': 0,
+                                                    'round_limit': 5, 'rounds': 5})
+        self.assertEqual(len(self.data['health_observations']), 5)
+
+    def test_last_configured_round_can_still_confirm_health(self):
+        """The round that used to be skipped can now be the one that confirms health."""
+        self.policy.update(health_consecutive_successes=1)
+        states = []
+        for now, healthy in [(0, None), (60, None), (120, None), (180, None), (240, True)]:
+            with patch('adaptive_rsi.release.time.time', return_value=now), \
+                 patch('adaptive_rsi.release.health_check', return_value={'healthy': healthy, 'sha': self.data['sha']}):
+                self.data = deployment_health(self.runtime, self.project, self.run, self.data, self.policy, None)
+            states.append(self.data['state'])
+        self.assertEqual(states, ['workflow_succeeded'] * 4 + ['healthy'])
+        self.assertEqual(self.data['health_attempts'], 5)
+        self.assertEqual(self.data['health_gate']['rounds'], 5)
+
     def test_health_retry_rechecks_owner_after_validation(self):
         from adaptive_rsi.release import retry
         for state in ('health_unconfirmed', 'rollback_health_unconfirmed'):
