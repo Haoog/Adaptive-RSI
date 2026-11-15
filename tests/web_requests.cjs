@@ -3584,6 +3584,375 @@ for(const direct of [false,true])for(const failure of ['status','catalog']){
   });
 }
 
+test('historical Codex login is not presented as the current account after credentials change',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({codex:{available:true,state:'authenticated'},sessions:[{id:'old-alice',backend:'codex',state:'completed',accounts:[{label:'alice@example.test',plan:'old-plan'}]}]});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('openai',async()=>{});
+  await tick();await tick();
+  const content=walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' ');
+  assert.match(content,/账号已连接/);assert.doesNotMatch(content,/alice@example\.test|old-plan/);
+});
+
+test('failed provider refresh hides old connection count after key changes',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let providerCalls=0;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:['example']}});
+    if(url.includes('/api/auth/providers?'))return ++providerCalls===1?response([{id:'example',name:'Example',connected:true,connection_count:2,methods:[{index:0,type:'api',label:'API key',supported:true}]}]):response({},503);
+    if(url.endsWith('/api/auth/key'))return response({ok:true});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+  const select=walk(page.node('mc-auth')).find(node=>node.tagName==='SELECT');select.value='example';select.handlers.change();
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
+  const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});await tick();await tick();
+  const content=walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' ');
+  assert.equal(providerCalls,2);assert.doesNotMatch(content,/2 个账号/);
+});
+
+test('completed Codex session labels account details as a login attempt',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let calls=0,statusCalls=0;
+  const session={id:'codex-1',backend:'codex',provider:null,state:'awaiting_authorization'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({codex:{available:true,state:++statusCalls>1?'authenticated':'unauthenticated'},sessions:statusCalls===1?[session]:[]});
+    if(url.includes('/api/auth/session?id='))return response(++calls===1?session:{...session,state:'completed',accounts:[{label:'new@example.test',plan:'plus'}]});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('openai',async()=>{});await tick();await tick();page.fireTimer(1500);await tick();await tick();
+  const content=walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' ');
+  assert.match(content,/本次登录尝试报告的账号：new@example\.test/);assert.match(content,/本次登录尝试报告的套餐：plus/);assert.doesNotMatch(content,/已连接账号：new/);
+});
+
+test('malformed provider connection counts are not displayed',async()=>{
+  for(const value of [true,'2',1.5,-1,0,Number.MAX_SAFE_INTEGER+1]){
+    const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);
+    page.context.fetch=async url=>{
+      if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:['example']}});
+      if(url.includes('/api/auth/providers?'))return response([{id:'example',name:'Example',connected:true,connection_count:value,methods:[]}]);
+      throw new Error('Unexpected request '+url);
+    };
+    vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+    const content=walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' ');assert.doesNotMatch(content,/个账号/,String(value));
+  }
+});
+
+test('OAuth completion invalidates prior counts before slow status refresh',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let statusCalls=0,sessionCalls=0,releaseStatus;
+  const heldStatus=new Promise(resolve=>{releaseStatus=resolve;});const session={id:'oauth-2',backend:'opencode',provider:'example',state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){statusCalls++;if(statusCalls>1)await heldStatus;return response({sessions:statusCalls===1?[session]:[],opencode:{available:true,authenticated_providers:['example']}});}
+    if(url.includes('/api/auth/providers?'))return response([{id:'example',name:'Example',connected:true,connection_count:2,methods:[]}]);
+    if(url.includes('/api/auth/session?id='))return response({...session,state:++sessionCalls>1?'completed':'awaiting_authorization'});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
+  try{page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,2);assert.doesNotMatch(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);}
+  finally{releaseStatus();await tick();await tick();}
+});
+
+test('completed OAuth recovered between status and session refreshes counts',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let releaseSession,providerCalls=0,statusCalls=0;
+  const heldSession=new Promise(resolve=>{releaseSession=resolve;});const session={id:'recover-1',backend:'opencode',provider:'example',state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){statusCalls++;return response({sessions:statusCalls===1?[session]:[],opencode:{available:true,authenticated_providers:['example']}});}
+    if(url.includes('/api/auth/session?id=')){await heldSession;return response({...session,state:'completed'});}
+    if(url.includes('/api/auth/providers?'))return response([{id:'example',name:'Example',connected:true,connection_count:++providerCalls===1?1:2,methods:[]}]);
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/1 个账号/);releaseSession();await tick();await tick();
+  assert.doesNotMatch(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/1 个账号/);
+  page.fireTimer(1500);await tick();await tick();assert.equal(providerCalls,2);assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
+});
+
+test('provider metadata read during a pending key mutation never revives old counts',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let releaseStatus,releaseKey,statusCalls=0,providerCalls=0,sessionCalls=0;
+  const heldStatus=new Promise(resolve=>{releaseStatus=resolve;}),heldKey=new Promise(resolve=>{releaseKey=resolve;});
+  const session={id:'oauth-other',backend:'opencode',provider:'other',state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){statusCalls++;if(statusCalls===2)await heldStatus;if(statusCalls>2)return response({},503);return response({sessions:statusCalls===1?[session]:[],opencode:{available:true,authenticated_providers:['example']}});}
+    if(url.includes('/api/auth/session?id='))return response({...session,state:++sessionCalls>1?'completed':'awaiting_authorization'});
+    if(url.includes('/api/auth/providers?')){providerCalls++;return response([{id:'example',name:'Example',connected:true,connection_count:2,methods:[{index:0,type:'api',label:'API key',supported:true}]},{id:'other',name:'Other',connected:false,methods:[]}]);}
+    if(url.endsWith('/api/auth/key')){await heldKey;return response({ok:true});}
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+  const select=walk(page.node('mc-auth')).find(node=>node.tagName==='SELECT');select.value='example';select.handlers.change();page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,2);
+  const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});page.context.lastAction.catch(()=>{});await tick();
+  try{releaseStatus();await tick();await tick();assert.equal(providerCalls,2);assert.doesNotMatch(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);}
+  finally{releaseKey();await tick();await tick();}
+  assert.doesNotMatch(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
+});
+
+test('discarded initial provider load is retried after recovered OAuth completion',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let releaseFirst,providerCalls=0;
+  const held=new Promise(resolve=>{releaseFirst=resolve;}),session={id:'recover-pending',backend:'opencode',provider:'example',state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[session],opencode:{available:true,authenticated_providers:['example']}});
+    if(url.includes('/api/auth/session?id='))return response({...session,state:'completed'});
+    if(url.includes('/api/auth/providers?')){const n=++providerCalls;if(n===1)await held;return response([{id:'example',name:'Example',connected:true,connection_count:n===1?1:2,methods:[]}]);}
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();releaseFirst();await tick();await tick();
+  const content=walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' ');
+  assert.equal(providerCalls,2);assert.match(content,/2 个账号/);assert.doesNotMatch(content,/1 个账号/);
+});
+
+test('provider response begun during key change is discarded after mutation settles',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let releaseStatus,releaseKey,releaseProviders,statusCalls=0,providerCalls=0,sessionCalls=0;
+  const heldStatus=new Promise(resolve=>{releaseStatus=resolve;}),heldKey=new Promise(resolve=>{releaseKey=resolve;}),heldProviders=new Promise(resolve=>{releaseProviders=resolve;});
+  const session={id:'oauth-late',backend:'opencode',provider:'other',state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){statusCalls++;if(statusCalls===2)await heldStatus;if(statusCalls>2)return response({},503);return response({sessions:statusCalls===1?[session]:[],opencode:{available:true,authenticated_providers:['example']}});}
+    if(url.includes('/api/auth/session?id='))return response({...session,state:++sessionCalls>1?'completed':'awaiting_authorization'});
+    if(url.includes('/api/auth/providers?')){if(++providerCalls===2)await heldProviders;return response([{id:'example',name:'Example',connected:true,connection_count:2,methods:[{index:0,type:'api',label:'API key',supported:true}]},{id:'other',name:'Other',connected:false,methods:[]}]);}
+    if(url.endsWith('/api/auth/key')){await heldKey;return response({ok:true});}
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+  const select=walk(page.node('mc-auth')).find(node=>node.tagName==='SELECT');select.value='example';select.handlers.change();page.fireTimer(1500);await tick();await tick();
+  const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});page.context.lastAction.catch(()=>{});await tick();
+  releaseStatus();await tick();await tick();assert.equal(providerCalls,2);releaseKey();await tick();await tick();releaseProviders();await tick();await tick();
+  assert.doesNotMatch(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
+});
+
+test('OpenCode key changes reload provider connection counts',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);
+  let connected=false,providerCalls=0;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['example']:[]}});
+    if(url.includes('/api/auth/providers?')){providerCalls++;return response([{id:'example',name:'Example',connected,connection_count:connected?2:0,methods:[{index:0,type:'api',label:'API key',supported:true}]}]);}
+    if(url.endsWith('/api/auth/key')){connected=true;return response({ok:true});}
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});
+  await tick();await tick();
+  const select=walk(page.node('mc-auth')).find(node=>node.tagName==='SELECT');select.value='example';select.handlers.change();
+  const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});
+  await tick();await tick();
+  const content=walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' ');
+  assert.equal(providerCalls,2);assert.match(content,/账号已连接 · 2 个账号/);assert.match(content,/Example · 已连接 · 2 个账号/);
+});
+
+test('OpenCode OAuth completion refreshes provider metadata',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);
+  let providerCalls=0,sessionCalls=0,statusCalls=0;
+  const session={id:'oauth-1',backend:'opencode',provider:'example',state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){statusCalls++;return response({sessions:statusCalls===1?[session]:[],opencode:{available:true,authenticated_providers:statusCalls>1?['example']:[]}});}
+    if(url.includes('/api/auth/providers?')){providerCalls++;return response([{id:'example',name:'Example',connected:providerCalls>1,connection_count:providerCalls>1?1:0,methods:[]}]);}
+    if(url.includes('/api/auth/session?id=')){sessionCalls++;return response({...session,state:sessionCalls>1?'completed':'awaiting_authorization'});}
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});
+  await tick();await tick();page.fireTimer(1500);await tick();await tick();
+  const content=walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' ');
+  assert.equal(providerCalls,2);assert.match(content,/账号已连接 · 1 个账号/);assert.match(content,/Example · 已连接 · 1 个账号/);
+});
+
+test('completed login status expiry exposes restart controls',async()=>{
+  const run=await authCompletionPage({failure:'session_required'});await run.finish();
+  assert.match(run.text(),/控制台登录已失效/);
+  assert.ok(run.walk(run.page.node('mc-auth')).some(node=>node.tagName==='FORM'),'restart form should remain visible');
+  assert.ok(!run.walk(run.page.node('mc-auth')).some(node=>node.textContent==='取消登录'),'completed session must not remain presented as running');
+});
+
+test('provider expiry invalidated by another provider mutation remains visible for current login',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let providerCalls=0,statusCalls=0,sessionCalls=0,releaseProviders;
+  const heldProviders=new Promise(resolve=>{releaseProviders=resolve;}),session={id:'codex-expiry',backend:'codex',provider:null,state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){statusCalls++;if(statusCalls>2)return response({},503);return response({sessions:statusCalls===1?[session]:[],codex:{available:true,state:statusCalls>1?'authenticated':'signed_out'},opencode:{available:true,authenticated_providers:['example']}});}
+    if(url.includes('/api/auth/session?id='))return response({...session,state:++sessionCalls>1?'completed':'awaiting_authorization'});
+    if(url.includes('/api/auth/providers?')){if(++providerCalls===2){await heldProviders;return response({},401);}return response([{id:'example',name:'Example',connected:true,connection_count:1,methods:[{index:0,type:'api',label:'API key',supported:true}]}]);}
+    if(url.endsWith('/api/auth/key'))return response({ok:true});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}',page.context);vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();page.context.window.RSIAuth.show('openai',async()=>{});await tick();await tick();
+  page.fireTimer(1500);await tick();await tick();assert.equal(providerCalls,2);
+  page.context.window.RSIAuth.show('opencode',async()=>{});await tick();
+  const select=walk(page.node('mc-auth')).find(node=>node.tagName==='SELECT');select.value='example';select.handlers.change();
+  const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});page.context.lastAction.catch(()=>{});await tick();await tick();
+  releaseProviders();await tick();await tick();page.context.window.RSIAuth.show('openai',async()=>{});await tick();
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/控制台登录已失效/);
+});
+
+test('later expiry from current completion remains visible after newer provider success',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let providerCalls=0,statusCalls=0,sessionCalls=0,releaseProviders;
+  const held=new Promise(resolve=>{releaseProviders=resolve;}),session={id:'codex-late-expiry',backend:'codex',provider:null,state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){statusCalls++;return response({sessions:statusCalls===1?[session]:[],codex:{available:true,state:statusCalls>1?'authenticated':'signed_out'},opencode:{available:true,authenticated_providers:['example']}});}
+    if(url.includes('/api/auth/session?id='))return response({...session,state:++sessionCalls>1?'completed':'awaiting_authorization'});
+    if(url.includes('/api/auth/providers?')){if(++providerCalls===2){await held;return response({},401);}return response([{id:'example',name:'Example',connected:true,connection_count:1,methods:[{index:0,type:'api',label:'API key',supported:true}]}]);}
+    if(url.endsWith('/api/auth/key'))return response({ok:true});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}',page.context);vm.runInContext(authSource,page.context);
+  page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();page.context.window.RSIAuth.show('openai',async()=>{});await tick();await tick();
+  page.fireTimer(1500);await tick();await tick();assert.equal(providerCalls,2);
+  page.context.window.RSIAuth.show('opencode',async()=>{});await tick();const select=walk(page.node('mc-auth')).find(node=>node.tagName==='SELECT');select.value='example';select.handlers.change();
+  const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});await tick();await tick();assert.equal(providerCalls,3);
+  releaseProviders();await tick();await tick();page.context.window.RSIAuth.show('openai',async()=>{});await tick();
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/控制台登录已失效/);
+});
+
+test('Codex completion preserves an in-flight OpenCode count refresh',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let providerCalls=0,statusCalls=0,sessionCalls=0,releaseProviders;
+  const held=new Promise(resolve=>{releaseProviders=resolve;}),session={id:'codex-during-count',backend:'codex',provider:null,state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){statusCalls++;return response({sessions:statusCalls===1?[session]:[],codex:{available:true,state:statusCalls>2?'authenticated':'signed_out'},opencode:{available:true,authenticated_providers:['example']}});}
+    if(url.includes('/api/auth/session?id='))return response({...session,state:++sessionCalls>1?'completed':'awaiting_authorization'});
+    if(url.includes('/api/auth/providers?')){const n=++providerCalls;if(n===2)await held;if(n>2)return response({},503);return response([{id:'example',name:'Example',connected:true,connection_count:n===1?1:2,methods:[{index:0,type:'api',label:'API key',supported:true}]}]);}
+    if(url.endsWith('/api/auth/key'))return response({ok:true});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+  const select=walk(page.node('mc-auth')).find(node=>node.tagName==='SELECT');select.value='example';select.handlers.change();const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});await tick();await tick();assert.equal(providerCalls,2);
+  page.fireTimer(1500);await tick();await tick();releaseProviders();await tick();await tick();
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
+});
+
+test('starting another OpenCode login replaces an invalidated key count refresh',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let providerCalls=0,releaseProviders;
+  const held=new Promise(resolve=>{releaseProviders=resolve;});
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:['example']}});
+    if(url.includes('/api/auth/providers?')){const n=++providerCalls;if(n===2)await held;return response([{id:'example',name:'Example',connected:true,connection_count:n===1?1:2,methods:[{index:0,type:'api',label:'API key',supported:true}]},{id:'other',name:'Other',connected:false,methods:[{index:0,type:'oauth',label:'OAuth',supported:true}]}]);}
+    if(url.endsWith('/api/auth/key'))return response({ok:true});
+    if(url.endsWith('/api/auth/start'))return response({id:'other-login',backend:'opencode',provider:'other',state:'awaiting_authorization',method:'auto'});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+  let select=walk(page.node('mc-auth')).find(node=>node.tagName==='SELECT');select.value='example';select.handlers.change();let form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});await tick();await tick();assert.equal(providerCalls,2);
+  select=walk(page.node('mc-auth')).find(node=>node.tagName==='SELECT');select.value='other';select.handlers.change();form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.handlers.submit({preventDefault(){}});await tick();await tick();releaseProviders();await tick();await tick();
+  assert.ok(providerCalls>=3,'an invalidated provider refresh must be replaced');assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
+});
+
+for(const startFails of [false,true])test(`OpenCode OAuth ${startFails?'failed':'pending'} start refreshes visible counts`,async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let providerCalls=0;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:['example']}});
+    if(url.includes('/api/auth/providers?'))return response([{id:'example',name:'Example',connected:true,connection_count:++providerCalls===1?1:2,methods:[{index:0,type:'oauth',label:'OAuth',supported:true}]}]);
+    if(url.endsWith('/api/auth/start'))return startFails?response({},503):response({id:'new-oauth',backend:'opencode',provider:'example',state:'awaiting_authorization',method:'auto'});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}',page.context);vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/1 个账号/);
+  const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.handlers.submit({preventDefault(){}});await tick();await tick();
+  assert.equal(providerCalls,2);assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
+});
+
+for(const operation of ['key','logout'])test(`failed OpenCode ${operation} refreshes hidden counts`,async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let providerCalls=0;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:['example']}});
+    if(url.includes('/api/auth/providers?'))return response([{id:'example',name:'Example',connected:true,connection_count:++providerCalls===1?1:2,methods:[{index:0,type:'api',label:'API key',supported:true}]}]);
+    if(url.endsWith('/api/auth/'+operation))return response({},503);
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}',page.context);vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/1 个账号/);
+  if(operation==='key'){const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});}
+  else{const logout=walk(page.node('mc-auth')).find(node=>node.textContent==='退出账号');logout.handlers.click();}
+  await tick();await tick();assert.equal(providerCalls,2);assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
+});
+
+test('completed login keeps restart controls while status refresh is held',async()=>{
+  const run=await authCompletionPage({hold:'status'});await run.finish();
+  const nodes=run.walk(run.page.node('mc-auth'));
+  assert.ok(nodes.some(node=>node.tagName==='FORM'),'completed login allows starting again');
+  assert.ok(nodes.some(node=>node.textContent==='停止等待'),'completed login can stop the pending refresh');
+  assert.ok(!nodes.some(node=>node.textContent==='取消登录'),'completed login is not shown as cancellable');
+  nodes.find(node=>node.textContent==='停止等待').handlers.click();await run.page.context.lastAction;
+  run.release();await run.tick();await run.tick();assert.equal(run.calls.catalog,0);
+});
+
+for(const mode of ['stop','restart'])test(`${mode} invalidates a completed login's delayed status`,async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let releaseStatus,statusCalls=0,sessionCalls=0;
+  const held=new Promise(resolve=>{releaseStatus=resolve;}),initial={id:'old-login',backend:'codex',provider:null,state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){const n=++statusCalls;if(n===2){await held;return response({sessions:[],codex:{available:true,state:'authenticated'}});}return response({sessions:n===1?[initial]:[],codex:{available:true,state:'signed_out'}});}
+    if(url.includes('/api/auth/session?id=')){sessionCalls++;return response(url.includes('new-login')?{...initial,id:'new-login',state:'completed'}:sessionCalls===1?initial:{...initial,state:'completed'});}
+    if(url.endsWith('/api/auth/start'))return response({...initial,id:'new-login',state:'starting'});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('openai',async()=>{});await tick();await tick();page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,2);
+  if(mode==='stop'){const stop=walk(page.node('mc-auth')).find(node=>node.textContent==='停止等待');assert.ok(stop);stop.handlers.click();await tick();}
+  const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');assert.ok(form);form.handlers.submit({preventDefault(){}});await tick();await tick();
+  page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,3,'new session must not join the old hung status request');
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/尚未登录/);
+  releaseStatus();await tick();await tick();assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/尚未登录/);
+});
+
+test('logout invalidates delayed completion status before refreshing account state',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let releaseStatus,statusCalls=0,sessionCalls=0;
+  const held=new Promise(resolve=>{releaseStatus=resolve;}),initial={id:'old-login',backend:'codex',provider:null,state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){const n=++statusCalls;if(n===2){await held;return response({sessions:[],codex:{available:true,state:'authenticated'}});}return response({sessions:n===1?[initial]:[],codex:{available:true,state:n===1?'authenticated':'signed_out'}});}
+    if(url.includes('/api/auth/session?id='))return response(++sessionCalls===1?initial:{...initial,state:'completed'});
+    if(url.endsWith('/api/auth/logout'))return response({});
+    if(url.includes('/api/auth/providers?'))return response([]);
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('openai',async()=>{});await tick();await tick();page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,2);
+  const logout=walk(page.node('mc-auth')).find(node=>node.textContent==='退出账号');assert.ok(logout);logout.handlers.click();await tick();await tick();assert.equal(statusCalls,3);
+  assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/尚未登录/);
+  releaseStatus();await tick();await tick();assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/尚未登录/);
+});
+
+test('stopping one completed login continues polling other active logins',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let releaseStatus,statusCalls=0,codexCalls=0,otherCalls=0;
+  const held=new Promise(resolve=>{releaseStatus=resolve;}),codex={id:'codex-login',backend:'codex',provider:null,state:'awaiting_authorization',method:'auto'},other={id:'other-login',backend:'opencode',provider:'example',state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){if(++statusCalls===2){await held;return response({sessions:[],codex:{available:true,state:'authenticated'}});}return response({sessions:[codex,other],codex:{available:true,state:'signed_out'}});}
+    if(url.includes('auth/session?id=codex-login'))return response(++codexCalls===1?codex:{...codex,state:'completed'});
+    if(url.includes('auth/session?id=other-login')){otherCalls++;return response(other);}
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('openai',async()=>{});await tick();await tick();assert.equal(otherCalls,1);
+  page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,2);
+  const stop=walk(page.node('mc-auth')).find(node=>node.textContent==='停止等待');assert.ok(stop);stop.handlers.click();await tick();
+  page.fireTimer(1500);await tick();await tick();assert.equal(otherCalls,2,'other active login remains polled');releaseStatus();await tick();
+});
+
+test('saving API key waits for account status requested after the key mutation',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let releaseStatus,statusCalls=0,sessionCalls=0,keyCalls=0;
+  const held=new Promise(resolve=>{releaseStatus=resolve;}),session={id:'opencode-login',backend:'opencode',provider:'example',state:'awaiting_authorization',method:'auto'};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){const n=++statusCalls;if(n===2){await held;return response({sessions:[],opencode:{available:true,authenticated_providers:[]}});}return response({sessions:n===1?[session]:[],opencode:{available:true,authenticated_providers:n===1?[]:['example']}});}
+    if(url.includes('auth/session?id=opencode-login'))return response(++sessionCalls===1?session:{...session,state:'completed'});
+    if(url.includes('/api/auth/providers?'))return response([{id:'example',name:'Example',connected:true,methods:[{index:0,type:'api',label:'API key',supported:true}]}]);
+    if(url.endsWith('/api/auth/key')){keyCalls++;return response({});}
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,2);
+  const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');assert.ok(form);form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});await tick();await tick();
+  assert.equal(keyCalls,1);assert.equal(statusCalls,3,'key save must request status after the mutation even while an older status hangs');
+  assert.ok(walk(page.node('mc-auth')).some(node=>node.textContent==='退出账号'));
+  releaseStatus();await tick();await tick();assert.ok(walk(page.node('mc-auth')).some(node=>node.textContent==='退出账号'),'older signed-out snapshot must be ignored');
+});
+
+test('stopping one completed login does not strand another shared status refresh',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let releaseStatus,statusCalls=0,codexCalls=0;
+  const held=new Promise(resolve=>{releaseStatus=resolve;}),codex={id:'codex-shared',backend:'codex',provider:null,state:'awaiting_authorization',method:'auto'},other={id:'other-shared',backend:'opencode',provider:'example',state:'awaiting_authorization',method:'code',attempt_generation:1};
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status')){const n=++statusCalls;if(n===2){await held;return response({sessions:[],codex:{available:true,state:'authenticated'}});}return response({sessions:n===1?[codex,other]:[],codex:{available:true,state:n===1?'signed_out':'authenticated'},opencode:{available:true,authenticated_providers:[]}});}
+    if(url.includes('auth/session?id=codex-shared'))return response(++codexCalls===1?codex:{...codex,state:'completed'});
+    if(url.includes('auth/session?id=other-shared'))return response(other);
+    if(url.endsWith('/api/auth/complete'))return response({...other,state:'completed'});
+    if(url.includes('/api/auth/providers?'))return response([{id:'example',name:'Example',connected:true,methods:[{index:0,type:'api',label:'API key',supported:true}]}]);
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('openai',async()=>{});await tick();await tick();page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,2);
+  page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+  const code=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');assert.ok(code);code.children[0].children[0].value='fixture';code.handlers.submit({preventDefault(){}});await tick();await tick();
+  const stop=walk(page.node('mc-auth')).find(node=>node.textContent==='停止等待');assert.ok(stop);stop.handlers.click();await tick();await tick();
+  page.fireTimer(1500);await tick();await tick();assert.equal(statusCalls,3,'other completed login should retry instead of joining the stopped request');
+  assert.equal(page.context.window.RSIAuth.isConnected('openai'),true);releaseStatus();await tick();await tick();
+});
+
 test('completed auth console expiry stays actionable and stops refresh retries',async()=>{
   const run=await authCompletionPage({failure:'session_required'});await run.finish();
   assert.match(run.text(),/控制台登录已失效/);assert.equal(run.calls.catalog,0);
@@ -3609,7 +3978,7 @@ test('completed auth bounds catalog retries for a persistent transient failure',
 for(const hold of ['status','catalog'])for(const restart of [false,true]){
   test(`completion ${hold} pending cannot revive auth after ${restart?'restart':'cancel or logout'}`,async()=>{
     const run=await authCompletionPage({hold,failure:hold==='status'?'session_required':'catalog'});await run.finish();
-    const button=run.walk(run.page.node('mc-auth')).find(node=>node.textContent===(hold==='status'?'取消登录':'退出账号'));
+    const button=run.walk(run.page.node('mc-auth')).find(node=>node.textContent===(hold==='status'?'停止等待':'退出账号'));
     assert.ok(button);button.handlers.click();await run.page.context.lastAction;
     if(restart){
       run.walk(run.page.node('mc-auth')).find(node=>node.tagName==='FORM').handlers.submit({preventDefault(){}});await run.page.context.lastAction;
