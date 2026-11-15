@@ -57,6 +57,55 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.runtime.shutdown_status()['phase'], 'completed')
         self.assertFalse(self.runtime.shutdown_status()['workers_timed_out'])
 
+    def test_close_isolates_authentication_error_and_releases_remaining_resources(self):
+        # 认证会话清理在坏盘/NFS 上失败时，close() 仍必须排空 worker 池、关闭
+        # store 并释放状态目录锁：CLI 与桌面端都只在 finally 里调用一次 close()。
+        self.runtime.configure({'updates': {'mode': 'manual'}})
+        self.runtime.start(paused=True)
+        generation = self.store._pool_generation
+        with patch.object(self.runtime.auth_sessions, 'close',
+                          side_effect=OSError('nfs cleanup failed')):
+            with self.assertRaisesRegex(OSError, 'nfs cleanup failed'):
+                self.runtime.close()
+        status = self.runtime.shutdown_status()
+        self.assertEqual(status['phase'], 'failed')
+        self.assertEqual([(item['phase'], item['target']) for item in status['errors']],
+                         [('authentication', 'auth_sessions')])
+        self.assertIn('OSError: nfs cleanup failed', status['errors'][0]['error'])
+        # 线程池已 shutdown：后续提交会被拒绝，而不是继续接受新工作。
+        with self.assertRaisesRegex(RuntimeError, 'cannot schedule new futures after shutdown'):
+            self.runtime.pool.submit(lambda: None)
+        self.assertGreater(self.store._pool_generation, generation)
+        self.assertTrue(self.runtime.lockfile.closed)
+
+    def test_close_reports_worker_and_reconcile_failures_separately(self):
+        with patch.object(self.runtime, '_shutdown_workers', side_effect=OSError('worker failed')), \
+             patch.object(self.runtime, '_reconcile_unstarted_workers', side_effect=ValueError('reconcile failed')):
+            with self.assertRaisesRegex(OSError, 'worker failed'):
+                self.runtime.close()
+        self.assertEqual([(item['phase'], item['target']) for item in self.runtime.shutdown_status()['errors']],
+                         [('workers', 'worker_pool'), ('workers', 'reconcile')])
+        self.assertGreater(self.store._pool_generation, 0)
+
+    def test_close_reports_no_errors_on_the_normal_path(self):
+        self.runtime.close()
+        status = self.runtime.shutdown_status()
+        self.assertEqual(status['phase'], 'completed')
+        self.assertEqual(status['errors'], [])
+
+    def test_close_releases_lockfile_even_when_store_close_fails(self):
+        # store 关闭失败不能连带占住状态目录锁，否则下一次启动会被判定为
+        # “另一个 runtime 已持有该状态目录”。
+        self.runtime.configure({'updates': {'mode': 'manual'}})
+        self.runtime.start(paused=True)
+        with patch.object(self.store, 'close', side_effect=OSError('read-only volume')):
+            with self.assertRaisesRegex(OSError, 'read-only volume'):
+                self.runtime.close()
+        status = self.runtime.shutdown_status()
+        self.assertEqual([(item['phase'], item['target']) for item in status['errors']],
+                         [('storage', 'store')])
+        self.assertTrue(self.runtime.lockfile.closed)
+
     def test_shutdown_bounds_non_cancellable_worker(self):
         gate, began = threading.Event(), threading.Event()
         _, run = self.claim()
