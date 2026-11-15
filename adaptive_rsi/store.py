@@ -1383,7 +1383,8 @@ class Store:
         db.commit()
         return applied
 
-    def transition(self, run, state, result=None, terminal=False, task_fields=None, clear_failure_on_stop=False):
+    def transition(self, run, state, result=None, terminal=False, task_fields=None,
+                   clear_failure_on_stop=False, failure_monitor=None):
         """Persist a transition, resolving stop requests atomically; return whether a write occurred."""
         now = time.time()
         with self.connect() as db:
@@ -1444,6 +1445,9 @@ class Store:
             result = {**{key: previous[key] for key in ["value", "scope", "plan_reason", "plan_decision", "failure", "stage"] if key in previous}, **(result or {})}
             db.execute("UPDATE runs SET state=?,result=?,ended=? WHERE id=?",
                        (state, encode(result or {}), now if terminal else None, run))
+            if terminal and state == "failed" and failure_monitor is not None:
+                db.execute("INSERT INTO failure_monitor_outbox(run,project,attributable,created) VALUES (?,?,?,?)",
+                           (run, row["project"], int(failure_monitor), now))
             # task_fields 必须与状态变更同事务写入（如 waiting_budget 的退避时间），
             # 否则调度器可能在两条语句之间按旧值把任务立即重排。
             extra = ""

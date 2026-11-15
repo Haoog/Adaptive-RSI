@@ -590,6 +590,130 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(evidence['monitor']['attribution'], 'single')
         self.assertNotIn('shared_failed', evidence['monitor'])
 
+    def test_monitor_failure_is_atomic_and_retryable_after_database_error(self):
+        import sqlite3
+        self.candidate({'monitor': {'passed': 0, 'failed': 0, 'runs': []}})
+        self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES ('parent','p','strategy','superseded','{}','{}',0)")
+        self.store.execute("UPDATE candidates SET parent='parent' WHERE id='c'")
+        self.store.execute('INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)',
+                           self.evolution.skill_values('p', 'c', {'guidance': 'x'}, {}, 1))
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('failed', 'p', encode([{'id': 'c'}]), '{}'))
+        self.store.execute("CREATE TRIGGER reject_invalidation BEFORE UPDATE OF status ON skills "
+                           "WHEN NEW.status='invalidated' BEGIN SELECT RAISE(ABORT,'injected'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'injected'):
+            self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id='c'")
+        self.assertEqual(row['status'], 'stable')
+        self.assertEqual(json.loads(row['evidence'])['monitor']['runs'], [])
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='parent'")['status'], 'superseded')
+        self.assertEqual(self.store.one('SELECT status FROM skills')['status'], 'verified')
+        self.store.execute('DROP TRIGGER reject_invalidation')
+        self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id='c'")
+        self.assertEqual(row['status'], 'rolled_back')
+        self.assertEqual(json.loads(row['evidence'])['monitor']['runs'], ['failed'])
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='parent'")['status'], 'stable')
+        self.assertEqual(self.store.one('SELECT status FROM skills')['status'], 'invalidated')
+        self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='rollback'")), 1)
+
+    def test_replay_repairs_previously_committed_failure_without_double_counting(self):
+        self.candidate({'monitor': {'passed': 0, 'failed': 1, 'runs': ['failed'], 'attribution': 'single',
+                                    'last_run': 'failed', 'last_checked': 1},
+                        'drift': {'reason': 'Attributable operational regression', 'attribution': 'single'}})
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('failed', 'p', encode([{'id': 'c'}]), '{}'))
+        self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id='c'")
+        self.assertEqual(row['status'], 'rolled_back')
+        self.assertEqual(json.loads(row['evidence'])['monitor']['failed'], 1)
+
+    def test_replay_does_not_undo_later_restoration(self):
+        self.candidate()
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('failed', 'p', encode([{'id': 'c'}]), '{}'))
+        self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        self.store.execute("UPDATE candidates SET status='stable' WHERE id='c'")
+        self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='c'")['status'], 'stable')
+        self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='rollback'")), 1)
+
+    def test_rollback_event_failure_aborts_monitor_and_strategy_changes(self):
+        import sqlite3
+        self.candidate({'monitor': {'passed': 0, 'failed': 0, 'runs': []}})
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('failed', 'p', encode([{'id': 'c'}]), '{}'))
+        self.store.execute("CREATE TRIGGER reject_rollback_event BEFORE INSERT ON events "
+                           "WHEN NEW.kind='rollback' BEGIN SELECT RAISE(ABORT,'injected'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'injected'):
+            self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id='c'")
+        self.assertEqual(row['status'], 'stable')
+        self.assertEqual(json.loads(row['evidence'])['monitor']['runs'], [])
+        self.store.execute('DROP TRIGGER reject_rollback_event')
+        self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='c'")['status'], 'rolled_back')
+        self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='rollback'")), 1)
+
+    def test_historical_drift_converges_on_duplicate_monitor_run(self):
+        self.candidate({'monitor': {'passed': 4, 'failed': 1, 'shared_failed': 1,
+                                    'runs': ['success'], 'attribution': 'shared'},
+                        'drift': {'state': 'watch', 'attribution': 'single', 'reason': 'historic'}})
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('success', 'p', encode([{'id': 'c'}]), '{}'))
+        self.evolution.monitor('p', True, {'id': 'success'})
+        evidence = json.loads(self.store.one("SELECT evidence FROM candidates WHERE id='c'")['evidence'])
+        self.assertEqual(evidence['drift']['attribution'], 'shared')
+        self.assertEqual(evidence['monitor']['passed'], 4)
+
+    def test_duplicate_monitor_repairs_mixed_attribution_atomically(self):
+        import sqlite3
+        evidence = {'monitor': {'passed': 2, 'failed': 3, 'shared_failed': 1,
+                                'runs': ['success'], 'attribution': 'single'},
+                    'drift': {'state': 'watch', 'attribution': 'single', 'reason': 'historic'}}
+        self.candidate(evidence)
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('success', 'p', encode([{'id': 'c'}]), '{}'))
+        self.store.execute("CREATE TRIGGER reject_attribution BEFORE UPDATE OF evidence ON candidates "
+                           "BEGIN SELECT RAISE(ABORT,'injected'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'injected'):
+            self.evolution.monitor('p', True, {'id': 'success'})
+        row = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+        self.assertEqual(json.loads(row['evidence']), evidence)
+        self.store.execute('DROP TRIGGER reject_attribution')
+        self.evolution.monitor('p', True, {'id': 'success'})
+        self.evolution.monitor('p', True, {'id': 'success'})
+        row = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+        repaired = json.loads(row['evidence'])
+        self.assertEqual(repaired['monitor']['attribution'], 'mixed')
+        self.assertEqual(repaired['drift']['attribution'], 'mixed')
+        self.assertEqual((repaired['monitor']['passed'], repaired['monitor']['failed']), (2, 3))
+        self.assertEqual(repaired['drift']['reason'], 'historic')
+
+    def test_duplicate_monitor_does_not_infer_attribution_from_inconsistent_counts(self):
+        evidence = {'monitor': {'passed': 2, 'failed': 1, 'shared_failed': 2,
+                                'runs': ['success'], 'attribution': 'single'},
+                    'drift': {'state': 'watch', 'attribution': 'single', 'reason': 'historic'}}
+        self.candidate(evidence)
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('success', 'p', encode([{'id': 'c'}]), '{}'))
+        self.evolution.monitor('p', True, {'id': 'success'})
+        row = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+        self.assertEqual(json.loads(row['evidence']), evidence)
+
+    def test_historical_drift_attribution_is_corrected_above_threshold(self):
+        self.config['evolution']['monitor_tasks'] = 10
+        self.candidate({'monitor': {'passed': 4, 'failed': 1, 'shared_failed': 1, 'runs': [], 'attribution': 'single'},
+                        'drift': {'state': 'watch', 'attribution': 'single', 'reason': 'historic'}})
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('success', 'p', encode([{'id': 'c'}]), '{}'))
+        self.evolution.monitor('p', True, {'id': 'success'})
+        evidence = json.loads(self.store.one("SELECT evidence FROM candidates WHERE id='c'")['evidence'])
+        self.assertEqual(evidence['monitor']['attribution'], 'shared')
+        self.assertEqual(evidence['drift']['attribution'], 'shared')
+        self.assertEqual(evidence['drift']['reason'], 'historic')
+
     def test_shared_failures_are_counted_without_rollback(self):
         # strategy 与 adapter 各自晋升后，同一 run 覆盖两个生效候选：失败仍需计数并进入
         # drift，但无法归因到单个策略，因此标记 shared 并跳过自动回滚。
@@ -612,6 +736,41 @@ class AuditEvolutionTest(unittest.TestCase):
             self.assertIn('no automatic rollback', evidence['drift']['reason'])
         event = self.store.one("SELECT data FROM events WHERE kind='strategy_inconclusive'")
         self.assertEqual(json.loads(event['data'])['attribution'], 'shared')
+
+    def test_shared_failure_attribution_survives_later_single_success(self):
+        self.candidate({'monitor': {'passed': 0, 'failed': 0}})
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                           ('a', 'p', 'adapter', 'stable', encode({'guidance': 'adapter', 'triggers': []}),
+                            encode({'monitor': {'passed': 0, 'failed': 0}}), 2))
+        for run_id, candidates in [('shared-failure', ['c', 'a']), ('single-success', ['c'])]:
+            self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                               (run_id, 'p', encode([{'id': cid} for cid in candidates]), encode({})))
+        self.evolution.monitor('p', False, {'id': 'shared-failure'}, attributable=True)
+        self.evolution.monitor('p', True, {'id': 'single-success'})
+        row = self.store.one('SELECT status,evidence FROM candidates WHERE id=?', ('c',))
+        evidence = json.loads(row['evidence'])
+        self.assertEqual(row['status'], 'stable')
+        self.assertEqual((evidence['monitor']['passed'], evidence['monitor']['failed']), (1, 1))
+        self.assertEqual(evidence['monitor']['shared_failed'], 1)
+        self.assertEqual(evidence['monitor']['attribution'], 'shared')
+        self.assertEqual(evidence['drift']['attribution'], 'shared')
+
+    def test_mixed_failures_keep_aggregate_attribution_and_single_rollback(self):
+        self.candidate({'monitor': {'passed': 0, 'failed': 0}})
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                           ('a', 'p', 'adapter', 'stable', encode({'guidance': 'adapter', 'triggers': []}),
+                            encode({'monitor': {'passed': 0, 'failed': 0}}), 2))
+        for run_id, candidates in [('shared-failure', ['c', 'a']), ('single-failure', ['c'])]:
+            self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                               (run_id, 'p', encode([{'id': cid} for cid in candidates]), encode({})))
+            self.evolution.monitor('p', False, {'id': run_id}, attributable=True)
+        row = self.store.one('SELECT status,evidence FROM candidates WHERE id=?', ('c',))
+        evidence = json.loads(row['evidence'])
+        self.assertEqual(row['status'], 'rolled_back')
+        self.assertEqual(evidence['monitor']['failed'], 2)
+        self.assertEqual(evidence['monitor']['shared_failed'], 1)
+        self.assertEqual(evidence['monitor']['attribution'], 'mixed')
+        self.assertEqual(evidence['drift']['attribution'], 'mixed')
 
     def feed_passing_runs(self, ids):
         for run_id in ids:

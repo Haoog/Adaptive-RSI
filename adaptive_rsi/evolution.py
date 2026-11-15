@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import json
 import math
@@ -2380,28 +2381,32 @@ class Evolution:
             return None
         return digest.hexdigest()
 
-    def monitor(self, project, passed, run=None, attributable=False):
-        config = self.runtime.config(project)
-        if not run or not (passed or attributable):
+    def monitor(self, project, passed, run=None, attributable=False, db=None, config=None):
+        if config is None:
+            config = self.runtime.config(project)
+        if not run:
             return
-        recorded = self.store.one("SELECT strategy,config FROM runs WHERE id=? AND project=?", (run["id"], project))
-        if not recorded:
-            return
-        active = {c["id"] for c in json.loads(recorded["strategy"] or "[]") if c.get("id")}
-        # 一次运行可能同时覆盖多个 kind 各自晋升的候选（如 strategy 与 adapter）。
-        # 这类失败仍要计入监控与 drift，但无法归因到单个候选，因此只观察、不自动回滚。
-        shared = len(active) > 1
-        if not passed and len(active) != 1:
-            event = {"strategies": sorted(active)}
-            if shared:
-                event["attribution"] = "shared"
-            self.store.event("strategy_inconclusive", "Regression cannot be attributed to a single strategy; no automatic rollback",
-                             project, run["id"], event)
-        for row in self.store.query("SELECT * FROM candidates WHERE project=? AND status='stable'", (project,)):
-            if row["id"] not in active:
-                continue
-            with self.store.connect() as db:
+        with (contextlib.nullcontext(db) if db is not None else self.store.connect()) as db:
+            if not db.in_transaction:
                 db.execute("BEGIN IMMEDIATE")
+            recorded = db.execute("SELECT strategy,config FROM runs WHERE id=? AND project=?", (run["id"], project)).fetchone()
+            if not recorded:
+                return
+            active = {c["id"] for c in json.loads(recorded["strategy"] or "[]") if c.get("id")}
+            shared = len(active) > 1
+            if not passed and not attributable and not shared:
+                return
+            if not passed and len(active) != 1:
+                event = {"strategies": sorted(active)}
+                if shared:
+                    event["attribution"] = "shared"
+                db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                           (project, run["id"], "strategy_inconclusive",
+                            "Regression cannot be attributed to a single strategy; no automatic rollback",
+                            encode(event), time.time()))
+            for row in db.execute("SELECT * FROM candidates WHERE project=? AND status='stable'", (project,)).fetchall():
+                if row["id"] not in active:
+                    continue
                 current = db.execute("SELECT evidence FROM candidates WHERE id=? AND status='stable'", (row["id"],)).fetchone()
                 if not current:
                     continue
@@ -2422,6 +2427,39 @@ class Evolution:
                 monitor = evidence.setdefault("monitor", {"passed": 0, "failed": 0})
                 seen = monitor.setdefault("runs", [])
                 if run["id"] in seen:
+                    # Aggregate counts prove the attribution even when this run was
+                    # already counted. Do not infer it from a truncated run list.
+                    failed = monitor.get("failed")
+                    shared_failed = monitor.get("shared_failed")
+                    drift = evidence.get("drift")
+                    if (type(failed) is int and type(shared_failed) is int
+                            and failed > 0 and 0 < shared_failed <= failed):
+                        attribution = "shared" if shared_failed == failed else "mixed"
+                        monitor["attribution"] = attribution
+                        if isinstance(drift, dict):
+                            drift["attribution"] = attribution
+                        db.execute("UPDATE candidates SET evidence=? WHERE id=? AND status='stable'",
+                                   (encode(evidence), row["id"]))
+                    # Only repair the last recorded attributable failure, and never undo
+                    # a later deliberate restoration of a candidate already rolled back.
+                    drift = evidence.get("drift")
+                    checked = monitor.get("last_checked")
+                    if (not passed and not shared and monitor.get("last_run") == run["id"]
+                            and isinstance(checked, (int, float)) and isinstance(drift, dict)
+                            and drift.get("reason") == "Attributable operational regression"):
+                        events = db.execute("SELECT data FROM events WHERE project=? AND kind='rollback' AND created>=?",
+                                            (project, checked)).fetchall()
+                        already_rolled_back = False
+                        for event in events:
+                            try:
+                                data = json.loads(event["data"] or "{}")
+                            except (TypeError, ValueError):
+                                continue
+                            if isinstance(data, dict) and data.get("candidate") == row["id"]:
+                                already_rolled_back = True
+                                break
+                        if not already_rolled_back:
+                            self._rollback_in_transaction(db, row["id"], self._compat_for(config))
                     continue
                 sentinel = monitor["passed"] >= config["evolution"]["monitor_tasks"]
                 # Continue observing attributable failures indefinitely. Successful
@@ -2437,9 +2475,17 @@ class Evolution:
                 if sentinel:
                     monitor["success_sample_rate"] = success_rate
                 monitor["passed" if passed else "failed"] += 1
-                monitor["attribution"] = "shared" if shared else "single"
                 if not passed and shared:
                     monitor["shared_failed"] = monitor.get("shared_failed", 0) + 1
+                # Attribution describes the cumulative failures, not just the latest run.
+                shared_failed = monitor.get("shared_failed", 0)
+                if shared_failed:
+                    attribution = "shared" if shared_failed == monitor["failed"] else "mixed"
+                elif monitor["failed"]:
+                    attribution = "single"
+                else:
+                    attribution = "shared" if shared else "single"
+                monitor["attribution"] = attribution
                 if sentinel and passed:
                     monitor["sampled_passed"] = monitor.get("sampled_passed", 0) + 1
                 monitor["last_run"] = run["id"]
@@ -2464,15 +2510,47 @@ class Evolution:
                         reason = "Observed pass ratio below 0.8"
                     drift = {"state": "watch", "phase": monitor["phase"], "reason": reason,
                              "passed": monitor["passed"], "failed": monitor["failed"],
-                             "attribution": "shared" if shared else "single"}
+                             "attribution": attribution}
                     if sentinel:
                         drift.update({"sampled": True, "success_sample_rate": success_rate,
                                       "sampled_passed": monitor.get("sampled_passed", 0),
                                       "unbiased_pass_ratio": round(pass_ratio, 4)})
                     evidence["drift"] = drift
+                elif isinstance(evidence.get("drift"), dict) and monitor["failed"]:
+                    # Preserve historical drift details while correcting its aggregate attribution.
+                    evidence["drift"]["attribution"] = attribution
                 db.execute("UPDATE candidates SET evidence=? WHERE id=? AND status='stable'", (encode(evidence), row["id"]))
-            if not passed and not shared:
-                self.rollback(row["id"])
+                if not passed and not shared:
+                    self._rollback_in_transaction(db, row["id"], self._compat_for(config))
+
+    @staticmethod
+    def _compat_for(config):
+        """配置不完整时（部分测试/降级调用）按未知兼容性处理，不阻断回滚。"""
+        try:
+            return compatibility(config)
+        except (KeyError, TypeError):
+            return None
+
+    def _rollback_in_transaction(self, db, candidate, current=None):
+        row = db.execute("SELECT * FROM candidates WHERE id=?", (candidate,)).fetchone()
+        if not row:
+            raise ValueError("Candidate not found")
+        if row["status"] == "rolled_back":
+            return
+        if row["status"] != "stable":
+            raise ValueError("Only an active strategy can be rolled back")
+        db.execute("UPDATE candidates SET status='rolled_back' WHERE id=?", (candidate,))
+        restored = self.restore_parent(db, row["parent"], current)
+        for skill in db.execute("SELECT id,evidence FROM skills WHERE project=? AND status='verified'", (row["project"],)).fetchall():
+            try:
+                skill_evidence = json.loads(skill["evidence"] or "{}")
+            except (TypeError, ValueError):
+                skill_evidence = {}
+            if isinstance(skill_evidence, dict) and skill_evidence.get("candidate") == candidate:
+                db.execute("UPDATE skills SET status='invalidated' WHERE id=?", (skill["id"],))
+        db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                   (row["project"], None, "rollback", self.ROLLBACK_MESSAGES[restored["outcome"]],
+                    encode({"candidate": candidate, **restored}), time.time()))
 
     def restore_parent(self, db, parent, current):
         """把被替换的父候选恢复为 stable；只有它能在 active_strategies 中生效时才恢复。
@@ -2506,26 +2584,7 @@ class Evolution:
         current = compatibility(self.runtime.config(row["project"])) if row["parent"] else None
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM candidates WHERE id=?", (candidate,)).fetchone()
-            if not row:
-                raise ValueError("Candidate not found")
-            if row["status"] == "rolled_back":
-                # 重复回滚是幂等操作；监控线程与用户操作并发时不产生误导性错误事件。
-                return
-            if row["status"] != "stable":
-                raise ValueError("Only an active strategy can be rolled back")
-            db.execute("UPDATE candidates SET status='rolled_back' WHERE id=?", (candidate,))
-            restored = self.restore_parent(db, row["parent"], current)
-            # Roll back learned instructions as well as the strategy pointer.
-            for skill in db.execute("SELECT id,evidence FROM skills WHERE project=? AND status='verified'", (row["project"],)).fetchall():
-                try:
-                    skill_evidence = json.loads(skill["evidence"] or "{}")
-                except (TypeError, ValueError):
-                    skill_evidence = {}
-                if isinstance(skill_evidence, dict) and skill_evidence.get("candidate") == candidate:
-                    db.execute("UPDATE skills SET status='invalidated' WHERE id=?", (skill["id"],))
-        self.store.event("rollback", self.ROLLBACK_MESSAGES[restored["outcome"]], row["project"],
-                         data={"candidate": candidate, **restored})
+            self._rollback_in_transaction(db, candidate, current)
 
 
 reproduce_bundle = Evolution.reproduce_bundle
