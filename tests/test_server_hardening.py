@@ -479,6 +479,8 @@ class ServerHardeningTest(unittest.TestCase):
         self.runtime.configure = lambda *args, **kwargs: {"config": self.store.setting("config", {})}
         self.runtime.config = lambda *args: json.loads(json.dumps(DEFAULTS))
         self.runtime.updates.snapshot = lambda: {}
+        # /api/state 现在在 SQLite 快照外组装更新视图（避免慢写拖住控制台轮询）。
+        self.runtime.updates.console_snapshot = lambda: {}
         capacity = self.store._connection_capacity
         limit = MAX_CONNECTIONS + POOL_SIZE
         for _ in range(limit):
