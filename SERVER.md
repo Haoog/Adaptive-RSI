@@ -63,7 +63,7 @@ ADAPTIVE_RSI_PUBLIC_URL=https://rsi.example.com
 
 Caddy 示例在 HTTPS 入口设置 `Strict-Transport-Security: max-age=31536000`，浏览器随后一年会优先使用 HTTPS。只有确认全部子域都支持 HTTPS 后才考虑 `includeSubDomains` 或 preload；应用的本地 HTTP 入口不发送 HSTS。
 
-认证失败在每个监听器内以 60 秒窗口计数，前 30 次返回原有 401，之后返回带 `Retry-After` 的 429。有效 Cookie 或启动链接仍可登录、使用 API 和健康探测；代理后的不同访问者共享失败计数，不根据可伪造的转发 IP 头建立身份。Host/Origin/CSRF 拒绝及会话失败共用每分钟至多一条安全审计，记录固定原因和抑制数量，不保存 URL、令牌、Cookie 或请求正文。`/api/health` 保留 Host 与 Cookie 认证。
+认证失败在每个监听器内以 60 秒窗口计数，前 30 次返回原有 401，之后 API 请求返回带 `Retry-After` 的 429（错误码 `session_required_rate_limited`，与 401 的 `session_required` 区分）。限流期间直接打开 `/` 或 `/index.html` 仍返回带恢复指引的登录页，第三方请求不会掩盖唯一的恢复入口；有效 Cookie 或启动链接始终可登录、使用 API 和健康探测，不受限流影响。代理后的不同访问者共享失败计数，不根据可伪造的转发 IP 头建立身份。Host/Origin/CSRF 拒绝及会话失败共用每分钟至多一条安全审计，记录固定原因和抑制数量，不保存 URL、令牌、Cookie 或请求正文。`/api/health` 保留 Host 与 Cookie 认证。
 
 API 异常只返回固定提示或白名单机器错误码，避免将底层异常中的路径、凭据或远端响应正文发回浏览器。会话轮换先原子写入私有文件再更新内存；失败时原会话继续有效。
 

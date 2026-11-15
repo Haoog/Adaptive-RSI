@@ -15,7 +15,7 @@ const formRevisions=new WeakMap(), settingsDrafts=new Map(), settingsClean=new M
 let navigationSequence=0;
 let settingsContext='',settingsGeneration=0,goalDraftRestoredProject=null;
 let configurationRepairBusy=false;
-let refreshSequence=0,refreshPromise=null,refreshController=null,refreshProject=null,refreshKey=null,refreshQueued=false,refreshForce=false,refreshWaiters=[],refreshPollTimer=null,lastUpdateToast='';
+let refreshSequence=0,refreshPromise=null,refreshController=null,refreshProject=null,refreshKey=null,refreshQueued=false,refreshForce=false,refreshWaiters=[],refreshPollTimer=null,lastUpdateToast='',sessionExpired=false,lastRefreshAt=0;
 let capabilitySequence=0,scopeChosen=false,scopeInitialized=false,taskOffset=0;
 const readinessCache=new Map(),bootBuild=document.documentElement?.dataset?.build||'';
 let readinessSequence=0;
@@ -51,6 +51,7 @@ const configReasonLabels={
  "config_invalid": "设置格式或字段无效，请检查配置后重试。"
 };
 const apiErrors={
+ "session_required_rate_limited":"尝试过于频繁，请稍候再试。",
  "patch_too_large":"补丁超过 2 MiB 的界面预览上限，请到该运行的目录下载完整补丁。",
  "Grouped requirements changed; reconcile revisions before splitting":"任务组的需求已修订，请先核对新增要求的归属，暂不自动拆分。",
  "Wait for the grouped run to stop before splitting":"任务组仍有运行，请先停止并等待运行结束，再拆分重做。",
@@ -123,6 +124,7 @@ const apiErrors={
  "Health response must confirm the exact deployment SHA and healthy status": "健康检查未确认本次部署版本正常，请检查服务返回的版本和状态。",
  "Restore the original authorization and let tracking retry the pending operation": "请恢复原工作流授权，系统会继续跟踪待执行操作。",
  "Only a confirmed failed workflow run can be retried; uncertain dispatches require reconciliation": "请先到 GitHub 确认工作流结果。只有已确认失败的执行才能重试。",
+ "This operation was abandoned; open a new operation instead of retrying": "这次操作已被人工放弃，请新建一次操作，不能重试。",
  "Multiple workflow runs match this operation ID. Compare repository, workflow, ref, exact target SHA and operation ID before selecting one.": "有多个工作流执行记录都匹配本次操作编号。请先核对仓库、工作流、引用、目标提交和操作编号，再选择其中一条。",
  "One matching workflow run is visible. Reading its status never starts another run.": "已看到一条匹配的工作流执行记录。读取状态不会再次启动工作流。",
  "GitHub has not published a matching workflow run yet. Wait and query again; manual run IDs are not accepted.": "GitHub 尚未发布与本次操作匹配的工作流记录。请等待后重新查询；这里不接受手动填写运行编号。",
@@ -437,7 +439,18 @@ async function safe(fn,form){
  }finally{if(form)pendingForms.delete(form);if(submit){submit.disabled=false;submitLabel(t('添加到当前项目'));}}
 }
 function refreshDelay(){if(document.visibilityState==='hidden')return 60000;return state?.runs?.some(run=>!run.ended)?5000:15000;}
-function scheduleRefreshPoll(delay=refreshDelay()){clearTimeout(refreshPollTimer);refreshPollTimer=setTimeout(()=>{refreshPollTimer=null;refresh().catch(error=>{$('connection').textContent=t(error.code==='session_required'?'需要重新登录':'连接中断');});},delay);}
+function clockTime(value){const date=new Date(value);return String(date.getHours()).padStart(2,'0')+':'+String(date.getMinutes()).padStart(2,'0');}
+// 会话失效后没有自动恢复入口：停止轮询，标出最后一次成功刷新的时间，并把现有的刷新按钮变成重新登录入口。
+function expireSessionCopy(){
+ $('connection').textContent=lastRefreshAt?t('登录已失效 · 当前显示 {time} 的数据').replace('{time}',clockTime(lastRefreshAt)):t('登录已失效');
+ const reload=$('reload-ui');reload.hidden=false;reload.textContent=t('登录已失效，重新打开控制台');
+}
+function expireSession(){
+ if(sessionExpired)return;
+ sessionExpired=true;clearTimeout(refreshPollTimer);refreshPollTimer=null;
+ expireSessionCopy();
+}
+function scheduleRefreshPoll(delay=refreshDelay()){if(sessionExpired)return;clearTimeout(refreshPollTimer);refreshPollTimer=setTimeout(()=>{refreshPollTimer=null;refresh().catch(()=>{if(!sessionExpired)$('connection').textContent=t('连接中断');});},delay);}
 function requestedStateSections(force=false){
  const sections=['core'],project=projectId||null,stale=Date.now()-30000;
  // 用户刚完成回滚、导入或晋升时，旧数组仍在 TTL 内也不能沿用；其他轮询继续使用 TTL。
@@ -446,6 +459,8 @@ function requestedStateSections(force=false){
  return sections;
 }
 async function refresh(options={}){
+ // 会话失效后只保留现有画面，等待用户点击重新登录；任何新的轮询或页面请求都不再发出。
+ if(sessionExpired)return;
  const force=!!options.force,requestedProject=projectId,requestedView=view,sections=requestedStateSections(force),taskView=['overview','tasks'].includes(view),filter=taskView?$('task-filter').value:'all',system=taskView?String($('show-system-tasks').checked):'true',offset=taskView?taskOffset:0;
  const key=JSON.stringify([requestedProject,view,offset,filter,system,sections]);
  if(refreshPromise){if(refreshKey===key)return refreshPromise;refreshQueued=true;refreshForce=refreshForce||force;refreshSequence++;refreshController?.abort();return new Promise((resolve,reject)=>refreshWaiters.push({resolve,reject}));}
@@ -471,7 +486,7 @@ async function refresh(options={}){
    else state={...(state||{}),...next};
    if(returned.has('analytics')){loadedStateSections.analyticsProject=next.selected_project??null;loadedStateSections.analyticsAt=Date.now();}
    if(returned.has('candidates')){loadedStateSections.candidatesProject=next.selected_project??null;loadedStateSections.candidatesAt=Date.now();}
-   $('connection').textContent=t('已连接');$('version').textContent='Adaptive RSI '+state.version;
+   lastRefreshAt=Date.now();$('connection').textContent=t('已连接');$('version').textContent='Adaptive RSI '+state.version;
    const select=$('project-select'),old=projectId;if(!state.projects.some(p=>p.id===projectId)){stashGoalDraft();projectId=state.projects[0]?.id||'';restoreGoalDraft();goalDraftRestoredProject=projectId;}
    if(JSON.stringify([...select.options].map(x=>[x.value,x.text]))!==JSON.stringify(state.projects.map(p=>[p.id,projectLabel(p)]))){select.replaceChildren(...state.projects.map(p=>{const o=el('option',projectLabel(p));o.value=p.id;o.title=projectPath(p);return o;}));if(!state.projects.length){const o=el('option',t('尚未接入项目'));o.value='';select.append(o);}}
    if(projectId&&!scopeChosen&&!scopeInitialized){stashSettings();$('config-scope').value='project';settingsBaseline=null;scopeInitialized=true;}
@@ -480,7 +495,7 @@ async function refresh(options={}){
   }catch(error){if(controller.signal.aborted){if(timedOut&&requestedProject===projectId)$('connection').textContent=t('连接超时');return;}throw error;}
   finally{clearTimeout(timeout);}
  })();refreshPromise=operation;
- try{return await operation;}finally{if(refreshPromise===operation){refreshPromise=null;refreshController=null;refreshProject=null;refreshKey=null;}if(refreshQueued){refreshQueued=false;const waiters=refreshWaiters.splice(0),forceNext=refreshForce;refreshForce=false;let next;try{next=refresh({force:forceNext});}catch(error){for(const waiter of waiters)waiter.reject(error);scheduleRefreshPoll();}if(next)Promise.resolve(next).then(value=>waiters.forEach(waiter=>waiter.resolve(value)),error=>waiters.forEach(waiter=>waiter.reject(error)));}else scheduleRefreshPoll();}
+ try{return await operation;}catch(error){if(error.code==='session_required')expireSession();throw error;}finally{if(refreshPromise===operation){refreshPromise=null;refreshController=null;refreshProject=null;refreshKey=null;}if(refreshQueued){refreshQueued=false;const waiters=refreshWaiters.splice(0),forceNext=refreshForce;refreshForce=false;let next;try{next=refresh({force:forceNext});}catch(error){for(const waiter of waiters)waiter.reject(error);scheduleRefreshPoll();}if(next)Promise.resolve(next).then(value=>waiters.forEach(waiter=>waiter.resolve(value)),error=>waiters.forEach(waiter=>waiter.reject(error)));}else scheduleRefreshPoll();}
 }
 function parentView(name){return name==='tasks'?'overview':name;}
 let attentionCount=0;
@@ -708,7 +723,7 @@ function renderTasks(){
  }
  document.querySelectorAll('[data-task-filter]').forEach(button=>{button.classList.toggle('active',button.dataset.taskFilter===filter);button.setAttribute('aria-pressed',String(button.dataset.taskFilter===filter));});
  const tasks=visibleTasks(scoped(state.tasks),filter,$('show-system-tasks').checked);
- window.RSIBatch?.toolbar();
+ window.RSIBatch?.toolbar(tasks);
  const candidate=state.selected_project&&state.selected_project!==projectId?null:state.pagination;
  const page=candidate&&candidate.offset===taskOffset&&(candidate.total===0?candidate.offset===0:candidate.offset<candidate.total)?candidate:null;
  $('tasks-prev').disabled=!taskOffset;$('tasks-next').disabled=!page?.has_more;$('tasks-page').textContent=page?(tasks.length?page.offset+1:0)+'–'+(tasks.length?Math.min(page.offset+tasks.length,page.total):0)+' / '+page.total:'';
@@ -771,8 +786,9 @@ function taskOutcome(data){
  }
  outcome.append(stageProgress(data));return outcome;
 }
+const valueFeedbackPending=new Map();
 function valueFeedback(data){
- const key=(data.project||'')+':'+(data.id||''),draft=valueFeedbackDrafts.get(key);
+ const key=JSON.stringify([data.project||'',data.id||'']),draft=valueFeedbackDrafts.get(key);
  const form=el('form',undefined,'value-feedback'),heading=el('h4',t('这次改进有帮助吗？')),hint=el('p',t('评价可选，仅用于观察，不会自动改变排序或策略。'),'muted'),select=el('select'),note=el('textarea'),status=el('p');
  const label=el('label',t('价值评价')),noteLabel=el('label',t('评价说明（可选）'));
  for(const [value,text] of [['','未评价'],['helpful','有帮助'],['unnecessary','没必要'],['false_positive','误报']]){const option=el('option',t(text));option.value=value;select.append(option);}
@@ -782,11 +798,14 @@ function valueFeedback(data){
  const remember=()=>{valueFeedbackDrafts.set(key,{rating:select.value,note:note.value});};
  select.addEventListener('change',remember);note.addEventListener('input',remember);
  const button=el('button',t('保存评价'),'text-button');button.type='submit';
+ const pending=valueFeedbackPending.get(key);if(pending){button.disabled=true;pending.add(button);}
  form.append(heading,hint,label,noteLabel,button,status);
  form.addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
-  button.disabled=true;status.textContent='';
-  try{await api('task/value-feedback',{project:data.project,task:data.task,run:data.id,rating:select.value||null,note:note.value});valueFeedbackDrafts.delete(key);if(form.isConnected)status.textContent=t('评价已保存');}
-  finally{button.disabled=false;}
+  if(valueFeedbackPending.has(key))return;
+  const buttons=new Set([button]);valueFeedbackPending.set(key,buttons);button.disabled=true;status.textContent='';
+  const submittedDraft=valueFeedbackDrafts.get(key),submitted={project:data.project,task:data.task,run:data.id,rating:select.value||null,note:note.value};
+  try{await api('task/value-feedback',submitted);if(valueFeedbackDrafts.get(key)===submittedDraft)valueFeedbackDrafts.delete(key);if(form.isConnected)status.textContent=t('评价已保存');}
+  finally{valueFeedbackPending.delete(key);for(const current of buttons)current.disabled=false;}
  },form);});return form;
 }
 function runPageRows(page){return Array.isArray(page)?page:(Array.isArray(page?.runs)?page.runs:[]);}
@@ -796,8 +815,12 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
  const stillCurrent=()=>ticket===detailSequence&&projectId===project&&detailTask?.id===task.id;
  if(!$('detail-dialog').open)$('detail-dialog').showModal();
  window.RSIExperience?.taskOpened(task,queueDraft);
+ // 列表接口只下发渲染所需的列；正文与证据在打开详情时按任务补取一次。
+ // 语言切换与操作后重绘复用已补全的 detailTask，不再重复请求。
+ const partial=task.body===undefined||task.evidence===undefined;
  const requirements=el('section',undefined,'task-requirements'),copy=el('p',task.body);copy.id='task-requirements';requirements.append(el('h3',t('任务要求')),copy);body.append(requirements);
- const evidence=lazyEvidence('来源与证据',()=>task.evidence||'');evidence.className='detail-section';body.append(evidence);
+ const evidence=lazyEvidence('来源与证据',()=>task.evidence||'');evidence.className='detail-section';evidence.hidden=partial;body.append(evidence);
+ if(partial)safe(async()=>{const detail=await api('task?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));if(!stillCurrent())return;task=detail;detailTask=detail;copy.textContent=detail.body||'';evidence.hidden=false;});
  // 首屏请求失败时，保留当前详情；重试只重取第一页，再继续本次渲染。
  let retrying=false,rendered=false;
  let firstPage;try{firstPage=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');}catch(error){if(!stillCurrent())return;
@@ -886,22 +909,29 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
   if(plan.affected.length){preview.append(el('p',t('以下后继任务依赖本任务；默认只取消当前任务。')));for(const item of plan.affected)preview.append(el('p',item.title+' · '+t(statusNames[item.state]||item.state)));if(!plan.truncated){const label=el('label',t('同时取消可取消的后继任务'));label.prepend(cascade);preview.append(label);}}
   if(plan.truncated)preview.append(el('p',t('后继过多，预览仅展示前 999 项；本次只能取消当前任务。')));
   const reasonLabel=el('label',t('干预原因（可选，保留原文）'));reasonLabel.append(reason);preview.append(reasonLabel);
-  if(!(await uiConfirm(t('确认取消任务及所选后继？'),preview)))return;
-  await api('cancel',{task:task.id,cascade:cascade.checked,revision:plan.revision,reason:reason.value});closeTaskDetail();await refresh();}));
+  if(!(await uiConfirm(t('确认取消任务及所选后继？'),preview))||!stillCurrent())return;
+  await api('cancel',{task:task.id,cascade:cascade.checked,revision:plan.revision,reason:reason.value});if(stillCurrent())closeTaskDetail();await refresh();}));
   if(task.state==='queued'){
    // 预约授权一个绝对时刻：时区与重复小时一起提交，由后端拒绝缺失/歧义时刻。
-   const scheduleBox=el('div',undefined,'task-schedule-editor'),time=el('input'),zone=el('input'),repeat=el('select');
+   const scheduleBox=el('div',undefined,'task-schedule-editor'),time=el('input'),zone=el('input'),repeat=el('select'),draft=draftStore.get('task-schedule',task.id);
    time.type='datetime-local';
-   zone.type='text';zone.value=displayTz||Intl.DateTimeFormat().resolvedOptions().timeZone;
+   zone.type='text';zone.value=draft?.zone??displayTz??Intl.DateTimeFormat().resolvedOptions().timeZone;
    for(const [value,text] of [['','时间唯一'],['0','第一次'],['1','第二次']]){const option=el('option',t(text));option.value=value;repeat.append(option);}
+   // 详情轮询与语言切换会整块重建；按任务恢复未提交的预约输入。
+   time.value=draft?.time??'';repeat.value=draft?.repeat??'';
+   const rememberSchedule=()=>draftStore.set('task-schedule',task.id,{time:time.value,zone:zone.value,repeat:repeat.value});
+   time.addEventListener('input',rememberSchedule);zone.addEventListener('input',rememberSchedule);repeat.addEventListener('change',rememberSchedule);
    const localLabel=el('label',t('本地时间'));localLabel.append(time);
    const zoneLabel=el('label',t('时区'));zoneLabel.append(zone);
    const repeatLabel=el('label',t('重复小时'));repeatLabel.append(repeat);
    scheduleBox.append(el('p',t('安排检查：此任务将在指定时刻开始运行。')),localLabel,zoneLabel,repeatLabel,
     action(t('预约'),async()=>{if(!time.value||!zone.value.trim()){toast(t('请填写本地时间和时区。'),true);return;}
-     await api('task/schedule-time',{task:task.id,local_time:time.value,timezone:zone.value.trim(),
-      fold:repeat.value===''?undefined:Number(repeat.value)});
-     toast(t('预约已保存'));closeTaskDetail();await refresh();},'button primary'));
+     const submitted={time:time.value,zone:zone.value,repeat:repeat.value};
+     await api('task/schedule-time',{task:task.id,local_time:submitted.time,timezone:submitted.zone.trim(),
+      fold:submitted.repeat===''?undefined:Number(submitted.repeat)});
+     const saved=draftStore.get('task-schedule',task.id);
+     if(saved&&saved.time===submitted.time&&saved.zone===submitted.zone&&saved.repeat===submitted.repeat)draftStore.remove('task-schedule',task.id);
+     toast(t('预约已保存'));if(stillCurrent())closeTaskDetail();await refresh();},'button primary'));
    secondary.append(el('summary',t('安排检查')),scheduleBox);}
   body.append(secondary);}
  restore?.(body);
@@ -1419,7 +1449,7 @@ async function renderReleaseOutcome(node,run,project){
  if(project!==projectId||!node.isConnected)return;
  const section=el('section',undefined,'release-outcome');section.append(el('h4',t('发布与上线')));
  for(const [kind,title]of [['release','发布'],['deploy','部署']]){const operation=automation[kind];if(!operation)continue;const row=el('div',undefined,'release-status-row');row.append(el('strong',t(title)+' · '),el('span',t(releaseStates[operation.state]||operation.state)));
-  const rerunUnknown=operation.state==='rerun_unknown'||operation.rollback?.state==='rerun_unknown',dispatchRejected=operation.state==='failed'&&operation.dispatch_receipt==='rejected'&&!operation.workflow_run_id;
+  const rerunUnknown=operation.state==='rerun_unknown'||operation.rollback?.state==='rerun_unknown',dispatchRejected=operation.state==='failed'&&['rejected','preflight_error'].includes(operation.dispatch_receipt)&&!operation.workflow_run_id;
   // 等待中的状态（合并后检查、同服务前次部署、等待发布成功）属进行中，提示用中性样式；其余错误保持红色。
   const waitingNotice=['waiting_verification','waiting_target','waiting_release'].includes(operation.state);
   if(operation.error&&!rerunUnknown)row.append(el('p',t(apiErrors[operation.error]||operation.error),waitingNotice?'muted':'form-error'));
@@ -1448,7 +1478,7 @@ const updateChannels={desktop:'桌面应用',pip:'Python 包（建议用 pip 升
 let desktopUpdate=null,desktopUpdateTimer=null,desktopCheckError=false;
 function stopDesktopUpdatePolling(){clearInterval(desktopUpdateTimer);desktopUpdateTimer=null;}
 async function checkDesktopUpdate(force=false){
- if(window.RSINativeUpdate){await window.RSINativeUpdate.run('check');desktopCheckError=false;return;}
+ if(window.RSINativeUpdate){await (force?window.RSINativeUpdate.run('check'):window.RSINativeUpdate.tick());desktopCheckError=false;return;}
  if(!window.RSIDesktop?.invoke)return;
  try{const info=await window.RSIDesktop.invoke('check_desktop_update',{force});desktopUpdate=info&&info.version?info:null;desktopCheckError=!!(info&&info.check_error);}catch{desktopUpdate=null;desktopCheckError=true;}
  // 下载可能先于本次页面会话开始（刷新界面或切换运行机器后加载）：恢复轮询直到完成或失败。
@@ -1509,14 +1539,17 @@ function renderUpdate(){if(!state)return;const update=state.update||{state:'unch
 $('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop&&window.RSINativeUpdate){await window.RSINativeUpdate.run('check');return;}if(window.RSIDesktop){await checkDesktopUpdate(true);if(desktopCheckError){toast(t('检查更新失败，请稍后重试。'),true);return;}if(!desktopUpdate)toast(t('已是最新稳定版'));return;}const result=await api('updates/check',{});if(result.update){state.update=result.update;renderUpdate();}else await refresh();if(result.started)toast(t('已开始检查更新'));}));
 $('apply-update').addEventListener('click',()=>safe(async()=>{if(!(await uiConfirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？'))))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));
 safe(async()=>{if(window.RSIDesktop){await window.RSIDesktop.ready;restoreRuntimeNavigation();if(window.RSIDesktop.invoke)window.RSIDesktop.invoke('set_native_language',{language}).catch(()=>{});}await refresh();});
-if(window.RSIDesktop)safe(checkDesktopUpdate);
+// native-update.js 在本脚本之后加载，启动检查要等到 DOMContentLoaded 才会走带节流的 tick()；
+// 直接在这里调用会落到旧的 check_desktop_update 命令，每次刷新都请求远端发布源。
+if(window.RSIDesktop)document.addEventListener('DOMContentLoaded',()=>safe(checkDesktopUpdate));
 $('language-select').addEventListener('change',()=>safe(async()=>{
  language=$('language-select').value;
  localWrite('rsi-language',language);
  if(window.RSIDesktop?.invoke)window.RSIDesktop.invoke('set_native_language',{language}).catch(()=>{});
  translateStatic();
  const connectionStates=['已连接','连接中断','连接超时','需要重新登录'];
- $('connection').textContent=t(connectionStates.find(name=>[name,english[name]].includes($('connection').textContent))||'已连接');
+ if(sessionExpired)expireSessionCopy();
+ else $('connection').textContent=t(connectionStates.find(name=>[name,english[name]].includes($('connection').textContent))||'已连接');
  if(!projectId&&$('project-select').options.length)$('project-select').options[0].textContent=t('尚未接入项目');
  $('toast').hidden=true;
  if(!state)return;

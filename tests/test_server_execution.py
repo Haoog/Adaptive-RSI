@@ -196,6 +196,75 @@ class ServerExecutionTest(unittest.TestCase):
             server.server_close()
             thread.join()
 
+    def test_state_poll_returns_without_waiting_for_dispatch_lock(self):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        server = Server(self.runtime)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        headers = {"Cookie": server.cookie + "=" + server.token}
+
+        def poll():
+            with opener.open(urllib.request.Request(server.local_origin + "/api/state",
+                                                    headers=headers), timeout=5) as response:
+                return response.status, json.loads(response.read())
+
+        try:
+            self.assertEqual(poll()[0], 200)
+            baseline = poll()[1]["update"]
+            acquired, release = threading.Event(), threading.Event()
+
+            def hold():
+                with self.runtime.dispatch_lock:
+                    acquired.set()
+                    release.wait(10)
+
+            holder = threading.Thread(target=hold, daemon=True)
+            holder.start()
+            self.assertTrue(acquired.wait(5))
+            started = time.monotonic()
+            try:
+                status, payload = poll()
+            finally:
+                release.set()
+                holder.join(5)
+            # 读端点不得在 SQLite 连接内等待全局写锁：慢写入期间仍须及时返回。
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["update"], baseline)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_state_reports_busy_only_while_an_update_is_active(self):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        server = Server(self.runtime)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        headers = {"Cookie": server.cookie + "=" + server.token}
+
+        def busy():
+            with opener.open(urllib.request.Request(server.local_origin + "/api/state",
+                                                    headers=headers), timeout=5) as response:
+                self.assertEqual(response.status, 200)
+                return json.loads(response.read())["update"]["busy"]
+
+        try:
+            self.store.put_setting("update-status", {"state": "unchecked", "current": "0.0.0"})
+            self.assertFalse(busy())
+            for state in ("downloading", "restarting"):
+                with self.subTest(state=state):
+                    self.store.put_setting("update-status", {"state": state, "current": "0.0.0"})
+                    self.assertTrue(busy())
+            self.runtime.updates.installing = True
+            self.store.put_setting("update-status", {"state": "available", "current": "0.0.0", "version": "9.9.9"})
+            self.assertTrue(busy())
+        finally:
+            self.runtime.updates.installing = False
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
 
 class UsageAndOpenCodeTest(unittest.TestCase):
     def test_codex_container_oauth_refresh_survives_the_temporary_home(self):

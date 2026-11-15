@@ -1,4 +1,5 @@
 import concurrent.futures
+import errno
 import fcntl
 import json
 import os
@@ -339,6 +340,220 @@ class RuntimeTest(unittest.TestCase):
         finally:
             probe.close()
 
+    def test_flock_io_error_does_not_skip_contention_check_on_retry(self):
+        opened = []
+        real_open = Path.open
+
+        def track_lockfile(file_path, *args, **kwargs):
+            handle = real_open(file_path, *args, **kwargs)
+            if file_path.name == "runtime.lock":
+                opened.append(handle)
+            return handle
+
+        with patch("adaptive_rsi.runtime.fcntl.flock",
+                   side_effect=OSError(errno.EIO, "simulated lock I/O failure")), \
+                patch.object(Path, "open", new=track_lockfile):
+            with self.assertRaises(OSError) as raised:
+                self.runtime.start()
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        self.assertIsNone(self.runtime.lockfile)
+        self.assertIsNone(self.runtime.thread)
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].closed)
+
+        owner = (self.store.root / "runtime.lock").open("a+")
+        try:
+            fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch("adaptive_rsi.runtime.fcntl.flock", wraps=fcntl.flock) as acquire:
+                with self.assertRaisesRegex(RuntimeError, "Another runtime already owns") as raised:
+                    self.runtime.start()
+            self.assertEqual(acquire.call_count, 1)
+            self.assertIsInstance(raised.exception.__context__, BlockingIOError)
+            self.assertIsNone(self.runtime.lockfile)
+            self.assertIsNone(self.runtime.thread)
+        finally:
+            owner.close()
+
+        self.runtime.start()
+        self.assertTrue(self.runtime.thread.is_alive())
+        self.runtime.close()
+
+    def test_runtime_open_releases_lock_after_non_contention_flock_error(self):
+        root = self.root / "open-lock-error"
+        opened = []
+        real_open = Path.open
+
+        def track_lockfile(file_path, *args, **kwargs):
+            handle = real_open(file_path, *args, **kwargs)
+            if file_path.name == "runtime.lock":
+                opened.append(handle)
+            return handle
+
+        with patch("adaptive_rsi.runtime.fcntl.flock",
+                   side_effect=OSError(errno.EIO, "simulated lock I/O failure")), \
+                patch.object(Path, "open", new=track_lockfile):
+            with self.assertRaises(OSError) as raised:
+                Runtime.open(root, agent=self.agent)
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].closed)
+
+        probe = (root / "runtime.lock").open("a+")
+        try:
+            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            probe.close()
+
+        runtime = Runtime.open(root, agent=self.agent)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "Another runtime already owns"):
+                Runtime.open(root, agent=self.agent)
+        finally:
+            runtime.close()
+
+    def test_scheduler_thread_start_failure_can_still_close_runtime(self):
+        thread_start = threading.Thread.start
+
+        def fail_scheduler_start(thread):
+            if thread.name == "rsi-scheduler":
+                raise RuntimeError("scheduler thread failed to start")
+            return thread_start(thread)
+
+        with patch.object(threading.Thread, "start", new=fail_scheduler_start):
+            with self.assertRaisesRegex(RuntimeError, "scheduler thread failed to start"):
+                self.runtime.start()
+        self.runtime.close()
+        self.assertTrue(self.runtime._closed)
+        self.assertIsNone(self.runtime.thread)
+
+    def test_concurrent_start_runs_initialization_once(self):
+        entered = threading.Event()
+        release = threading.Event()
+        second_attempted = threading.Event()
+        second_returned = threading.Event()
+        recover_calls = []
+        errors = []
+
+        def recover():
+            recover_calls.append(True)
+            if len(recover_calls) == 1:
+                entered.set()
+                release.wait(5)
+
+        def start():
+            try:
+                self.runtime.start()
+            except Exception as exc:
+                errors.append(exc)
+
+        def second_start():
+            second_attempted.set()
+            try:
+                start()
+            finally:
+                second_returned.set()
+
+        first = threading.Thread(target=start)
+        second = threading.Thread(target=second_start)
+        with patch.object(self.runtime.operations, "recover", side_effect=recover), \
+                patch.object(self.runtime.updates, "restore_startup"), \
+                patch.object(self.runtime.store, "recover"), \
+                patch.object(self.runtime.store, "execute"), \
+                patch.object(self.runtime, "_index_postprocess_pending"), \
+                patch.object(self.runtime, "loop", side_effect=self.runtime.stop.wait):
+            try:
+                first.start()
+                self.assertTrue(entered.wait(5), "First start should enter initialization")
+                second.start()
+                self.assertTrue(second_attempted.wait(5), "Second start should attempt initialization")
+                self.assertFalse(second_returned.wait(0.1),
+                                 "Concurrent start must wait for the first initialization")
+            finally:
+                release.set()
+                first.join(5)
+                second.join(5)
+                self.runtime.close()
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(recover_calls), 1)
+
+    def test_close_waits_for_startup_before_closing_runtime(self):
+        entered = threading.Event()
+        release = threading.Event()
+        close_started = threading.Event()
+        close_finished = threading.Event()
+        errors = []
+
+        def recover():
+            entered.set()
+            release.wait(5)
+
+        def start():
+            try:
+                self.runtime.start()
+            except Exception as exc:
+                errors.append(exc)
+
+        def close():
+            close_started.set()
+            self.runtime.close()
+            close_finished.set()
+
+        starter = threading.Thread(target=start)
+        closer = threading.Thread(target=close)
+        with patch.object(self.runtime.operations, "recover", side_effect=recover), \
+                patch.object(self.runtime.updates, "restore_startup"), \
+                patch.object(self.runtime.store, "recover"), \
+                patch.object(self.runtime.store, "execute"), \
+                patch.object(self.runtime, "_index_postprocess_pending"), \
+                patch.object(self.runtime, "loop", side_effect=self.runtime.stop.wait):
+            try:
+                starter.start()
+                self.assertTrue(entered.wait(5), "Start should be held during initialization")
+                closer.start()
+                self.assertTrue(close_started.wait(5))
+                deadline = time.monotonic() + 5
+                while not self.runtime._closing and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                self.assertTrue(self.runtime._closing, "Close should close admission before waiting")
+                self.assertFalse(close_finished.wait(0.1),
+                                 "Close must not close storage while startup is in progress")
+            finally:
+                release.set()
+                starter.join(5)
+                if closer.ident is not None:
+                    closer.join(5)
+                self.runtime.close()
+        self.assertFalse(starter.is_alive())
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(self.runtime._closed)
+        # 关闭后状态目录锁已释放：lockfile 置空（#404 的交接语义）或保持已关闭对象。
+        self.assertTrue(self.runtime.lockfile is None or self.runtime.lockfile.closed)
+        self.assertFalse(self.runtime.thread.is_alive())
+
+    def test_start_is_idempotent_and_keeps_one_scheduler_thread(self):
+        self.runtime.configure({"updates": {"mode": "manual"}})
+        self.runtime.start()
+        self.runtime.start()
+        schedulers = [t for t in threading.enumerate() if t.name == "rsi-scheduler"]
+        self.assertEqual(len(schedulers), 1)
+        self.runtime.close()
+        self.assertEqual([t for t in threading.enumerate() if t.name == "rsi-scheduler"], [])
+
+    def test_second_start_does_not_change_project_paused_state(self):
+        self.runtime.configure({"updates": {"mode": "manual"}})
+        paused_project = self.runtime.add_project(fixture(self.root / "paused-project"))
+        self.runtime.pause(self.project, False)
+        self.runtime.start()
+        # 重复 start 是 no-op：不应把已在运行的项目再次批量置为暂停。
+        self.runtime.start(paused=True)
+        self.assertEqual(
+            self.store.one("SELECT paused FROM projects WHERE id=?", (paused_project,))["paused"], 1)
+        self.assertEqual(
+            self.store.one("SELECT paused FROM projects WHERE id=?", (self.project,))["paused"], 0)
+
     def test_active_strategies_fetches_evidence_without_extra_candidate_queries(self):
         key = compatibility(self.runtime.config(self.project))
         for candidate, evidence in [("a", {"compatibility": key}), ("b", {"compatibility": "other"}),
@@ -365,7 +580,8 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual([s["id"] for s in strategies], ["a", "c"])
         self.assertEqual(strategies[0]["content"]["guidance"], "Reproduce arithmetic boundary cases")
         self.assertEqual([sql for sql in statements if "FROM candidates" in sql],
-                         ["SELECT id,kind,content,evidence FROM candidates WHERE project=? AND status='stable'"])
+                         ["SELECT id,kind,content,evidence,created FROM candidates "
+                          "WHERE project=? AND status='stable'"])
 
     def test_inspection_reads_each_finding_path_only_once(self):
         findings = {"findings": [
@@ -1862,6 +2078,325 @@ Path(%r).write_text('allowed output')
         self.assertEqual(self.runtime.active_strategies(self.project), [])
         self.assertEqual(self.runtime.memories(self.project, "add"), [])
 
+    def test_failure_monitor_recovers_after_restart(self):
+        config = self.runtime.config(self.project)
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                           ('recovery-candidate', self.project, 'strategy', 'stable', '{}',
+                            encode({'monitor': {'passed': 0, 'failed': 0, 'runs': []}}), time.time()))
+        task_id, run = self.claim('failure monitor restart')
+        self.store.execute('UPDATE runs SET strategy=? WHERE id=?',
+                           (encode([{'id': 'recovery-candidate'}]), run['id']))
+        task = self.store.one('SELECT * FROM tasks WHERE id=?', (task_id,))
+        check = {'name': 'regression', 'argv': ['true'], 'cwd': '.'}
+        result = {'decision': 'fail', 'evaluation': {'checks': {
+            'baseline': [{**check, 'passed': True}], 'candidate': [{**check, 'passed': False}]}}}
+        with patch.object(self.runtime, 'monitor_strategy', side_effect=RuntimeError('injected monitor failure')):
+            with self.assertRaisesRegex(RuntimeError, 'injected monitor failure'):
+                self.runtime.finish_failure(run, task, result, config)
+        self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))['state'], 'failed')
+        self.runtime.close()
+        self.store = Store(self.root / 'controller')
+        self.runtime = Runtime(self.store, self.agent)
+        updater = patch.object(self.runtime.updates, 'tick')
+        updater.start()
+        self.addCleanup(updater.stop)
+        self.runtime.start(paused=True)
+        deadline = time.monotonic() + 7
+        while time.monotonic() < deadline:
+            row = self.store.one("SELECT status,evidence FROM candidates WHERE id='recovery-candidate'")
+            if row['status'] == 'rolled_back':
+                break
+            time.sleep(0.05)
+        self.assertEqual(row['status'], 'rolled_back')
+        self.assertEqual(json.loads(row['evidence'])['monitor']['failed'], 1)
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='rollback'")), 1)
+
+    def test_failure_outbox_and_terminal_transition_are_atomic(self):
+        import sqlite3
+        config = self.runtime.config(self.project)
+        task_id, run = self.claim('outbox insert failure')
+        task = self.store.one('SELECT * FROM tasks WHERE id=?', (task_id,))
+        self.store.execute("CREATE TRIGGER reject_monitor_outbox BEFORE INSERT ON failure_monitor_outbox "
+                           "BEGIN SELECT RAISE(ABORT,'outbox unavailable'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'outbox unavailable'):
+            self.runtime.finish_failure(run, task, {'decision': 'fail'}, config)
+        self.assertIsNone(self.store.one('SELECT ended FROM runs WHERE id=?', (run['id'],))['ended'])
+        self.assertEqual(self.store.query('SELECT * FROM failure_monitor_outbox'), [])
+        self.store.execute('DROP TRIGGER reject_monitor_outbox')
+        self.runtime.finish_failure(run, task, {'decision': 'fail'}, config)
+        self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))['state'], 'failed')
+
+    def test_cancelled_failure_does_not_create_monitor_outbox(self):
+        config = self.runtime.config(self.project)
+        task_id, run = self.claim('cancelled failure')
+        self.store.execute("UPDATE tasks SET state='cancelled' WHERE id=?", (task_id,))
+        task = self.store.one('SELECT * FROM tasks WHERE id=?', (task_id,))
+        self.runtime.finish_failure(run, task, {'decision': 'fail'}, config)
+        self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))['state'], 'cancelled')
+        self.assertEqual(self.store.query('SELECT * FROM failure_monitor_outbox'), [])
+
+    def test_failure_outbox_retry_rolls_back_all_effects_and_deduplicates(self):
+        import sqlite3
+        config = self.runtime.config(self.project)
+        evidence = {'monitor': {'passed': 0, 'failed': 0, 'runs': []}}
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                           ('outbox-candidate', self.project, 'strategy', 'stable', '{}', encode(evidence), time.time()))
+        task_id, run = self.claim('outbox retry')
+        self.store.execute('UPDATE runs SET strategy=? WHERE id=?', (encode([{'id': 'outbox-candidate'}]), run['id']))
+        task = self.store.one('SELECT * FROM tasks WHERE id=?', (task_id,))
+        check = {'name': 'regression', 'argv': ['true'], 'cwd': '.'}
+        result = {'decision': 'fail', 'evaluation': {'checks': {
+            'baseline': [{**check, 'passed': True}], 'candidate': [{**check, 'passed': False}]}}}
+        self.store.execute("CREATE TRIGGER reject_outbox_ack BEFORE DELETE ON failure_monitor_outbox "
+                           "BEGIN SELECT RAISE(ABORT,'ack unavailable'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'ack unavailable'):
+            self.runtime.finish_failure(run, task, result, config)
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id='outbox-candidate'")
+        self.assertEqual(row['status'], 'stable')
+        self.assertEqual(json.loads(row['evidence']), evidence)
+        self.assertEqual(len(self.store.query('SELECT * FROM failure_monitor_outbox')), 1)
+        self.assertEqual(self.store.query("SELECT seq FROM events WHERE kind='rollback'"), [])
+        self.store.execute('DROP TRIGGER reject_outbox_ack')
+        self.runtime.drain_failure_monitors()
+        self.runtime.drain_failure_monitors()
+        self.runtime.monitor_strategy(self.project, False, run, attributable=True)
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id='outbox-candidate'")
+        self.assertEqual(row['status'], 'rolled_back')
+        self.assertEqual(json.loads(row['evidence'])['monitor']['failed'], 1)
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='rollback'")), 1)
+        self.assertEqual(self.store.query('SELECT * FROM failure_monitor_outbox'), [])
+
+    def test_shared_failure_outbox_retries_all_candidates_together(self):
+        config = self.runtime.config(self.project)
+        evidence = {'monitor': {'passed': 0, 'failed': 0, 'runs': []}}
+        for candidate in ('outbox-a', 'outbox-b'):
+            self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                               (candidate, self.project, 'strategy', 'stable', '{}', encode(evidence), time.time()))
+        task_id, run = self.claim('shared outbox retry')
+        self.store.execute('UPDATE runs SET strategy=? WHERE id=?',
+                           (encode([{'id': 'outbox-a'}, {'id': 'outbox-b'}]), run['id']))
+        task = self.store.one('SELECT * FROM tasks WHERE id=?', (task_id,))
+        check = {'name': 'regression', 'argv': ['true'], 'cwd': '.'}
+        result = {'decision': 'fail', 'evaluation': {'checks': {
+            'baseline': [{**check, 'passed': True}], 'candidate': [{**check, 'passed': False}]}}}
+        with patch.object(self.runtime, 'monitor_strategy', side_effect=RuntimeError('crash')):
+            with self.assertRaisesRegex(RuntimeError, 'crash'):
+                self.runtime.finish_failure(run, task, result, config)
+        self.store.execute("CREATE TRIGGER reject_second BEFORE UPDATE OF evidence ON candidates "
+                           "WHEN NEW.id='outbox-b' BEGIN SELECT RAISE(ABORT,'second candidate'); END")
+        self.runtime.drain_failure_monitors()
+        for candidate in ('outbox-a', 'outbox-b'):
+            row = self.store.one('SELECT evidence,status FROM candidates WHERE id=?', (candidate,))
+            self.assertEqual(json.loads(row['evidence']), evidence)
+            self.assertEqual(row['status'], 'stable')
+        self.assertEqual(self.store.query("SELECT seq FROM events WHERE kind='strategy_inconclusive'"), [])
+        self.assertEqual(len(self.store.query('SELECT run FROM failure_monitor_outbox')), 1)
+        self.store.execute('DROP TRIGGER reject_second')
+        self.runtime.drain_failure_monitors()
+        self.runtime.drain_failure_monitors()
+        for candidate in ('outbox-a', 'outbox-b'):
+            row = self.store.one('SELECT evidence,status FROM candidates WHERE id=?', (candidate,))
+            self.assertEqual(json.loads(row['evidence'])['monitor']['failed'], 1)
+            self.assertEqual(row['status'], 'stable')
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='strategy_inconclusive'")), 1)
+        self.assertEqual(self.store.query('SELECT run FROM failure_monitor_outbox'), [])
+
+    def test_process_failure_kinds_reach_failure_monitor_through_evaluator(self):
+        class HighRisk(FakeAgent):
+            def invoke(self, role, *args, **kwargs):
+                result = super().invoke(role, *args, **kwargs)
+                if role == "planning":
+                    result["risk"] = "high"
+                return result
+
+        self.runtime.agent = HighRisk()
+        config = self.runtime.config(self.project)
+        environment = {"backend": "stub", "image": None}
+        cases = [
+            ("timeout", -9, "Command timed out", "", "timeout"),
+            ("execution_error", 2, "Runner exited unexpectedly", "RuntimeError: child process failed", "exit"),
+            ("assertion", 1, None, "AssertionError: expected 5, received -1", "exit"),
+        ]
+        for kind, exit_code, error, stderr, error_kind in cases:
+            with self.subTest(kind=kind):
+                candidate_id = "failure-" + kind
+                self.store.execute(
+                    "INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+                    (candidate_id, self.project, "strategy", "stable", "{}",
+                     encode({"monitor": {"passed": 0, "failed": 0, "runs": []}}), time.time()),
+                )
+
+                def check(_sandbox, spec, workspace, *args, **kwargs):
+                    failed = (Path(workspace).name in {"candidate", "candidate_full"} and
+                              spec["name"] == "real unittest regression")
+                    return {"name": spec["name"], "argv": spec["argv"],
+                            "exit_code": exit_code if failed else 0, "stdout": "",
+                            "stderr": stderr if failed else "Ran 1 test\nOK\n",
+                            "seconds": 0.01, "error": error if failed else None,
+                            "error_kind": error_kind if failed else None}
+
+                baseline = {"decision": "pass", "rows": [], "execution_environment": environment}
+                with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+                     patch.object(self.runtime.evaluator, "_execution_environment",
+                                  return_value=(config, environment)), \
+                     patch.object(self.runtime.evaluator, "execution_identity", return_value=environment), \
+                     patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline", return_value=baseline), \
+                     patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=check):
+                    task_id, run = self.claim("Production failure evidence: " + kind)
+                    self.runtime.process(run)
+
+                row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+                result = json.loads(row["result"])
+                evaluation = result["evaluation"]
+                failed_row = next(item for item in evaluation["checks"]["candidate_full"]
+                                  if item["name"] == "real unittest regression")
+                self.assertEqual(row["state"], "failed", row["result"])
+                self.assertFalse(failed_row["passed"])
+                self.assertEqual(failed_row["error"], error)
+                self.assertEqual(failed_row["error_kind"], error_kind)
+                self.assertEqual(result["decision"], "fail")
+                candidate = self.store.one("SELECT status,evidence FROM candidates WHERE id=?", (candidate_id,))
+                self.assertEqual(candidate["status"], "rolled_back")
+                monitor = json.loads(candidate["evidence"])["monitor"]
+                self.assertEqual(monitor["failed"], 1)
+                self.assertEqual(monitor["runs"], [run["id"]])
+                self.assertEqual(self.store.query(
+                    "SELECT * FROM failure_monitor_outbox WHERE run=?", (run["id"],)), [])
+
+    def test_duplicate_check_identity_does_not_hide_regression(self):
+        config = self.runtime.config(self.project)
+        candidate = "duplicate-check-identity"
+        evidence = {"monitor": {"passed": 0, "failed": 0, "runs": []}}
+        self.store.execute(
+            "INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+            (candidate, self.project, "strategy", "stable", "{}", encode(evidence), time.time()),
+        )
+        task_id, run = self.claim("duplicate check identity")
+        self.store.execute("UPDATE runs SET strategy=?,config=? WHERE id=?",
+                           (encode([{"id": candidate}]), encode(config), run["id"]))
+        task = self.store.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        duplicate = {"name": "same", "argv": ["true"], "cwd": "."}
+        result = {"decision": "fail", "evaluation": {"checks": {
+            "baseline": [{**duplicate, "passed": True}],
+            "candidate": [{**duplicate, "passed": False}, {**duplicate, "passed": True}],
+        }}}
+        self.runtime.finish_failure(run, task, result, config)
+
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id=?", (candidate,))
+        self.assertEqual(row["status"], "rolled_back")
+        self.assertEqual(json.loads(row["evidence"])["monitor"]["failed"], 1)
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='rollback'")), 1)
+
+    def test_unattributable_shared_failure_is_recorded_before_outbox_ack(self):
+        evidence = {'monitor': {'passed': 0, 'failed': 0, 'runs': []}}
+        for candidate in ('shared-a', 'shared-b', 'not-in-run'):
+            self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                               (candidate, self.project, 'strategy', 'stable', '{}', encode(evidence), time.time()))
+        task_id, run = self.claim('unattributable shared failure')
+        self.store.execute('UPDATE runs SET strategy=? WHERE id=?',
+                           (encode([{'id': 'shared-b'}, {'id': 'shared-a'}]), run['id']))
+        task = self.store.one('SELECT * FROM tasks WHERE id=?', (task_id,))
+
+        self.runtime.finish_failure(run, task, {'decision': 'fail', 'reason': 'execution error'},
+                                    self.runtime.config(self.project))
+
+        self.assertEqual(self.store.query('SELECT * FROM failure_monitor_outbox'), [])
+        for candidate in ('shared-a', 'shared-b'):
+            row = self.store.one('SELECT status,evidence FROM candidates WHERE id=?', (candidate,))
+            monitor = json.loads(row['evidence'])['monitor']
+            self.assertEqual(row['status'], 'stable')
+            self.assertEqual(monitor['failed'], 1)
+            self.assertEqual(monitor['shared_failed'], 1)
+            self.assertEqual(monitor['attribution'], 'shared')
+            self.assertEqual(monitor['runs'], [run['id']])
+        unrelated = json.loads(self.store.one("SELECT evidence FROM candidates WHERE id='not-in-run'")['evidence'])
+        self.assertEqual(unrelated, evidence)
+        inconclusive = self.store.query("SELECT data FROM events WHERE kind='strategy_inconclusive' AND run=?",
+                                        (run['id'],))
+        self.assertEqual(len(inconclusive), 1)
+        self.assertEqual(json.loads(inconclusive[0]['data'])['attribution'], 'shared')
+
+    def test_failure_outbox_batches_do_not_starve_later_entries(self):
+        with self.store.connect() as db:
+            for number in range(101):
+                run_id = 'pending-%03d' % number
+                db.execute("INSERT INTO runs(id,project,state,ended) VALUES (?,?,'failed',1)",
+                           (run_id, self.project))
+                db.execute('INSERT INTO failure_monitor_outbox(run,project,attributable,created) VALUES (?,?,1,?)',
+                           (run_id, self.project, number))
+        # A failed consumer leaves rows in place; the next batch still reaches later work.
+        with patch.object(self.runtime, '_consume_failure_monitor', side_effect=RuntimeError('unavailable')) as consume, \
+                patch.object(self.store, 'event'):
+            self.runtime.drain_failure_monitors()
+            self.assertEqual(consume.call_count, 100)
+            self.runtime.drain_failure_monitors()
+            self.assertEqual(consume.call_args.args[0], 'pending-100')
+            self.runtime.drain_failure_monitors()
+            self.assertEqual(consume.call_args.args[0], 'pending-099')
+    def test_failure_monitor_ignores_candidate_promoted_after_run_started(self):
+        config = self.runtime.config(self.project)
+        evidence = {"monitor": {"passed": 0, "failed": 0, "runs": []}}
+        for candidate, status, content in (("run-strategy", "stable", "{}"),
+                                           ("promoted-during-run", "ready",
+                                            encode({"guidance": "new", "triggers": []}))):
+            self.store.execute(
+                "INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+                (candidate, self.project, "strategy", status, content, encode(evidence), time.time()),
+            )
+        task_id, run = self.claim("strategy promoted during run")
+        strategies, generations = self.runtime._active_strategy_snapshot(self.project, config)
+        recorded = [{**strategy, "_candidate_created": generations[strategy["id"]]}
+                    for strategy in strategies]
+        self.store.execute("UPDATE runs SET strategy=?,config=? WHERE id=?",
+                           (encode(recorded), encode(config), run["id"]))
+        self.runtime.promote_strategy("promoted-during-run")
+        task = self.store.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        check = {"name": "same", "argv": ["true"], "cwd": "."}
+        result = {"decision": "fail", "evaluation": {"checks": {
+            "baseline": [{**check, "passed": True}],
+            "candidate": [{**check, "passed": False}],
+        }}}
+
+        self.runtime.finish_failure(run, task, result, config)
+
+        promoted = self.store.one("SELECT status,evidence FROM candidates WHERE id='promoted-during-run'")
+        self.assertEqual(promoted["status"], "stable")
+        self.assertEqual(json.loads(promoted["evidence"])["monitor"]["failed"], 0)
+        self.assertEqual(self.store.query("SELECT seq FROM events WHERE kind='rollback'"), [])
+
+    def test_failure_monitor_ignores_reused_candidate_id_created_after_run_started(self):
+        config = self.runtime.config(self.project)
+        candidate = "reused-after-run-start"
+        evidence = {"monitor": {"passed": 0, "failed": 0, "runs": []}}
+        self.store.execute(
+            "INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+            (candidate, self.project, "strategy", "stable", "{}", encode(evidence), time.time()),
+        )
+        task_id, run = self.claim("candidate id reused before terminal persistence")
+        strategies, generations = self.runtime._active_strategy_snapshot(self.project, config)
+        recorded = [{**strategy, "_candidate_created": generations[strategy["id"]]}
+                    for strategy in strategies]
+        self.store.execute("UPDATE runs SET strategy=?,config=? WHERE id=?",
+                           (encode(recorded), encode(config), run["id"]))
+        self.store.execute("DELETE FROM candidates WHERE id=?", (candidate,))
+        self.store.execute(
+            "INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+            (candidate, self.project, "strategy", "stable", "{}", encode(evidence), time.time()),
+        )
+        task = self.store.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        check = {"name": "same", "argv": ["true"], "cwd": "."}
+        result = {"decision": "fail", "evaluation": {"checks": {
+            "baseline": [{**check, "passed": True}],
+            "candidate": [{**check, "passed": False}],
+        }}}
+
+        self.runtime.finish_failure(run, task, result, config)
+
+        reused = self.store.one("SELECT status,evidence FROM candidates WHERE id=?", (candidate,))
+        self.assertEqual(reused["status"], "stable")
+        self.assertEqual(json.loads(reused["evidence"])["monitor"]["failed"], 0)
+        self.assertEqual(self.store.query("SELECT seq FROM events WHERE kind='rollback'"), [])
+
     def test_finish_failure_aligns_regression_attribution_by_check_identity(self):
         config = self.runtime.config(self.project)
         check_a = {"name": "check_a", "argv": ["python3", "-c", "print(1)"], "cwd": "."}
@@ -1932,7 +2467,8 @@ Path(%r).write_text('allowed output')
                 "evaluation": {
                     "checks": {
                         "baseline": [{**check_b, "passed": False}, {**check_a, "passed": True}],
-                        "candidate": [{**check_a, "passed": False}, {**check_b, "passed": True}],
+                        "candidate": [{**check_a, "passed": False, "exit_code": 0},
+                                      {**check_b, "passed": True}],
                     }
                 }
             }

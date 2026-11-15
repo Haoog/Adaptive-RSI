@@ -13,7 +13,17 @@ import stat
 
 
 CLEANUP_NAMES = ("workspace", "candidate", "baseline", "evaluation", "experiments",
-                 "dependencies", "acceptance-design", "feedback")
+                 "dependencies", "acceptance-design", "acceptance", "feedback")
+
+# pipeline.py 直接写到 runs/<id>/ 顶层的普通文件；它们不在 CLEANUP_NAMES 的
+# 目录分支里。漏掉任何一个，runs.path 置空后就没有入口再找到它，保留承诺
+# 只兑现一部分，磁盘与 inode 随每次过期运行无界增长。
+RUN_FILE_ARTIFACTS = ("plan.json", "tool-scope.json", "acceptance.json",
+                      "resume.patch", "review.json", "risk-review.json")
+
+# candidate.patch 有意保留：runs.path 置空后 revert_code 与 rollback 仍靠它
+# 还原历史改动。它也是运行目录里唯一允许存留的条目。
+RETAINED_RUN_ARTIFACTS = ("candidate.patch",)
 
 # 维护默认每小时一轮；失败后的最短重试间隔按次数指数增长，上限一小时。
 MAINTENANCE_INTERVAL = 3600
@@ -345,6 +355,30 @@ def _held_in_transaction(db, run_id, project):
     return None
 
 
+def _run_directory_settled(directory):
+    """Report whether only intentionally retained entries remain in a run directory.
+
+    ``candidate.patch`` is the sole survivor retention allows, because revert and
+    rollback still read it after ``runs.path`` is cleared.  Anything else - an
+    unknown file or directory, or a link swapped in for the retained name - keeps
+    the path so a later pass (or an upgraded cleaner) can still find and remove
+    it; detaching first would orphan it behind ``path IS NOT NULL``.
+    """
+    try:
+        entries = list(os.scandir(directory))
+    except FileNotFoundError:
+        return True
+    for entry in entries:
+        if entry.name not in RETAINED_RUN_ARTIFACTS:
+            return False
+        try:
+            if not entry.is_file(follow_symlinks=False):
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def _remove_run_artifacts(store, run_id, project, directory, stored=None):
     """Delete a finished run's own artifacts, one write transaction per artifact.
 
@@ -354,13 +388,19 @@ def _remove_run_artifacts(store, run_id, project, directory, stored=None):
     to finish.  Per-artifact transactions bound the write-lock span to a single
     artifact instead of the whole multi-project cleanup pass.  Once no artifacts
     remain, one final transaction detaches the run's path so later passes filter
-    it out through `path IS NOT NULL` instead of re-scanning it forever.
+    it out through `path IS NOT NULL` instead of re-scanning it forever; the
+    detach only happens when the directory holds nothing but the retained patch
+    (or is gone), so an unknown leftover keeps its only lookup key.
     ``stored`` is the exact runs.path value from the database, which may differ
     from the resolved ``directory`` by a symlink layer (e.g. /var on macOS).
     """
-    for name in CLEANUP_NAMES:
+    for name in CLEANUP_NAMES + RUN_FILE_ARTIFACTS:
         target = directory / name
-        if target.is_symlink() or not target.is_dir():
+        if target.is_symlink():
+            continue
+        is_directory = name in CLEANUP_NAMES
+        present = target.is_dir if is_directory else target.is_file
+        if not present():
             continue
         with store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -368,7 +408,7 @@ def _remove_run_artifacts(store, run_id, project, directory, stored=None):
                 return False
             # Re-check under the write lock: an entry swapped for a link after
             # the caller's lexical check must not be removed as the artifact.
-            if target.is_symlink() or not target.is_dir():
+            if target.is_symlink() or not present():
                 continue
             _remove_artifact(directory, name)
     # All own artifacts are gone (deleted here or already absent). Detach the
@@ -379,6 +419,8 @@ def _remove_run_artifacts(store, run_id, project, directory, stored=None):
     with store.connect() as db:
         db.execute('BEGIN IMMEDIATE')
         if _held_in_transaction(db, run_id, project):
+            return False
+        if not _run_directory_settled(directory):
             return False
         # Match the exact path that was cleaned so a concurrently rewritten
         # path is never detached from artifacts that still exist.
@@ -481,10 +523,55 @@ class Maintenance:
         except Exception:
             logging.getLogger(__name__).exception("Maintenance backoff reset failed")
 
+    def _record_maintenance_degraded(self, failures, now):
+        """Persist per-run cleanup failures that the pass otherwise survives.
+
+        ``scheduler_scope`` swallows run-level exceptions on purpose, so a run
+        that can never be deleted used to leave only one deduplicated event
+        while ``maintenance-last`` advanced.  The record keeps this pass's
+        failed set, a cumulative consecutive-pass counter, and one event per
+        pass, so the degradation stays visible after the bounded event log
+        drops older entries.  A clean pass removes the record; a repaired run
+        disappears from ``runs`` while remaining failures keep the counter.
+        """
+        try:
+            previous = self.store.setting("maintenance-degraded", None)
+        except Exception:
+            previous = None
+            logging.getLogger(__name__).exception("Maintenance degraded state read failed")
+        if not failures:
+            if previous is None:
+                return
+            try:
+                self.store.execute("DELETE FROM settings WHERE key='maintenance-degraded'")
+            except Exception:
+                logging.getLogger(__name__).exception("Maintenance degraded state reset failed")
+            return
+        passes = previous.get("count", 0) if isinstance(previous, dict) else 0
+        if type(passes) is not int or passes < 0:
+            passes = 0
+        passes += 1
+        last_error = "%s: %s" % (failures[-1]["error_type"], failures[-1]["message"])
+        record = {"at": now, "count": passes, "runs": failures, "last_error": last_error}
+        try:
+            self.store.put_setting("maintenance-degraded", record)
+            # 事件只带前 20 条样本，避免整卷只读时把每轮事件写成大对象；
+            # 完整失败集合保存在 maintenance-degraded 设置里。
+            self.store.event("maintenance_degraded",
+                             "Maintenance kept %d run(s) for retry: %s" % (len(failures), last_error),
+                             data={"count": passes, "runs": failures[:20], "last_error": last_error})
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Maintenance degraded evidence persistence failed")
+
     def maintenance(self):
         now = time.time()
         if now - self.store.setting("maintenance-last", 0) < MAINTENANCE_INTERVAL:
             return
+        # 运行级删除失败只影响该运行：收集后整轮仍算完成，但留下降级证据，
+        # 失败运行的 path 保留给下一轮自然重试。scheduler_scope 会吞掉运行级
+        # 异常，只靠它会让「保留策略在个别运行上失效」看起来仍然健康。
+        degraded = []
         with self.scheduler_scope("credential_cleanup"):
             self.model_center.cleanup_credentials()
         for project in self.store.query("SELECT * FROM projects"):
@@ -557,8 +644,18 @@ class Maintenance:
                         # 删除仍不持有调度/配置锁，但每个工件在各自的 BEGIN IMMEDIATE 内
                         # 用同一连接重查 hold：预检后提交的 hold 会阻止余下删除，删除期间
                         # 的 hold 写入会等到该事务结束后才提交。
-                        _remove_run_artifacts(self.store, run["id"], project["id"], directory,
-                                              stored=run["path"])
+                        # 单个运行删除失败（EACCES、只读挂载、网络文件系统错误）
+                        # 不阻塞同批其他运行；path 保留，下一轮自然重试。
+                        try:
+                            _remove_run_artifacts(self.store, run["id"], project["id"], directory,
+                                                  stored=run["path"])
+                        except (OSError, sqlite3.Error) as exc:
+                            degraded.append({"run": run["id"], "project": project["id"],
+                                             "error_type": type(exc).__name__,
+                                             "message": str(exc)[:200]})
+                            logging.getLogger(__name__).warning(
+                                "Maintenance kept run %s for retry (%s: %s)",
+                                run["id"], type(exc).__name__, exc)
                 # Freeze promotion/rollback while choosing and deleting retired candidates.
                 with self.store.connect() as db:
                     db.execute("BEGIN IMMEDIATE")
@@ -850,4 +947,5 @@ class Maintenance:
             else:
                 continue
             break
+        self._record_maintenance_degraded(degraded, now)
         self.store.put_setting("maintenance-last", now)

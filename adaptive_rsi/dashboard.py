@@ -21,6 +21,16 @@ TASKS = """(SELECT t.*, json_extract(CASE WHEN json_valid(d.data) THEN d.data EL
     LEFT JOIN task_decisions d ON d.task=t.id)"""
 
 
+DETAIL_ONLY = ("body", "evidence")
+
+
+def list_columns(store):
+    """列表列裁剪：正文与证据只在详情接口下发，避免每次轮询重复传输整页任务原文。"""
+    names = [row["name"] for row in store.query("PRAGMA table_info(tasks)")]
+    return ", ".join(["tasks." + name for name in names if name not in DETAIL_ONLY] +
+                     ["tasks.decision_reason", "tasks.display_state"])
+
+
 def records(store, project=None, limit=50, offset=0, group="all", include_system=True):
     limit = max(1, min(200, int(limit)))
     offset = max(0, int(offset))
@@ -36,7 +46,7 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
     total = store.one("SELECT count(*) AS n FROM " + TASKS + " WHERE " + task_clause, args)["n"]
     import time
     from .experience import queue_status
-    tasks = store.query("SELECT * FROM " + TASKS + " tasks WHERE " + task_clause +
+    tasks = store.query("SELECT " + list_columns(store) + " FROM " + TASKS + " tasks WHERE " + task_clause +
                         " ORDER BY " + store.queue_order(display=True) +
                         " LIMIT ? OFFSET ?", (*args, time.time(), time.time(), limit, offset))
     queue = {row["id"]: row for row in queue_status(store, project)} if project else {}

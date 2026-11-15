@@ -1,6 +1,7 @@
 """Evidence integrity and dataset lifecycle acceptance without external models."""
 import hashlib
 import json
+import os
 import shutil
 import tempfile
 import time
@@ -9,8 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from adaptive_rsi.config import fingerprint
+from adaptive_rsi.config import compatibility, fingerprint
 from adaptive_rsi.evolution import Evolution, case_spec, paired_summary
+from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store, encode
 
 
@@ -60,6 +62,51 @@ class AuditEvolutionTest(unittest.TestCase):
             self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
                                (split, 'p', split, split, encode(spec), holdout_uses if split == 'holdout' else 0, 1))
         return {'id': 'p'}, repo, self.root / 'run', {'id': 'run', 'task': 'task', 'config': encode(self.config)}
+
+    def ready_candidate(self, *, drift=False, unsampled_drift=False):
+        """构造一个证据完整、等待人工晋升的 ready 候选。"""
+        from adaptive_rsi.config import DEFAULTS, compatibility, merge
+        from adaptive_rsi.gitops import git
+        from tests.test_runtime import CHECKS, fixture
+        repo = fixture(self.root / 'repo')
+        self.config = merge(DEFAULTS, {'evolution': {'repeats': 1}})
+        self.store.execute("INSERT INTO projects(id,name,path,config,paused,created) "
+                           "VALUES ('p','p','/tmp/p','{}',0,0)")
+        spec = {'task': 'fix add', 'base': git(repo, 'rev-parse', 'HEAD'), 'checks': CHECKS,
+                'source': 'real', 'repository': str(repo), 'overlay': None}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('case-1', 'p', 'f1', 'validation', encode(spec), 0, 1))
+        manifest = [{'case': 'case-1', 'split': 'validation', 'family': 'f1', 'sampled': True,
+                     'spec': fingerprint(spec), 'task': fingerprint(spec['task']),
+                     'checks': fingerprint(spec['checks']), 'overlay': None,
+                     'tree': git(repo, 'rev-parse', spec['base'] + '^{tree}')}]
+        if unsampled_drift:
+            other = {**spec, 'task': 'other task'}
+            self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                               ('case-2', 'p', 'f2', 'validation', encode(other), 0, 2))
+            manifest.append({**manifest[0], 'case': 'case-2', 'family': 'f2', 'sampled': False,
+                             'spec': fingerprint(other), 'task': fingerprint(other['task'])})
+            self.store.execute('UPDATE cases SET spec=? WHERE id=?',
+                               (encode({**other, 'active': False}), 'case-2'))
+        if drift:
+            self.store.execute('UPDATE cases SET spec=? WHERE id=?',
+                               (encode({**spec, 'task': 'drifted task'}), 'case-1'))
+        plan = {'version': 2, 'repeats': 1, 'samples': [{'id': 'case-1', 'split': 'validation'}]}
+        evidence = {'dataset': {'version': 1, 'manifest': manifest},
+                    'preregistered_plan': {'data': plan, 'sha256': fingerprint(plan)},
+                    'trials': [{'case': 'case-1', 'split': 'validation', 'repetition': 0,
+                                'stable': {'pass': True}, 'candidate': {'pass': True}}],
+                    'final_review': {'fresh': True},
+                    'promotion_review': {'limitations': []},
+                    'compatibility': compatibility(self.config)}
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) '
+                           'VALUES (?,?,?,?,?,?,?)',
+                           ('candidate', 'p', 'strategy', 'ready',
+                            encode({'guidance': 'new guidance', 'triggers': []}), encode(evidence), 2))
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) '
+                           'VALUES (?,?,?,?,?,?,?)',
+                           ('previous', 'p', 'strategy', 'stable',
+                            encode({'guidance': 'old', 'triggers': []}), encode({}), 1))
 
     def test_malformed_case_specs_are_skipped_without_blocking_the_proposal(self):
         args = self.setup_proposal()
@@ -243,6 +290,64 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(json.loads(values_no_guidance[4]), ['t'])
         self.assertEqual(values_no_guidance[5], '')
 
+    def test_overlong_guidance_is_rejected_before_any_trial(self):
+        """超过试验注入上限的正文直接拒绝，不产生候选，也不把未评估部分标成已验证。"""
+        args = self.setup_proposal()
+        self.evolution.runtime.invoke = lambda *unused, **kwargs: {
+            'kind': 'strategy', 'guidance': 'x' * 2001, 'triggers': ['secret']}
+        with self.assertRaisesRegex(RuntimeError, 'exceeds 2000 characters'):
+            self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(self.calls['trial'], 0)
+        self.assertEqual(self.store.query("SELECT * FROM candidates WHERE status='reserved'"), [])
+        failed = self.store.query("SELECT * FROM candidates WHERE status='insufficient_evidence'")
+        self.assertEqual(len(failed), 1)
+        self.assertIn('exceeds 2000 characters', json.loads(failed[0]['evidence'])['reason'])
+        # 边界值 2000 仍被接受：上限不能靠一处静默截断来凑。
+        self.assertTrue(Evolution.validate_proposal(
+            {'kind': 'strategy', 'guidance': 'x' * 2000, 'triggers': ['secret']})[0])
+
+    def test_accepted_guidance_is_identical_in_evaluated_and_promoted_skill(self):
+        """被接受的提案在试验注入与晋升写库两条路径写出的正文逐字相同。"""
+        for length in (1, 2000):
+            proposal = {'kind': 'strategy', 'guidance': 'g' * length, 'triggers': ['secret']}
+            evaluated = Evolution.candidate_skill('candidate', proposal)
+            promoted = Evolution.skill_values('p', 'candidate', proposal, {}, 0)
+            self.assertEqual(evaluated['content'], promoted[5])
+            self.assertEqual(len(promoted[5]), length)
+
+    def test_mixed_trigger_types_are_identical_in_evaluated_and_promoted_skill(self):
+        proposal = {'kind': 'strategy', 'guidance': 'g', 'triggers': ['secret', 123, None, '  ']}
+        evaluated = Evolution.candidate_skill('candidate', proposal)
+        promoted = Evolution.promoted_skill('p', 'candidate', proposal, {}, 0)
+        assert promoted is not None
+        self.assertEqual(json.loads(promoted[4]), evaluated['triggers'])
+        self.assertEqual(json.loads(promoted[4]), ['secret', '  '])
+
+    def test_promotion_without_retrievable_triggers_writes_no_verified_skill(self):
+        """triggers 全为空的候选晋升后不写 verified 技能行，避免不可审计的检索记录。"""
+        args, observed = self.setup_ablation(triggers=(), auto_promote=True)
+        baseline = {'id': 'stable-kind', 'kind': 'strategy', 'content': {'guidance': 'old'}}
+        self.evolution.runtime.active_strategies = lambda project: [baseline]
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(result['status'], 'stable')
+        self.assertEqual(self.store.query('SELECT * FROM skills'), [])
+        self.assertIsNone(Evolution.promoted_skill('p', 'c', {'guidance': 'g', 'triggers': []}, {}, 0))
+        self.assertIsNone(Evolution.promoted_skill('p', 'c', {'guidance': 'g', 'triggers': ['   ']}, {}, 0))
+
+    def test_manual_promotion_without_triggers_writes_no_verified_skill(self):
+        """手动晋升与自动晋升一致：无可检索触发词时只切换策略，不写技能行。"""
+        self.store.execute("INSERT INTO projects(id,name,path,config,paused,created) "
+                           "VALUES ('p','p','/tmp/p','{}',0,0)")
+        for candidate, status in (('old', 'stable'), ('ready', 'ready')):
+            self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) '
+                               'VALUES (?,?,?,?,?,?,?)',
+                               (candidate, 'p', 'strategy', status,
+                                encode({'guidance': 'empty triggers', 'triggers': []}), encode({}), time.time()))
+        result = self.evolution.promote('ready')
+        self.assertEqual(result['status'], 'stable')
+        self.assertEqual(self.store.query('SELECT * FROM skills'), [])
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='old'")['status'], 'superseded')
+
     def test_auto_promote_with_valid_proposal_promotes_to_stable_and_writes_skills(self):
         args, observed = self.setup_ablation(auto_promote=True)
         baseline = {'id': 'stable-kind', 'kind': 'strategy', 'content': {'guidance': 'old'}}
@@ -305,6 +410,26 @@ class AuditEvolutionTest(unittest.TestCase):
         finally:
             runtime.active_strategies = original
         self.assertFalse(self.evolution.attempt_due('p', config)[0])
+
+    def test_housekeeping_limits_do_not_rearm_the_failed_experiment(self):
+        """只改 retention_days 等清理参数时同一份证据不再重新付费演化。"""
+        from adaptive_rsi.config import DEFAULTS, merge
+        config = merge(DEFAULTS, {})
+        runtime = SimpleNamespace(store=self.store, config=lambda project: config,
+                                  active_strategies=lambda project: [])
+        evolution = Evolution(runtime)
+        signature = evolution.input_signature('p', config)
+        evolution.record_attempt('p', signature, 'insufficient_evidence')
+        housekeeping = merge(DEFAULTS, {'limits': {'retention_days': 60}})
+        self.assertEqual(signature, evolution.input_signature('p', housekeeping))
+        self.assertFalse(evolution.attempt_due('p', housekeeping)[0])
+        # 执行相关参数仍必须让签名变化：去重不能把真正的实验条件差异也放过。
+        for key, value in (('command_seconds', 1800), ('max_output_mb', 24),
+                           ('concurrency', 2), ('retries', 0),
+                           ('min_free_disk_mb', 256), ('min_available_memory_mb', 256)):
+            changed = merge(DEFAULTS, {'limits': {key: value}})
+            self.assertNotEqual(signature, evolution.input_signature('p', changed), key)
+            self.assertTrue(evolution.attempt_due('p', changed)[0], key)
 
     def test_unknown_cost_quality_pass_keeps_explicit_warning(self):
         trials = []
@@ -515,8 +640,195 @@ class AuditEvolutionTest(unittest.TestCase):
         self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)', ('late', 'p', encode([{'id': 'c'}]), encode({})))
         self.evolution.monitor('p', False, {'id': 'late'}, attributable=True)
         row = self.store.one('SELECT status,evidence FROM candidates WHERE id=?', ('c',))
+        evidence = json.loads(row['evidence'])
         self.assertEqual(row['status'], 'rolled_back')
-        self.assertEqual(json.loads(row['evidence'])['drift']['phase'], 'sentinel')
+        self.assertEqual(evidence['drift']['phase'], 'sentinel')
+        # 单候选失败可归因，drift 与计数必须显式标记 single。
+        self.assertEqual(evidence['drift']['attribution'], 'single')
+        self.assertEqual(evidence['monitor']['attribution'], 'single')
+        self.assertNotIn('shared_failed', evidence['monitor'])
+
+    def test_monitor_failure_is_atomic_and_retryable_after_database_error(self):
+        import sqlite3
+        self.candidate({'monitor': {'passed': 0, 'failed': 0, 'runs': []}})
+        self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES ('parent','p','strategy','superseded','{}','{}',0)")
+        self.store.execute("UPDATE candidates SET parent='parent' WHERE id='c'")
+        self.store.execute('INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)',
+                           self.evolution.skill_values('p', 'c', {'guidance': 'x'}, {}, 1))
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('failed', 'p', encode([{'id': 'c'}]), '{}'))
+        self.store.execute("CREATE TRIGGER reject_invalidation BEFORE UPDATE OF status ON skills "
+                           "WHEN NEW.status='invalidated' BEGIN SELECT RAISE(ABORT,'injected'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'injected'):
+            self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id='c'")
+        self.assertEqual(row['status'], 'stable')
+        self.assertEqual(json.loads(row['evidence'])['monitor']['runs'], [])
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='parent'")['status'], 'superseded')
+        self.assertEqual(self.store.one('SELECT status FROM skills')['status'], 'verified')
+        self.store.execute('DROP TRIGGER reject_invalidation')
+        self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id='c'")
+        self.assertEqual(row['status'], 'rolled_back')
+        self.assertEqual(json.loads(row['evidence'])['monitor']['runs'], ['failed'])
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='parent'")['status'], 'stable')
+        self.assertEqual(self.store.one('SELECT status FROM skills')['status'], 'invalidated')
+        self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='rollback'")), 1)
+
+    def test_replay_repairs_previously_committed_failure_without_double_counting(self):
+        self.candidate({'monitor': {'passed': 0, 'failed': 1, 'runs': ['failed'], 'attribution': 'single',
+                                    'last_run': 'failed', 'last_checked': 1},
+                        'drift': {'reason': 'Attributable operational regression', 'attribution': 'single'}})
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('failed', 'p', encode([{'id': 'c'}]), '{}'))
+        self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id='c'")
+        self.assertEqual(row['status'], 'rolled_back')
+        self.assertEqual(json.loads(row['evidence'])['monitor']['failed'], 1)
+
+    def test_replay_does_not_undo_later_restoration(self):
+        self.candidate()
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('failed', 'p', encode([{'id': 'c'}]), '{}'))
+        self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        self.store.execute("UPDATE candidates SET status='stable' WHERE id='c'")
+        self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='c'")['status'], 'stable')
+        self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='rollback'")), 1)
+
+    def test_rollback_event_failure_aborts_monitor_and_strategy_changes(self):
+        import sqlite3
+        self.candidate({'monitor': {'passed': 0, 'failed': 0, 'runs': []}})
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('failed', 'p', encode([{'id': 'c'}]), '{}'))
+        self.store.execute("CREATE TRIGGER reject_rollback_event BEFORE INSERT ON events "
+                           "WHEN NEW.kind='rollback' BEGIN SELECT RAISE(ABORT,'injected'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'injected'):
+            self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        row = self.store.one("SELECT status,evidence FROM candidates WHERE id='c'")
+        self.assertEqual(row['status'], 'stable')
+        self.assertEqual(json.loads(row['evidence'])['monitor']['runs'], [])
+        self.store.execute('DROP TRIGGER reject_rollback_event')
+        self.evolution.monitor('p', False, {'id': 'failed'}, attributable=True)
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='c'")['status'], 'rolled_back')
+        self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='rollback'")), 1)
+
+    def test_historical_drift_converges_on_duplicate_monitor_run(self):
+        self.candidate({'monitor': {'passed': 4, 'failed': 1, 'shared_failed': 1,
+                                    'runs': ['success'], 'attribution': 'shared'},
+                        'drift': {'state': 'watch', 'attribution': 'single', 'reason': 'historic'}})
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('success', 'p', encode([{'id': 'c'}]), '{}'))
+        self.evolution.monitor('p', True, {'id': 'success'})
+        evidence = json.loads(self.store.one("SELECT evidence FROM candidates WHERE id='c'")['evidence'])
+        self.assertEqual(evidence['drift']['attribution'], 'shared')
+        self.assertEqual(evidence['monitor']['passed'], 4)
+
+    def test_duplicate_monitor_repairs_mixed_attribution_atomically(self):
+        import sqlite3
+        evidence = {'monitor': {'passed': 2, 'failed': 3, 'shared_failed': 1,
+                                'runs': ['success'], 'attribution': 'single'},
+                    'drift': {'state': 'watch', 'attribution': 'single', 'reason': 'historic'}}
+        self.candidate(evidence)
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('success', 'p', encode([{'id': 'c'}]), '{}'))
+        self.store.execute("CREATE TRIGGER reject_attribution BEFORE UPDATE OF evidence ON candidates "
+                           "BEGIN SELECT RAISE(ABORT,'injected'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'injected'):
+            self.evolution.monitor('p', True, {'id': 'success'})
+        row = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+        self.assertEqual(json.loads(row['evidence']), evidence)
+        self.store.execute('DROP TRIGGER reject_attribution')
+        self.evolution.monitor('p', True, {'id': 'success'})
+        self.evolution.monitor('p', True, {'id': 'success'})
+        row = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+        repaired = json.loads(row['evidence'])
+        self.assertEqual(repaired['monitor']['attribution'], 'mixed')
+        self.assertEqual(repaired['drift']['attribution'], 'mixed')
+        self.assertEqual((repaired['monitor']['passed'], repaired['monitor']['failed']), (2, 3))
+        self.assertEqual(repaired['drift']['reason'], 'historic')
+
+    def test_duplicate_monitor_does_not_infer_attribution_from_inconsistent_counts(self):
+        evidence = {'monitor': {'passed': 2, 'failed': 1, 'shared_failed': 2,
+                                'runs': ['success'], 'attribution': 'single'},
+                    'drift': {'state': 'watch', 'attribution': 'single', 'reason': 'historic'}}
+        self.candidate(evidence)
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('success', 'p', encode([{'id': 'c'}]), '{}'))
+        self.evolution.monitor('p', True, {'id': 'success'})
+        row = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+        self.assertEqual(json.loads(row['evidence']), evidence)
+
+    def test_historical_drift_attribution_is_corrected_above_threshold(self):
+        self.config['evolution']['monitor_tasks'] = 10
+        self.candidate({'monitor': {'passed': 4, 'failed': 1, 'shared_failed': 1, 'runs': [], 'attribution': 'single'},
+                        'drift': {'state': 'watch', 'attribution': 'single', 'reason': 'historic'}})
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('success', 'p', encode([{'id': 'c'}]), '{}'))
+        self.evolution.monitor('p', True, {'id': 'success'})
+        evidence = json.loads(self.store.one("SELECT evidence FROM candidates WHERE id='c'")['evidence'])
+        self.assertEqual(evidence['monitor']['attribution'], 'shared')
+        self.assertEqual(evidence['drift']['attribution'], 'shared')
+        self.assertEqual(evidence['drift']['reason'], 'historic')
+
+    def test_shared_failures_are_counted_without_rollback(self):
+        # strategy 与 adapter 各自晋升后，同一 run 覆盖两个生效候选：失败仍需计数并进入
+        # drift，但无法归因到单个策略，因此标记 shared 并跳过自动回滚。
+        self.candidate({'monitor': {'passed': 0, 'failed': 0}})
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                           ('a', 'p', 'adapter', 'stable', encode({'guidance': 'adapter', 'triggers': []}),
+                            encode({'monitor': {'passed': 0, 'failed': 0}}), 2))
+        self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                           ('shared-run', 'p', encode([{'id': 'c'}, {'id': 'a'}]), encode({})))
+        self.evolution.monitor('p', False, {'id': 'shared-run'}, attributable=True)
+        for cid in ('c', 'a'):
+            row = self.store.one('SELECT status,evidence FROM candidates WHERE id=?', (cid,))
+            evidence = json.loads(row['evidence'])
+            self.assertEqual(row['status'], 'stable')
+            self.assertEqual(evidence['monitor']['failed'], 1)
+            self.assertEqual(evidence['monitor']['shared_failed'], 1)
+            self.assertEqual(evidence['monitor']['attribution'], 'shared')
+            self.assertEqual(evidence['drift']['state'], 'watch')
+            self.assertEqual(evidence['drift']['attribution'], 'shared')
+            self.assertIn('no automatic rollback', evidence['drift']['reason'])
+        event = self.store.one("SELECT data FROM events WHERE kind='strategy_inconclusive'")
+        self.assertEqual(json.loads(event['data'])['attribution'], 'shared')
+
+    def test_shared_failure_attribution_survives_later_single_success(self):
+        self.candidate({'monitor': {'passed': 0, 'failed': 0}})
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                           ('a', 'p', 'adapter', 'stable', encode({'guidance': 'adapter', 'triggers': []}),
+                            encode({'monitor': {'passed': 0, 'failed': 0}}), 2))
+        for run_id, candidates in [('shared-failure', ['c', 'a']), ('single-success', ['c'])]:
+            self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                               (run_id, 'p', encode([{'id': cid} for cid in candidates]), encode({})))
+        self.evolution.monitor('p', False, {'id': 'shared-failure'}, attributable=True)
+        self.evolution.monitor('p', True, {'id': 'single-success'})
+        row = self.store.one('SELECT status,evidence FROM candidates WHERE id=?', ('c',))
+        evidence = json.loads(row['evidence'])
+        self.assertEqual(row['status'], 'stable')
+        self.assertEqual((evidence['monitor']['passed'], evidence['monitor']['failed']), (1, 1))
+        self.assertEqual(evidence['monitor']['shared_failed'], 1)
+        self.assertEqual(evidence['monitor']['attribution'], 'shared')
+        self.assertEqual(evidence['drift']['attribution'], 'shared')
+
+    def test_mixed_failures_keep_aggregate_attribution_and_single_rollback(self):
+        self.candidate({'monitor': {'passed': 0, 'failed': 0}})
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
+                           ('a', 'p', 'adapter', 'stable', encode({'guidance': 'adapter', 'triggers': []}),
+                            encode({'monitor': {'passed': 0, 'failed': 0}}), 2))
+        for run_id, candidates in [('shared-failure', ['c', 'a']), ('single-failure', ['c'])]:
+            self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)',
+                               (run_id, 'p', encode([{'id': cid} for cid in candidates]), encode({})))
+            self.evolution.monitor('p', False, {'id': run_id}, attributable=True)
+        row = self.store.one('SELECT status,evidence FROM candidates WHERE id=?', ('c',))
+        evidence = json.loads(row['evidence'])
+        self.assertEqual(row['status'], 'rolled_back')
+        self.assertEqual(evidence['monitor']['failed'], 2)
+        self.assertEqual(evidence['monitor']['shared_failed'], 1)
+        self.assertEqual(evidence['monitor']['attribution'], 'mixed')
+        self.assertEqual(evidence['drift']['attribution'], 'mixed')
 
     def feed_passing_runs(self, ids):
         for run_id in ids:
@@ -572,6 +884,72 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(drift['phase'], 'sentinel')
         self.assertEqual(drift['sampled_passed'], 1)
         self.assertAlmostEqual(drift['unbiased_pass_ratio'], 30 / 40, places=3)
+
+    def rollback_runtime(self):
+        """真实 Runtime：active_strategies 的兼容性过滤必须来自生产实现。"""
+        runtime = Runtime(self.store, agent=object())
+        self.addCleanup(runtime.close)
+        self.store.execute("INSERT INTO projects(id,name,path,config,paused,created) VALUES (?,?,?,?,?,?)",
+                           ('p', 'p', str(self.root / 'repo'), '{}', 1, 1))
+        return runtime
+
+    def rollback_candidates(self, sealed, current):
+        """a 在 sealed 配置下晋升，b 在 current 配置下接管；b 之后监控失败触发回滚。"""
+        for candidate, parent, status, compat in (('a', None, 'superseded', sealed), ('b', 'a', 'stable', current)):
+            self.store.execute('INSERT INTO candidates(id,project,kind,parent,status,content,evidence,created) '
+                               'VALUES (?,?,?,?,?,?,?,?)',
+                               (candidate, 'p', 'strategy', parent, status,
+                                encode({'guidance': 'Check boundaries', 'triggers': ['add']}),
+                                encode({'compatibility': compat}), 1))
+
+    def test_rollback_restores_a_parent_that_matches_the_current_configuration(self):
+        runtime = self.rollback_runtime()
+        sealed = compatibility(runtime.config('p'))
+        self.rollback_candidates(sealed, sealed)
+        self.store.execute('INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)',
+                           ('skill-a', 'p', None, 'verified', '["add"]', 'lesson a',
+                            '{"candidate":"a"}', time.time() + 100, time.time()))
+        runtime.rollback_strategy('b')
+        self.assertEqual(self.store.one('SELECT status FROM candidates WHERE id=?', ('a',))['status'], 'stable')
+        self.assertEqual([candidate['id'] for candidate in runtime.active_strategies('p')], ['a'])
+        self.assertEqual([item['content'] for item in runtime.memories('p', 'add')], ['lesson a'])
+        event = self.store.one("SELECT * FROM events WHERE kind='rollback' ORDER BY seq DESC")
+        self.assertEqual(event['message'], 'Restored previous stable strategy and invalidated its learned skill')
+
+    def test_rollback_keeps_an_incompatible_parent_out_of_active_strategies(self):
+        runtime = self.rollback_runtime()
+        sealed = compatibility(runtime.config('p'))
+        self.store.execute('UPDATE projects SET config=? WHERE id=?',
+                           (encode({'checks': [{'name': 'b', 'cwd': '.', 'argv': ['true']}]}), 'p'))
+        current = compatibility(runtime.config('p'))
+        self.assertNotEqual(sealed, current)
+        self.rollback_candidates(sealed, current)
+        runtime.rollback_strategy('b')
+        # 父候选的封存指纹属于旧配置，恢复成 stable 只会被 active_strategies 静默过滤。
+        self.assertEqual(self.store.one('SELECT status FROM candidates WHERE id=?', ('a',))['status'], 'ready')
+        self.assertEqual(runtime.active_strategies('p'), [])
+        event = self.store.one("SELECT * FROM events WHERE kind='rollback' ORDER BY seq DESC")
+        self.assertNotIn('Restored previous stable strategy', event['message'])
+        self.assertEqual(json.loads(event['data']), {'candidate': 'b', 'parent': 'a',
+                                                     'parent_compatibility': sealed,
+                                                     'current_compatibility': current,
+                                                     'outcome': 'rollback_incompatible_parent'})
+        # 用户改回旧配置后仍可显式启用该候选，而不是永久失去这条策略。
+        self.store.execute('UPDATE projects SET config=? WHERE id=?', ('{}', 'p'))
+        self.assertEqual(runtime.promote_strategy('a'), {'candidate': 'a', 'status': 'stable'})
+        self.assertEqual([candidate['id'] for candidate in runtime.active_strategies('p')], ['a'])
+
+    def test_rollback_reports_a_parent_whose_evidence_cannot_be_read(self):
+        runtime = self.rollback_runtime()
+        sealed = compatibility(runtime.config('p'))
+        self.rollback_candidates(sealed, sealed)
+        self.store.execute("UPDATE candidates SET content='{broken' WHERE id='a'")
+        runtime.rollback_strategy('b')
+        # 内容不可解析的父候选同样不会出现在 active_strategies 中，不能谎称已恢复。
+        self.assertEqual(self.store.one('SELECT status FROM candidates WHERE id=?', ('a',))['status'], 'superseded')
+        event = self.store.one("SELECT * FROM events WHERE kind='rollback' ORDER BY seq DESC")
+        self.assertEqual(json.loads(event['data'])['outcome'], 'rollback_unreadable_parent')
+        self.assertNotIn('Restored previous stable strategy', event['message'])
 
     def test_retirement_and_reclassification_keep_exposure(self):
         self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)', ('x', 'p', 'family', 'validation', encode({'signature': 's'}), 2, 1))
@@ -805,6 +1183,67 @@ class AuditEvolutionTest(unittest.TestCase):
         spec['task'] = 'different task'
         self.store.execute('UPDATE cases SET spec=? WHERE id=?', (encode(spec), 'case'))
         self.assertFalse(self.evolution.verify_inputs('p', [item])['valid'])
+
+    def test_promote_rejects_drifted_sealed_inputs_without_side_effects(self):
+        """用例在人工复核窗口内漂移后，手动晋升不能按旧证据注入 stable 技能。"""
+        self.ready_candidate(drift=True)
+        with self.assertRaisesRegex(ValueError, r'case-1 \(.*task'):
+            self.evolution.promote('candidate')
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='candidate'")['status'], 'ready')
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='previous'")['status'], 'stable')
+        self.assertEqual(self.store.query('SELECT * FROM skills'), [])
+
+    def assert_promotion_rejects_post_verification_change(self, target):
+        self.ready_candidate()
+        verify = self.evolution.verify_inputs
+
+        def change_after_verification(*args, **kwargs):
+            result = verify(*args, **kwargs)
+            if target == 'case':
+                self.store.execute("UPDATE cases SET spec=? WHERE id='case-1'", ('{}',))
+            else:
+                self.store.execute("UPDATE candidates SET evidence=? WHERE id='candidate'", ('{}',))
+            return result
+
+        with patch.object(self.evolution, 'verify_inputs', side_effect=change_after_verification):
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                self.evolution.promote('candidate')
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='candidate'")['status'], 'ready')
+        self.assertEqual(self.store.query('SELECT * FROM skills'), [])
+
+    def test_promote_rejects_case_change_after_input_verification(self):
+        self.assert_promotion_rejects_post_verification_change('case')
+
+    def test_promote_rejects_evidence_change_after_input_verification(self):
+        self.assert_promotion_rejects_post_verification_change('evidence')
+
+    def test_promote_rejects_reclassified_sealed_case(self):
+        self.ready_candidate()
+        self.store.execute("UPDATE cases SET split='development' WHERE id='case-1'")
+        with self.assertRaisesRegex(ValueError, 'split'):
+            self.evolution.promote('candidate')
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='candidate'")['status'], 'ready')
+        self.assertEqual(self.store.query('SELECT * FROM skills'), [])
+
+    def test_promote_with_unchanged_sealed_inputs_still_promotes(self):
+        self.ready_candidate()
+        result = self.evolution.promote('candidate')
+        self.assertEqual(result, {'candidate': 'candidate', 'status': 'stable'})
+        row = self.store.one("SELECT status,parent FROM candidates WHERE id='candidate'")
+        self.assertEqual((row['status'], row['parent']), ('stable', 'previous'))
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='previous'")['status'], 'superseded')
+        # #410 起：没有可检索触发词的候选不写 verified 技能行，只影响统计口径，
+        # 策略晋升本身照常完成（见 promoted_skill 的说明）。
+        self.assertEqual(self.store.query('SELECT * FROM skills'), [])
+
+    def test_promote_records_unsampled_drift_without_blocking(self):
+        """未抽中用例的漂移只留档，不阻断晋升（与自动晋升同一口径）。"""
+        self.ready_candidate(unsampled_drift=True)
+        result = self.evolution.promote('candidate')
+        self.assertEqual(result['status'], 'stable')
+        evidence = json.loads(self.store.one("SELECT evidence FROM candidates WHERE id='candidate'")['evidence'])
+        self.assertEqual([row['case'] for row in evidence['input_verification']['unsampled_mismatches']], ['case-2'])
+        self.assertIn('case-2', evidence['promotion_review']['limitations'][0])
 
     def test_overlay_identity_includes_empty_directories_and_modes(self):
         overlay = self.root / 'overlay'
@@ -1788,7 +2227,7 @@ class AuditEvolutionTest(unittest.TestCase):
         case = destination / 'cases' / 'case-unlisted'
         self.assertTrue(Evolution.verify_bundle(destination)['valid'])
 
-        injected = [case / 'repository' / 'sitecustomize.py',
+        injected = [self.case_tree(destination, 'case-unlisted') / 'sitecustomize.py',
                     case / 'UNLISTED.txt',
                     destination / 'UNLISTED.txt']
         for path in injected:
@@ -1816,7 +2255,7 @@ class AuditEvolutionTest(unittest.TestCase):
             capture_output=True, text=True, env={'PATH': '/usr/bin:/bin'})
         self.assertEqual(cli.returncode, 1, cli.stdout + cli.stderr)
         self.assertNotIn('All bundle files verified', cli.stdout)
-        self.assertIn('cases/case-unlisted/repository/sitecustomize.py', cli.stdout)
+        self.assertIn(injected[0].relative_to(destination).as_posix(), cli.stdout)
         self.assertFalse(marker.exists())
 
         # 未注入的正常导出包不回归：verify 通过，--strict 退出 0 且检查真实执行。
@@ -1834,10 +2273,10 @@ class AuditEvolutionTest(unittest.TestCase):
         """导出 bundle 只封存工作树：.git 不随包走（origin 指向的宿主机 suite
         路径不外泄），cases/ 下出现 .git 由 verify_bundle 判失效而不是静默豁免。"""
         destination = self.sealed_bundle(repo_name='repo-gitless')
-        repository = destination / 'cases' / 'case-gitless' / 'repository'
+        repository = self.case_tree(destination, 'case-gitless')
         self.assertTrue(repository.is_dir())
         self.assertFalse((repository / '.git').exists())
-        self.assertFalse(list((destination / 'cases').rglob('.git')))
+        self.assertFalse(list(destination.rglob('.git')))
         # 包内任何残留文件都不应包含源仓库的宿主机绝对路径。
         for path in destination.rglob('*'):
             if path.is_file() and not path.is_symlink():
@@ -1849,7 +2288,7 @@ class AuditEvolutionTest(unittest.TestCase):
         (injected / 'config').write_text('[remote "origin"]\n\turl = ' + str(self.root) + '/repo-gitless\n')
         result = Evolution.verify_bundle(destination)
         self.assertFalse(result['valid'])
-        self.assertIn('cases/case-gitless/repository/.git', result['mismatches'])
+        self.assertIn((repository / '.git').relative_to(destination).as_posix(), result['mismatches'])
         # reproduce_bundle 的完整性判定同口径拒绝，run_checks 不再走到复制 .git。
         repro = Evolution.reproduce_bundle(destination)
         self.assertFalse(repro['integrity']['valid'])
@@ -1865,7 +2304,7 @@ class AuditEvolutionTest(unittest.TestCase):
         destination = self.sealed_bundle(repo_name='repo-overlay-git', overlay=overlay)
         case = destination / 'cases' / 'case-overlay-git'
         self.assertEqual((case / 'overlay' / 'protected.txt').read_text(), 'sealed input\n')
-        self.assertFalse(list((destination / 'cases').rglob('.git')))
+        self.assertFalse(list(destination.rglob('.git')))
         for path in destination.rglob('*'):
             if path.is_file() and not path.is_symlink():
                 self.assertNotIn(str(self.root), path.read_bytes().decode('utf-8', errors='replace'))
@@ -1896,10 +2335,11 @@ class AuditEvolutionTest(unittest.TestCase):
         destination = self.root / 'bundle-sampled'
         self.evolution.export_bundle('c', destination)
 
-        # 1. 只有抽中用例封存工作树；未抽中条目连 case.json 都不落盘。
-        self.assertEqual(sorted(path.parent.name for path in (destination / 'cases').glob('*/repository')),
-                         ['case-a', 'case-b'])
+        # 1. 只有抽中用例导出 case.json；未抽中条目连 case.json 都不落盘。
+        #    case-a / case-b 共用同一 base，因此只封存一份仓库树。
         self.assertEqual(sorted(path.name for path in (destination / 'cases').iterdir()), ['case-a', 'case-b'])
+        self.assertEqual(sorted(path.name for path in (destination / 'repositories').iterdir()), [tree])
+        self.assertEqual(self.case_tree(destination, 'case-a'), self.case_tree(destination, 'case-b'))
 
         # 2. bundle.json 保留全部条目的身份与导出标记，审计信息不丢。
         exported = json.loads((destination / 'bundle.json').read_text(encoding='utf-8'))
@@ -1910,11 +2350,11 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(entries['case-c']['split'], 'validation')
         self.assertTrue(any('unsampled' in item for item in exported['limitations']))
 
-        # 3. 包体不随未抽中条目放大：两份工作树而不是四份。
+        # 3. 包体不随抽中用例数放大：两个用例共用一份工作树，而不是各存一份。
         source_bytes = sum(path.stat().st_size for path in repo.rglob('*')
                            if path.is_file() and '.git' not in path.relative_to(repo).parts)
         bundle_bytes = sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())
-        self.assertLess(bundle_bytes, source_bytes * 2 + 16384)
+        self.assertLess(bundle_bytes, source_bytes + 16384)
 
         # 4. 抽中用例仍可校验与离线复现；未执行用例的检查命令不进入依赖清单。
         self.assertTrue(Evolution.verify_bundle(destination)['valid'])
@@ -1924,6 +2364,155 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertTrue(result['integrity']['valid'])
         self.assertNotIn('fake-unsampled-tool', [item['name'] for item in result['dependencies']['missing']])
         self.assertTrue(result['reproducible'])
+
+    def test_export_bundle_shares_one_tree_for_same_base_cases(self):
+        """同一 (repository, base) 的多个抽中用例共用一份树，包体不随样本数放大。"""
+        from tests.test_runtime import fixture
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo-shared')
+        (repo / 'payload.bin').write_bytes(b'payload' * 8192)
+        git(repo, 'add', '.')
+        git(repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost',
+            'commit', '--quiet', '-m', 'payload')
+        base = git(repo, 'rev-parse', 'HEAD')
+        items = []
+        for name in ('a', 'b', 'c'):
+            spec = {'task': 'task ' + name, 'base': base, 'source': 'real',
+                    'checks': [{'name': 'unit_check', 'cwd': '.',
+                                'argv': ['python3', '-c', 'print("ok")']}],
+                    'signature': 'sig-' + name, 'repository': str(repo), 'overlay': None}
+            self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                               ('case-' + name, 'p', 'family-' + name, 'validation',
+                                encode(spec), 0, time.time()))
+            items.append({'case': 'case-' + name, 'split': 'validation', 'sampled': True})
+        self.candidate({'dataset': {'manifest': items}, 'providers': []})
+        destination = self.root / 'bundle-shared'
+        exported = self.evolution.export_bundle('c', destination)
+
+        # 1. 三份完全相同的工作树只落一份；case.json 各自用相对路径指过去。
+        trees = sorted((destination / 'repositories').iterdir())
+        self.assertEqual(len(trees), 1)
+        self.assertEqual({self.case_tree(destination, 'case-' + name) for name in 'abc'}, {trees[0]})
+        for name in 'abc':
+            spec = json.loads((destination / 'cases' / ('case-' + name) / 'case.json')
+                              .read_text(encoding='utf-8'))
+            self.assertTrue(spec['repository'].startswith('..'))
+            self.assertNotIn(str(self.root), spec['repository'])
+
+        # 2. 包体与清单只算一次树：文件登记数等于树内文件数，而不是样本数倍。
+        registered = [path for path in exported['files'] if path.startswith('repositories/')]
+        source_bytes = sum(path.stat().st_size for path in repo.rglob('*')
+                           if path.is_file() and '.git' not in path.relative_to(repo).parts)
+        bundle_bytes = sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())
+        self.assertLess(bundle_bytes, source_bytes + 16384)
+        self.assertEqual(len(registered), sum(1 for path in trees[0].rglob('*') if path.is_file()))
+
+        # 3. 校验与离线复现不变：三个用例都能按 case.json 找到树并执行检查。
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['reproducible'], result['limitations'])
+        self.assertEqual([(row['case'], row['passed']) for row in result['executed_checks']],
+                         [('case-a', True), ('case-b', True), ('case-c', True)])
+
+    def test_export_bundle_separates_trees_for_different_bases_and_overlay(self):
+        """不同 base 的抽中用例各有自己的树；overlay 仍按用例单独封存。"""
+        from tests.test_runtime import fixture
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo-mixed')
+        (repo / 'first.txt').write_text('first\n')
+        git(repo, 'add', '.')
+        git(repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost',
+            'commit', '--quiet', '-m', 'first')
+        first = git(repo, 'rev-parse', 'HEAD')
+        (repo / 'second.txt').write_text('second\n')
+        git(repo, 'add', '.')
+        git(repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost',
+            'commit', '--quiet', '-m', 'second')
+        second = git(repo, 'rev-parse', 'HEAD')
+        overlay = self.root / 'overlay-mixed'
+        overlay.mkdir()
+        (overlay / 'marker.txt').write_text('overlay\n')
+        specs = {'case-first-1': (first, None), 'case-first-2': (first, None),
+                 'case-second': (second, None), 'case-overlay': (first, str(overlay))}
+        items = []
+        for name, (base, cover) in specs.items():
+            spec = {'task': 'task ' + name, 'base': base, 'source': 'real',
+                    'checks': [{'name': 'unit_check', 'cwd': '.',
+                                'argv': ['python3', '-c', 'print("ok")']}],
+                    'signature': 'sig-' + name, 'repository': str(repo), 'overlay': cover}
+            self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                               (name, 'p', 'family-' + name, 'validation', encode(spec), 0, time.time()))
+            items.append({'case': name, 'split': 'validation', 'sampled': True})
+        self.candidate({'dataset': {'manifest': items}, 'providers': []})
+        destination = self.root / 'bundle-mixed'
+        self.evolution.export_bundle('c', destination)
+
+        first_tree = self.case_tree(destination, 'case-first-1')
+        second_tree = self.case_tree(destination, 'case-second')
+        self.assertEqual(len(list((destination / 'repositories').iterdir())), 2)
+        self.assertEqual(self.case_tree(destination, 'case-first-2'), first_tree)
+        self.assertEqual(self.case_tree(destination, 'case-overlay'), first_tree)
+        self.assertNotEqual(second_tree, first_tree)
+        self.assertTrue((second_tree / 'second.txt').is_file())
+        self.assertFalse((first_tree / 'second.txt').exists())
+        # overlay 仍是该用例独有的一份，不被共享树吞掉。
+        self.assertTrue((destination / 'cases' / 'case-overlay' / 'overlay' / 'marker.txt').is_file())
+        self.assertEqual(json.loads((destination / 'cases' / 'case-overlay' / 'case.json')
+                                    .read_text(encoding='utf-8'))['overlay'], 'overlay')
+        self.assertFalse((destination / 'cases' / 'case-first-1' / 'overlay').exists())
+
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['reproducible'], result['limitations'])
+        rows = {row['case']: row for row in result['executed_checks']}
+        self.assertTrue(rows['case-overlay']['overlay_applied'])
+        self.assertFalse(rows['case-second']['overlay_applied'])
+        self.assertTrue(all(row['passed'] for row in result['executed_checks']))
+
+    def test_declared_unresolved_overlay_prevents_reproduction(self):
+        destination = self.sealed_bundle(repo_name='repo-bad-overlay')
+        case = destination / 'cases' / 'case-bad-overlay'
+        spec_path = case / 'case.json'
+        spec = json.loads(spec_path.read_text(encoding='utf-8'))
+        for declared in ('missing-overlay', '../../../protected-overlay', ''):
+            with self.subTest(overlay=declared):
+                spec['overlay'] = declared
+                spec_path.write_text(encode(spec), encoding='utf-8')
+                self.reseal_bundle(destination)
+                for run_checks in (False, True):
+                    result = Evolution.reproduce_bundle(
+                        destination, env={'PATH': '/usr/bin:/bin'}, run_checks=run_checks,
+                        which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+                    self.assertTrue(result['integrity']['valid'])
+                    self.assertFalse(result['reproducible'], result)
+                    self.assertTrue(any('overlay is missing or escapes the bundle' in msg
+                                        for msg in result['limitations']))
+                    if run_checks:
+                        self.assertFalse(result['checks_passed'])
+                        self.assertEqual(result['executed_checks'][0]['check'], None)
+                        self.assertIn('overlay', result['executed_checks'][0]['error'])
+
+    def test_bundle_reproduction_supports_legacy_case_repository_layout(self):
+        """旧包把树放在 cases/<id>/repository、case.json 记 "repository"：仍能复现。"""
+        destination = self.sealed_bundle(repo_name='repo-legacy')
+        case = destination / 'cases' / 'case-legacy'
+        shutil.move(str(self.case_tree(destination, 'case-legacy')), str(case / 'repository'))
+        (destination / 'repositories').rmdir()
+        spec = json.loads((case / 'case.json').read_text(encoding='utf-8'))
+        spec['repository'] = 'repository'
+        (case / 'case.json').write_text(encode(spec), encoding='utf-8')
+        self.reseal_bundle(destination)
+
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertTrue(result['reproducible'], result['limitations'])
+        self.assertEqual([row['passed'] for row in result['executed_checks']], [True])
 
     def sealed_bundle(self, checks=None, providers=None, evidence=None, repo_name='repo', overlay=None):
         """导出一个含单个用例的封存实验包，供 bundle 复现测试复用。"""
@@ -2042,7 +2631,7 @@ class AuditEvolutionTest(unittest.TestCase):
         # 中定位并真实执行，不能被当成「宿主缺少工具」而跳过全部检查。
         destination = self.sealed_bundle(repo_name='repo-relative-argv')
         case = destination / 'cases' / 'case-relative-argv'
-        script = case / 'repository' / 'run.sh'
+        script = self.case_tree(destination, 'case-relative-argv') / 'run.sh'
         script.write_text('#!/bin/sh\nexit 0\n')
         script.chmod(0o755)
         spec = json.loads((case / 'case.json').read_text(encoding='utf-8'))
@@ -2313,6 +2902,14 @@ class AuditEvolutionTest(unittest.TestCase):
         manifest['files'] = files
         (destination / 'bundle.json').write_text(encode(manifest), encoding='utf-8')
 
+    def case_tree(self, destination, case_id):
+        """按 case.json 的相对路径定位随包导出的仓库树；同 tree 的用例共用一份。"""
+        case = destination / 'cases' / case_id
+        spec = json.loads((case / 'case.json').read_text(encoding='utf-8'))
+        # 只要词法归一化，不解析符号链接：临时目录本身可能经符号链接访问
+        # （macOS 的 /var -> private/var），resolve() 会让路径脱离 destination。
+        return Path(os.path.normpath(case / spec['repository']))
+
     def test_bundle_reproduction_applies_sealed_overlay_in_staging_copy(self):
         # 线程 2：overlay-only 检查在一次性副本中可见并执行，bundle 内文件保持不变。
         destination = self.sealed_overlay_bundle()
@@ -2329,7 +2926,7 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual([row['check'] for row in result['executed_checks']],
                          ['sees_staging_copy', 'overlay_only_test'])
         # 覆盖层落盘脚本不在导出目录中：命令确实运行在一次性副本里。
-        self.assertFalse((destination / 'cases' / 'case-01' / 'repository' / 'sealed_marker.txt').exists())
+        self.assertFalse((self.case_tree(destination, 'case-01') / 'sealed_marker.txt').exists())
         for relative, digest in files_before.items():
             self.assertEqual(hashlib.sha256((destination / relative).read_bytes()).hexdigest(), digest,
                              relative)
@@ -2369,7 +2966,8 @@ class AuditEvolutionTest(unittest.TestCase):
         case_dir = destination / 'cases' / 'case-escape'
         outside = self.root / 'outside'
         outside.mkdir()
-        (case_dir / 'repository' / 'vendor').symlink_to(outside)
+        tree = self.case_tree(destination, 'case-escape')
+        (tree / 'vendor').symlink_to(outside)
         overlay = self.root / 'overlay-escape'
         (overlay / 'vendor').mkdir(parents=True)
         (overlay / 'vendor' / 'escaped.txt').write_text('escaped\n')
@@ -2381,7 +2979,7 @@ class AuditEvolutionTest(unittest.TestCase):
         # 未登记的符号链接条目在 verify_bundle 阶段就被拒绝，不再等到 staging。
         rejected = Evolution.verify_bundle(destination)
         self.assertFalse(rejected['valid'])
-        self.assertIn('cases/case-escape/repository/vendor', rejected['mismatches'])
+        self.assertIn((tree / 'vendor').relative_to(destination).as_posix(), rejected['mismatches'])
 
         # 即使完整性校验被绕过，复现侧仍要拒绝 overlay 经仓库内符号链接写到副本外。
         with patch.object(Evolution, 'verify_bundle',
@@ -2438,10 +3036,9 @@ class AuditEvolutionTest(unittest.TestCase):
             checks=[{'name': 'escaped_cwd', 'cwd': 'escape',
                      'argv': ['python3', '-c', 'open("ESCAPED", "w").write("1")']}],
             repo_name='repo-cwd-escape')
-        case_dir = destination / 'cases' / 'case-cwd-escape'
         outside = self.root / 'outside-cwd'
         outside.mkdir()
-        (case_dir / 'repository' / 'escape').symlink_to(outside)
+        (self.case_tree(destination, 'case-cwd-escape') / 'escape').symlink_to(outside)
 
         with patch.object(Evolution, 'verify_bundle',
                           return_value={'valid': True, 'mismatches': [], 'limitations': []}):
@@ -2647,6 +3244,63 @@ class AuditEvolutionTest(unittest.TestCase):
              '--run-checks', '--strict'],
             capture_output=True, text=True, env={'PATH': '/usr/bin:/bin'})
         self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+
+    def test_bundle_reproduction_honours_declared_check_timeout(self):
+        # 评估侧按 checks[].timeout_seconds 执行；旧离线复现写死 60 s，会把声明
+        # 0.2 s 的检查跑满并判通过，掩盖真实超时行为、得出与基线相反的结论。
+        checks = [{'name': 'declared-short', 'cwd': '.', 'timeout_seconds': 0.2,
+                   'argv': ['python3', '-c',
+                            'import time; time.sleep(1.5); print("ran past declared budget")']}]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-check-short-timeout')
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(len(result['executed_checks']), 1)
+        row = result['executed_checks'][0]
+        self.assertFalse(row['passed'])
+        self.assertEqual(row['exit_code'], -1)
+        self.assertEqual(row['timeout_seconds'], 0.2)
+        self.assertIn('timed out', row['error'])
+        # 进程在打印前就被杀掉，证明没有跑满用例自身的 1.5 s。
+        self.assertNotIn('ran past declared budget', row.get('stdout', ''))
+        self.assertEqual(result['checks_failed'], 1)
+        self.assertFalse(result['reproducible'])
+        self.assertTrue(any('Offline checks failed: 1 of 1' in item for item in result['limitations']))
+
+    def test_bundle_reproduction_default_timeout_allows_slow_check(self):
+        # 未声明 timeout_seconds 时沿用评估侧的 300 s 缺省，不再用旧的 60 s 硬编码；
+        # 1.5 s 的检查必须通过，否则评估侧接受的慢检查会在离线侧被误杀。
+        checks = [{'name': 'undeclared-slow', 'cwd': '.',
+                   'argv': ['python3', '-c', 'import time; time.sleep(1.5); print("done")']}]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-check-default-timeout')
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(len(result['executed_checks']), 1)
+        row = result['executed_checks'][0]
+        self.assertTrue(row['passed'], row)
+        self.assertEqual(row['timeout_seconds'], 300)
+        self.assertIs(result['checks_passed'], True)
+        self.assertTrue(result['reproducible'])
+
+    def test_bundle_reproduction_rejects_invalid_check_timeout(self):
+        # 声明字段被读取后必须校验：字符串无法交给 subprocess，不能静默套用缺省值。
+        checks = [{'name': 'bad-timeout', 'cwd': '.', 'timeout_seconds': '30',
+                   'argv': ['python3', '-c', 'print("should not run")']}]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-check-bad-timeout')
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertEqual(len(result['executed_checks']), 1)
+        row = result['executed_checks'][0]
+        self.assertFalse(row['passed'])
+        self.assertEqual(row['exit_code'], -1)
+        self.assertIn('timeout_seconds must be a positive finite number', row['error'])
+        self.assertNotIn('should not run', row.get('stdout', ''))
+        self.assertEqual(result['checks_failed'], 1)
+        self.assertFalse(result['reproducible'])
 
     def test_bundle_malformed_check_specs_block_reproducibility(self):
         checks = [
@@ -2893,6 +3547,71 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(plan['selection_policy'], 'traffic_weighted_min_one_per_stratum')
         self.assertEqual(len(plan['samples']), 6)
         self.assertIn('share of the population', ' '.join(evidence['promotion_review']['limitations']))
+
+    def test_sealed_plan_replays_selection_from_recorded_population(self):
+        """uses 是层内排序主键：记录 eligible 全集后审计方才能复算抽中的样本。"""
+        args = self.setup_proposal()
+        from adaptive_rsi.gitops import git
+        from tests.test_runtime import CHECKS
+        repo = args[1]
+        base = git(repo, 'rev-parse', 'HEAD')
+        # 找一个 seeded hash 排在既有 validation 用例之前的 id：真实抽样按 uses 选中
+        # uses=0 的 'validation'；只有把未知 uses 当成 0 复算才会选中 alt。
+        alt = next(name for name in ('validation-alt-%d' % index for index in range(500))
+                   if fingerprint({'id': name, 'seed': 'run'}) < fingerprint({'id': 'validation', 'seed': 'run'}))
+        spec = {'task': 'validation secret task', 'base': base, 'checks': CHECKS, 'source': 'real',
+                'signature': alt, 'repository': str(repo), 'overlay': None}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           (alt, 'p', alt, 'validation', encode(spec), 2, 1))
+        result = self.evolution.propose_and_evaluate(*args)
+        evidence = self.evidence_of(result['candidate'])
+        # 以 JSON 往返模拟审计方从封存文件读回的计划。
+        plan = json.loads(encode(evidence['preregistered_plan']['data']))
+        self.assertEqual(plan['selection_seed'], 'run')
+        self.assertEqual({row['id']: row['uses'] for row in plan['selection_population']['validation']},
+                         {'validation': 0, alt: 2})
+        self.assertEqual([row['id'] for row in plan['samples'] if row['split'] == 'validation'],
+                         ['validation'])
+        verification = Evolution.verify_selection(plan)
+        self.assertTrue(verification['valid'])
+        self.assertEqual(verification['expected'], verification['observed'])
+        self.assertEqual(evidence['promotion_review']['selection_verification'], verification)
+
+        # 篡改排序主键 uses：把未知 uses 当 0 的「最合理复算」会选中另一个样本。
+        erased = json.loads(encode(plan))
+        next(row for row in erased['selection_population']['validation']
+             if row['id'] == alt)['uses'] = 0
+        changed = Evolution.verify_selection(erased)
+        self.assertFalse(changed['valid'])
+        self.assertEqual(changed['reason'], 'sample_not_rederivable')
+        self.assertIn('validation:' + alt, changed['expected'])
+        self.assertNotIn('validation:validation', changed['expected'])
+        # 替换抽中样本或改样本记录的 prior_uses 同样不可复算。
+        for mutate, reason in (
+                (lambda data: data['samples'].__setitem__(
+                    0, {'id': alt, 'split': 'validation', 'stratum': ['real', 'small'], 'prior_uses': 2}),
+                 'sample_not_rederivable'),
+                (lambda data: data['samples'][0].update(prior_uses=9), 'sample_prior_uses_mismatch')):
+            tampered = json.loads(encode(plan))
+            mutate(tampered)
+            self.assertEqual(Evolution.verify_selection(tampered)['reason'], reason)
+
+    def test_unreproducible_selection_blocks_promotion_and_is_flagged(self):
+        args = self.setup_proposal()
+        # 让验证集产生一次真实改进，确保执行到终态评审而不是提前返回。
+        self.evolution.runtime.execute_candidate = lambda *call, **kwargs: {
+            'decision': 'pass' if str(call[5]).endswith('candidate') else 'fail'}
+        invalid = {'valid': False, 'reason': 'sample_not_rederivable',
+                   'expected': ['validation:other'], 'observed': ['validation:validation']}
+        with patch.object(Evolution, 'verify_selection', return_value=invalid):
+            result = self.evolution.propose_and_evaluate(*args)
+        evidence = self.evidence_of(result['candidate'])
+        self.assertEqual(evidence['decision'], 'insufficient_evidence')
+        self.assertIn('cannot be reproduced', evidence['reason'])
+        self.assertEqual(evidence['promotion_review']['selection_verification'], invalid)
+        self.assertTrue(any('cannot be reproduced' in item
+                            for item in evidence['promotion_review']['limitations']))
+        self.assertEqual(result['status'], 'insufficient_evidence')
 
 
 if __name__ == '__main__':

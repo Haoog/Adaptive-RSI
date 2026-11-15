@@ -41,12 +41,20 @@ BUDGET_WAIT_RETRIES = 3
 ADMISSION_BACKOFF_SECONDS = 30
 # 阶段预算跨尝试累计时，崩溃最多丢失一个检查点间隔的已耗时间。
 STAGE_BUDGET_CHECKPOINT_SECONDS = 15
+# 检查点写库只争取这么久的写锁：DB 忙时放弃本轮检查点（下个间隔重试），
+# 不把取消轮询和阶段切换拖到 store 的 15 秒 busy timeout。
+STAGE_BUDGET_CHECKPOINT_BUSY_MS = 50
 
 # 失败退避的时长上限：指数退避只表达「越失败越谨慎」，不无限拉长。
 FAILURE_BACKOFF_MAX_SECONDS = 21600
 
-# 后处理待办的领取上限：每轮最多处理这一数量，避免历史遗留或持续失败项长时间占用调度锁。
+# 后处理待办的领取上限：每轮最多处理这一数量，避免历史遗留或持续失败项长时间占用调度线程。
 POSTPROCESS_BATCH = 20
+
+# 后处理每轮的墙钟预算：单条 delivery 会同步执行 git push 与 gh pr create（各 60s
+# 超时），整批 20 条最多能把调度线程占住几十分钟。预算用尽即返回，剩余 marker 留在
+# 持久索引里由下一个调度节拍继续；单条 drain_postprocess(run_id) 不受此预算限制。
+POSTPROCESS_TICK_SECONDS = 5
 
 # 后处理确定性失败的重试上限：attempts 达到上限后置 failed 终态并摘除待办索引，
 # 不再每 5 秒热循环。重试节奏由调度节拍本身（~5s）承担，瞬时失败保持即时重试契约。
@@ -149,6 +157,12 @@ def _diff_touches(changed, path):
     return any(name == path or name.startswith(path + "/") for name in changed)
 
 
+# 同一任务的检查点落盘是「读旧账取最大值 → 写新账」的读-改-写：跨 run 对象的
+# 时钟锁不通用（owner 与 trial 各持一把），用进程级锁把这段串起来。它只在时钟锁
+# 之外获取，因此写库阻塞不会回流到 begin_phase/invoke 与取消轮询。
+_stage_budget_write_lock = threading.Lock()
+
+
 class IssueSyncCorruptPending(ValueError):
     """_deliver 因 issue-sync 进度行损坏而拒绝交付；携带项目供调用方在回滚后补写事件。"""
 
@@ -186,8 +200,13 @@ class Runtime(Maintenance):
         self.evaluator = Evaluator(store)
         self._shutdown = {"phase": "running", "started": None, "ended": None,
                           "scheduler_timed_out": False, "maintenance_timed_out": False,
-                          "workers_timed_out": False, "reconcile_failed": 0}
+                          "workers_timed_out": False, "reconcile_failed": 0,
+                          "budget_persist_failures": 0, "errors": []}
+        # 预算落盘由 worker 与 trial 轮询并发触发，失败计数必须原子累加。
+        self._budget_persist_lock = threading.Lock()
         self._close_lock = threading.Lock()
+        # Startup initialization and shutdown must not mutate the same runtime concurrently.
+        self._lifecycle_lock = threading.Lock()
         self._closed = False
         # 领取与关闭的共同边界：close 先关闭准入，再排空线程池；竞态下不会留下已领取
         # 但从未启动的 run，也不会在关闭开始后继续领取新任务。
@@ -202,6 +221,10 @@ class Runtime(Maintenance):
         self.futures = set()
         self._futures_lock = threading.Lock()
         self._future_runs = {}
+        # 排空超时后仍在执行的 future：不能随 reconcile 一起被抹掉。它们继续计入
+        # shutdown_status().remaining_workers，并让状态目录锁保留到最后一个退出。
+        self._stuck_futures = set()
+        self._lockfile_lock = threading.Lock()
         self._scheduler_failures = {}
         self._scheduler_failures_lock = threading.Lock()
         self.automation_receipt_failures = {}
@@ -216,6 +239,9 @@ class Runtime(Maintenance):
         self._automation_locks = {}
         self._automation_locks_guard = threading.Lock()
         self.dispatch_lock = threading.RLock()
+        # 后处理专用锁：只串行后处理本身，不参与暂停/保存配置/调度领取。旧实现把整批
+        # 后处理放在 dispatch_lock 里，一条 gh pr create 就能冻结这些入口数十秒。
+        self._postprocess_lock = threading.RLock()
         self.maintenance_lock = threading.Lock()
         self.maintenance_thread = None
         self.maintenance_stop = threading.Event()
@@ -988,37 +1014,69 @@ class Runtime(Maintenance):
         return task
 
     def start(self, paused=False):
-        if self.lockfile is None or self.lockfile.closed:
-            self.lockfile = (self.store.root / "runtime.lock").open("a+")
+        """Claim the state directory lock and launch the scheduler thread.
+
+        Idempotent while the scheduler is running: a second call returns without
+        starting another thread or re-applying ``paused``, so in-process callers
+        see the same single-owner contract as ``Runtime.open()``.
+        """
+        with self._lifecycle_lock:
+            if self._closing or self._closed:
+                raise RuntimeError("Runtime is closing or closed")
+            if self.thread and self.thread.is_alive():
+                return
+            if self.lockfile is None or self.lockfile.closed:
+                lockfile = (self.store.root / "runtime.lock").open("a+")
+                try:
+                    fcntl.flock(lockfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    lockfile.close()
+                    raise RuntimeError("Another runtime already owns this state directory")
+                except BaseException:
+                    lockfile.close()
+                    raise
+                self.lockfile = lockfile
             try:
-                fcntl.flock(self.lockfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+                self.operations.recover()
+                if paused:
+                    self.store.execute("UPDATE projects SET paused=1")
+                self.updates.restore_startup()
+                self.store.recover()
+                # 旧版本没有待办索引；一次性为历史 pending 记录补索引，之后每轮只按索引领取。
+                self._index_postprocess_pending()
+                self.store.execute("DELETE FROM settings WHERE key IN "
+                                   "(SELECT 'run-stop:' || id FROM runs WHERE ended IS NOT NULL)")
+                # 只有已获授权的发布任务可续跑；普通任务保留中断证据，由用户手动重试。
+                self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? "
+                                   "WHERE source='system_publish' AND state='interrupted'", (time.time(),))
+                thread = threading.Thread(target=self.loop, name="rsi-scheduler", daemon=True)
+                thread.start()
+                self.thread = thread
+            except BaseException:
+                # 启动失败时释放状态目录锁并关闭文件，成功路径保持原有行为（锁持有到 stop/进程结束）。
                 self.lockfile.close()
                 self.lockfile = None
-                raise RuntimeError("Another runtime already owns this state directory")
-        try:
-            self.operations.recover()
-            if paused:
-                self.store.execute("UPDATE projects SET paused=1")
-            self.updates.restore_startup()
-            self.store.recover()
-            # 旧版本没有待办索引；一次性为历史 pending 记录补索引，之后每轮只按索引领取。
-            self._index_postprocess_pending()
-            self.store.execute("DELETE FROM settings WHERE key IN "
-                               "(SELECT 'run-stop:' || id FROM runs WHERE ended IS NOT NULL)")
-            # 只有已获授权的发布任务可续跑；普通任务保留中断证据，由用户手动重试。
-            self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? "
-                               "WHERE source='system_publish' AND state='interrupted'", (time.time(),))
-            self.thread = threading.Thread(target=self.loop, name="rsi-scheduler", daemon=True)
-            self.thread.start()
-        except BaseException:
-            # 启动失败时释放状态目录锁并关闭文件，成功路径保持原有行为（锁持有到 stop/进程结束）。
-            self.lockfile.close()
-            self.lockfile = None
-            raise
+                raise
 
     def shutdown_status(self):
-        return {**self._shutdown, 'remaining_workers': sum(not f.done() for f in tuple(self.futures)),
+        """Shutdown progress plus the handoff state of the state directory.
+
+        ``phase='completed'`` only means ``close()`` returned. ``handoff_complete``
+        also requires no live worker, a released state-directory lock, and no
+        unreconciled claimed run; a timed-out worker keeps the lock so a second
+        runtime cannot take over while it may still write run rows.
+        """
+        with self._futures_lock:
+            tracked = set(self.futures) | self._stuck_futures
+            remaining = sum(not future.done() for future in tracked)
+            stuck = sorted({self._future_runs[future] for future in self._stuck_futures
+                            if not future.done() and future in self._future_runs})
+            locked = self.lockfile is not None and not self.lockfile.closed
+        return {**self._shutdown, 'remaining_workers': remaining,
+                'stuck_workers': stuck,
+                'state_dir_locked': locked,
+                'handoff_complete': bool(self._closed and not remaining and not locked
+                                         and not self._shutdown['reconcile_failed']),
                 'remaining_operations': len(self.operations.active),
                 'operations_timed_out': self.operations.timed_out,
                 'maintenance_running': bool(self.maintenance_thread and self.maintenance_thread.is_alive())}
@@ -1031,69 +1089,146 @@ class Runtime(Maintenance):
             # 已进入临界区的 claim+submit 仍由 _close 的 reconcile 收尾。
             with self._admission:
                 self._closing = True
-            self._shutdown.update(phase='stopping', started=time.time())
-            try:
-                self._close()
-            except BaseException:
-                self._shutdown.update(phase='failed', ended=time.time())
-                raise
-            self._closed = True
-            # completed 只表示关闭流程走完；reconcile_failed>0 表示仍有已领取的
-            # run 未能落终态，必须等下一次启动的 store.recover() 修复。
-            self._shutdown.update(phase='completed', ended=time.time())
+            with self._lifecycle_lock:
+                self._shutdown.update(phase='stopping', started=time.time())
+                try:
+                    failures = self._close()
+                except BaseException:
+                    self._shutdown.update(phase='failed', ended=time.time())
+                    raise
+                # 个别子系统报错时 _close 仍已尝试完所有阶段：worker 池、store 与状态
+                # 目录锁都已释放，因此照常标记关闭完成；completed 只表示所有阶段都执行
+                # 过，reconcile_failed>0 或 errors 非空时必须按未干净关闭处理。
+                self._closed = True
+                # completed 只表示所有阶段都执行过；reconcile_failed>0 表示仍有已领取的
+                # run 未能落终态，必须等下一次启动的 store.recover() 修复。
+                # 超时未退出的 worker 由 handoff_complete=False 单独暴露（并继续持有
+                # 状态目录锁），不能仅凭 phase=completed 判定可以接班。
+                self._shutdown.update(phase='failed' if failures else 'completed', ended=time.time())
+                if failures:
+                    raise failures[0]
 
     def _close(self):
+        """Attempt every phase; return step exceptions for ``close()`` to re-raise."""
+        failures = []
+
+        def attempt(phase, target, action):
+            try:
+                action()
+            except Exception as error:
+                # 只隔离 Exception：坏盘、NFS 或权限异常不能让后续阶段被跳过，
+                # 而 KeyboardInterrupt 等 BaseException 仍立即上抛。
+                self._shutdown['errors'].append({
+                    'phase': phase, 'target': target,
+                    'error': ('%s: %s' % (type(error).__name__, error))[:200]})
+                failures.append(error)
+                logging.getLogger(__name__).exception(
+                    'Shutdown step %s (%s) failed; continuing with remaining steps', target, phase)
+
         self.stop.set()
         self.maintenance_stop.set()
         self.wake.set()
         self._shutdown['phase'] = 'authentication'
-        self.auth_sessions.close()
+        attempt('authentication', 'auth_sessions', self.auth_sessions.close)
         self._shutdown['phase'] = 'operations'
-        self.operations.close()
+        attempt('operations', 'operations', self.operations.close)
+
+        def scheduler_phase():
+            self._shutdown['scheduler_timed_out'] = False
+            if self.thread:
+                # stop 已在上方置位，dispatch 不会再领取新工作；但线程可能正卡在
+                # store.root 的挂起文件系统调用里，join 必须有上界，否则维护线程
+                # 的上界永远走不到。
+                self.thread.join(SCHEDULER_JOIN_TIMEOUT)
+                if self.thread.is_alive():
+                    logging.getLogger(__name__).warning(
+                        "Scheduler thread did not stop within %ss; proceeding with shutdown",
+                        SCHEDULER_JOIN_TIMEOUT)
+                    self._shutdown['scheduler_timed_out'] = True
+
         self._shutdown['phase'] = 'scheduler'
-        self._shutdown['scheduler_timed_out'] = False
-        if self.thread:
-            # stop 已在上方置位，dispatch 不会再领取新工作；但线程可能正卡在
-            # store.root 的挂起文件系统调用里，join 必须有上界，否则维护线程
-            # 的上界永远走不到。
-            self.thread.join(SCHEDULER_JOIN_TIMEOUT)
-            if self.thread.is_alive():
-                logging.getLogger(__name__).warning(
-                    "Scheduler thread did not stop within %ss; proceeding with shutdown",
-                    SCHEDULER_JOIN_TIMEOUT)
-                self._shutdown['scheduler_timed_out'] = True
+        attempt('scheduler', 'scheduler_thread', scheduler_phase)
+
+        def reconcile_workers():
+            _, failed = self._reconcile_unstarted_workers()
+            self._shutdown['reconcile_failed'] = len(failed)
+
         self._shutdown['phase'] = 'workers'
         self._shutdown['workers_timed_out'] = False
         try:
-            self._shutdown_workers()
+            attempt('workers', 'worker_pool', self._shutdown_workers)
         finally:
-            # 即使线程池排空自身报错，也必须为已取消、从未启动的领取留下终态。
-            _, failed = self._reconcile_unstarted_workers()
-            self._shutdown['reconcile_failed'] = len(failed)
+            # 独立记录两个失败，也在中断时仍尝试协调未启动的领取。
+            attempt('workers', 'reconcile', reconcile_workers)
+
+        def maintenance_phase():
+            self._shutdown['maintenance_timed_out'] = False
+            if self.maintenance_thread and self.maintenance_thread is not threading.current_thread():
+                # 维护线程是 daemon，但它可能卡在 NFS/坏盘上的 flock 或 fsync 里
+                # 永不返回；join 必须限时，超时后记录证据放行 close，进程退出不受阻。
+                self.maintenance_thread.join(MAINTENANCE_JOIN_TIMEOUT)
+                if self.maintenance_thread.is_alive():
+                    logging.getLogger(__name__).warning(
+                        "Maintenance thread did not stop within %ss; proceeding with shutdown",
+                        MAINTENANCE_JOIN_TIMEOUT)
+                    self._shutdown['maintenance_timed_out'] = True
+
         self._shutdown['phase'] = 'maintenance'
-        self._shutdown['maintenance_timed_out'] = False
-        if self.maintenance_thread and self.maintenance_thread is not threading.current_thread():
-            # 维护线程是 daemon，但它可能卡在 NFS/坏盘上的 flock 或 fsync 里
-            # 永不返回；join 必须限时，超时后记录证据放行 close，进程退出不受阻。
-            self.maintenance_thread.join(MAINTENANCE_JOIN_TIMEOUT)
-            if self.maintenance_thread.is_alive():
-                logging.getLogger(__name__).warning(
-                    "Maintenance thread did not stop within %ss; proceeding with shutdown",
-                    MAINTENANCE_JOIN_TIMEOUT)
-                self._shutdown['maintenance_timed_out'] = True
+        attempt('maintenance', 'maintenance_thread', maintenance_phase)
         self._shutdown['phase'] = 'storage'
         # 关闭数据层空闲连接；已借出的连接由各自的 with 块负责。
-        self.store.close()
-        if self.lockfile:
-            self.lockfile.close()
+        attempt('storage', 'store', self.store.close)
+        # 超时仍未退出的 worker 仍可能写这个状态目录：保留 flock，由最后一个
+        # worker 的 done callback 释放；否则新进程会在旧 worker 还活着时接管。
+        # 队列里任何未完成的 future 都覆盖到，避免排空步骤自身失败时提前放锁。
+        with self._futures_lock:
+            pending = {future for future in (self.futures | self._stuck_futures)
+                       if not future.done()}
+            self._stuck_futures.update(pending)
+            registered = set(self._stuck_futures)
+        # Register only after storage cleanup: a finished future invokes its
+        # callback synchronously and must not release ownership during close().
+        for future in registered:
+            future.add_done_callback(self._stuck_worker_done)
+        if not pending:
+            attempt('storage', 'lockfile', self._release_state_dir_lock)
+        return failures
+
+    def _release_state_dir_lock(self):
+        """Release the state-directory flock once nobody owns the directory anymore."""
+        with self._lockfile_lock:
+            lock, self.lockfile = self.lockfile, None
+            if lock is not None:
+                try:
+                    lock.close()
+                except OSError:
+                    logging.getLogger(__name__).exception(
+                        'Failed to release the state directory lock')
+
+    def _stuck_worker_done(self, future):
+        """Forget a timed-out worker; release the lock when the last one exits."""
+        with self._futures_lock:
+            self._stuck_futures.discard(future)
+            self.futures.discard(future)
+            self._future_runs.pop(future, None)
+            remaining = any(not item.done() for item in self._stuck_futures)
+        self.wake.set()
+        if remaining:
+            return
+        logging.getLogger(__name__).warning(
+            'Timed-out worker finished after shutdown; handing off the state directory')
+        self._release_state_dir_lock()
 
     def _shutdown_workers(self):
         """Drain workers within WORKER_DRAIN_TIMEOUT, then record still-running runs.
 
         Queued work is cancelled for ``_reconcile_unstarted_workers``; the rest
         gets a bounded wait. A run stuck in a blocking call that never polls
-        ``stop`` would otherwise pin ``close`` in the workers phase; its open
-        row is recovered by ``store.recover()`` on the next start.
+        ``stop`` would otherwise pin ``close`` in the workers phase. Its future
+        is kept as handoff evidence: it still counts in ``remaining_workers``
+        and the runtime keeps the state-directory lock until it really exits, so
+        a second runtime cannot recover the open row while the worker may still
+        write it.
         """
         with self._futures_lock:
             unfinished_runs = {future: run for future, run in self._future_runs.items()
@@ -1119,6 +1254,10 @@ class Runtime(Maintenance):
         if not running:
             return
         self._shutdown['workers_timed_out'] = True
+        # 这些 future 在 close() 返回后仍会执行：登记为 stuck，交给 reconcile 之后的
+        # 状态与锁交接使用；最后一个退出时才释放状态目录锁。
+        with self._futures_lock:
+            self._stuck_futures.update(running)
         runs = sorted(unfinished_runs[future] for future in running if future in unfinished_runs)
         logging.getLogger(__name__).warning(
             "Worker threads did not stop within %ss; proceeding with shutdown (runs: %s)",
@@ -1141,12 +1280,25 @@ class Runtime(Maintenance):
         A failed write must surface as shutdown evidence (``reconcile_failed``),
         not only as a process log line: ``phase='completed'`` no longer implies
         every claimed run reached a terminal state.
+
+        Futures that outlived the drain timeout are kept in ``_stuck_futures``
+        and stay tracked in ``_future_runs``: they still own a worker thread and
+        the state-directory lock, so clearing them here would under-report
+        ``remaining_workers`` and release ownership too early.
         """
         with self._futures_lock:
-            pending = list(self._future_runs.items())
-            self._future_runs.clear()
-            for future, _ in pending:
-                self.futures.discard(future)
+            pending, retained = [], []
+            for future, run in list(self._future_runs.items()):
+                if future.cancelled() or (future.done() and future not in self._stuck_futures):
+                    pending.append((future, run))
+                    self.futures.discard(future)
+                    self._future_runs.pop(future, None)
+                elif not future.done() and future not in self._stuck_futures:
+                    retained.append(future)
+        if retained:
+            logging.getLogger(__name__).warning(
+                "Shutdown left %s tracked worker(s) without a drain timeout record",
+                len(retained))
         reconciled, failed = 0, []
         for future, run in pending:
             if not future.cancelled():
@@ -1436,6 +1588,7 @@ class Runtime(Maintenance):
                 self.maintenance_async()
                 with self.scheduler_scope('postprocess'):
                     self.drain_postprocess()
+                self.drain_failure_monitors()
                 for future in tuple(self.futures):
                     if future.done():
                         with self._futures_lock:
@@ -1567,9 +1720,16 @@ class Runtime(Maintenance):
                 with self._admission:
                     if self._closing or self.stop.is_set():
                         return
-                    run = None if self.updates.is_busy() else self.store.claim(project["id"], config)
-                    if not run:
+                    if self.updates.is_busy():
                         return
+                    run = self.store.claim(project["id"], config)
+                    if not run:
+                        # ready_clause 认可的候选不一定都领得到：issue-sync 快照 pending 的
+                        # 发布任务会被跳过，损坏的 evidence/overrides 候选会被拉黑。这里只把
+                        # 该项目移出本轮重试，不能 return 结束整个 tick——它的公平账本不前进，
+                        # 下个 tick 仍排第一，会把同一 tick 的其他项目和空闲并发持续饿死。
+                        eligible = [(p, c) for p, c in eligible if p["id"] != project["id"]]
+                        continue
                     # 账本只服务下一次调度的排序，claim 却已经改写任务与 runs 行；若这里
                     # 让一次瞬时写失败（database is locked / 磁盘满）逃出去，run 会永久
                     # 停在 planning、任务停在 planning，同项目的普通任务在 recover() 前
@@ -1628,16 +1788,20 @@ class Runtime(Maintenance):
                        (marker, encode({'created': time.time()})))
 
     def drain_postprocess(self, run_id=None):
-        with self.dispatch_lock:
-            return self._drain_postprocess(run_id)
+        # 不再整批持 dispatch_lock：逐条只取后处理专用锁，单条副作用仍由 deliver()
+        # 内部的重入 dispatch_lock 与任务写保持原子。整批远端调用若占用全局锁，
+        # 用户点暂停、保存配置、切换项目与调度领取都要排在一条 gh pr create 后面。
+        return self._drain_postprocess(run_id)
 
     def _drain_postprocess(self, run_id=None):
         if run_id is not None:
             key = 'postprocess:' + run_id
-            row = self.store.one('SELECT value FROM settings WHERE key=?', (key,))
-            if row:
-                self._drain_postprocess_record(key, run_id, row['value'],
-                                               'postprocess-pending:' + run_id)
+            # 回执读取与处理同锁：另一线程刚完成时不能拿旧快照重放步骤。
+            with self._postprocess_lock:
+                row = self.store.one('SELECT value FROM settings WHERE key=?', (key,))
+                if row:
+                    self._drain_postprocess_record(key, run_id, row['value'],
+                                                   'postprocess-pending:' + run_id)
             return
         # 待办索引使用主键范围（而不是 LIKE 全表扫描）并有界领取；已完成/obsolete
         # 的历史回执继续留在 postprocess: 命名空间，但不会进入本轮的查询与解析。
@@ -1652,14 +1816,21 @@ class Runtime(Maintenance):
                                         ('postprocess-pending:', cursor, POSTPROCESS_BATCH - len(markers)))
         if markers:
             self.store.put_setting('postprocess-pending-cursor', markers[-1]['key'])
+        # 每轮有墙钟预算：单条 delivery 可能卡到 60s 超时，处理到预算用尽就返回，
+        # 未处理的 marker 留在持久索引里由下一个调度节拍接着做；至少处理一条，
+        # 否则慢速输入会让待办永不前进。
+        deadline = time.monotonic() + POSTPROCESS_TICK_SECONDS
         for marker in markers:
             identifier = marker['key'].split(':', 1)[1]
             key = 'postprocess:' + identifier
-            row = self.store.one('SELECT value FROM settings WHERE key=?', (key,))
-            if not row:
-                self.store.execute('DELETE FROM settings WHERE key=?', (marker['key'],))
-                continue
-            self._drain_postprocess_record(key, identifier, row['value'], marker['key'])
+            with self._postprocess_lock:
+                row = self.store.one('SELECT value FROM settings WHERE key=?', (key,))
+                if row:
+                    self._drain_postprocess_record(key, identifier, row['value'], marker['key'])
+                else:
+                    self.store.execute('DELETE FROM settings WHERE key=?', (marker['key'],))
+            if time.monotonic() >= deadline:
+                break
 
     def _drain_postprocess_record(self, key, identifier, value, marker=None):
         with self.scheduler_scope('postprocess_run', run=identifier):
@@ -1888,45 +2059,170 @@ class Runtime(Maintenance):
                 return stage, started
         return run.get('_deadline_stage'), run.get('_deadline_started')
 
-    def _save_stage_budget(self, run, now, keep):
-        """落盘或清除任务已耗的阶段时间：只有中断把额度交接给下一次尝试。"""
+    def _stage_budget_snapshot(self, run, now, keep):
+        """在时钟锁内生成检查点快照：只读内存字段，不做任何存储访问。
+
+        写库（含 DB busy 等待）必须在锁外完成，否则一次慢写会占住整把时钟锁，
+        把同一 run 的 begin_phase/invoke 与取消轮询一起拖住。
+        """
         used, task = run.get('_stage_used'), run.get('task')
         if not task or not isinstance(used, dict):
-            return
-        key = self._stage_budget_key(task)
+            return None
+        values = dict(used)
+        stage, started = self._billable_stage(run)
+        if keep and stage in ('preparation', 'evaluation') and started is not None:
+            values[stage] = self._stage_seconds(values.get(stage)) + max(0.0, now - started)
+        values = {name: self._stage_seconds(values.get(name))
+                  for name in ('preparation', 'evaluation')}
+        return self._stage_budget_key(task), values, run.get('id')
+
+    def _stage_budget_evidence(self, kind, message, run, data):
+        """预算账本失败的尽力证据：事件自身失败只退回日志，不递归、不打断 run。"""
         try:
-            values = dict(used)
-            stage, started = self._billable_stage(run)
-            if keep and stage in ('preparation', 'evaluation') and started is not None:
-                values[stage] = self._stage_seconds(values.get(stage)) + max(0.0, now - started)
-            values = {name: self._stage_seconds(values.get(name))
-                      for name in ('preparation', 'evaluation')}
-            if not keep or not any(values.values()):
-                self.store.execute('DELETE FROM settings WHERE key=?', (key,))
-            else:
-                # 记录归属尝试：终态提交后、finally 之前崩溃会留下键，载入时据此判定它是否还有效。
-                self.store.put_setting(key, {**values, 'run': run.get('id')})
+            self.store.event(kind, message, run.get('project'), run.get('id'),
+                             {'run': run.get('id'), **data})
         except Exception:
-            # 预算是尽力而为的护栏：写入失败不能反过来中断正在收尾的 run。
-            logging.getLogger(__name__).warning('Could not persist stage budget for %s', run.get('id'), exc_info=True)
+            logging.getLogger(__name__).warning(
+                'Could not record %s for run %s (%s)', kind, run.get('id'), data.get('error'),
+                exc_info=True)
+
+    def _persist_stage_budget(self, key, values, run_id, keep):
+        """落盘或清除任务已耗的阶段时间：只有中断把额度交接给下一次尝试。
+
+        必须在时钟锁外调用，但仍在取消轮询链上（is_cancelled → _deadline_expired），
+        因此这里不能用任何「排队等待」：写锁只做非阻塞抢占，抢不到就丢掉本轮检查点
+        （下个间隔重试），慢库不会让别的 run 的轮询排在这把进程级锁后面。
+
+        同一尝试的账本按阶段取最大值合并：两轮轮询的写可能乱序完成，晚到的旧快照
+        不得回退已经记录的额度。账本已归属别的尝试时只有更新的尝试能改写，上一次
+        尝试迟到的检查点（含收尾删除）一律丢弃，不能把旧消耗记到新一轮账上。
+        读旧账与写新账共用一条连接，连接借出后先把
+        busy_timeout 压到检查点预算内，避免一次慢写等满默认的 15 秒。
+
+        终态那次写（process 的 finally）抢锁失败时同样丢弃：账本保留上一个检查点，
+        最多丢一个间隔的偏差，与硬崩溃的损失同量级，不会让收尾线程无限等待。
+        """
+        if not _stage_budget_write_lock.acquire(blocking=False):
+            # 另一个线程正在写检查点，它可能卡在慢库上：本线程不排队，丢本轮。
+            logging.getLogger(__name__).info(
+                'Dropped stage budget checkpoint for %s: another checkpoint write is in flight', run_id)
+            return
+        try:
+            with self.store.connect() as db:
+                previous_timeout = db.execute('PRAGMA busy_timeout').fetchone()[0]
+                db.execute('PRAGMA busy_timeout=%d' % STAGE_BUDGET_CHECKPOINT_BUSY_MS)
+                try:
+                    # 与 run 终态及下一次 claim 串行化；先取写锁再判断归属，
+                    # 避免检查之后、写入之前状态发生变化。
+                    db.execute('BEGIN IMMEDIATE')
+                    attempt = db.execute(
+                        'SELECT task,state,ended,rowid FROM runs WHERE id=?', (run_id,)).fetchone()
+                    if (not attempt or key != self._stage_budget_key(attempt['task'])
+                            or (keep and attempt['ended'] is not None and attempt['state'] != 'interrupted')
+                            or db.execute('SELECT 1 FROM runs WHERE task=? AND rowid>? LIMIT 1',
+                                          (attempt['task'], attempt['rowid'])).fetchone()):
+                        return
+                    row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+                    try:
+                        stored = json.loads(row['value']) if row else {}
+                    except (TypeError, ValueError):
+                        stored = {}
+                    if not isinstance(stored, dict):
+                        stored = {}
+                    owner = stored.get('run')
+                    if owner and owner != run_id and not self._stage_budget_newer_attempt(db, run_id, owner):
+                        # 账本属于更晚的尝试：本线程是上一次尝试的迟到检查点，它的终态
+                        # 已经结案。放它进来会把旧消耗记到新一轮账本上（下一轮提前超时），
+                        # 也会用旧值覆盖新一轮已经写下的额度。
+                        logging.getLogger(__name__).info(
+                            'Dropped stale stage budget checkpoint for %s: ledger belongs to %s',
+                            run_id, owner)
+                        return
+                    if not keep or not any(values.values()):
+                        db.execute('DELETE FROM settings WHERE key=?', (key,))
+                        return
+                    if owner and owner != run_id:
+                        # 新尝试接手旧账本：载入时已把交接额度并进 _stage_used，快照本身
+                        # 就是权威值，不取上一次尝试的最大值（那是它的消耗，不属于本轮）。
+                        values = {name: self._stage_seconds(values.get(name)) for name in values}
+                    else:
+                        previous = {name: self._stage_seconds(stored.get(name)) for name in values}
+                        # 账本只增不减：同一尝试的旧快照算得更早、写得更晚，不得回退额度。
+                        values = {name: max(values[name], previous[name]) for name in values}
+                    # 记录归属尝试：终态提交后、finally 之前崩溃会留下键，载入时据此判定它是否还有效。
+                    db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',
+                               (key, encode({**values, 'run': run_id})))
+                finally:
+                    try:
+                        db.execute('PRAGMA busy_timeout=%d' % previous_timeout)
+                    except Exception:
+                        pass
+        except Exception as error:
+            # 预算是尽力而为的护栏：写入失败不能反过来中断正在收尾的 run，也不能把
+            # 取消轮询拖到 busy timeout。DB 忙只丢本轮检查点（下个间隔重试），
+            # 其他异常保留完整调用栈便于排查。
+            logger = logging.getLogger(__name__)
+            if 'locked' in str(error) or 'busy' in str(error).lower():
+                logger.info('Dropped stage budget checkpoint for %s: %s', run_id, error)
+            else:
+                logger.warning('Could not persist stage budget for %s', run_id, exc_info=True)
+                with self._budget_persist_lock:
+                    self._shutdown['budget_persist_failures'] += 1
+                self._stage_budget_evidence(
+                    'stage_budget_persist_failed',
+                    'Stage budget could not be saved or cleared; a retry may start with a full allowance',
+                    {'id': run_id},
+                    {'task': key.split(':', 1)[1] if ':' in key else None, 'key': key,
+                     'error': f'{type(error).__name__}: {error}'[:200]})
+        finally:
+            _stage_budget_write_lock.release()
+
+    @staticmethod
+    def _stage_budget_newer_attempt(db, run_id, owner):
+        """本次快照所属尝试是否比账本当前归属的尝试更新（按插入顺序判定）。
+
+        只有更新的尝试才有权改写账本：上一次尝试若已结案，它迟到的检查点（含收尾
+        删除）不得影响新一轮的额度；反之新一轮接手旧账本时以自身快照为准。仍在
+        写库的旧快照无法在时钟锁内围栏，因此归属校验放在事务里做最后一道判断。
+        """
+        rows = {row['id']: row['rowid'] for row in db.execute(
+            'SELECT id,rowid FROM runs WHERE id IN (?,?)', (run_id, owner))}
+        started, previous = rows.get(run_id), rows.get(owner)
+        return started is not None and (previous is None or started > previous)
 
     def _checkpoint_owner_budget(self, owner, now):
-        """trial 轮询顺带为所属 run 落盘：时钟各自独立，账本仍按 owner 的阶段计。"""
+        """trial 轮询顺带为所属 run 取快照：时钟各自独立，账本仍按 owner 的阶段计。
+
+        返回待落盘快照，由调用方在释放时钟锁后写入。
+        """
         if owner is None:
-            return
+            return None
         with _clock_lock(owner):
             checkpoint = owner.get('_deadline_checkpoint')
             if checkpoint is not None and now - checkpoint < STAGE_BUDGET_CHECKPOINT_SECONDS:
-                return
-            self._save_stage_budget(owner, now, keep=True)
+                return None
+            snapshot = self._stage_budget_snapshot(owner, now, keep=True)
             owner['_deadline_checkpoint'] = now
+            return snapshot
 
     def _load_stage_budget(self, run):
         """载入同一任务上一尝试的额度；不属于未结尝试的残留直接丢弃。"""
         key = self._stage_budget_key(run.get('task'))
-        stored = self.store.setting(key, {})
-        if not isinstance(stored, dict):
-            stored = {}
+        stored, detail = {}, None
+        row = self.store.one('SELECT value FROM settings WHERE key=?', (key,))
+        if row:
+            try:
+                stored = json.loads(row['value'])
+            except (ValueError, TypeError):
+                stored, detail = None, 'not valid JSON'
+            if not isinstance(stored, dict):
+                # 键存在但账本不可解析：按 0 处理，但不能静默当成一次成功载入。
+                detail = detail or type(stored).__name__
+                stored = {}
+                self._stage_budget_evidence(
+                    'stage_budget_corrupt',
+                    'Stage budget setting is not a JSON object; treating it as unused',
+                    run, {'task': run.get('task'), 'error': f'stage budget is {detail}'})
         owner = stored.get('run')
         if owner and owner != run.get('id'):
             row = self.store.one('SELECT state,ended FROM runs WHERE id=?', (owner,))
@@ -1975,22 +2271,34 @@ class Runtime(Maintenance):
     def _deadline_expired(self, run):
         """Judge the stage clock and record the timeout stage under the per-run lock.
 
-        相位推导、时钟重置、预算检查点与超时判定是同一组跨字段的读-改-写：
-        worker 的 begin_phase/invoke 会并发改同一 dict，acceptance 基线等取消
-        轮询线程也会在这里判定。整段持锁串行化；锁内只做阶段推断所需的存储读取，
-        以及一份很小的预算检查点写入（与时钟字段同锁才能保持一致快照）。
+        相位推导、时钟重置与超时判定是同一组跨字段的读-改-写：worker 的
+        begin_phase/invoke 会并发改同一 dict，acceptance 基线等取消轮询线程也会
+        在这里判定。整段持锁串行化；锁内只碰内存字段，runs.state 查询与检查点
+        写库都在锁外完成，慢 DB 不会把阶段切换或取消响应拖住。
         """
+        # 相位推断所需的 runs.state 预取到锁外；_explicit_phase 一旦写入不会被
+        # 清除，因此只有它缺席、且没有模型调用在途时才需要这次查询（与锁内原先的
+        # 惰性求值同条件）。
+        state_row, state_checked = None, False
+        if ('_deadline_started' in run and not run.get('_explicit_phase')
+                and run.get('_model_started') is None):
+            state_row = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
+            state_checked = True
+        pending = None
         with _clock_lock(run):
             if '_deadline_started' in run:
                 if run.get('_model_started') is not None:
                     stage = 'model'
                 elif run.get('_explicit_phase'):
                     stage = run['_explicit_phase']
+                elif state_checked:
+                    stage = 'evaluation' if state_row and state_row['state'] == 'evaluating' else 'preparation'
                 else:
-                    # 仅当 _model_started 与 _explicit_phase 都缺席时才需要 runs.state 推断阶段；
-                    # 该谓词是高频取消轮询路径，惰性求值避免每次白查一次 runs 表。
-                    state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
-                    stage = 'evaluation' if state and state['state'] == 'evaluating' else 'preparation'
+                    # 预取时模型调用仍在途、取锁时已结束：沿用当前阶段，不无依据地
+                    # 重新推断（否则会把评估时钟错锚到准备阶段）。
+                    stage = run.get('_deadline_stage')
+                    if stage not in ('preparation', 'evaluation'):
+                        stage = 'preparation'
                 now = time.monotonic()
                 if run.get('_deadline_stage') != stage:
                     # 模型调用的进出由 invoke 恢复外层锚点，在此累计会重复计时；
@@ -2021,20 +2329,28 @@ class Runtime(Maintenance):
                 checkpoint = run.get('_deadline_checkpoint')
                 if '_stage_used' in run and (checkpoint is None or now - checkpoint >= STAGE_BUDGET_CHECKPOINT_SECONDS):
                     # 硬崩溃时 finally 不会执行；按间隔落盘，重启后最多损失一个间隔。
-                    self._save_stage_budget(run, now, keep=True)
+                    # 锁内只取快照并占用这一轮窗口，写库在锁外完成。
+                    pending = self._stage_budget_snapshot(run, now, keep=True)
                     run['_deadline_checkpoint'] = now
                 elif run.get('_budget_owner') is not None:
                     # trial 自身不记账，但它运行期间父 run 仍在消耗阶段预算：
                     # 模型调用/评估循环的长轮询要按 owner 的检查点继续落盘，
                     # 否则硬崩溃会把整段试验耗时丢掉。计费阶段取 owner 的。
-                    self._checkpoint_owner_budget(run['_budget_owner'], now)
+                    pending = self._checkpoint_owner_budget(run['_budget_owner'], now)
+        if pending is not None:
+            self._persist_stage_budget(*pending, keep=True)
         return False
 
     def active_strategies(self, project, config=None):
+        return self._active_strategy_snapshot(project, config)[0]
+
+    def _active_strategy_snapshot(self, project, config=None):
         # evidence 随首查一并取出，避免对每个 candidate 追加一条查询；输出保持原有字段。
-        rows = self.store.query("SELECT id,kind,content,evidence FROM candidates WHERE project=? AND status='stable'", (project,))
+        rows = self.store.query("SELECT id,kind,content,evidence,created FROM candidates "
+                                "WHERE project=? AND status='stable'", (project,))
         key = compatibility(config or self.config(project))
         result = []
+        generations = {}
         for row in rows:
             evidence, content = decode_object(row["evidence"]), decode_object(row["content"])
             if evidence.get("evidence_error") or content.get("evidence_error"):
@@ -2043,7 +2359,8 @@ class Runtime(Maintenance):
             if expected and expected != key:
                 continue
             result.append({"id": row["id"], "kind": row["kind"], "content": content})
-        return result
+            generations[row["id"]] = row["created"]
+        return result, generations
 
     def memories(self, project, text, extra=None):
         """Retrieve verified skills for active strategies matching text, plus optional extra candidate skills.
@@ -2130,8 +2447,10 @@ class Runtime(Maintenance):
         # 该阶段时钟从此刻起算，不继承旧阶段的已耗时间。
         # 推导与四个字段的写入必须原子：取消轮询线程会并发重算同一时钟。
         self.store.phase(run["id"], role)
+        # runs.state 在锁外读取：锁内只做时钟字段的读-改-写，DB 往返（可能等
+        # busy timeout / 连接池）不占用时钟锁，否则取消轮询和阶段切换会跟着排队。
+        state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
         with _clock_lock(run):
-            state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
             outer_stage = (run.get('_explicit_phase') or
                            ('evaluation' if state and state['state'] == 'evaluating' else 'preparation'))
             if run.get('_deadline_stage') != outer_stage or run.get('_deadline_started') is None:
@@ -2190,7 +2509,9 @@ class Runtime(Maintenance):
             # 只有中断会交接给下一次尝试；其他终态（含 deadline 阻塞）视为本轮已结案。
             keep = bool(row) and (row['ended'] is None or row['state'] == 'interrupted')
             with _clock_lock(run):
-                self._save_stage_budget(run, time.monotonic(), keep)
+                pending = self._stage_budget_snapshot(run, time.monotonic(), keep)
+            if pending is not None:
+                self._persist_stage_budget(*pending, keep)
 
     def _process(self, run):
         try:
@@ -2281,8 +2602,11 @@ class Runtime(Maintenance):
             if task["source"] == "system_reassess":
                 self.store.transition(run["id"], "completed", {"reason": "Deferred tasks compared against current execution baseline"}, True)
                 return
-            strategies = self.active_strategies(project["id"], config)
-            self.store.execute("UPDATE runs SET strategy=? WHERE id=?", (encode(strategies), run["id"]))
+            strategies, strategy_generations = self._active_strategy_snapshot(project["id"], config)
+            recorded_strategies = [{**strategy, "_candidate_created": strategy_generations[strategy["id"]]}
+                                   for strategy in strategies]
+            self.store.execute("UPDATE runs SET strategy=? WHERE id=?",
+                               (encode(recorded_strategies), run["id"]))
             workspace = snapshot(source, directory / "workspace", base)
             if task["source"] in ["system_light", "system_deep"]:
                 self.inspect(project, workspace, task["source"].split("_")[1], run, strategies)
@@ -2438,21 +2762,24 @@ class Runtime(Maintenance):
             delay = min(FAILURE_BACKOFF_MAX_SECONDS, 60 * 2 ** attempts)
             # run 保留失败证据，任务与退避同事务回队，依赖清理看不到临时 failed。
             task_fields = {"state": "queued", "available": time.time() + delay}
-        transitioned = self.store.transition(run["id"], state, result, True, task_fields=task_fields)
-        if state == "failed" and transitioned and self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"] == "failed":
+        regression = False
+        if state == "failed":
             checks = (result.get("evaluation") or {}).get("checks") or {}
             candidate_rows = checks.get("candidate_full") or checks.get("candidate") or []
-            candidate_by_id = {
-                check_identity(row): row
+            candidate_failures = {
+                check_identity(row)
                 for row in candidate_rows
-                if isinstance(row, dict) and check_identity(row) is not None
+                if isinstance(row, dict) and check_identity(row) is not None and not row.get("passed")
             }
             baseline_rows = checks.get("baseline") or []
             regression = any(
-                old.get("passed") and not candidate_by_id[check_identity(old)].get("passed")
+                old.get("passed") and check_identity(old) in candidate_failures
                 for old in baseline_rows
-                if isinstance(old, dict) and check_identity(old) in candidate_by_id
+                if isinstance(old, dict) and check_identity(old) is not None
             )
+        transitioned = self.store.transition(run["id"], state, result, True, task_fields=task_fields,
+                                             failure_monitor=regression if state == "failed" else None)
+        if state == "failed" and transitioned and self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"] == "failed":
             self.monitor_strategy(run["project"], False, run, attributable=regression)
         if retry and transitioned and self.store.one("SELECT state FROM tasks WHERE id=?", (task["id"],))["state"] == "queued":
             self.store.event("retry", "Fresh run scheduled with bounded backoff", run["project"], run["id"])
@@ -2803,7 +3130,41 @@ class Runtime(Maintenance):
 
     def monitor_strategy(self, project, passed, run=None, attributable=False):
         from .evolution import Evolution
+        if not passed and run and self.store.one("SELECT 1 FROM runs WHERE id=? AND state='failed' AND ended IS NOT NULL", (run["id"],)):
+            self._consume_failure_monitor(run["id"])
+            return
         Evolution(self).monitor(project, passed, run, attributable)
+
+    def _consume_failure_monitor(self, run_id):
+        from .evolution import Evolution
+        pending = self.store.one("SELECT project FROM failure_monitor_outbox WHERE run=?", (run_id,))
+        if not pending:
+            return
+        config = self.config(pending["project"])
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            pending = db.execute("SELECT * FROM failure_monitor_outbox WHERE run=?", (run_id,)).fetchone()
+            if pending:
+                Evolution(self).monitor(pending["project"], False, {"id": run_id},
+                                        bool(pending["attributable"]), db=db, config=config)
+                db.execute("DELETE FROM failure_monitor_outbox WHERE run=?", (run_id,))
+
+    def drain_failure_monitors(self):
+        # Rotate past failed entries so a full batch of persistent errors cannot
+        # prevent later runs from being monitored. Restart begins at the oldest.
+        cursor = getattr(self, "_failure_monitor_cursor", None)
+        pending_rows = self.store.query(
+            "SELECT run,project,created FROM failure_monitor_outbox "
+            "WHERE (? IS NULL OR (created,run)>(?,?)) ORDER BY created,run LIMIT 100",
+            (cursor[0], cursor[0], cursor[1]) if cursor else (None, None, None))
+        if not pending_rows and cursor:
+            self._failure_monitor_cursor = None
+            pending_rows = self.store.query(
+                "SELECT run,project,created FROM failure_monitor_outbox ORDER BY created,run LIMIT 100")
+        for pending in pending_rows:
+            with self.scheduler_scope("failure_monitor", pending["project"], pending["run"]):
+                self._consume_failure_monitor(pending["run"])
+            self._failure_monitor_cursor = (pending["created"], pending["run"])
 
     def rollback_strategy(self, candidate):
         from .evolution import Evolution

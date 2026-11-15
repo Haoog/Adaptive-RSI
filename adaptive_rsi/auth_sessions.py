@@ -256,6 +256,8 @@ class _Process:
         self.control = None
         self.close_lock = threading.RLock()
         self.is_closed = False
+        # close() 中吞掉的清理异常留作诊断；单项失败不能阻断其余 fd/目录回收。
+        self.close_errors = []
         self.config = config or {}
         self.container = self.config.get("sandbox", {}).get("backend") == "docker" or not shutil.which(backend)
         self.container_name = "adaptive-rsi-auth-" + secrets.token_hex(12) if self.container else ""
@@ -331,7 +333,11 @@ class _Process:
                 except (OSError, subprocess.TimeoutExpired):
                     pass
             if self.control is not None:
-                os.close(self.control)
+                try:
+                    os.close(self.control)
+                except OSError as exc:
+                    # fd 可能已被继承方或系统关闭（EBADF）；不能阻断后续进程/目录回收。
+                    self.close_errors.append(exc)
                 self.control = None
             if self.process:
                 if self.process.poll() is None:
@@ -348,8 +354,18 @@ class _Process:
                     pass
                 for stream in (self.process.stdin, self.process.stdout):
                     if stream:
-                        stream.close()
-            self.directory.cleanup()
+                        try:
+                            stream.close()
+                        except (OSError, ValueError) as exc:
+                            # 子进程已退出且 stdin 仍有未 flush 的缓冲时，close() 会再
+                            # flush 一次并抛 BrokenPipeError；fd 已释放，目录清理必须继续。
+                            self.close_errors.append(exc)
+            try:
+                self.directory.cleanup()
+            except (OSError, ValueError) as exc:
+                # 临时 Home 落在坏盘/NFS 上时删除失败不应中断服务关闭；
+                # 进程与容器已回收，残留目录交给系统或下次启动清理。
+                self.close_errors.append(exc)
 
 
 class CodexAuth(_Process):
@@ -1043,10 +1059,17 @@ class AuthSessions:
         self.public_sessions = {}
         self.sessions = {}
         self.workers = {}
+        # 凭据写入（可能起子进程或 fsync）在 self.lock 外执行；此集合标记写入中的会话，
+        # 供 cancel() 拒绝并发取消，并让状态扫描不要把写入中的会话提前过期。
+        self.credential_writes = set()
+        self.api_key_writes = set()
         self.discoveries = set()
+        # (backend, provider) -> 该凭据正在被登出删除。登出在 self.lock 外做删除与
+        # CLI 子进程，等 credential_lock 的 _save() 与 reserve() 据此放弃回装/登记。
+        self.logging_out = set()
         self.threads = set()
-        # 线程登记不占用 self.lock：后者在 install_credential/logout 期间被长时间持有，
-        # 过期快照的后台刷新若等待它，请求线程仍会被阻塞。
+        # 线程登记不占用 self.lock：后者在 logout 期间仍会被较长时间持有（凭据移除
+        # 会起子进程），过期快照的后台刷新若等待它，请求线程仍会被阻塞。
         self.threads_lock = threading.Lock()
         self.closed = False
         # close() 期间状态文件写失败时保留首个异常，供排查；不向调用方抛出。
@@ -1140,10 +1163,16 @@ class AuthSessions:
             raise AuthError("invalid_backend")
         return backend
 
+    @staticmethod
+    def _logout_key(backend, provider):
+        """登出标记的粒度：codex 只有一个 provider，按后端标记；opencode 按 provider。"""
+        return (backend, provider if backend == "opencode" else None)
+
     @property
     def busy(self):
         with self.view_lock:
             ids = [key for key, item in self.public_sessions.items() if item["state"] in ACTIVE]
+            writing = self.credential_writes.copy()
         count = 0
         for key in ids:
             try:
@@ -1154,7 +1183,7 @@ class AuthSessions:
                 continue
             # status() 的非阻塞回收在锁竞争时可能返回陈旧 ACTIVE 快照；
             # busy 语义是「仍在进行」，过期行即便尚未被扫描也不再占用名额。
-            if result["state"] in ACTIVE and self.now() < result["expires_at"]:
+            if result["state"] in ACTIVE and (self.now() < result["expires_at"] or key in writing):
                 count += 1
         return count
 
@@ -1504,14 +1533,19 @@ class AuthSessions:
         with self.lock:
             if self.closed:
                 raise AuthError("service_closed")
+            # 同凭据的登出正在锁外删除/调 CLI；此时登记的会话会在登出收尾时被取消，
+            # 不如让调用方稍后重试（旧实现靠锁住整段登出达到同样效果）。
+            if self._logout_key(backend, provider) in self.logging_out:
+                raise AuthError("auth_busy")
             # busy 的非阻塞过期扫描在锁竞争时可能跳过；这里持锁，必须先把同后端
             # 已过 expires_at 却仍为 ACTIVE 的行收成 expired，否则过期会话会
             # 在 TTL 内持续 auth_busy。
             for session_key, item in list(self.sessions.items()):
                 if (item["backend"] == backend and item["state"] in ACTIVE
-                        and self.now() >= item["expires_at"]):
+                        and self.now() >= item["expires_at"]
+                        and session_key not in self.credential_writes):
                     self._update(session_key, state="expired", error="auth_expired")
-            if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
+            if backend in self.api_key_writes or any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
                 raise AuthError("auth_busy")
             session_id = secrets.token_urlsafe(24)
             self.sessions[session_id] = {"id": session_id, "backend": backend, "provider": provider,
@@ -1825,6 +1859,9 @@ class AuthSessions:
                 self._update(session_id, state="expired", error="auth_expired")
                 return
         try:
+            # 凭据 I/O 可能起子进程（opencode auth import 最长 20s）或 fsync：锁内只
+            # 校验状态并登记「写入中」，锁外持 credential_lock 完成写入，避免在
+            # dispatch_lock 内调用 reserve() 的请求等满整段写入而阻塞全站写端点。
             with self.lock:
                 current_session = self.sessions.get(session_id)
                 if current_session is None:
@@ -1834,11 +1871,20 @@ class AuthSessions:
                 if self.now() >= current_session["expires_at"]:
                     self._update(session_id, state="expired", error="auth_expired")
                     return
+                with self.view_lock:
+                    self.credential_writes.add(session_id)
+            try:
+                if self._logout_key(backend, provider) in self.logging_out:
+                    # 凭据已被登出删除；此时安装会把刚删掉的凭据装回去。会话通常已
+                    # 被登出取消（上面的 ACTIVE 判定会先返回），这里是兜底。
+                    raise AuthError("auth_protocol_error")
                 if backend != "codex" and modern:
                     worker.install_credential(provider, value)
                 else:
                     try:
                         if backend == "codex":
+                            # 与 opencode 分支一致：合并写回，保留用户手放的 OPENAI_API_KEY
+                            # 和新版 CLI 写入的未知字段，只覆盖凭据本身的同名字段。
                             merged = _read_json_for_write(_codex_path())
                             merged.update(data)
                             _write_json(_codex_path(), merged)
@@ -1850,7 +1896,19 @@ class AuthSessions:
                         raise AuthError("auth_storage_failed", {"errno": exc.errno}) from None
                 # 授权期间的状态/供应商查询可能重新填充旧缓存，保存凭据后再次失效。
                 self._invalidate_caches(backend)
-                self._update(session_id, state="completed")
+                with self.lock:
+                    current_session = self.sessions.get(session_id)
+                    if current_session is None:
+                        return
+                    if self.closed or stop.is_set() or current_session["state"] not in ACTIVE:
+                        return
+                    self._update(session_id, state="completed")
+            finally:
+                # 写入中取消会被 cancel() 拒绝，因此这里结束前状态仍是同一 ACTIVE 会话；
+                # 仍在持锁时摘标记，避免「标记已摘、completed 未写」的窗口被取消穿过。
+                with self.lock:
+                    with self.view_lock:
+                        self.credential_writes.discard(session_id)
         finally:
             credential_lock.release()
 
@@ -1868,14 +1926,24 @@ class AuthSessions:
             item = self.sessions.get(session_id) if isinstance(session_id, str) else None
             if item is None:
                 raise AuthError("unknown_session")
-            if item["state"] in ACTIVE and self.now() >= item["expires_at"]:
-                self._update(session_id, state="expired", error="auth_expired")
-                # 锁内只做状态判定并摘除 workers 引用；close() 含 docker rm、killpg、
-                # wait 及目录清理等慢操作，放到锁外执行。close() 自身幂等，
-                # 与 cancel()/_run()/close() 的并发路径一致，不会双重关闭。
-                expired_worker = self.workers.pop(session_id, None)
-                if expired_worker:
-                    expired_worker[1].set()
+            # 凭据写入期间不在这里过期：写入方持有 credential_lock 且尚未收尾，
+            # 提前标 expired 会得到「凭据已落盘、会话却过期」的矛盾终态。
+            if (item["state"] in ACTIVE and self.now() >= item["expires_at"]
+                    and session_id not in self.credential_writes):
+                try:
+                    self._update(session_id, state="expired", error="auth_expired")
+                except OSError:
+                    # 状态目录只读/磁盘满时，懒回收写盘失败不该把「查询状态」变成 500：
+                    # _update 已把内存回滚为 ACTIVE，这里按锁竞争语义返回回滚后的快照，
+                    # 等目录恢复可写后由下一次 status() 真正收成 expired 并落盘。
+                    pass
+                else:
+                    # 锁内只做状态判定并摘除 workers 引用；close() 含 docker rm、killpg、
+                    # wait 及目录清理等慢操作，放到锁外执行。close() 自身幂等，
+                    # 与 cancel()/_run()/close() 的并发路径一致，不会双重关闭。
+                    expired_worker = self.workers.pop(session_id, None)
+                    if expired_worker:
+                        expired_worker[1].set()
             result = self._public(item)
         finally:
             self.lock.release()
@@ -1891,7 +1959,8 @@ class AuthSessions:
             item = self.sessions.get(session_id)
             if item is None:
                 raise AuthError("unknown_session")
-            if item["state"] in ACTIVE and self.now() >= item["expires_at"]:
+            if (item["state"] in ACTIVE and self.now() >= item["expires_at"]
+                    and session_id not in self.credential_writes):
                 self._update(session_id, state="expired", error="auth_expired")
             if item["state"] != "awaiting_authorization" or item.get("method") != "code":
                 raise AuthError("invalid_auth_state")
@@ -1909,6 +1978,10 @@ class AuthSessions:
         self.status(session_id)
         memory_error = None
         with self.lock:
+            if session_id in self.credential_writes:
+                # 凭据写入已开始；放行取消会出现「已取消却仍安装凭据」。
+                # 与 logout/set_api_key 等待凭据锁一致，返回 409 让用户稍后重试。
+                raise AuthError("auth_credentials_busy")
             try:
                 self._update(session_id, state="cancelled")
             except MemoryError as exc:
@@ -1951,40 +2024,54 @@ class AuthSessions:
             with self.lock:
                 if self.closed:
                     raise AuthError("service_closed")
-                if backend == "codex":
-                    path = _codex_path()
-                    try:
-                        path.unlink()
-                    except FileNotFoundError:
-                        pass
-                else:
-                    binary = shutil.which("opencode")
-                    try:
-                        remove_auth_export(provider)
-                        if not self.custom_factory and binary:
-                            logout_provider(provider, binary)
-                    except (OpenCodeCompatibilityError, RuntimeError, OSError):
-                        raise AuthError("auth_protocol_error") from None
-                    path = auth_path()
-                    data = _read_json_for_write(path)
-                    if provider in data:
-                        data.pop(provider, None)
-                        _write_json(path, data)
+                # 凭据删除、opencode auth logout 子进程（timeout=20）与写盘都在
+                # self.lock 之外：服务端在 dispatch_lock 临界区内调 reserve()，而
+                # reserve() 要取 self.lock，锁内起子进程会让任务领取、配置保存和
+                # 交付/发版写入一起停摆。凭据改写的互斥由 credential_lock 保证；
+                # logging_out 让等锁的 _save() 在拿到锁后放弃回装已删除的凭据。
+                self.logging_out.add(self._logout_key(backend, provider))
+            if backend == "codex":
+                path = _codex_path()
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            else:
+                binary = shutil.which("opencode")
+                try:
+                    remove_auth_export(provider)
+                    if not self.custom_factory and binary:
+                        logout_provider(provider, binary)
+                except (OpenCodeCompatibilityError, RuntimeError, OSError):
+                    raise AuthError("auth_protocol_error") from None
+                path = auth_path()
+                data = _read_json_for_write(path)
+                if provider in data:
+                    data.pop(provider, None)
+                    _write_json(path, data)
+            with self.lock:
                 # 凭据移除全部成功后再取消会话：移除失败时若已把会话标成 cancelled，
                 # 用户虽收到 auth_protocol_error，进行中的登录却已被终止，重试也无从恢复。
-                for session_id, item in self.sessions.items():
-                    if item["backend"] == backend and item["state"] in ACTIVE:
-                        self._update(session_id, state="cancelled")
-                        if session_id in self.workers:
-                            workers.append(self.workers[session_id])
+                for session_id, item in list(self.sessions.items()):
+                    if item["backend"] != backend or item["state"] not in ACTIVE:
+                        continue
+                    # opencode 同一后端可有多个 provider：退出 B 不能连带取消正在为
+                    # A 进行的设备授权，否则用户必须重新取设备码才能继续；codex 只有
+                    # 一个 provider，仍按后端取消全部会话。
+                    if backend == "opencode" and item.get("provider") != provider:
+                        continue
+                    self._update(session_id, state="cancelled")
+                    if session_id in self.workers:
+                        workers.append(self.workers[session_id])
+                self._invalidate_caches(backend)
         finally:
+            with self.lock:
+                self.logging_out.discard(self._logout_key(backend, provider))
             credential_lock.release()
             for worker, stop in workers:
                 stop.set()
                 if worker:
                     worker.close()
-        with self.lock:
-            self._invalidate_caches(backend)
         return self.snapshot()
 
     def set_api_key(self, backend, provider, key):
@@ -2000,13 +2087,15 @@ class AuthSessions:
             # ACTIVE 的同后端行，否则一次过期的尝试会在 TTL 内持续 auth_busy。
             for session_key, item in list(self.sessions.items()):
                 if (item["backend"] == backend and item["state"] in ACTIVE
-                        and self.now() >= item["expires_at"]):
+                        and self.now() >= item["expires_at"]
+                        and session_key not in self.credential_writes):
                     self._update(session_key, state="expired", error="auth_expired")
             if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
                 raise AuthError("auth_busy")
         if not AUTH_LOCK.acquire(blocking=False):
             raise AuthError("auth_credentials_busy")
         worker = None
+        write_reserved = False
         try:
             with self.lock:
                 if self.closed:
@@ -2025,6 +2114,8 @@ class AuthSessions:
                     raise AuthError("service_closed")
                 if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
                     raise AuthError("auth_busy")
+                self.api_key_writes.add(backend)
+                write_reserved = True
             modern = bool(getattr(getattr(worker, "capabilities", None), "modern", False))
             if modern and hasattr(worker, "set_api_key") and hasattr(worker, "export_credential"):
                 worker.set_api_key(provider, key.strip())
@@ -2036,20 +2127,24 @@ class AuthSessions:
                         raise AuthError("service_closed")
                     if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
                         raise AuthError("auth_busy")
-                    worker.install_credential(provider, credentials)
-                    self._invalidate_caches(backend)
+                # 安装可能起子进程；与 _save 一致移出会话锁，只在 AUTH_LOCK 下写凭据。
+                worker.install_credential(provider, credentials)
             else:
                 with self.lock:
                     if self.closed:
                         raise AuthError("service_closed")
                     if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
                         raise AuthError("auth_busy")
-                    data = _read_json_for_write(auth_path())
-                    data[provider] = {"type": "api", "key": key.strip()}
-                    _write_json(auth_path(), data)
-                    self._invalidate_caches(backend)
+                data = _read_json_for_write(auth_path())
+                data[provider] = {"type": "api", "key": key.strip()}
+                _write_json(auth_path(), data)
+            with self.lock:
+                self._invalidate_caches(backend)
         finally:
             try:
+                if write_reserved:
+                    with self.lock:
+                        self.api_key_writes.discard(backend)
                 if worker:
                     with self.lock:
                         self.discoveries.discard(worker)
@@ -2091,8 +2186,17 @@ class AuthSessions:
         for worker, stop in workers:
             stop.set()
             if worker:
-                worker.close()
+                try:
+                    worker.close()
+                except BaseException as exc:
+                    # 单个 worker 关闭失败（如 stdin 残留缓冲 + 子进程已死）不能中止
+                    # 关停：其余 worker、发现任务与线程回收仍必须执行，异常只留作诊断。
+                    first_error = first_error or exc
         for worker in discoveries:
-            worker.close()
+            try:
+                worker.close()
+            except BaseException as exc:
+                first_error = first_error or exc
         for thread in threads:
             thread.join(timeout=2)
+        self._close_error = first_error

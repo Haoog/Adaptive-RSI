@@ -12,11 +12,12 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.parse
 from unittest.mock import patch
 
 from adaptive_rsi.config import DEFAULTS, validate
 from adaptive_rsi.gitops import git
-from adaptive_rsi.release import ApiRejected, advance, api as real_api, authorize_workflow, candidates, health_check, key, owner_key, pending, retry, workflow_choices
+from adaptive_rsi.release import ApiRejected, advance, api as real_api, authorize_workflow, candidates, health_check, key, owner_key, pending, reconcile, retry, workflow_choices
 from adaptive_rsi.delivery import pr_body
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store, encode
@@ -44,6 +45,25 @@ jobs:
     steps:
       - run: echo configured-by-maintainer
 """
+
+
+class _ReleaseClock:
+    """Controllable stand-in for ``adaptive_rsi.release.time``."""
+
+    def __init__(self, now):
+        self.now = now
+
+    def time(self):
+        return self.now
+
+    def monotonic(self):
+        return time.monotonic()
+
+    def gmtime(self, stamp=None):
+        return time.gmtime(stamp)
+
+    def strftime(self, fmt, stamp):
+        return time.strftime(fmt, stamp)
 
 
 class ReleaseAutomationTest(unittest.TestCase):
@@ -128,6 +148,95 @@ class ReleaseAutomationTest(unittest.TestCase):
             self.assertEqual(result["state"], "workflow_succeeded")
             self.assertNotIn("remote_visibility", result)
 
+    def test_clock_skew_beyond_the_created_margin_falls_back_to_an_unfiltered_page(self):
+        from adaptive_rsi.release import reconcile
+        github_now = time.time()
+        github_created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(github_now))
+        clock = _ReleaseClock(github_now + 600)
+        with patch("adaptive_rsi.release.time", clock), patch("adaptive_rsi.release.api", side_effect=self.api):
+            receipt = self.tick()["release"]
+        self.assertEqual(receipt["state"], "submitted")
+        self.assertGreater(receipt["created_at"] - github_now, 120)
+
+        listing = []
+
+        def github(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("actions/runs/"):
+                return self.remote
+            self.assertIn("/runs?", endpoint)
+            listing.append(endpoint)
+            runs = [self.remote] if self.remote else []
+            if "created=" in endpoint:
+                # GitHub applies ``created`` as a lower bound against its own
+                # clock; ISO-8601 UTC stamps compare lexicographically.
+                since = urllib.parse.unquote(endpoint.split("created=")[1].split("&")[0])[2:]
+                runs = [item for item in runs if item["created_at"] >= since]
+            return {"workflow_runs": runs}
+
+        self.remote = dict(self.remote_run(receipt), created_at=github_created)
+        with patch("adaptive_rsi.release.time", clock), patch("adaptive_rsi.release.api", side_effect=github):
+            data = reconcile(self.runtime, self.run, "release", receipt, persist=True)
+        self.assertEqual(data["state"], "workflow_succeeded")
+        self.assertEqual(data["reconciliation"]["state"], "matched")
+        self.assertIsNotNone(data["reconciliation"].get("created_window_missed_at"))
+        self.assertEqual(len(listing), 2, "a zero-row created window must be followed by one unfiltered page")
+        self.assertIn("created=", listing[0])
+        self.assertNotIn("created=", listing[1])
+
+    def test_unfiltered_fallback_finds_target_when_filtered_page_has_other_runs(self):
+        from adaptive_rsi.release import _remote_runs
+        calls = []
+        target = {"id": 17, "display_title": "rsi-operation"}
+        other = {"id": 18, "display_title": "another-operation"}
+
+        def listing(repo, endpoint, method="GET", fields=None):
+            calls.append(endpoint)
+            return {"workflow_runs": [other] if "created=" in endpoint else [other, target]}
+
+        data = {"workflow": ".github/workflows/publish.yml", "operation_id": "rsi-operation",
+                "created_at": time.time()}
+        with patch("adaptive_rsi.release.api", side_effect=listing):
+            self.assertEqual(_remote_runs("example/project", data), [target])
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("created=", calls[1])
+        self.assertIn("created_window_missed_at", data)
+
+    def test_unfiltered_fallback_is_throttled_and_skipped_when_the_window_matches(self):
+        from adaptive_rsi.release import RECONCILIATION_RECHECK_SECONDS, _remote_runs
+        clock = _ReleaseClock(time.time())
+        calls = []
+        found = []
+
+        def listing(repo, endpoint, method="GET", fields=None):
+            calls.append(endpoint)
+            return {"workflow_runs": found}
+
+        data = {"workflow": ".github/workflows/publish.yml", "operation_id": "rsi-operation",
+                "created_at": clock.now}
+        with patch("adaptive_rsi.release.time", clock), patch("adaptive_rsi.release.api", side_effect=listing):
+            self.assertEqual(_remote_runs("example/project", data), [])
+            self.assertEqual(len(calls), 2)
+            self.assertNotIn("created=", calls[1])
+            self.assertIn("page=1", calls[1])
+            self.assertEqual(data["unfiltered_fallback_at"], clock.now)
+            clock.now += RECONCILIATION_RECHECK_SECONDS - 1
+            self.assertEqual(_remote_runs("example/project", data), [])
+            self.assertEqual(len(calls), 3, "the unfiltered page is throttled to one per recheck window")
+            clock.now += 1
+            self.assertEqual(_remote_runs("example/project", data), [])
+            self.assertEqual(len(calls), 5)
+            self.assertEqual(_remote_runs("example/project", data, force=True), [])
+            self.assertEqual(len(calls), 7, "an operator query re-reads GitHub immediately")
+
+            # 时钟正常且 run 在 created 窗口内：只查一次带下界的列表，不发生兜底。
+            calls.clear()
+            found.append({"id": 17, "display_title": "rsi-operation"})
+            fresh = {"workflow": ".github/workflows/publish.yml", "operation_id": "rsi-operation",
+                     "created_at": clock.now - 60}
+            self.assertEqual(len(_remote_runs("example/project", fresh)), 1)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("created=", calls[0])
+
     def test_permanent_reconciliation_rejection_blocks_tracking_with_one_error_event(self):
         with patch("adaptive_rsi.release.api", side_effect=self.api):
             first = self.tick()["release"]
@@ -153,6 +262,39 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.assertFalse(pending(self.runtime, self.run))
         with self.assertRaisesRegex(ValueError, "Reconciliation is blocked"):
             retry(self.runtime, self.project, self.run["id"], "release")
+
+    def _assert_transient_limit_keeps_tracking(self, exc):
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            first = self.tick()["release"]
+            self.remote = self.remote_run(first, state="in_progress")
+            self.assertEqual(self.tick()["release"]["state"], "running")
+        before = len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'"))
+        # 五轮远多于 ADVANCE_FAILURE_LIMIT：临时限流不能把在途回执推成终态。
+        with patch("adaptive_rsi.release.api", side_effect=exc):
+            for _ in range(5):
+                self.assertEqual(self.tick()["release"]["state"], "running")
+        saved = self.runtime.store.setting(key(self.run["id"], "release"))
+        self.assertEqual(saved["state"], "running")
+        self.assertNotIn("advance_failures", saved)
+        self.assertEqual(saved["last_advance_error"], str(exc))
+        self.assertGreater(saved["retry_at"], time.time())
+        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")), before)
+        self.assertTrue(pending(self.runtime, self.run))
+        # 限流结束后下一轮对账继续跟踪同一回执并正常收口。
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            self.remote = self.remote_run(saved)
+            self.assertEqual(self.tick()["release"]["state"], "workflow_succeeded")
+        self.assertNotIn("retry_at", self.runtime.store.setting(key(self.run["id"], "release")))
+
+    def test_local_cooldown_does_not_consume_the_permanent_failure_budget(self):
+        # local=True：请求从未离开本机，更不能算作一次永久对账失败。
+        self._assert_transient_limit_keeps_tracking(
+            ApiRejected("GitHub rate limit cooldown active; request was not sent", 429, local=True))
+
+    def test_github_rate_limit_does_not_consume_the_permanent_failure_budget(self):
+        # GitHub 明确但临时的拒绝（secondary/primary limit）同样只等待、不判死。
+        self._assert_transient_limit_keeps_tracking(
+            ApiRejected("gh: API rate limit exceeded (HTTP 403)", 403))
 
     def test_blocked_reconciliation_recovers_read_only_without_widening_abandon(self):
         from adaptive_rsi.release import ReconciliationRejected, abandon, resolve
@@ -210,9 +352,40 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.assertIn("authorization revoked or target changed", result["deploy"]["error"])
         api.assert_not_called()
 
+    def test_abandoned_rerun_unknown_receipt_cannot_be_revived_by_retry(self):
+        from adaptive_rsi.release import abandon
+        data = {"state": "rerun_unknown", "operation_id": "fixture-operation", "sha": MERGED,
+                "repository": "example/project", "workflow": self.policy["workflow"], "ref": self.policy["ref"],
+                "workflow_sha": TRUSTED, "workflow_run_id": 17, "attempt": 1, "previous_attempt": 1,
+                "rerun_pending": True, "rerun_requested_at": time.time() - 600, "dispatch_receipt": "accepted"}
+        self.runtime.store.put_setting(key(self.run["id"], "release"), data)
+        with patch("adaptive_rsi.release.api", side_effect=ApiRejected("gh: Not Found (HTTP 404)", 404)):
+            closed = abandon(self.runtime, self.project, self.run["id"], "release", "operator confirmed no run")
+        self.assertEqual(closed["state"], "failed")
+        saved = self.runtime.store.setting(key(self.run["id"], "release"))
+        self.assertEqual(saved["state"], "failed")
+        self.assertEqual(saved["operator_abandon"]["reason"], "operator confirmed no run")
+        # 放弃同时作废未确认的重跑请求；残留字段会让下一次 retry 回到 rerun 分支。
+        self.assertNotIn("rerun_pending", saved)
+        self.assertNotIn("rerun_requested_at", saved)
+        self.assertEqual(saved["rerun_receipt"], "abandoned")
+        self.assertIn("rerun_abandoned_at", saved)
+        self.assertFalse(pending(self.runtime, self.run))
+        # 终态不可重试：不读取 GitHub、不提交重跑，也不覆盖已关闭的回执。
+        with patch("adaptive_rsi.release.api", side_effect=self.api) as api:
+            with self.assertRaisesRegex(ValueError, "abandoned"):
+                retry(self.runtime, self.project, self.run["id"], "release")
+        api.assert_not_called()
+        saved = self.runtime.store.setting(key(self.run["id"], "release"))
+        self.assertEqual(saved["state"], "failed")
+        self.assertEqual(saved["rerun_receipt"], "abandoned")
+        self.assertFalse(pending(self.runtime, self.run))
+
     def test_corrupt_automation_receipt_is_preserved_and_blocks_dispatch(self):
         from adaptive_rsi.release import status
-        for raw in ('{broken', '[]', 'null', '{}', '{"state":3}', '{"state":"submitted"}'):
+        for raw in ('{broken', '[]', 'null', '{}', '{"state":3}', '{"state":"mystery_state"}',
+                    '{"state":"rolling_back","rollback":{"state":"mystery_state"}}',
+                    '{"state":"submitted"}'):
             with self.subTest(raw=raw):
                 self.runtime.store.execute('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)',
                                            (key(self.run['id'], 'release'), raw))
@@ -220,7 +393,11 @@ class ReleaseAutomationTest(unittest.TestCase):
                     self.assertFalse(pending(self.runtime, self.run))
                     result = self.tick()
                     self.assertEqual(result['release']['receipt_error'], 'invalid_automation_receipt')
-                    self.assertEqual(status(self.runtime, self.project, self.run['id'])['release']['state'], 'blocked')
+                    diagnosis = status(self.runtime, self.project, self.run['id'])['release']
+                    self.assertEqual(diagnosis['state'], 'blocked')
+                    self.assertEqual(diagnosis['receipt_error'], 'invalid_automation_receipt')
+                    self.assertEqual(diagnosis['error'],
+                                     'Automation record is unreadable; repair the stored record before continuing')
                     api.assert_not_called()
                 self.assertEqual(self.runtime.store.one('SELECT value FROM settings WHERE key=?',
                                  (key(self.run['id'], 'release'),))['value'], raw)
@@ -408,7 +585,7 @@ class ReleaseAutomationTest(unittest.TestCase):
 
     def test_local_rate_limit_cooldown_keeps_release_pending_and_dispatches_later(self):
         # 冷却在请求发出前拦下：没有 gh 调用，也不能写成 GitHub 拒绝的终态失败。
-        with patch("adaptive_rsi.release._API_BACKOFF", {"github.com": time.monotonic() + 60}), \
+        with patch("adaptive_rsi.release._API_BACKOFF", {"example/project": time.monotonic() + 60}), \
                 patch("adaptive_rsi.release.checked") as command:
             first = self.tick()["release"]
         self.assertEqual(first["state"], "pending")
@@ -431,7 +608,7 @@ class ReleaseAutomationTest(unittest.TestCase):
     def test_local_rate_limit_cooldown_before_dispatch_post_reverts_to_pending(self):
         # validate_pin 之后才进入冷却：POST 没有发出，必须从 dispatching 退回 pending。
         with patch("adaptive_rsi.release.validate_pin"), \
-                patch("adaptive_rsi.release._API_BACKOFF", {"github.com": time.monotonic() + 60}), \
+                patch("adaptive_rsi.release._API_BACKOFF", {"example/project": time.monotonic() + 60}), \
                 patch("adaptive_rsi.release.checked") as command:
             first = self.tick()["release"]
         self.assertEqual(first["state"], "pending")
@@ -470,6 +647,90 @@ class ReleaseAutomationTest(unittest.TestCase):
         return {"id": 17, "head_sha": TRUSTED, "display_title": data["operation_id"], "event": "workflow_dispatch",
                 "path": data["workflow"], "head_branch": data.get("ref"), "status": state, "conclusion": conclusion,
                 "run_attempt": attempt, "html_url": "https://github.com/example/project/actions/runs/17"}
+
+    def jobs_api(self, response, reads):
+        def api(repo, endpoint, method="GET", fields=None):
+            if endpoint.endswith("jobs?per_page=20"):
+                reads.append(endpoint)
+                if isinstance(response, Exception):
+                    raise response
+                return response
+            return self.api(repo, endpoint, method, fields)
+        return api
+
+    def completed_with_job_read(self, response):
+        reads = []
+        with patch("adaptive_rsi.release.api", side_effect=self.jobs_api(response, reads)):
+            first = self.tick()["release"]
+            events_before = len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'"))
+            self.remote = self.remote_run(first)
+            self.remote.update(created_at="2026-01-01T00:00:00Z", run_started_at="2026-01-01T00:00:10Z",
+                               updated_at="2026-01-01T00:10:10Z")
+            return self.tick()["release"], reads, events_before
+
+    def test_completed_reconcile_records_job_timing_once_per_attempt(self):
+        reads = []
+        jobs = {"total_count": 2, "jobs": [
+            {"name": "build", "status": "completed", "conclusion": "success",
+             "started_at": "2026-01-01T00:00:20Z", "completed_at": "2026-01-01T00:05:20Z"},
+            {"name": "reverify", "status": "completed", "conclusion": "success",
+             "started_at": "2026-01-01T00:05:30Z", "completed_at": "2026-01-01T00:10:00Z"}]}
+        done, reads, _ = self.completed_with_job_read(jobs)
+        timing = done["timing"]
+        self.assertEqual(done["state"], "workflow_succeeded")
+        self.assertEqual([job["name"] for job in timing["jobs"]], ["build", "reverify"])
+        self.assertEqual(timing["jobs"][1]["started_at"], "2026-01-01T00:05:30Z")
+        self.assertEqual((timing["jobs_attempt"], timing["jobs_total_count"]), (1, 2))
+        # Run-level fields keep their previous values; job data is additive only.
+        self.assertEqual((timing["queue_seconds"], timing["execution_seconds"]), (10.0, 600.0))
+        self.assertEqual(reads, ["actions/runs/17/jobs?per_page=20"])
+        with patch("adaptive_rsi.release.api", side_effect=self.jobs_api(jobs, reads)):
+            self.assertEqual(reconcile(self.runtime, self.run, "release", done, persist=False)["timing"], timing)
+            self.remote["run_attempt"] = 2
+            reconcile(self.runtime, self.run, "release", done, persist=False)
+        self.assertEqual(reads, ["actions/runs/17/jobs?per_page=20",
+                                 "actions/runs/17/attempts/2/jobs?per_page=20"])
+
+    def test_job_timing_is_bounded_and_read_once_for_a_finished_attempt(self):
+        jobs = {"total_count": 12, "jobs": [{"name": "job-%d" % index, "started_at": "2026-01-01T00:00:20Z",
+                                            "completed_at": "2026-01-01T00:01:00Z"} for index in range(11)] +
+               [{"name": "x" * 400, "started_at": "2026-01-01T00:00:20Z"}]}
+        done, reads, _ = self.completed_with_job_read(jobs)
+        timing = done["timing"]
+        self.assertEqual(len(timing["jobs"]), 10)
+        self.assertEqual(timing["jobs_total_count"], 12)
+        self.assertEqual(len(timing["jobs"][0]["name"]), len("job-0"))
+        self.assertTrue(all(len(job["name"]) <= 120 for job in timing["jobs"]))
+        self.assertEqual(reads, ["actions/runs/17/jobs?per_page=20"])
+
+    def test_job_timing_read_rejection_never_changes_state_or_failure_counter(self):
+        done, reads, events_before = self.completed_with_job_read(ApiRejected("gh: Server error (HTTP 500)", 500))
+        self.assertEqual(done["state"], "workflow_succeeded")
+        self.assertNotIn("jobs", done["timing"])
+        self.assertTrue(done["timing"]["jobs_error"])
+        self.assertEqual((done["timing"]["queue_seconds"], done["timing"]["execution_seconds"]), (10.0, 600.0))
+        self.assertNotIn("advance_failures", done)
+        self.assertEqual(reads, ["actions/runs/17/jobs?per_page=20"])
+        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")), events_before)
+
+    def test_malformed_job_listing_is_ignored_without_error_events(self):
+        done, reads, events_before = self.completed_with_job_read({"total_count": 2, "jobs": "not-a-list"})
+        self.assertEqual(done["state"], "workflow_succeeded")
+        self.assertNotIn("jobs", done["timing"])
+        self.assertNotIn("jobs_attempt", done["timing"])
+        self.assertNotIn("advance_failures", done)
+        self.assertEqual(reads, ["actions/runs/17/jobs?per_page=20"])
+        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")), events_before)
+
+    def test_job_timing_cancellation_propagates_instead_of_becoming_a_jobs_error(self):
+        from adaptive_rsi.process import Cancelled
+        done, reads, _ = self.completed_with_job_read({"total_count": 1, "jobs": []})
+        self.remote["run_attempt"] = 2
+        with patch("adaptive_rsi.release.api", side_effect=self.jobs_api(Cancelled("Cancelled"), reads)):
+            with self.assertRaises(Cancelled):
+                reconcile(self.runtime, self.run, "release", done, persist=False)
+        self.assertNotIn("jobs_error", done["timing"])
+        self.assertEqual(reads[-1], "actions/runs/17/attempts/2/jobs?per_page=20")
 
     def test_dispatch_pins_target_and_reconciles_after_restart_without_duplicates(self):
         with patch("adaptive_rsi.release.api", side_effect=self.api):
@@ -835,6 +1096,74 @@ class ReleaseAutomationTest(unittest.TestCase):
         with patch("adaptive_rsi.release.api", side_effect=ApiRejected("gh: Not Found (HTTP 404)", 404)):
             closed = abandon(self.runtime, self.project, self.run["id"], "deploy", "GitHub access permanently revoked")
         self.assertEqual(closed["state"], "failed")
+
+    def test_permanent_preflight_failure_stops_polling_and_retry_dispatches_once(self):
+        deploy = self.setup_deployment()
+        self.runtime.store.put_setting(owner_key(self.project, "example/project", deploy),
+                                       {"run": "previous-run", "sha": PREVIOUS})
+        self.runtime.store.put_setting(key("previous-run", "deploy"), {"state": "healthy", "sha": PREVIOUS})
+        before = len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'"))
+        reads = []
+        def forbidden(repo, endpoint, method="GET", fields=None):
+            reads.append(endpoint)
+            if endpoint.startswith("compare/"):
+                raise ApiRejected("gh: Forbidden (HTTP 403)", 403)
+            return self.api(repo, endpoint, method, fields)
+        # 派发前的永久 403 与前两轮的对账失败共用同一预算：3 轮后停止轮询。
+        with patch("adaptive_rsi.release.api", side_effect=forbidden):
+            for expected in ("blocked", "blocked", "failed"):
+                self.assertEqual(self.tick()["deploy"]["state"], expected)
+            self.assertEqual(reads, ["compare/" + PREVIOUS + "..." + MERGED] * 3)
+            self.assertFalse(pending(self.runtime, self.run))
+            # 达到上限后不再调用 GitHub，也不再写事件。
+            reads.clear()
+            for _ in range(2):
+                self.assertEqual(self.tick()["deploy"]["state"], "failed")
+        self.assertEqual(reads, [])
+        saved = self.runtime.store.setting(key(self.run["id"], "deploy"))
+        self.assertEqual(saved["state"], "failed")
+        self.assertEqual(saved["advance_failures"], 3)
+        self.assertEqual(saved["last_advance_error"], "gh: Forbidden (HTTP 403)")
+        self.assertEqual(saved["error"], "gh: Forbidden (HTTP 403)")
+        self.assertEqual(saved["dispatch_receipt"], "preflight_error")
+        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")) - before, 1)
+        # 权限恢复后 retry 清零预算并放回待发，只发起一次新的派发。
+        self.commands.clear()
+        def restored(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("compare/"):
+                return {"status": "ahead", "ahead_by": 1}
+            return self.api(repo, endpoint, method, fields)
+        with patch("adaptive_rsi.release.api", side_effect=restored):
+            self.assertEqual(retry(self.runtime, self.project, self.run["id"], "deploy")["state"], "pending")
+            self.assertEqual(self.tick()["deploy"]["state"], "submitted")
+            self.assertEqual(self.tick()["deploy"]["state"], "submitted")
+        self.assertEqual(sum(method == "POST" and "/dispatches" in endpoint
+                             for endpoint, method, _ in self.commands), 1)
+        resumed = self.runtime.store.setting(key(self.run["id"], "deploy"))
+        self.assertNotIn("advance_failures", resumed)
+
+    def test_preflight_cooldown_does_not_consume_failure_budget(self):
+        deploy = self.setup_deployment()
+        self.runtime.store.put_setting(owner_key(self.project, "example/project", deploy),
+                                       {"run": "previous-run", "sha": PREVIOUS})
+        self.runtime.store.put_setting(key("previous-run", "deploy"), {"state": "healthy", "sha": PREVIOUS})
+        def cooldown(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("compare/"):
+                raise ApiRejected("GitHub rate limit cooldown active; request was not sent", 429, local=True)
+            return self.api(repo, endpoint, method, fields)
+        # 本机冷却没有发出请求：连续多轮也不能把回执推成永久失败。
+        with patch("adaptive_rsi.release.api", side_effect=cooldown):
+            for _ in range(4):
+                self.assertIn(self.tick()["deploy"]["state"], {"pending", "blocked"})
+        saved = self.runtime.store.setting(key(self.run["id"], "deploy"))
+        self.assertNotIn("advance_failures", saved)
+        self.assertTrue(pending(self.runtime, self.run))
+        def restored(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("compare/"):
+                return {"status": "ahead"}
+            return self.api(repo, endpoint, method, fields)
+        with patch("adaptive_rsi.release.api", side_effect=restored):
+            self.assertEqual(self.tick()["deploy"]["state"], "submitted")
 
     def test_health_exception_does_not_modify_concurrent_receipt(self):
         deploy = self.setup_deployment(rollback=True)
@@ -1854,6 +2183,35 @@ class WorkflowConfigurationTest(unittest.TestCase):
                     with self.subTest(workflow=name, path=step["with"]["path"]):
                         self.assertIn(step["with"]["path"], allowed_paths)
                         self.assertIn("hashFiles(", step["with"]["key"])
+
+
+class ApiCooldownScopeTest(unittest.TestCase):
+    def setUp(self):
+        from adaptive_rsi import release
+        self.release = release
+        release._API_BACKOFF.clear()
+        self.addCleanup(release._API_BACKOFF.clear)
+
+    def test_rate_limit_cooldown_is_scoped_to_the_repository(self):
+        with patch.object(self.release, "checked",
+                          side_effect=RuntimeError("API rate limit exceeded (HTTP 403)")):
+            with self.assertRaises(ApiRejected) as first:
+                self.release.api("example/one", "commits/main")
+        self.assertTrue(first.exception.transient)
+        self.assertEqual(first.exception.retry_after, self.release.API_COOLDOWN_SECONDS)
+        with self.assertRaisesRegex(ApiRejected, "cooldown active"):
+            self.release.api("example/one", "commits/main")
+        # 另一个仓库不受牵连：一次限流不应冻结所有项目的读写。
+        with patch.object(self.release, "checked", return_value='{"ok": true}') as command:
+            self.assertEqual(self.release.api("example/two", "commits/main"), {"ok": True})
+        command.assert_called_once()
+
+    def test_permanent_forbidden_is_not_transient_and_starts_no_cooldown(self):
+        with patch.object(self.release, "checked", side_effect=RuntimeError("gh: Forbidden (HTTP 403)")):
+            with self.assertRaises(ApiRejected) as exc:
+                self.release.api("example/one", "commits/main")
+        self.assertFalse(exc.exception.transient)
+        self.assertNotIn("example/one", self.release._API_BACKOFF)
 
 
 if __name__ == "__main__":

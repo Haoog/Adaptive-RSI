@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urlparse
 from . import __version__
 from .build import BUILD_ID
 from .dashboard import records
-from .store import decode_object, decode_evidence
+from .store import StoreBusy, decode_object, decode_evidence
 from .adapters import detect
 from .catalog import CatalogError, list_models
 from .credentials import CredentialError
@@ -142,14 +142,99 @@ GET /api/workflow-metrics
 """
 
 
+# Every write must carry the token from GET /api/contract in this header. The
+# dispatch guard and the generated document read the same constant, so the
+# document cannot name a header the server does not check.
+CSRF_HEADER = "X-RSI-CSRF"
+
+
+def _openapi_json(schema):
+    return {"content": {"application/json": {"schema": schema}}}
+
+
 def openapi_paths():
-    """Return OpenAPI path items generated from the declared route catalog."""
+    """Return OpenAPI path items generated from the declared route catalog.
+
+    Every operation documents the responses of the transport gate the handler
+    applies before dispatch (Host allowlist, session cookie); writes also
+    declare the Origin and CSRF header they require. Without them the request
+    is answered 403 before the route logic runs, which is why a client written
+    from a bare route list meets unexplained failures.
+    """
+    error = {"$ref": "#/components/schemas/Error"}
+    denied = {
+        "400": {"description": "Invalid request body or parameters", **_openapi_json(error)},
+        "401": {"description": "Session cookie missing or invalid (error_code=session_required)",
+                **_openapi_json(error)},
+        "403": {"description": "Host not in the allowlist, or Origin/CSRF mismatch",
+                **_openapi_json(error)},
+    }
     paths = {}
     for entry in OPENAPI_ROUTES.strip().splitlines():
         method, path = entry.split()
-        paths.setdefault(path, {})[method.lower()] = {
-            "responses": {"200": {"description": "JSON response"}}}
+        operation = {"responses": {"200": {"description": "JSON response"}, **denied}}
+        if method == "POST":
+            operation["parameters"] = [{"$ref": "#/components/parameters/Origin"},
+                                       {"$ref": "#/components/parameters/Csrf"}]
+            operation["requestBody"] = {
+                "required": True,
+                "description": "JSON object with Content-Type application/json and a non-empty body",
+                **_openapi_json({"type": "object"})}
+        paths.setdefault(path, {})[method.lower()] = operation
     return paths
+
+
+def openapi_document(origin, local_origin, cookie_name):
+    """OpenAPI 3.1 document: the declared routes plus the transport rules."""
+    servers = [{"url": origin}]
+    if local_origin != origin:
+        # Both netlocs pass the Host allowlist; naming only the public origin
+        # would leave a localhost client unable to tell which Host to send.
+        servers.append({"url": local_origin})
+    return {
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Adaptive RSI local API",
+            "version": str(API_VERSION),
+            "description": (
+                "Every literal /api route this server dispatches. Prefix fallbacks (/api/, "
+                "/api/auth/, /api/model-center/) are not individual routes. Every request needs a "
+                "Host header from the server allowlist (the server origin or its local origin); "
+                "any other Host is answered 403 before dispatch. Reads also need the session "
+                "cookie from the URL printed by adaptive-rsi serve/open. Every write needs an "
+                "Origin equal to the console origin, the " + CSRF_HEADER + " header holding the "
+                "csrf token returned by GET /api/contract, and a JSON object body with "
+                "Content-Type application/json; a missing or mismatched Origin/CSRF pair is "
+                "answered 403 before the route runs. Errors are JSON objects whose error_code "
+                "values are listed by GET /api/contract."),
+        },
+        "servers": servers,
+        "paths": openapi_paths(),
+        "security": [{"sessionCookie": []}],
+        "components": {
+            "securitySchemes": {"sessionCookie": {
+                "type": "apiKey", "in": "cookie", "name": cookie_name,
+                "description": "Console session cookie; open the URL printed by adaptive-rsi "
+                               "serve/open, and send a Host header from the server allowlist"}},
+            "parameters": {
+                "Origin": {"name": "Origin", "in": "header", "required": True,
+                           "description": "Console origin (the server origin or its local origin); "
+                                          "any other value is answered 403",
+                           "schema": {"type": "string"}},
+                "Csrf": {"name": CSRF_HEADER, "in": "header", "required": True,
+                         "description": "csrf token returned by GET /api/contract",
+                         "schema": {"type": "string"}},
+            },
+            "schemas": {"Error": {
+                "type": "object", "required": ["error"],
+                "properties": {
+                    "error": {"type": "string"},
+                    "error_code": {"type": "string", "description":
+                                   "Stable code; the authoritative list is descriptor().errors "
+                                   "from GET /api/contract"},
+                }}},
+        },
+    }
 
 
 # POST body fields that reach SQLite bindings must be scalars. A dict/list
@@ -452,6 +537,13 @@ class Handler(BaseHTTPRequestHandler):
                 payload["error_code"] = code
             self.respond(payload, 400)
             return
+        if isinstance(exc, StoreBusy):
+            # 连接容量或写锁的瞬时争用不是服务端缺陷：给出可重试的 503。
+            # 此时数据库仍然满载，写 request_log 会再等一轮容量预算，直接跳过。
+            self._request_log_skipped = True
+            self.respond({"error": "Database is busy; retry shortly", "error_code": "store_busy"},
+                         503, headers={"Retry-After": "1"})
+            return
         code = getattr(exc, "code", None)
         code = code if isinstance(code, str) and (code in SAFE_ERROR_CODES or
                     re.fullmatch(r"opencode_incompatible_[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}", code)) else None
@@ -567,10 +659,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def authentication_failure(self):
         retry = self.server.security_failure("session_required", authentication=True)
-        if retry:
-            self.respond({"error": "Too many authentication failures", "error_code": "session_required"},
+        login_page = self.command in ("GET", "HEAD") and urlparse(self.path).path in ["/", "/index.html"]
+        if retry and login_page:
+            # 登录页是唯一的恢复入口：限流期间也要正常渲染，不能被第三方坏请求换成 JSON。
+            self.respond(self.server.assets["login.html"], 429, "text/html; charset=utf-8",
+                         headers={"Retry-After": str(retry)})
+        elif retry:
+            # 429 只抑制 API 请求，并用独立错误码与 401 的会话失效区分。
+            self.respond({"error": "Too many authentication failures",
+                          "error_code": "session_required_rate_limited"},
                          429, headers={"Retry-After": str(retry)})
-        elif self.command in ("GET", "HEAD") and urlparse(self.path).path in ["/", "/index.html"]:
+        elif login_page:
             # HEAD 与 GET 共享登录页的 401 表示与头；respond() 负责不发送 body。
             self.respond(self.server.assets["login.html"], 401, "text/html; charset=utf-8")
         else:
@@ -602,6 +701,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch_GET(self):
         self._request_id = secrets.token_hex(8)
+        self._request_log_skipped = False
         # The shutdown probe must stay readable while the runtime closes its
         # store; it only reads in-memory phase and counters.
         if urlparse(self.path).path == "/api/shutdown-status":
@@ -681,15 +781,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(runtime.operations.get(params.get("id", [""])[0]))
             elif parsed.path == "/api/contract":
                 if params.get("format", [""])[0] == "openapi":
-                    self.respond({
-                        "openapi": "3.1.0",
-                        "info": {"title": "Adaptive RSI local API", "version": str(API_VERSION)},
-                        "servers": [{"url": self.server.origin}],
-                        "paths": openapi_paths(),
-                        "security": [{"sessionCookie": []}],
-                        "components": {"securitySchemes": {"sessionCookie": {
-                            "type": "apiKey", "in": "cookie", "name": self.server.cookie}}},
-                    })
+                    self.respond(openapi_document(self.server.origin, self.server.local_origin,
+                                                  self.server.cookie))
                     return
                 self.respond({
                     "descriptor": descriptor(),
@@ -721,8 +814,6 @@ class Handler(BaseHTTPRequestHandler):
                 data["projects"] = store.query("SELECT id,name,path FROM projects ORDER BY created")
                 for project in data["projects"]:
                     project["name"] = project_display_name(project["name"], project["path"])
-                from .store import encode, uid
-                store.execute("INSERT OR IGNORE INTO settings VALUES ('instance-id',?)", (encode(uid()),))
                 data["instance"] = store.setting("instance-id")
                 from .dashboard import TASKS
                 data["notifications"] = store.query("SELECT t.id,t.project,t.title,t.state,t.display_state,t.updated,r.id AS run,r.result FROM " + TASKS + " t LEFT JOIN runs r ON r.id=(SELECT id FROM runs WHERE task=t.id ORDER BY started DESC,rowid DESC LIMIT 1) WHERE t.source NOT LIKE 'system_%' ORDER BY t.updated DESC LIMIT 200")
@@ -918,12 +1009,15 @@ class Handler(BaseHTTPRequestHandler):
                                               "retry_at": None, "degraded": None}
                 self.respond(metrics)
             elif parsed.path == "/api/state":
+                legacy = "sections" not in params
+                requested = {part.strip() for value in params.get("sections", []) for part in value.split(",") if part.strip()}
+                unknown = requested - {"core", "candidates", "analytics"}
+                if unknown:
+                    raise RequestError("Unknown state section; expected core, candidates or analytics")
+                # 更新视图在 SQLite 快照外组装：旧的 is_busy() 要等全局 dispatch_lock，
+                # 在读事务内等待会占住连接许可，慢写端点会拖垮每一个控制台轮询。
+                update = runtime.updates.console_snapshot()
                 with store.snapshot():
-                    legacy = "sections" not in params
-                    requested = {part.strip() for value in params.get("sections", []) for part in value.split(",") if part.strip()}
-                    unknown = requested - {"core", "candidates", "analytics"}
-                    if unknown:
-                        raise RequestError("Unknown state section; expected core, candidates or analytics")
                     try:
                         global_config = runtime.config()
                     except (ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
@@ -1015,7 +1109,7 @@ class Handler(BaseHTTPRequestHandler):
                             "csrf": self.server.csrf, "projects": projects, **rows, "config": global_config,
                             "config_revision": store.config_revision(selected if selected else None),
                             "global_config_revision": store.config_revision(),
-                            "update": runtime.updates.snapshot(), "schedules": schedules,
+                            "update": update, "schedules": schedules,
                             "resource_admission": pressure}
                     include_candidates = legacy or "candidates" in requested
                     include_analytics = legacy or "analytics" in requested
@@ -1195,19 +1289,21 @@ class Handler(BaseHTTPRequestHandler):
                 error_code = "internal_error"
             self.api_error(exc)
         finally:
-            if urlparse(self.path).path.startswith("/api/"):
+            if urlparse(self.path).path.startswith("/api/") and not getattr(self, "_request_log_skipped", False):
                 self._record_get(request_id, started, error_code)
 
     def do_POST(self):
         self._request_id = secrets.token_hex(8)
+        self._request_log_skipped = False
         with self.server.runtime.store.query_scope(request=self._request_id):
             return self._do_POST()
 
     def _do_POST(self):
         started = time.time()
+        response_lock = None
         if not self.authenticated():
             return
-        if self.headers.get("Origin") not in {self.server.origin, self.server.local_origin} or not self._token_matches(self.headers.get("X-RSI-CSRF", ""), self.server.csrf):
+        if self.headers.get("Origin") not in {self.server.origin, self.server.local_origin} or not self._token_matches(self.headers.get(CSRF_HEADER, ""), self.server.csrf):
             self.server.security_failure("origin_or_csrf")
             self.respond({"error": "Invalid origin or CSRF token"}, 403)
             return
@@ -1232,6 +1328,7 @@ class Handler(BaseHTTPRequestHandler):
                     name = {str: "a string", bool: "a boolean", int: "an integer",
                             dict: "an object", list: "a list"}.get(expected, "a scalar")
                     raise RequestError(field + " must be " + name)
+            response_code, response_headers, response_lock = 200, None, None
             if path == "/api/operations":
                 self.respond(runtime.operations.start(body.get("kind"), body.get("parameters", {})))
                 return
@@ -1290,6 +1387,7 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/model-center/"):
                 center = runtime.model_center
                 project = body.get("project") or None
+                response_code = 200
                 if path == "/api/model-center/fetch":
                     result = center.fetch(body.get("provider"), project)
                 elif path == "/api/model-center/probe":
@@ -1320,9 +1418,8 @@ class Handler(BaseHTTPRequestHandler):
                         elif path == "/api/model-center/resume":
                             result = center.resume_provider(body.get("provider"), project)
                         else:
-                            self.respond({"error": "Not found"}, 404)
-                            return
-                self.respond(result)
+                            result, response_code = {"error": "Not found"}, 404
+                self.respond(result, response_code)
                 return
             if urlparse(self.path).path == "/api/models":
                 try:
@@ -1376,6 +1473,13 @@ class Handler(BaseHTTPRequestHandler):
                             raise RequestError(str(exc)) from exc
                 self.respond(result)
                 return
+            path = urlparse(self.path).path
+            if path == "/api/session/rotate":
+                # 先等会话锁再拿 dispatch_lock。轮换响应需持有会话锁直至新 cookie
+                # 发出；若反向等待，会让第二个轮换请求在 dispatch_lock 内排队，
+                # 连带阻塞所有写端点。
+                response_lock = self.server._session_lock
+                response_lock.acquire()
             with runtime.dispatch_lock:
                 path = urlparse(self.path).path
                 if path != "/api/cancel":
@@ -1472,18 +1576,17 @@ class Handler(BaseHTTPRequestHandler):
                     result = {"id": Evolution(runtime).import_case(body["project"], body["manifest"])}
                 elif path == "/api/session/rotate":
                     # 轮换后旧链接立即失效；响应携带新 cookie，当前浏览器保持登录。
-                    with self.server._session_lock:
-                        result = self.server.rotate_session()
-                        self.respond(result, headers={"Set-Cookie": self.server.cookie_header(self.headers.get("Host"))})
-                    return
+                    result = self.server.rotate_session()
+                    response_headers = {"Set-Cookie": self.server.cookie_header(self.headers.get("Host"))}
                 else:
-                    self.respond({"error": "Not found"}, 404)
-                    return
-                self.respond(result)
+                    result, response_code = {"error": "Not found"}, 404
+            self.respond(result, response_code, headers=response_headers)
         except Exception as exc:
             self.api_error(exc)
         finally:
-            if urlparse(self.path).path.startswith("/api/"):
+            if response_lock is not None:
+                response_lock.release()
+            if urlparse(self.path).path.startswith("/api/") and not getattr(self, "_request_log_skipped", False):
                 try:
                     status = getattr(self, "_response_status", 500)
                     self.server.runtime.store.record_request(

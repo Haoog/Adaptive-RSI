@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from adaptive_rsi import delivery, readiness, release
 from adaptive_rsi.config import DEFAULTS
-from adaptive_rsi.process import ProcessError
+from adaptive_rsi.process import Cancelled, ProcessError
 import tests.test_delivery_loop as delivery_tests
 import tests.test_release_endpoints as recovery_tests
 from adaptive_rsi.gitops import git
@@ -21,6 +21,17 @@ PROTECTION_FIXTURES = Path(__file__).resolve().parent / 'fixtures' / 'github_pro
 
 def captured(name):
     return json.loads((PROTECTION_FIXTURES / name).read_text(encoding='utf-8'))
+
+
+def cleanup_api(branches, pulls, calls):
+    """Paged `release.api` stub: serves one row list per page and records page numbers."""
+    def fake(repo, endpoint, *args, **kwargs):
+        kind = 'branches' if endpoint.startswith('branches') else 'pulls'
+        page = int(endpoint.rsplit('page=', 1)[1])
+        calls.setdefault(kind, []).append(page)
+        pages = branches if kind == 'branches' else pulls
+        return pages[page - 1] if page <= len(pages) else []
+    return fake
 
 
 class ClosedPublicationTest(unittest.TestCase):
@@ -82,27 +93,93 @@ class BaselineAndCleanupTest(unittest.TestCase):
         self.assertTrue(result['evidence_invalidated'])
         self.assertEqual(git(self.workspace, 'rev-parse', 'HEAD'), self.head)
 
-    def test_full_cleanup_page_yields_no_candidates(self):
-        branches = [{'name': 'feat/rsi-' + str(i), 'commit': {'sha': str(i)}} for i in range(100)]
-        prs = [{'state': 'CLOSED', 'head': {'ref': row['name'], 'sha': row['commit']['sha']}} for row in branches]
-        with patch.object(release, 'api', side_effect=[branches, prs]):
-            result = delivery.branch_cleanup_preview('example/project')
+    def test_cleanup_preview_reads_past_the_first_page_for_a_deletable_branch(self):
+        first = [{'name': 'feature-%d' % i, 'commit': {'sha': 'b' * 40}} for i in range(100)]
+        second = [{'name': 'fix/rsi-0123456789abcdef', 'commit': {'sha': 'a' * 40}}]
+        second += [{'name': 'feature-b-%d' % i, 'commit': {'sha': 'c' * 40}} for i in range(19)]
+        pulls = [[{'state': 'closed', 'head': {'ref': 'fix/rsi-0123456789abcdef', 'sha': 'a' * 40,
+                                                 'repo': {'full_name': 'example/project'}}}]]
+        calls = {}
+        with patch.object(release, 'api', side_effect=cleanup_api([first, second], pulls, calls)):
+            result = delivery.branch_cleanup_preview('example/project', recovery_refs=set())
+        self.assertTrue(result['complete'])
+        self.assertFalse(result['truncated'])
+        self.assertEqual(result['candidates'], ['fix/rsi-0123456789abcdef'])
+        self.assertNotIn('incomplete_inventory', [row['reason'] for row in result['protected']])
+        self.assertFalse(result['deletion_performed'])
+        self.assertEqual(calls['branches'], [1, 2])
+        self.assertEqual(calls['pulls'], [1])
+
+    def test_cleanup_preview_does_not_accept_fork_or_unknown_repo_as_ownership(self):
+        branches = [{'name': 'fix/rsi-same', 'commit': {'sha': 'same'}}]
+        for repo in ({'full_name': 'fork/project'}, None, {}):
+            with self.subTest(repo=repo):
+                pulls = [{'state': 'closed', 'head': {'ref': 'fix/rsi-same', 'sha': 'same', 'repo': repo}}]
+                with patch.object(release, 'api', side_effect=cleanup_api([branches], [pulls], {})):
+                    result = delivery.branch_cleanup_preview('example/project', recovery_refs=set())
+                self.assertEqual(result['candidates'], [])
+                self.assertEqual(result['protected'][0]['reason'], 'unverified_ownership')
+
+    def test_cleanup_preview_reports_truncated_inventory_at_page_limit(self):
+        pages = []
+        for page in range(1, delivery.PAGE_LIMIT + 1):
+            rows = [{'name': 'feature-%d-%d' % (page, i), 'commit': {'sha': 'b' * 40}} for i in range(99)]
+            if page == 3:
+                rows.append({'name': 'fix/rsi-0123456789abcdef', 'commit': {'sha': 'a' * 40}})
+            else:
+                rows.append({'name': 'feature-%d-x' % page, 'commit': {'sha': 'c' * 40}})
+            pages.append(rows)
+        pulls = [[{'state': 'open', 'head': {'ref': 'other-%d' % i, 'sha': 'd' * 40}} for i in range(100)]
+                 for _ in range(delivery.PAGE_LIMIT)]
+        calls = {}
+        with patch.object(release, 'api', side_effect=cleanup_api(pages, pulls, calls)):
+            result = delivery.branch_cleanup_preview('example/project', recovery_refs=set())
         self.assertFalse(result['complete'])
+        self.assertTrue(result['truncated'])
         self.assertEqual(result['candidates'], [])
+        reasons = {row['branch']: row['reason'] for row in result['protected']}
+        self.assertEqual(reasons.get('fix/rsi-0123456789abcdef'), 'incomplete_inventory')
+        self.assertFalse(result['deletion_performed'])
+        self.assertEqual(calls['branches'], list(range(1, delivery.PAGE_LIMIT + 1)))
+        self.assertEqual(calls['pulls'], list(range(1, delivery.PAGE_LIMIT + 1)))
+
+    def test_cleanup_preview_keeps_the_cap_when_a_page_read_fails(self):
+        def failing(repo, endpoint, *args, **kwargs):
+            if endpoint.startswith('branches'):
+                raise RuntimeError('gh api failed (HTTP 502)')
+            return []
+
+        with patch.object(release, 'api', side_effect=failing):
+            result = delivery.branch_cleanup_preview('example/project', recovery_refs=set())
+        self.assertFalse(result['complete'])
+        self.assertTrue(result['truncated'])
+        self.assertEqual(result['candidates'], [])
+        self.assertFalse(result['deletion_performed'])
+
+    def test_cleanup_preview_requires_recovery_inventory_before_any_candidate(self):
+        branches = [{'name': 'feat/rsi-old', 'commit': {'sha': 'old'}}]
+        prs = [{'state': 'closed', 'head': {'ref': 'feat/rsi-old', 'sha': 'old'}}]
+        with patch.object(release, 'api', side_effect=cleanup_api([branches], [prs], {})):
+            result = delivery.branch_cleanup_preview('example/project')
+        self.assertEqual(result['candidates'], [])
+        self.assertEqual(result['protected'], [{'branch': 'feat/rsi-old', 'reason': 'recovery_inventory_unknown'}])
+        self.assertFalse(result['deletion_performed'])
 
     def test_cleanup_preview_protects_open_pr_recovery_and_unknown_branches(self):
         branches = [{'name': 'feat/rsi-old', 'commit': {'sha': 'old'}},
                     {'name': 'fix/rsi-open', 'commit': {'sha': 'open'}},
                     {'name': 'feat/rsi-backup', 'commit': {'sha': 'backup'}},
                     {'name': 'main', 'commit': {'sha': 'main'}}]
-        prs = [{'state': 'CLOSED', 'head': {'ref': 'feat/rsi-old', 'sha': 'old'}},
+        prs = [{'state': 'CLOSED', 'head': {'ref': 'feat/rsi-old', 'sha': 'old', 'repo': {'full_name': 'example/project'}}},
                {'state': 'OPEN', 'head': {'ref': 'fix/rsi-open', 'sha': 'open'}}]
-        with patch.object(release, 'api', side_effect=[branches, prs]) as command:
+        with patch.object(release, 'api', side_effect=cleanup_api([branches], [prs], {})) as command:
             result = delivery.branch_cleanup_preview('example/project', recovery_refs=['backup'])
+        reasons = {item['branch']: item['reason'] for item in result['protected']}
         self.assertEqual(result['candidates'], ['feat/rsi-old'])
+        self.assertEqual(reasons.get('fix/rsi-open'), 'open_pr')
+        self.assertEqual(reasons.get('feat/rsi-backup'), 'protected_or_recovery')
+        self.assertEqual(reasons.get('main'), 'not_managed')
         self.assertFalse(result['deletion_performed'])
-        self.assertEqual(command.call_count, 2)
-        self.assertTrue(all(len(call.args) == 2 for call in command.call_args_list))
 
     def test_cleanup_preview_distinguishes_pushed_branch_without_pr(self):
         branches = [{'name': 'feat/rsi-pushed', 'commit': {'sha': 'pushed_sha'}},
@@ -195,7 +272,7 @@ class ProtectionRulesTest(unittest.TestCase):
     def test_active_rules_endpoint_can_establish_strictness_without_classic_protection(self):
         def command(argv, **kwargs):
             if argv[2].endswith('/protection'):
-                raise RuntimeError('HTTP 404')
+                raise ProcessError({'error': 'gh: Branch not protected (HTTP 404)'})
             self.assertIn('/rules/branches/main', argv[2])
             return json.dumps([{'type': 'required_status_checks', 'parameters': {'strict_required_status_checks_policy': True}}, {'type': 'merge_queue'}])
         with patch.object(delivery, 'checked', side_effect=command):
@@ -206,10 +283,56 @@ class ProtectionRulesTest(unittest.TestCase):
         self.assertEqual(result['sources']['rulesets'], 'observed')
 
     def test_ruleset_read_failure_is_unknown_even_with_classic_rules(self):
-        with patch.object(delivery, 'checked', side_effect=[json.dumps({'required_status_checks': {'strict': False}}), RuntimeError('HTTP 403')]):
+        with patch.object(delivery, 'checked', side_effect=[json.dumps({'required_status_checks': {'strict': False}}),
+                                                             ProcessError({'error': 'gh: Forbidden (HTTP 403)'})]):
             result = delivery.merge_protection(self.config)
         self.assertIsNone(result['merge_queue'])
         self.assertFalse(result['complete'])
+
+    def test_transient_read_failure_is_retried_instead_of_cached(self):
+        # 一次 502 不是「分支保护未知」的确定答案：下一次读取必须真的重试，
+        # 否则就绪页会把一次抖动显示成 5 分钟的假警告。
+        with patch.object(delivery, 'checked', side_effect=[
+                json.dumps({'required_status_checks': {'strict': False}}),
+                ProcessError({'error': 'gh: Server Error (HTTP 502)'})]):
+            failed = delivery.merge_protection(self.config)
+        self.assertEqual((failed['state'], failed['complete']), ('unknown', False))
+        self.assertEqual(delivery._PROTECTION_CACHE, {})
+        with patch.object(delivery, 'checked', side_effect=[
+                json.dumps({'required_status_checks': {'strict': False}}),
+                json.dumps([[{'type': 'required_status_checks',
+                              'parameters': {'strict_required_status_checks_policy': True}}]])]) as command:
+            recovered = delivery.merge_protection(self.config)
+        self.assertEqual(command.call_count, 2)
+        self.assertEqual((recovered['state'], recovered['complete']), ('strict', True))
+
+    def test_ruleset_404_is_retried_instead_of_cached(self):
+        classic = json.dumps({'required_status_checks': {'strict': False}})
+        with patch.object(delivery, 'checked', side_effect=[
+                classic, ProcessError({'error': 'gh: Not Found (HTTP 404)'})]):
+            failed = delivery.merge_protection(self.config)
+        self.assertFalse(failed['complete'])
+        with patch.object(delivery, 'checked', side_effect=[classic, json.dumps([])]) as command:
+            recovered = delivery.merge_protection(self.config)
+        self.assertEqual(command.call_count, 2)
+        self.assertTrue(recovered['complete'])
+
+    def test_not_found_answer_is_cached_for_the_advisory_ttl(self):
+        # classic 404 是「未保护」的确定答案，保持 300 秒缓存：未保护仓库的
+        # 就绪页加载不再每次打两次 API。
+        result = self.replay('unprotected-classic-404.json', 'unprotected-branch-rules-empty.json')
+        with patch.object(delivery, 'checked', side_effect=AssertionError('cached protection read re-issued')):
+            self.assertIs(delivery.merge_protection(self.config), result)
+
+    def test_cancelled_read_propagates_without_poisoning_the_cache(self):
+        for responses in ([Cancelled('Project paused or run cancelled')],
+                          [json.dumps({'required_status_checks': {'strict': False}}),
+                           Cancelled('Project paused or run cancelled')]):
+            delivery._PROTECTION_CACHE.clear()
+            with patch.object(delivery, 'checked', side_effect=responses):
+                with self.assertRaises(Cancelled):
+                    delivery.merge_protection(self.config)
+            self.assertEqual(delivery._PROTECTION_CACHE, {})
 
     def replay(self, *names):
         """Drive the real decision code with responses captured from live `gh api` reads."""

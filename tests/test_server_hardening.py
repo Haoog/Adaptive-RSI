@@ -8,6 +8,7 @@ import io
 import json
 import os
 import sqlite3
+import socket
 import tempfile
 import threading
 import time
@@ -19,8 +20,8 @@ from urllib.parse import quote
 
 from adaptive_rsi.catalog import CatalogError
 from adaptive_rsi.operations import Operations
-from adaptive_rsi.server import Handler, Server
-from adaptive_rsi.store import Store
+from adaptive_rsi.server import CSRF_HEADER, Handler, Server
+from adaptive_rsi.store import MAX_CONNECTIONS, POOL_SIZE, Store
 
 
 class ServerHardeningTest(unittest.TestCase):
@@ -160,6 +161,176 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertNotIn(b"/private/path", payload)
         self.assertEqual(before, (self.server.token, self.server.csrf, self.server.url))
         self.assertEqual(self.request()[0], 200)
+        self.assertEqual(self.request("/api/session/rotate", "POST")[0], 200)
+
+    def test_concurrent_rotation_does_not_hold_dispatch_lock_and_returns_matching_sessions(self):
+        first_response_entered, first_response_finished = threading.Event(), threading.Event()
+        waiting_for_session = threading.Event()
+        original_respond = Handler.respond
+
+        class ObservedLock:
+            def __init__(self, lock):
+                self.lock = lock
+                self.guard = threading.Lock()
+                self.owner = None
+                self.depth = 0
+
+            def acquire(self):
+                identity = threading.get_ident()
+                with self.guard:
+                    if self.owner is not None and self.owner != identity:
+                        waiting_for_session.set()
+                acquired = self.lock.acquire()
+                if acquired:
+                    with self.guard:
+                        self.owner = identity
+                        self.depth += 1
+                return acquired
+
+            def release(self):
+                with self.guard:
+                    self.depth -= 1
+                    if not self.depth:
+                        self.owner = None
+                self.lock.release()
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, *_):
+                self.release()
+
+        session_lock = ObservedLock(self.server._session_lock)
+        self.server._session_lock = session_lock
+        self.runtime.pause = lambda project, paused: {"project": project, "paused": paused}
+
+        def slow_first_response(handler, *args, **kwargs):
+            if handler.path == "/api/session/rotate" and not first_response_entered.is_set():
+                first_response_entered.set()
+                if not first_response_finished.wait(5):
+                    raise TimeoutError("test did not release the first rotation response")
+            return original_respond(handler, *args, **kwargs)
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        try:
+            with patch.object(Handler, "respond", slow_first_response):
+                first = pool.submit(self.request, "/api/session/rotate", "POST")
+                self.assertTrue(first_response_entered.wait(2), "first rotation did not reach response write")
+                second = pool.submit(self.request, "/api/session/rotate", "POST")
+                self.assertTrue(waiting_for_session.wait(2), "second rotation did not wait for the session lock")
+
+                connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=1)
+                started = time.monotonic()
+                try:
+                    connection.request("POST", "/api/pause", body=json.dumps({"project": "p", "paused": True}),
+                                       headers={"Cookie": self.server.cookie + "=" + self.server.token,
+                                                "Origin": self.server.local_origin,
+                                                "X-RSI-CSRF": self.server.csrf,
+                                                "Content-Type": "application/json"})
+                    response = connection.getresponse()
+                    status, body = response.status, response.read()
+                except (TimeoutError, socket.timeout):
+                    self.fail("a concurrent rotation blocked an unrelated write")
+                finally:
+                    connection.close()
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body), {"saved": True})
+                self.assertLess(time.monotonic() - started, 1.0)
+                first_response_finished.set()
+                first_result = first.result(timeout=5)
+                second_result = second.result(timeout=5)
+        finally:
+            first_response_finished.set()
+            pool.shutdown(wait=True)
+
+        for status, headers, payload in (first_result, second_result):
+            self.assertEqual(status, 200)
+            result = json.loads(payload)
+            token = result["url"].split("token=", 1)[1]
+            self.assertTrue(headers["Set-Cookie"].startswith(self.server.cookie + "=" + token + ";"))
+            self.assertTrue(result["csrf"])
+        first_session, second_session = json.loads(first_result[2]), json.loads(second_result[2])
+        self.assertNotEqual(first_session["url"], second_session["url"])
+        self.assertEqual(second_session["url"], self.server.url)
+        self.assertEqual(second_session["csrf"], self.server.csrf)
+
+    def test_post_response_does_not_hold_dispatch_lock_during_slow_socket_write(self):
+        lock = self.runtime.dispatch_lock
+        admission_lock_states, write_lock_states = [], []
+        response_entered, response_finished = threading.Event(), threading.Event()
+        self.runtime.updates.require_ready = lambda: admission_lock_states.append(lock._is_owned())
+
+        def archive(project, confirmation):
+            write_lock_states.append(lock._is_owned())
+            return {"payload": "x" * (8 * 1024 * 1024)}
+
+        self.runtime.archive_project = archive
+        original_setup, original_respond = Handler.setup, Handler.respond
+
+        class ObservedWriter:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def write(self, data):
+                if len(data) > 1024 * 1024:
+                    response_entered.set()
+                return self.stream.write(data)
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+        def small_socket_buffer(handler):
+            original_setup(handler)
+            handler.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            handler.connection.settimeout(.25)
+            handler.wfile = ObservedWriter(handler.wfile)
+
+        def observe_response(handler, *args, **kwargs):
+            try:
+                return original_respond(handler, *args, **kwargs)
+            finally:
+                if handler.path == "/api/project/archive":
+                    response_finished.set()
+
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.settimeout(5)
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        client.connect(("127.0.0.1", self.server.server_port))
+        body = b'{"project":"p"}'
+        request = (b"POST /api/project/archive HTTP/1.1\r\n"
+                   + f"Host: 127.0.0.1:{self.server.server_port}\r\n".encode()
+                   + f"Cookie: {self.server.cookie}={self.server.token}\r\n".encode()
+                   + f"Origin: {self.server.local_origin}\r\n".encode()
+                   + f"X-RSI-CSRF: {self.server.csrf}\r\n".encode()
+                   + b"Content-Type: application/json\r\nConnection: close\r\n"
+                   + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        try:
+            with patch.object(Handler, "setup", small_socket_buffer), \
+                    patch.object(Handler, "respond", observe_response):
+                client.sendall(request)
+                self.assertTrue(response_entered.wait(5), "POST 响应未开始")
+                self.assertFalse(response_finished.wait(.1), "大响应没有形成慢客户端背压")
+                acquired = lock.acquire(timeout=.5)
+                if acquired:
+                    lock.release()
+                self.assertTrue(acquired, "响应传输期间 dispatch_lock 仍被占用")
+                self.assertTrue(response_finished.wait(5), "慢客户端响应没有按 socket timeout 收尾")
+        finally:
+            client.close()
+            self.assertTrue(response_finished.wait(5), "断开客户端后响应处理线程未结束")
+
+        self.assertEqual(admission_lock_states, [True])
+        self.assertEqual(write_lock_states, [True])
+        rows = []
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            rows = self.store.query("SELECT status,error_code FROM request_log WHERE path='/api/project/archive'")
+            if rows:
+                break
+            time.sleep(.01)
+        self.assertEqual([(row["status"], row["error_code"]) for row in rows],
+                         [(500, "response_interrupted")])
 
     def test_concurrent_rotation_has_complete_private_final_file(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -299,6 +470,40 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertEqual([(r['status'], r['error_code']) for r in rows], [(500, 'download_interrupted')])
         self.assertTrue(self.server._backup_gate.acquire(blocking=False))
         self.server._backup_gate.release()
+
+    def test_database_capacity_exhaustion_returns_retryable_503(self):
+        # 测试夹具的 runtime 是 SimpleNamespace；真实 configure 的第一步也是读配置，
+        # 这里用同样的 store 访问验证 POST 错误边界会透传 StoreBusy。补齐 /api/state
+        # 需要的最小只读接口，让“释放容量后恢复 200”可以在同一条路由上断言。
+        from adaptive_rsi.config import DEFAULTS
+        self.runtime.configure = lambda *args, **kwargs: {"config": self.store.setting("config", {})}
+        self.runtime.config = lambda *args: json.loads(json.dumps(DEFAULTS))
+        self.runtime.updates.snapshot = lambda: {}
+        # /api/state 现在在 SQLite 快照外组装更新视图（避免慢写拖住控制台轮询）。
+        self.runtime.updates.console_snapshot = lambda: {}
+        capacity = self.store._connection_capacity
+        limit = MAX_CONNECTIONS + POOL_SIZE
+        for _ in range(limit):
+            self.assertTrue(capacity.acquire(blocking=False))
+        try:
+            # 生产默认仍等 15 秒（与 SQLite busy 超时一致）；用例缩短等待，
+            # 证明等待预算来自实例配置，而不是写死在 connect() 里。
+            with patch.object(self.store, "connection_wait", 0.05):
+                for path, method, body in (("/api/state", "GET", None),
+                                           ("/api/config", "POST", {"values": {}})):
+                    started = time.monotonic()
+                    status, headers, payload = self.request(path, method, body)
+                    self.assertLess(time.monotonic() - started, 5)
+                    detail = json.loads(payload)
+                    self.assertEqual(status, 503)
+                    self.assertEqual(headers.get("Retry-After"), "1")
+                    self.assertEqual(detail["error_code"], "store_busy")
+                # 不依赖数据库的端点不能被容量耗尽拖住。
+                self.assertEqual(self.request("/api/health")[0], 200)
+        finally:
+            for _ in range(limit):
+                capacity.release()
+        self.assertEqual(self.request("/api/state")[0], 200)
 
     def test_backup_rejects_large_files_symlinks_fifo_and_bad_offsets(self):
         with self.backup.open("wb") as stream:
@@ -512,7 +717,24 @@ class ServerHardeningTest(unittest.TestCase):
             responses = list(pool.map(lambda _: self.request(authenticated=False), range(42)))
         self.assertEqual(sum(status == 401 for status, _, _ in responses), 30)
         self.assertEqual(sum(status == 429 for status, _, _ in responses), 12)
-        self.assertTrue(all("Retry-After" in headers for status, headers, _ in responses if status == 429))
+        denied = [json.loads(payload) for status, _, payload in responses if status == 401]
+        limited = [json.loads(payload) for status, _, payload in responses if status == 429]
+        self.assertTrue(all(payload["error_code"] == "session_required" for payload in denied))
+        self.assertTrue(all(payload["error_code"] == "session_required_rate_limited" for payload in limited))
+        # 限流只抑制 API；首次打开控制台的人仍须看到唯一的恢复指引，而不是一行 JSON。
+        for path in ("/", "/index.html"):
+            status, headers, payload = self.request(path, authenticated=False)
+            self.assertEqual(status, 429)
+            self.assertTrue(headers["Content-Type"].startswith("text/html"))
+            self.assertIn("Retry-After", headers)
+            self.assertIn("python3 scripts/rsi open", payload.decode())
+        # HEAD 与 GET 共享限流后的登录页头，但不传输 body。
+        status, headers, payload = self.request("/", "HEAD", authenticated=False)
+        self.assertEqual((status, payload), (429, b""))
+        self.assertTrue(headers["Content-Type"].startswith("text/html"))
+        status, headers, _ = self.request("/api/health", authenticated=False)
+        self.assertEqual(status, 429)
+        self.assertIn("Retry-After", headers)
         self.assertEqual(self.request()[0], 200)
         self.assertEqual(self.request("/?token=" + self.server.token, authenticated=False)[0], 303)
         self.assertEqual(self.request("/login.css", authenticated=False)[0], 200)
@@ -796,6 +1018,37 @@ class ServerHardeningTest(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual([row["id"] for row in json.loads(payload)["runs"]], order)
 
+    def test_attention_reads_instance_id_without_writing(self):
+        # 实例 ID 是启动期常量：新建 Store 打开状态目录时就有值，且按 JSON 字符串存储。
+        instance = self.store.setting("instance-id")
+        self.assertIsInstance(instance, str)
+        observer = sqlite3.connect(str(self.store.path), timeout=5)
+        self.addCleanup(observer.close)
+        # request_log 是所有 GET 共有的可观测写入，这里隔离它，只看端点自身：
+        # 独立连接（非池连接）的 data_version 只在其它连接提交写事务时变化。
+        with patch.object(self.store, "record_request", return_value=False):
+            before = observer.execute("PRAGMA data_version").fetchone()[0]
+            status, _, payload = self.request("/api/attention")
+            after = observer.execute("PRAGMA data_version").fetchone()[0]
+        self.assertEqual(status, 200)
+        self.assertEqual(after, before)
+        data = json.loads(payload)
+        self.assertEqual(data["instance"], instance)
+        self.assertEqual(self.store.setting("instance-id"), instance)
+        for field in ("instance", "notifications", "projects"):
+            self.assertIn(field, data)
+
+        # 行被删除时端点仍返回 200（实例 ID 为空），并且不重建该行。
+        self.store.execute("DELETE FROM settings WHERE key='instance-id'")
+        with patch.object(self.store, "record_request", return_value=False):
+            before = observer.execute("PRAGMA data_version").fetchone()[0]
+            status, _, payload = self.request("/api/attention")
+            after = observer.execute("PRAGMA data_version").fetchone()[0]
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["instance"], None)
+        self.assertEqual(after, before)
+        self.assertEqual(self.store.query("SELECT value FROM settings WHERE key='instance-id'"), [])
+
     def test_backup_copy_runs_outside_dispatch_lock(self):
         from adaptive_rsi import storage_tools
 
@@ -1030,6 +1283,44 @@ class ServerHardeningTest(unittest.TestCase):
                          "OpenAPI 文档包含未实现的路由")
         for path in sorted(dispatched):
             self.assertEqual(sorted(dispatched[path]), sorted(document[path]), path)
+
+    def test_openapi_document_states_transport_gate(self):
+        # be-429：只列路由的文档会让照文档写的客户端在分派前撞上不解释的 403；
+        # 文档必须写明 Host allowlist 与每个写请求的 Origin/CSRF 要求。
+        status, headers, payload = self.request("/api/contract?format=openapi")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Type"), "application/json; charset=utf-8")
+        document = json.loads(payload)
+        self.assertEqual(document["servers"][0], {"url": self.server.origin})
+        self.assertTrue(all(entry["url"].split("://", 1)[1] in self.server.allowed_hosts
+                            for entry in document["servers"]))
+        description = document["info"]["description"]
+        for required in ("Host", "allowlist", "Origin", CSRF_HEADER, "Content-Type"):
+            self.assertIn(required, description)
+        parameters = document["components"]["parameters"]
+        self.assertEqual((parameters["Origin"]["name"], parameters["Origin"]["in"]), ("Origin", "header"))
+        self.assertEqual((parameters["Csrf"]["name"], parameters["Csrf"]["in"]), (CSRF_HEADER, "header"))
+        self.assertTrue(parameters["Origin"]["required"] and parameters["Csrf"]["required"])
+        self.assertEqual(document["components"]["securitySchemes"]["sessionCookie"]["name"],
+                         self.server.cookie)
+        self.assertEqual(document["components"]["schemas"]["Error"]["required"], ["error"])
+        for path, methods in document["paths"].items():
+            for method, operation in methods.items():
+                responses = operation["responses"]
+                self.assertLessEqual({"200", "400", "401", "403"}, set(responses), (path, method))
+                self.assertEqual(responses["403"]["content"]["application/json"]["schema"],
+                                 {"$ref": "#/components/schemas/Error"})
+                refs = [parameter["$ref"] for parameter in operation.get("parameters", [])]
+                if method == "post":
+                    self.assertEqual(refs, ["#/components/parameters/Origin",
+                                            "#/components/parameters/Csrf"], path)
+                    self.assertTrue(operation["requestBody"]["required"], path)
+                else:
+                    self.assertEqual([], refs, path)
+        # 文档里的头名就是分派前实际校验的头：换成错误值仍然 403，文档没有说谎。
+        status, _, _ = self.request("/api/config", "POST", {"values": {}},
+                                    headers={CSRF_HEADER: "not-the-token"})
+        self.assertEqual(status, 403)
 
     def test_connection_gate_releases_permit_when_thread_spawn_fails(self):
         # Thread.start() 抛错时 process_request 必须退还 gate 名额，

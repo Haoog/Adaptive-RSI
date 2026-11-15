@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import json
 import math
@@ -10,7 +11,7 @@ from pathlib import Path
 from .config import BUILTIN_PROVIDERS, compatibility, fingerprint, merge, validate
 from .gitops import git, repository, snapshot
 from .process import Cancelled, scrub_tree
-from .store import encode, uid
+from .store import decode_object, encode, uid
 from .usage_report import one_snapshot
 
 
@@ -21,6 +22,15 @@ ABLATION_CONFIGURATIONS = ("baseline", "strategy_only", "skill_only", "combined"
 # 配对试验只有 pass/fail 是结论性结果。insufficient_evidence / error / interrupted /
 # 缺失都表示那一臂没有跑成：既不是改进，也不是回归。
 CONCLUSIVE_DECISIONS = ("pass", "fail")
+# 输入签名只收录影响试验执行的 limits：retention_days 等清理参数、旧额度键改动的是
+# 运维策略而非实验内容，不应让同一份证据重新付费演化。新增会改变试验结果的 limits
+# 键时须同步扩充这里，避免执行参数变化被去重逻辑放过。
+EXPERIMENT_LIMITS = ("command_seconds", "max_output_mb", "concurrency", "retries",
+                     "min_free_disk_mb", "min_available_memory_mb")
+# 技能正文的评估上限：配对试验与消融注入的候选技能、生产检索注入的已验证技能
+# （runtime.memories 使用同一数值）都按此截断。提案校验与晋升写库必须共用这个
+# 常量，否则晋升会把试验从未覆盖的正文标成「已验证」。
+SKILL_CONTENT_LIMIT = 2000
 
 
 def arm_decision(arm):
@@ -338,20 +348,21 @@ def case_allocation(population, selected):
             for stratum in sorted(sizes, key=lambda value: fingerprint({"stratum": value}))]
 
 
-def select_cases(cases, count, seed):
+def select_cases(cases, count, seed, stratum=case_stratum):
     """Pick up to `count` cases with traffic-weighted allocation across strata.
 
     每层按其在候选总体中的占比获得样本，样本数允许时每层至少 1 个；同一
     `seed` 结果稳定，不同 `seed` 只改变层内挑选顺序，不改变各层配额。
+    `stratum` 允许审计复算直接使用封存记录的分层，而不必重建用例 spec。
     """
     strata = {}
     for case in cases:
-        strata.setdefault(case_stratum(case), []).append(case)
-    quotas = stratum_quotas({stratum: len(rows) for stratum, rows in strata.items()}, count)
+        strata.setdefault(stratum(case), []).append(case)
+    quotas = stratum_quotas({key: len(rows) for key, rows in strata.items()}, count)
     selected = []
-    for stratum in sorted(quotas, key=lambda value: fingerprint({"stratum": value})):
-        rows = sorted(strata.get(stratum, []), key=lambda case: (case["uses"], fingerprint({"id": case["id"], "seed": seed})))
-        selected.extend(rows[:quotas[stratum]])
+    for key in sorted(quotas, key=lambda value: fingerprint({"stratum": value})):
+        rows = sorted(strata.get(key, []), key=lambda case: (case["uses"], fingerprint({"id": case["id"], "seed": seed})))
+        selected.extend(rows[:quotas[key]])
     return selected
 
 
@@ -367,16 +378,25 @@ def _stale_running_attempt(attempt):
 
 
 class Evolution:
+    ROLLBACK_MESSAGES = {
+        "restored": "Restored previous stable strategy and invalidated its learned skill",
+        "rollback_incompatible_parent": "Previous stable strategy is incompatible with the current configuration; no strategy is active, re-promote it explicitly after restoring the old configuration",
+        "rollback_unreadable_parent": "Previous stable strategy has unreadable evidence; no strategy is active until an explicit revalidation",
+        "rollback_missing_parent": "Previous stable strategy no longer exists; no strategy is active",
+        "rollback_without_parent": "Rolled back the active strategy; no previous stable strategy to restore",
+    }
+
     def __init__(self, runtime):
         self.runtime = runtime
         self.store = runtime.store
         self._plan_keys = {}
 
-    def verify_inputs(self, project, manifest):
+    def verify_inputs(self, project, manifest, case_rows=None):
         mismatches = []
         unsampled_mismatches = []
         for item in manifest:
-            row = self.store.one("SELECT spec FROM cases WHERE id=? AND project=?", (item["case"], project))
+            row = (case_rows.get(item["case"]) if case_rows is not None else
+                   self.store.one("SELECT spec,split,family FROM cases WHERE id=? AND project=?", (item["case"], project)))
             try:
                 try:
                     spec = json.loads(row["spec"]) if row else {}
@@ -389,6 +409,8 @@ class Evolution:
                           "tree": git(spec["repository"], "rev-parse", spec["base"] + "^{tree}"),
                           "overlay": self.overlay_digest(spec.get("overlay"))}
                 changed = [key for key, value in actual.items() if item.get(key) != value]
+                changed.extend(key for key in ("split", "family")
+                               if key in item and row and item[key] != row[key])
                 # 配置了 overlay 却已不可用时，封存值与当前值都可能取不到（同为 None）；
                 # 相等不代表输入未变，这类用例必须在封存校验里失败，不能支持晋升。
                 if spec.get("overlay") and actual["overlay"] is None:
@@ -419,6 +441,52 @@ class Evolution:
         valid = bool(expected) and set(actual) == expected and len(actual) == len(expected) == len(trials)
         return {"valid": valid, "reason": "complete_preregistered_analysis" if valid else "incomplete_or_unplanned_trials",
                 "analysis": "preregistered" if valid else "exploratory", "expected": len(expected), "observed": len(actual)}
+
+    @staticmethod
+    def verify_selection(plan):
+        """Recompute the sealed sample from the recorded population and seed.
+
+        计划记录 ``selection_seed`` 与每个 split 的 eligible 全集 (id, stratum, uses)，
+        审计方可用同一 ``select_cases`` 复算，区分策略抽样与人工挑选。
+        """
+        data = plan if isinstance(plan, dict) else {}
+        seed, population, samples = data.get("selection_seed"), data.get("selection_population"), data.get("samples")
+        if not isinstance(seed, str) or not seed:
+            return {"valid": False, "reason": "selection_seed_missing"}
+        if not isinstance(population, dict) or not isinstance(samples, list):
+            return {"valid": False, "reason": "selection_population_missing"}
+        allocation = data.get("allocation") if isinstance(data.get("allocation"), dict) else {}
+        expected, observed, uses, considered = [], [], [], {}
+        for split in ("validation", "holdout"):
+            target, rows = allocation.get(split), population.get(split)
+            requested = target.get("requested") if isinstance(target, dict) else None
+            if not isinstance(rows, list) or type(requested) is not int or requested < 0:
+                return {"valid": False, "reason": "selection_population_incomplete", "split": split}
+            cases = []
+            for row in rows:
+                if (not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]
+                        or type(row.get("uses")) is not int or row["uses"] < 0
+                        or not isinstance(row.get("stratum"), list) or len(row["stratum"]) != 2
+                        or not all(isinstance(part, str) for part in row["stratum"])):
+                    return {"valid": False, "reason": "selection_population_malformed", "split": split}
+                cases.append({"id": row["id"], "uses": row["uses"], "stratum": tuple(row["stratum"])})
+                considered[(split, row["id"])] = row["uses"]
+            picked = select_cases(cases, requested, seed, stratum=lambda case: case["stratum"])
+            expected.extend(split + ":" + case["id"] for case in picked)
+        for sample in samples:
+            if (not isinstance(sample, dict) or sample.get("split") not in ("validation", "holdout")
+                    or not isinstance(sample.get("id"), str)):
+                return {"valid": False, "reason": "samples_malformed"}
+            key = (sample["split"], sample["id"])
+            observed.append(sample["split"] + ":" + sample["id"])
+            if key in considered and (type(sample.get("prior_uses")) is not int
+                                      or sample["prior_uses"] != considered[key]):
+                uses.append(sample["split"] + ":" + sample["id"])
+        valid = (expected == observed and len(set(observed)) == len(observed) and not uses)
+        return {"valid": valid,
+                "reason": "recomputed_from_recorded_population" if valid else
+                          "sample_prior_uses_mismatch" if uses else "sample_not_rederivable",
+                "expected": expected, "observed": observed}
 
     def update_case(self, project, case, *, active, split=None, source):
         """Retire instead of deleting; exposure identities and all prior uses survive."""
@@ -631,6 +699,10 @@ class Evolution:
         guidance = proposal.get("guidance")
         if not isinstance(guidance, str) or not guidance.strip():
             return False, "Model proposal guidance must be a non-empty string"
+        # 试验只注入前 SKILL_CONTENT_LIMIT 个字符；更长正文的尾部永远不会被评估，
+        # 因此直接拒绝，不把未经试验覆盖的内容晋升为已验证技能。
+        if len(guidance) > SKILL_CONTENT_LIMIT:
+            return False, "Model proposal guidance exceeds %d characters" % SKILL_CONTENT_LIMIT
         if not isinstance(proposal.get("triggers"), list):
             return False, "Model proposal triggers must be a list"
         return True, ""
@@ -639,8 +711,8 @@ class Evolution:
     def ablation_required(proposal):
         """策略候选同时写入可检索技能；引导与触发词都非空时两者才会共同生效。
 
-        triggers 为空的候选虽然也会写技能行，但检索永远不会命中，报告无从区分
-        两个模块，因此不排入消融，保留原来的 insufficient_evidence。
+        triggers 为空的候选不写技能行（检索永远不会命中），报告无从区分两个
+        模块，因此也不排入消融，保留原来的 insufficient_evidence。
         """
         if not isinstance(proposal, dict) or proposal.get("kind") not in ("strategy", "meta_strategy", "adapter"):
             return False
@@ -663,7 +735,7 @@ class Evolution:
         """构造候选提案对应的临时技能对象，用于初筛配对评估与受控消融。"""
         guidance = proposal.get("guidance", "") if isinstance(proposal, dict) else ""
         triggers = proposal.get("triggers", []) if isinstance(proposal, dict) else []
-        return {"content": str(guidance)[:2000],
+        return {"content": str(guidance)[:SKILL_CONTENT_LIMIT],
                 "evidence": {"candidate": candidate, "ablation": True},
                 "triggers": [trigger for trigger in triggers if isinstance(trigger, str)],
                 "created": time.time() if now is None else now}
@@ -836,19 +908,27 @@ class Evolution:
                     continue
                 target = root / "cases" / item["case"]
                 target.mkdir(parents=True)
-                snapshot(spec["repository"], target / "repository", spec["base"])
-                # bundle 只封存工作树文件：snapshot 写出的 .git 既含 origin 指向的宿主机
-                # suite 绝对路径（本地路径泄漏），又因不入 manifest 成为校验盲区，且
-                # 对象库白白增大包体。reproduce_bundle 只按 case.json 的 checks 执行，
-                # 不依赖 git 元数据，导出时整棵删除；删不干净即失败而不是照常导出。
-                sealed_tree(target / "repository")
+                # 同一个 tree 的抽中用例共用一份仓库基线：tree 哈希由 git 现算，
+                # N 份完全相同的检出只会让包体、清单和逐文件校验按样本数放大，
+                # 对校验没有增量信息。case.json 记相对路径指过去，接收方仍按
+                # 用例目录定位各自的树，不必猜包内固定目录名。
+                tree = git(spec["repository"], "rev-parse", spec["base"] + "^{tree}")
+                shared = root / "repositories" / tree
+                if not shared.exists():
+                    snapshot(spec["repository"], shared, spec["base"])
+                    # bundle 只封存工作树文件：snapshot 写出的 .git 既含 origin 指向的宿主机
+                    # suite 绝对路径（本地路径泄漏），又因不入 manifest 成为校验盲区，且
+                    # 对象库白白增大包体。reproduce_bundle 只按 case.json 的 checks 执行，
+                    # 不依赖 git 元数据，导出时整棵删除；删不干净即失败而不是照常导出。
+                    sealed_tree(shared)
                 if spec.get("overlay"):
                     scrub_tree(spec["overlay"])
                     shutil.copytree(spec["overlay"], target / "overlay", symlinks=True)
                     # overlay 是宿主机目录，同样可能自带 .git：留下会把宿主机路径带进
                     # 包体，并让 verify_bundle 把刚导出的包判为失效。
                     sealed_tree(target / "overlay")
-                spec = {**spec, "repository": "repository", "overlay": "overlay" if spec.get("overlay") else None}
+                spec = {**spec, "repository": Path(os.path.relpath(shared, target)).as_posix(),
+                        "overlay": "overlay" if spec.get("overlay") else None}
                 (target / "case.json").write_text(encode(spec), encoding="utf-8")
                 entry["exported"] = True
             if unsampled:
@@ -910,14 +990,20 @@ class Evolution:
         return {"valid": not mismatches, "mismatches": mismatches, "limitations": manifest.get("limitations", [])}
 
     @staticmethod
-    def reproduce_bundle(directory, env=None, which=None, required_credentials=None, run_checks=False):
+    def reproduce_bundle(directory, env=None, which=None, required_credentials=None, run_checks=False,
+                         timeout_seconds=None):
         """Inspect and verify offline reproduction readiness for a sealed bundle.
 
         Verifies input integrity, requires at least one exported case with every
         registered dataset case present, and itemizes all missing tool
         dependencies and credentials without failing fast on the first missing
         requirement.
+
+        ``timeout_seconds`` is the default budget for checks that do not declare
+        their own ``timeout_seconds``; it defaults to the evaluator's 300 s so a
+        check the evaluation side accepts is not killed early offline.
         """
+        import math
         import os
         import shutil
         import subprocess
@@ -1070,15 +1156,39 @@ class Evolution:
                 if error:
                     malformed_checks.append(f"Case {case_id}: checks[{i}] {error}")
 
+        # case.json 的 repository/overlay 是相对用例目录的路径。新包把同 tree 的
+        # 仓库基线去重到 repositories/<tree>/，旧包（"repository"）仍按用例目录
+        # 解析，两种布局都要能定位。解析结果必须留在 bundle 内：绝对路径、../
+        # 或符号链接把目录指到包外时一律当缺失，交给调用方记录失败，不读取包外内容。
+        def sealed_dir(case_entry, value, fallback):
+            value = value if isinstance(value, str) and value else fallback
+            try:
+                path = (case_entry / value).resolve()
+            except (OSError, RuntimeError):
+                return None
+            if root not in path.parents:
+                return None
+            return path if path.is_dir() else None
+
+        invalid_overlays = {}
+        for case_id, case_entry, spec in case_items:
+            declared = spec.get("overlay")
+            if declared is not None and (not isinstance(declared, str) or not declared
+                                         or sealed_dir(case_entry, declared, None) is None):
+                invalid_overlays[case_id] = "overlay is missing or escapes the bundle"
+
         # argv[0] 含路径分隔符且不是绝对路径时，subprocess 按检查 cwd（一次性副本
         # 内）解析，不是宿主 PATH 查询：必须到用例 repository/overlay 里定位。否则
         # 包内自带的 ./run.sh 会被 which() 按宿主进程当前目录判成缺工具，整包检查
         # 随之全部跳过，失败原因还会指向宿主环境。绝对路径仍指宿主文件，照旧处理。
-        def bundle_executable(case_entry, check, cmd):
+        def bundle_executable(case_entry, spec, check, cmd):
             relative = Path(check.get("cwd", ".")) / cmd
-            for base in ("overlay", "repository"):
+            for value, fallback in ((spec.get("overlay"), "overlay"),
+                                    (spec.get("repository"), "repository")):
+                root_dir = sealed_dir(case_entry, value, fallback)
+                if root_dir is None:
+                    continue
                 try:
-                    root_dir = (case_entry / base).resolve()
                     target = (root_dir / relative).resolve()
                 except (OSError, RuntimeError):
                     continue
@@ -1118,7 +1228,7 @@ class Evolution:
                 table = seen_bundle if bundled else seen_tools
                 if key not in table:
                     if bundled:
-                        found = bundle_executable(case_entry, check, cmd)
+                        found = bundle_executable(case_entry, spec, check, cmd)
                         if found:
                             info = {"name": cmd, "type": "bundle",
                                     "path": found.relative_to(root).as_posix(),
@@ -1239,15 +1349,53 @@ class Evolution:
             if msg not in repro_limitations:
                 repro_limitations.append(msg)
 
+        for case_id, error in invalid_overlays.items():
+            repro_limitations.append(f"Case {case_id}: {error}")
+
         # 5. Optional check execution
         # 检查命令在一次性临时副本上执行：先复制 repository，再把封存 overlay
         # 叠上去（与 evaluator 同一套 scrub + 符号链接拒绝语义），bundle 原文件保持不变。
+        # 每个检查的预算：用例声明 timeout_seconds 时按声明执行（evaluator 为派生
+        # 检查读取同一字段），未声明时沿用调用方缺省值。旧实现写死 60 s，会把评估侧
+        # 允许更久的编译/集成检查杀成 TimeExpired，得出与基线相反的假失败结论。
+        default_timeout = 300 if timeout_seconds is None else timeout_seconds
+
+        def clipped(value):
+            """失败行与成功行保持同一 stdout/stderr 形状；非文本异常输出记空串。"""
+            return value[:1000] if isinstance(value, str) else ""
+
+        def check_timeout(check):
+            """本检查的秒级预算；声明值非法时返回 None，由执行路径显式记失败。
+
+            评估侧直接 ``check.get("timeout_seconds", 300)`` 交给进程层，离线复现
+            必须读同一字段，否则声明为 1 s 的检查会跑满整个旧 60 s 上限还判通过。
+            """
+            value = check.get("timeout_seconds", default_timeout)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            if not math.isfinite(value) or value <= 0:
+                return None
+            return value
+
         executed_checks = []
         if run_checks and integrity.get("valid") and not missing_tools and not missing_bundle:
             import tempfile
             for case_id, case_entry, spec in case_items:
-                repo_dir = case_entry / "repository"
-                overlay_dir = case_entry / "overlay"
+                repo_dir = sealed_dir(case_entry, spec.get("repository"), "repository")
+                overlay_dir = sealed_dir(case_entry, spec.get("overlay"), "overlay")
+                if case_id in invalid_overlays:
+                    executed_checks.append({
+                        "case": case_id, "check": None, "argv": [],
+                        "exit_code": -1, "passed": False, "error": invalid_overlays[case_id],
+                    })
+                    continue
+                if repo_dir is None:
+                    executed_checks.append({
+                        "case": case_id, "check": None, "argv": [],
+                        "exit_code": -1, "passed": False,
+                        "error": "repository is missing or escapes the bundle",
+                    })
+                    continue
                 staging_tmp = None
                 try:
                     staging_tmp = tempfile.mkdtemp(prefix="bundle-check-")
@@ -1259,7 +1407,7 @@ class Evolution:
                     overlay_applied = False
                     try:
                         shutil.copytree(repo_dir, staging, symlinks=True)
-                        if overlay_dir.is_dir():
+                        if overlay_dir is not None:
                             scrub_tree(overlay_dir)
                             for parent, dirs, files in os.walk(overlay_dir, followlinks=False):
                                 for name in files:
@@ -1292,6 +1440,19 @@ class Evolution:
                         if not isinstance(check, dict) or check_spec_error(check):
                             continue
                         argv = check.get("argv")
+                        timeout = check_timeout(check)
+                        if timeout is None:
+                            executed_checks.append({
+                                "case": case_id,
+                                "check": check.get("name"),
+                                "argv": argv,
+                                "exit_code": -1,
+                                "passed": False,
+                                "overlay_applied": overlay_applied,
+                                "timeout_seconds": check.get("timeout_seconds", default_timeout),
+                                "error": "timeout_seconds must be a positive finite number of seconds",
+                            })
+                            continue
                         declared_cwd = check.get("cwd", ".")
                         cwd = (staging / declared_cwd).resolve()
                         # 声明的 cwd 缺失、不是目录或经符号链接逃出一次性副本时，
@@ -1317,7 +1478,7 @@ class Evolution:
                                 cwd=cwd,
                                 capture_output=True,
                                 text=True,
-                                timeout=60,
+                                timeout=timeout,
                                 env=env_dict,
                             )
                             executed_checks.append({
@@ -1328,10 +1489,13 @@ class Evolution:
                                 "exit_code": proc.returncode,
                                 "passed": proc.returncode == 0,
                                 "overlay_applied": overlay_applied,
+                                "timeout_seconds": timeout,
                                 "stdout": proc.stdout[:1000],
                                 "stderr": proc.stderr[:1000],
                             })
                         except Exception as exc:
+                            # 失败行也保留 stdout/stderr 键：超时异常会带上被杀前
+                            # 的部分输出，调用方不必区分成功/失败两种形状。
                             executed_checks.append({
                                 "case": case_id,
                                 "check": check.get("name"),
@@ -1340,6 +1504,9 @@ class Evolution:
                                 "exit_code": -1,
                                 "passed": False,
                                 "overlay_applied": overlay_applied,
+                                "timeout_seconds": timeout,
+                                "stdout": clipped(getattr(exc, "stdout", "")),
+                                "stderr": clipped(getattr(exc, "stderr", "")),
                                 "error": str(exc),
                             })
                 except Exception as exc:
@@ -1371,6 +1538,7 @@ class Evolution:
             len(missing_creds) == 0 and
             credential_limitation is None and
             len(malformed_checks) == 0 and
+            len(invalid_overlays) == 0 and
             checks_passed is not False
         )
 
@@ -1545,7 +1713,8 @@ class Evolution:
                           "overlay": self.overlay_digest(overlay) if spec and overlay_available(overlay) else None,
                           "active": spec.get("active", True) if spec else None,
                           "available": spec.get("available", True) if spec else None})
-        return fingerprint({"build": BUILD_ID, "limits": config["limits"],
+        limits = {key: config["limits"].get(key) for key in EXPERIMENT_LIMITS}
+        return fingerprint({"build": BUILD_ID, "limits": limits,
             "observations": inputs["observations"], "failures": inputs["failures"],
             "development": inputs["development"],
             "strategies": [{"id": c["id"], "kind": c["kind"], "content": c["content"]} for c in inputs["current"]],
@@ -1704,8 +1873,14 @@ class Evolution:
         # 新鲜 holdout 已经在上面单独筛出，分层抽样只作用于这组未曝光样本。抽样先于封存：
         # 封存清单仍记录 eligible 全集供导出与审计，但逐项标记是否实际执行，执行期校验
         # 只约束抽中样本，未抽中项的漂移只计入 unsampled_mismatches 与晋升评审限制。
-        selection = {"validation": select_cases(validation_cases, minimum, run["id"]),
-                     "holdout": select_cases(fresh_holdout, minimum, run["id"])}
+        selection_seed = run["id"]
+        selection = {"validation": select_cases(validation_cases, minimum, selection_seed),
+                     "holdout": select_cases(fresh_holdout, minimum, selection_seed)}
+        # `uses` 是层内排序主键：只记录抽中样本会让「按策略抽样」与「人工挑选」在封存
+        # 证据里无法区分；同时记录 seed 与 eligible 全集的 (id, stratum, uses) 供复算。
+        selection_population = {split: [{"id": case["id"], "stratum": list(case_stratum(case)),
+                                         "uses": case["uses"]} for case in rows]
+                                for split, rows in (("validation", validation_cases), ("holdout", fresh_holdout))}
         sampled_ids = {case["id"] for rows in selection.values() for case in rows}
         manifest = []
         for case in cases:
@@ -1784,10 +1959,11 @@ class Evolution:
             "SELECT count(*) AS n FROM candidates WHERE project=? AND kind=? AND "
             "json_valid(evidence) AND json_extract(evidence,'$.compatibility')=?",
             (project["id"], proposal["kind"], evidence["compatibility"]))["n"] + 1
-        plan = {"version": 2, "created": time.time(), "repeats": config["evolution"]["repeats"],
+        plan = {"version": 3, "created": time.time(), "repeats": config["evolution"]["repeats"],
                 "metric": "independent_case_family_paired_pass", "max_cost_ratio": config["evolution"]["max_cost_ratio"],
                 "stop_rules": ["validation_failure", "cancelled", "resource_budget", "complete_planned_trials"],
                 "selection_policy": "traffic_weighted_min_one_per_stratum",
+                "selection_seed": selection_seed, "selection_population": selection_population,
                 "allocation": {split: {"requested": minimum, "population": len(rows),
                                        "strata": case_allocation(rows, selection[split])}
                                for split, rows in (("validation", validation_cases), ("holdout", fresh_holdout))},
@@ -1805,6 +1981,7 @@ class Evolution:
                                 "sampling": "validation inputs with a demonstrated joint gain",
                                 "limit": config["evolution"].get("ablation_cases", 0)}
         evidence["preregistered_plan"] = {"data": plan, "sha256": fingerprint(plan)}
+        evidence["selection_verification"] = self.verify_selection(plan)
         evidence["promotion_review"] = {
             "baseline": current, "proposal": proposal, "experiment": candidate,
             "changed_kind": proposal["kind"], "plan_hash": fingerprint(plan),
@@ -1871,11 +2048,21 @@ class Evolution:
             evidence["plan_verification"] = self.verify_plan(evidence["preregistered_plan"], evidence["trials"])
             if not evidence["plan_verification"]["valid"]:
                 evidence.update(decision="insufficient_evidence", reason="Preregistered trial plan is incomplete or changed")
+            evidence["selection_verification"] = self.verify_selection(evidence["preregistered_plan"]["data"])
+            if not evidence["selection_verification"]["valid"]:
+                evidence.update(decision="insufficient_evidence",
+                                reason="Sealed sample cannot be reproduced from the recorded selection population")
             evidence["input_verification"] = self.verify_inputs(project["id"], manifest)
             if not evidence["input_verification"]["valid"]:
                 evidence.update(decision="insufficient_evidence", reason="Sealed experiment inputs changed during execution")
             drifted = evidence["input_verification"].get("unsampled_mismatches") or []
             review = evidence.get("promotion_review")
+            if isinstance(review, dict):
+                review["selection_verification"] = evidence["selection_verification"]
+                if not evidence["selection_verification"]["valid"]:
+                    review.setdefault("limitations", []).append(
+                        "The sealed sample cannot be reproduced from the recorded population; "
+                        "whether it followed the selection policy is unverifiable")
             if drifted and isinstance(review, dict):
                 review.setdefault("limitations", []).append(
                     "Sealed cases not selected for execution changed during the experiment; "
@@ -1914,8 +2101,9 @@ class Evolution:
                     with self.store.connect() as db:
                         db.execute("BEGIN IMMEDIATE")
                         self.activate(db, candidate, promoted, evidence)
-                        db.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
-                                   self.skill_values(project["id"], candidate, proposal, config, promoted))
+                        skill = self.promoted_skill(project["id"], candidate, proposal, config, promoted)
+                        if skill is not None:
+                            db.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)", skill)
                 self.store.event("promotion", "Candidate passed paired validation and holdout; limited operational monitoring started",
                                  project["id"], run["id"], {"candidate": candidate})
                 state = "stable"
@@ -1953,12 +2141,30 @@ class Evolution:
 
     @staticmethod
     def skill_values(project, candidate, content, config, now):
-        """自动晋升与手动晋升写同一种已验证技能，避免两条路径产生不同字段。"""
+        """自动晋升与手动晋升写同一种已验证技能，避免两条路径产生不同字段。
+
+        正文与 candidate_skill 使用同一上限：试验只覆盖前 SKILL_CONTENT_LIMIT 个
+        字符，写库也就只写这一段（历史候选可能超过该上限，不能被标成整段已验证）。
+        """
         triggers = content.get("triggers", []) if isinstance(content, dict) else []
         guidance = content.get("guidance", "") if isinstance(content, dict) else ""
-        return (uid(), project, None, "verified", encode(triggers), guidance,
+        triggers = [trigger for trigger in triggers if isinstance(trigger, str)] if isinstance(triggers, list) else []
+        return (uid(), project, None, "verified", encode(triggers), str(guidance)[:SKILL_CONTENT_LIMIT],
                 encode({"candidate": candidate, "config_hash": fingerprint(config)}),
                 now + 30 * 86400, now)
+
+    @classmethod
+    def promoted_skill(cls, project, candidate, content, config, now):
+        """晋升时写入的技能行；没有可检索触发词时返回 None，不写 verified 技能。
+
+        与 ablation_required 一致：triggers 全为空（或只含空白）的候选永远不会被
+        runtime.memories 检索到，写入 verified 行只会多加一条无法审计效果的技能
+        记录并污染「已验证技能数」统计；策略晋升本身不受影响。
+        """
+        triggers = content.get("triggers", []) if isinstance(content, dict) else []
+        if not isinstance(triggers, list) or not any(isinstance(trigger, str) and trigger.strip() for trigger in triggers):
+            return None
+        return cls.skill_values(project, candidate, content, config, now)
 
     def promote(self, candidate):
         """启用一个已通过配对验证但等待人工确认的候选。"""
@@ -1969,11 +2175,41 @@ class Evolution:
             raise ValueError("Project not found")
         config = self.runtime.config(row["project"])
         now = time.time()
+        try:
+            preflight = json.loads(row["evidence"] or "{}")
+        except (TypeError, ValueError):
+            preflight = {}
+        if not isinstance(preflight, dict):
+            preflight = {}
+        # 手动晋升与自动晋升同一口径：人工复核可能隔很久，期间用例被退休/改分级、
+        # overlay 被清理或仓库被重建。这里重算封存 manifest（含 git tree），必须在
+        # 写事务之前完成，避免持锁执行外部命令；老证据没有 manifest 时保持原有行为。
+        dataset = preflight.get("dataset")
+        manifest = dataset.get("manifest") if isinstance(dataset, dict) else None
+        preflight_project, preflight_evidence = row["project"], row["evidence"]
+        case_rows = ({item["case"]: self.store.one(
+            "SELECT spec,split,family FROM cases WHERE id=? AND project=?", (item["case"], preflight_project))
+                      for item in manifest} if isinstance(manifest, list) and manifest else {})
+        input_verification = (self.verify_inputs(preflight_project, manifest, case_rows)
+                              if case_rows else None)
+        if input_verification and input_verification["mismatches"]:
+            raise ValueError("Sealed experiment inputs changed since evaluation: " + ", ".join(
+                item["case"] + " (" + ", ".join(item["fields"]) + ")"
+                for item in input_verification["mismatches"]))
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM candidates WHERE id=?", (candidate,)).fetchone()
             if not row:
                 raise ValueError("Candidate not found")
+            if row["project"] != preflight_project or row["evidence"] != preflight_evidence:
+                raise ValueError("Candidate evidence changed during input verification; retry promotion")
+            # 只在事务内比较数据库快照，不在写锁内执行 git 或扫描 overlay。
+            for case, before in case_rows.items():
+                current = db.execute("SELECT spec,split,family FROM cases WHERE id=? AND project=?",
+                                     (case, preflight_project)).fetchone()
+                if (tuple(current) if current else None) != (
+                        tuple(before[key] for key in ("spec", "split", "family")) if before else None):
+                    raise ValueError("Sealed experiment inputs changed during verification; retry promotion")
             if row["status"] != "ready":
                 raise ValueError("Only a verified ready candidate can be promoted")
             if not db.execute("SELECT id FROM projects WHERE id=?", (row["project"],)).fetchone():
@@ -1992,16 +2228,36 @@ class Evolution:
             if not isinstance(sealed_evidence, dict):
                 sealed_evidence = {}
             if sealed_evidence.get("preregistered_plan"):
-                verification = self.verify_plan(sealed_evidence["preregistered_plan"], sealed_evidence.get("trials", []))
+                plan = sealed_evidence["preregistered_plan"]
+                verification = self.verify_plan(plan, sealed_evidence.get("trials", []))
                 if not verification["valid"] or not sealed_evidence.get("final_review", {}).get("fresh"):
                     raise ValueError("Candidate lacks complete sealed trials and fresh final review")
+                # 新版计划必须能从记录的总体复算抽样；旧证据没有 population 时保持可晋升，
+                # 由 selection_verification 如实记录无法复算的原因。
+                selection = self.verify_selection(plan.get("data", {}) if isinstance(plan, dict) else {})
+                sealed = plan.get("data", {}) if isinstance(plan, dict) else {}
+                if isinstance(sealed, dict) and sealed.get("selection_seed") and not selection["valid"]:
+                    raise ValueError("Candidate selection cannot be reproduced from the sealed population")
             expected = sealed_evidence.get("compatibility")
             if expected and expected != compatibility(config):
                 raise ValueError("Candidate evidence is incompatible with current configuration")
-            # 与自动晋升一致：同项目同类型的旧稳定版让位，候选保留原有证据。
-            self.activate(db, candidate, now)
-            db.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
-                       self.skill_values(row["project"], candidate, content, config, now))
+            drifted = (input_verification or {}).get("unsampled_mismatches") or []
+            if drifted:
+                # 未抽中项漂移只留档，不作废整轮证据（与自动晋升 1579-1585 同口径）。
+                sealed_evidence["input_verification"] = input_verification
+                review = sealed_evidence.get("promotion_review")
+                if isinstance(review, dict):
+                    review.setdefault("limitations", []).append(
+                        "Sealed cases not selected for execution changed before manual promotion; "
+                        "recorded in input_verification.unsampled_mismatches: "
+                        + ", ".join(sorted(item["case"] for item in drifted)))
+                self.activate(db, candidate, now, sealed_evidence)
+            else:
+                # 与自动晋升一致：同项目同类型的旧稳定版让位，候选保留原有证据。
+                self.activate(db, candidate, now)
+            skill = self.promoted_skill(row["project"], candidate, content, config, now)
+            if skill is not None:
+                db.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)", skill)
         self.store.event("promotion", "Ready candidate manually promoted; limited operational monitoring started",
                          row["project"], data={"candidate": candidate})
         return {"candidate": candidate, "status": "stable"}
@@ -2101,6 +2357,7 @@ class Evolution:
         if is_terminal or plan_changed or "win_rate" not in evidence:
             if plan:
                 evidence["plan_verification"] = self.verify_plan(plan, trials)
+                evidence["selection_verification"] = self.verify_selection(plan.get("data", {}) if isinstance(plan, dict) else {})
                 if status == "evaluating" and not evidence["plan_verification"]["valid"]:
                     evidence["plan_verification"]["analysis"] = "planned_in_progress"
             evidence["win_rate"] = paired_summary(trials)
@@ -2152,25 +2409,41 @@ class Evolution:
             return None
         return digest.hexdigest()
 
-    def monitor(self, project, passed, run=None, attributable=False):
-        config = self.runtime.config(project)
-        if not run or not (passed or attributable):
+    def monitor(self, project, passed, run=None, attributable=False, db=None, config=None):
+        if config is None:
+            config = self.runtime.config(project)
+        if not run:
             return
-        recorded = self.store.one("SELECT strategy,config FROM runs WHERE id=? AND project=?", (run["id"], project))
-        if not recorded:
-            return
-        active = {c["id"] for c in json.loads(recorded["strategy"] or "[]") if c.get("id")}
-        if not passed and len(active) != 1:
-            self.store.event("strategy_inconclusive", "Regression cannot be attributed to a single strategy; no automatic rollback",
-                             project, run["id"], {"strategies": sorted(active)})
-            return
-        for row in self.store.query("SELECT * FROM candidates WHERE project=? AND status='stable'", (project,)):
-            if row["id"] not in active:
-                continue
-            with self.store.connect() as db:
+        with (contextlib.nullcontext(db) if db is not None else self.store.connect()) as db:
+            if not db.in_transaction:
                 db.execute("BEGIN IMMEDIATE")
-                current = db.execute("SELECT evidence FROM candidates WHERE id=? AND status='stable'", (row["id"],)).fetchone()
+            recorded = db.execute("SELECT strategy,config FROM runs WHERE id=? AND project=?", (run["id"], project)).fetchone()
+            if not recorded:
+                return
+            # 记录生成时间：候选可能被重新晋升成同 id 的新一代，回滚必须对得上具体一代。
+            active = {c["id"]: c.get("_candidate_created")
+                      for c in json.loads(recorded["strategy"] or "[]")
+                      if isinstance(c, dict) and c.get("id")}
+            shared = len(active) > 1
+            if not passed and not attributable and not shared:
+                return
+            if not passed and len(active) != 1:
+                event = {"strategies": sorted(active)}
+                if shared:
+                    event["attribution"] = "shared"
+                db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                           (project, run["id"], "strategy_inconclusive",
+                            "Regression cannot be attributed to a single strategy; no automatic rollback",
+                            encode(event), time.time()))
+            for row in db.execute("SELECT * FROM candidates WHERE project=? AND status='stable'", (project,)).fetchall():
+                if row["id"] not in active:
+                    continue
+                current = db.execute("SELECT evidence,created FROM candidates WHERE id=? AND status='stable'",
+                                     (row["id"],)).fetchone()
                 if not current:
+                    continue
+                expected_created = active[row["id"]]
+                if expected_created is not None and current["created"] != expected_created:
                     continue
                 try:
                     evidence = json.loads(current["evidence"] or "{}")
@@ -2189,6 +2462,40 @@ class Evolution:
                 monitor = evidence.setdefault("monitor", {"passed": 0, "failed": 0})
                 seen = monitor.setdefault("runs", [])
                 if run["id"] in seen:
+                    # Aggregate counts prove the attribution even when this run was
+                    # already counted. Do not infer it from a truncated run list.
+                    failed = monitor.get("failed")
+                    shared_failed = monitor.get("shared_failed")
+                    drift = evidence.get("drift")
+                    if (type(failed) is int and type(shared_failed) is int
+                            and failed > 0 and 0 < shared_failed <= failed):
+                        attribution = "shared" if shared_failed == failed else "mixed"
+                        monitor["attribution"] = attribution
+                        if isinstance(drift, dict):
+                            drift["attribution"] = attribution
+                        db.execute("UPDATE candidates SET evidence=? WHERE id=? AND status='stable'",
+                                   (encode(evidence), row["id"]))
+                    # Only repair the last recorded attributable failure, and never undo
+                    # a later deliberate restoration of a candidate already rolled back.
+                    drift = evidence.get("drift")
+                    checked = monitor.get("last_checked")
+                    if (not passed and not shared and monitor.get("last_run") == run["id"]
+                            and isinstance(checked, (int, float)) and isinstance(drift, dict)
+                            and drift.get("reason") == "Attributable operational regression"):
+                        events = db.execute("SELECT data FROM events WHERE project=? AND kind='rollback' AND created>=?",
+                                            (project, checked)).fetchall()
+                        already_rolled_back = False
+                        for event in events:
+                            try:
+                                data = json.loads(event["data"] or "{}")
+                            except (TypeError, ValueError):
+                                continue
+                            if isinstance(data, dict) and data.get("candidate") == row["id"]:
+                                already_rolled_back = True
+                                break
+                        if not already_rolled_back:
+                            self._rollback_in_transaction(db, row["id"], self._compat_for(config),
+                                                          active.get(row["id"]))
                     continue
                 sentinel = monitor["passed"] >= config["evolution"]["monitor_tasks"]
                 # Continue observing attributable failures indefinitely. Successful
@@ -2204,6 +2511,17 @@ class Evolution:
                 if sentinel:
                     monitor["success_sample_rate"] = success_rate
                 monitor["passed" if passed else "failed"] += 1
+                if not passed and shared:
+                    monitor["shared_failed"] = monitor.get("shared_failed", 0) + 1
+                # Attribution describes the cumulative failures, not just the latest run.
+                shared_failed = monitor.get("shared_failed", 0)
+                if shared_failed:
+                    attribution = "shared" if shared_failed == monitor["failed"] else "mixed"
+                elif monitor["failed"]:
+                    attribution = "single"
+                else:
+                    attribution = "shared" if shared else "single"
+                monitor["attribution"] = attribution
                 if sentinel and passed:
                     monitor["sampled_passed"] = monitor.get("sampled_passed", 0) + 1
                 monitor["last_run"] = run["id"]
@@ -2221,41 +2539,92 @@ class Evolution:
                     total = monitor["passed"] + monitor["failed"]
                     pass_ratio = monitor["passed"] / total if total else 1.0
                 if not passed or pass_ratio < 0.8:
-                    drift = {"state": "watch", "phase": monitor["phase"],
-                             "reason": "Attributable operational regression" if not passed else "Observed pass ratio below 0.8",
-                             "passed": monitor["passed"], "failed": monitor["failed"]}
+                    if not passed:
+                        reason = ("Shared operational regression; no automatic rollback" if shared
+                                  else "Attributable operational regression")
+                    else:
+                        reason = "Observed pass ratio below 0.8"
+                    drift = {"state": "watch", "phase": monitor["phase"], "reason": reason,
+                             "passed": monitor["passed"], "failed": monitor["failed"],
+                             "attribution": attribution}
                     if sentinel:
                         drift.update({"sampled": True, "success_sample_rate": success_rate,
                                       "sampled_passed": monitor.get("sampled_passed", 0),
                                       "unbiased_pass_ratio": round(pass_ratio, 4)})
                     evidence["drift"] = drift
+                elif isinstance(evidence.get("drift"), dict) and monitor["failed"]:
+                    # Preserve historical drift details while correcting its aggregate attribution.
+                    evidence["drift"]["attribution"] = attribution
                 db.execute("UPDATE candidates SET evidence=? WHERE id=? AND status='stable'", (encode(evidence), row["id"]))
-            if not passed:
-                self.rollback(row["id"])
+                if not passed and not shared:
+                    self._rollback_in_transaction(db, row["id"], self._compat_for(config),
+                                                  active.get(row["id"]))
 
-    def rollback(self, candidate):
+    @staticmethod
+    def _compat_for(config):
+        """配置不完整时（部分测试/降级调用）按未知兼容性处理，不阻断回滚。"""
+        try:
+            return compatibility(config)
+        except (KeyError, TypeError):
+            return None
+
+    def _rollback_in_transaction(self, db, candidate, current=None, expected_created=None):
+        row = db.execute("SELECT * FROM candidates WHERE id=?", (candidate,)).fetchone()
+        if not row:
+            raise ValueError("Candidate not found")
+        if expected_created is not None and row["created"] != expected_created:
+            # 候选已被新一代替换：这一代的失败证据不再适用于当前生效的策略。
+            return
+        if row["status"] == "rolled_back":
+            return
+        if row["status"] != "stable":
+            raise ValueError("Only an active strategy can be rolled back")
+        db.execute("UPDATE candidates SET status='rolled_back' WHERE id=?", (candidate,))
+        restored = self.restore_parent(db, row["parent"], current)
+        for skill in db.execute("SELECT id,evidence FROM skills WHERE project=? AND status='verified'", (row["project"],)).fetchall():
+            try:
+                skill_evidence = json.loads(skill["evidence"] or "{}")
+            except (TypeError, ValueError):
+                skill_evidence = {}
+            if isinstance(skill_evidence, dict) and skill_evidence.get("candidate") == candidate:
+                db.execute("UPDATE skills SET status='invalidated' WHERE id=?", (skill["id"],))
+        db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                   (row["project"], None, "rollback", self.ROLLBACK_MESSAGES[restored["outcome"]],
+                    encode({"candidate": candidate, **restored}), time.time()))
+
+    def restore_parent(self, db, parent, current):
+        """把被替换的父候选恢复为 stable；只有它能在 active_strategies 中生效时才恢复。
+
+        可见性规则与 Runtime.active_strategies 一致：封存指纹存在时必须匹配当前配置，
+        证据或内容无法解析的候选同样不可见。不匹配时保留候选并置为 ready，供用户改回
+        配置后显式重新启用，而不是恢复一个静默失效的 stable。
+        """
+        if not parent:
+            return {"outcome": "rollback_without_parent"}
+        row = db.execute("SELECT content,evidence FROM candidates WHERE id=?", (parent,)).fetchone()
+        if not row:
+            return {"parent": parent, "outcome": "rollback_missing_parent"}
+        evidence, content = decode_object(row["evidence"]), decode_object(row["content"])
+        sealed = evidence.get("compatibility")
+        detail = {"parent": parent, "parent_compatibility": sealed, "current_compatibility": current}
+        if evidence.get("evidence_error") or content.get("evidence_error"):
+            return {**detail, "outcome": "rollback_unreadable_parent"}
+        if sealed and sealed != current:
+            db.execute("UPDATE candidates SET status='ready' WHERE id=?", (parent,))
+            return {**detail, "outcome": "rollback_incompatible_parent"}
+        db.execute("UPDATE candidates SET status='stable' WHERE id=?", (parent,))
+        return {**detail, "outcome": "restored"}
+
+    def rollback(self, candidate, expected_created=None):
+        # 恢复父候选前要按当前配置核对它的封存指纹；配置在事务外读取，避免持有
+        # BEGIN IMMEDIATE 写事务时再从连接池借一条连接。
+        row = self.store.one("SELECT project,parent FROM candidates WHERE id=?", (candidate,))
+        if not row:
+            raise ValueError("Candidate not found")
+        current = compatibility(self.runtime.config(row["project"])) if row["parent"] else None
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM candidates WHERE id=?", (candidate,)).fetchone()
-            if not row:
-                raise ValueError("Candidate not found")
-            if row["status"] == "rolled_back":
-                # 重复回滚是幂等操作；监控线程与用户操作并发时不产生误导性错误事件。
-                return
-            if row["status"] != "stable":
-                raise ValueError("Only an active strategy can be rolled back")
-            db.execute("UPDATE candidates SET status='rolled_back' WHERE id=?", (candidate,))
-            if row["parent"]:
-                db.execute("UPDATE candidates SET status='stable' WHERE id=?", (row["parent"],))
-            # Roll back learned instructions as well as the strategy pointer.
-            for skill in db.execute("SELECT id,evidence FROM skills WHERE project=? AND status='verified'", (row["project"],)).fetchall():
-                try:
-                    skill_evidence = json.loads(skill["evidence"] or "{}")
-                except (TypeError, ValueError):
-                    skill_evidence = {}
-                if isinstance(skill_evidence, dict) and skill_evidence.get("candidate") == candidate:
-                    db.execute("UPDATE skills SET status='invalidated' WHERE id=?", (skill["id"],))
-        self.store.event("rollback", "Restored previous stable strategy and invalidated its learned skill", row["project"], data={"candidate": candidate})
+            self._rollback_in_transaction(db, candidate, current, expected_created)
 
 
 reproduce_bundle = Evolution.reproduce_bundle

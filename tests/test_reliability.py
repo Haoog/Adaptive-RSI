@@ -772,6 +772,31 @@ class ReliabilityTest(unittest.TestCase):
                          {"state": "collected", "bytes": len(content), "sha256": "a" * 64})
         self.assertEqual(cached["artifacts"]["coverage.xml"], {"state": "rejected", "reason": "symlink"})
 
+    def test_early_refusal_evaluations_persist_their_report(self):
+        # 行内摘要只保留 decision 与 report.json 链接；提前返回也必须落盘，
+        # 否则 no-checks 与无法证明变更来源时的 reason/provenance 会永久丢失。
+        evaluator = Evaluator(self.store)
+        config = self.runtime.config(self.project)
+        empty = self.root / "no-checks"
+        result = evaluator.evaluate(self.repo, self.repo, [], empty, config)
+        self.assertEqual(result["decision"], "insufficient_evidence")
+        report = json.loads((empty / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual((report["decision"], report["reason"], report["checks"]),
+                         ("insufficient_evidence", result["reason"], {}))
+
+        test_first = self.root / "test-first"
+        evaluator.evaluate(self.repo, self.repo, CHECKS, test_first, config, test_first=True,
+                           changed_files=["calculator.py", "pyproject.toml", "tests/test_behavior.py"])
+        report = json.loads((test_first / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["decision"], "insufficient_evidence")
+        self.assertIn("test harness", report["reason"])
+
+        provenance = self.root / "unavailable-provenance"
+        result = evaluator.evaluate(self.repo, self.repo, CHECKS, provenance, config, changed_files=False)
+        report = json.loads((provenance / "report.json").read_text(encoding="utf-8"))
+        self.assertFalse(report["changed_files_available"])
+        self.assertEqual(report["reason"], result["reason"])
+
     def test_test_first_evaluation_blocks_changed_harness_before_running_checks(self):
         evaluator = Evaluator(self.store)
         with patch.object(evaluator, "_execution_environment", return_value=(self.runtime.config(self.project), None)), \
@@ -1092,6 +1117,59 @@ class ReliabilityTest(unittest.TestCase):
         self.assertIsNone(outcome)
         self.assertFalse(evaluate.called)
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "obsolete")
+
+    def test_missing_acceptance_checks_is_a_host_hold_not_an_empty_trial(self):
+        """无验收检查是宿主侧早退：实验要返回真实原因，不能记成“模型没有改动”。"""
+        from adaptive_rsi import pipeline
+        bare = self.root / "bare"
+        bare.mkdir()
+        git(bare, "init", "--quiet")
+        (bare / "notes.txt").write_text("no manifest and no discoverable checks\n")
+        git(bare, "add", ".")
+        git(bare, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "--quiet", "-m", "bare")
+        project_id = self.runtime.add_project(bare)
+        self.runtime.configure({"checks": [], "limits": {"retries": 0}, "evolution": {"enabled": False}}, project_id)
+        self.runtime.pause(project_id, False)
+        project = self.runtime.project(project_id)
+        task_id = self.runtime.goal(project_id, "Fix addition")
+        task = self.store.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        run = self.store.claim(project_id, self.runtime.config(project_id))
+        base = git(project["path"], "rev-parse", "HEAD")
+        directory = self.root / "no-checks"
+        workspace = snapshot(project["path"], directory / "workspace", base)
+        trial = self.runtime.new_trial_context(run)
+        ready = {"ready": True, "items": []}
+        with patch("adaptive_rsi.readiness.inspect", return_value=ready):
+            outcome = pipeline.execute_candidate(
+                self.runtime, trial, project, task, project["path"], base, directory, workspace,
+                [], experiment=True)
+        # 实验早退返回决策字典，原因来自宿主侧，no_change 不参与映射。
+        self.assertEqual(outcome["decision"], "insufficient_evidence")
+        self.assertIn("acceptance checks", outcome["reason"])
+        self.assertNotIn("no_change", outcome)
+        with patch("adaptive_rsi.readiness.inspect", return_value=ready):
+            production = pipeline.execute_candidate(
+                self.runtime, run, project, task, project["path"], base,
+                self.root / "no-checks-production", workspace, [])
+        # 生产路径语义不变：仍然是 None，run 以 insufficient_evidence 收尾。
+        self.assertIsNone(production)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"],
+                         "insufficient_evidence")
+        # 试验账本把这次早退记成宿主侧保留，而不是“模型没有改动”。
+        # 账本早退发生在规划之后，仍需真实 case 记录满足曝光上限。
+        case_id = "case-no-checks"
+        self.store.execute("INSERT INTO cases VALUES (?,?,?,?,?,?,?)",
+                           (case_id, project_id, "no-checks", "validation",
+                            encode({"task": "Fix addition", "base": base, "checks": []}), 0, time.time()))
+        with patch("adaptive_rsi.readiness.inspect", return_value=ready):
+            mapped = Evolution(self.runtime).run_configuration(
+                {**run, "task": task_id}, project, {"id": case_id, "family": "no-checks", "split": "validation"},
+                {"task": "Fix addition", "base": base, "checks": [], "repository": str(bare), "overlay": None},
+                "candidate", 0, [], self.root / "mapped", "candidate", self.runtime.config(project_id))
+        self.assertFalse(mapped["pass"])
+        self.assertFalse(mapped["no_change"])
+        self.assertIn("acceptance checks", mapped["reason"])
+        self.assertNotEqual(mapped["reason"], "No change")
 
     def scope_agent(self, implementation, scope=("src",), change_kind="refactor"):
         """计划范围固定为窄目录，实现模型在工作区直接执行给定的文件动作。"""

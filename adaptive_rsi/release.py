@@ -92,7 +92,8 @@ def automation_state_flag(data, name, policy=None):
 RERUN_CONFIRM_SECONDS = 300
 RECONCILIATION_UNKNOWN = {"dispatch_unknown", "rerun_unknown", "reconciliation_blocked"}
 # 活动回执连续对账失败的上限。达到后转入 reconciliation_blocked：停止自动轮询、
-# 只保留一条错误事件，但仍允许只读的人工对账与关闭入口。
+# 只保留一条错误事件，但仍允许只读的人工对账与关闭入口。派发前（尚未产生任何
+# 远端副作用）的永久失败同样受该预算约束，达到上限后转入 failed 并等待人工 retry。
 ADVANCE_FAILURE_LIMIT = 3
 # 目标被非终态回执占用超过该时限后，等待中的新部署转 blocked 并指出阻塞它的
 # run；只释放等待者的队列位置，不会自动接管仍活跃的部署。
@@ -140,15 +141,25 @@ class ReconciliationRejected(ValueError):
     """A fixed, user-safe refusal for manual workflow reconciliation."""
 
 
+# GitHub 的临时拒绝文案：secondary limit 用 "rate limit"，滥用检测不带该词。
+RATE_LIMIT_TERMS = ("rate limit", "abuse detection")
+
+
 class ApiRejected(RuntimeError):
     """GitHub explicitly rejected a request before accepting its side effect."""
 
-    def __init__(self, message, status, local=False):
+    def __init__(self, message, status, local=False, transient=False, retry_after=None):
         super().__init__(message)
         self.status = status
         # True 表示本机限流冷却在 `gh` 发出请求之前就拦下了它：GitHub 没有看到
         # 这次调用，也就谈不上拒绝，调用方应把它当成可自动重试的本地等待。
         self.local = local
+        # True 表示拒绝只是临时的（本地冷却、429、403 限流）：等待后可以重试，
+        # 不能当成「永久失败」消耗在途回执的失败预算。
+        text = str(message).lower()
+        self.transient = bool(local or transient or status == 429 or
+                              status == 403 and any(term in text for term in RATE_LIMIT_TERMS))
+        self.retry_after = retry_after
 
 
 _API_BACKOFF = {}
@@ -157,10 +168,12 @@ API_COOLDOWN_SECONDS = 60
 
 def api(repo, endpoint, method="GET", fields=None):
     # Never sleep in the scheduler or automatically replay a write. All callers
-    # of this transport share the primary/secondary limit cooldown.
-    retry_at = _API_BACKOFF.get("github.com", 0)
+    # of this transport share the primary/secondary limit cooldown, scoped to the
+    # repository that hit it: one project's limit must not freeze every project.
+    retry_at = _API_BACKOFF.get(repo, 0)
     if time.monotonic() < retry_at:
-        raise ApiRejected("GitHub rate limit cooldown active; request was not sent", 429, local=True)
+        raise ApiRejected("GitHub rate limit cooldown active; request was not sent", 429, local=True,
+                          retry_after=max(1, round(retry_at - time.monotonic())))
     path = "repos/" + repo + ("/" + endpoint if endpoint else "")
     argv = ["gh", "api", path, "--method", method]
     for key, value in (fields or {}).items():
@@ -169,11 +182,13 @@ def api(repo, endpoint, method="GET", fields=None):
         output = checked(argv)
     except RuntimeError as exc:
         status = re.search(r"\(HTTP (\d{3})\)", str(exc))
-        if status and (int(status[1]) == 429 or int(status[1]) == 403 and
-                       any(term in str(exc).lower() for term in ("rate limit", "abuse detection"))):
-            _API_BACKOFF["github.com"] = time.monotonic() + API_COOLDOWN_SECONDS
-        if status and 400 <= int(status[1]) < 500 and int(status[1]) != 408:
-            raise ApiRejected(str(exc), int(status[1])) from exc
+        code = int(status[1]) if status else 0
+        limited = code == 429 or code == 403 and any(term in str(exc).lower() for term in RATE_LIMIT_TERMS)
+        if limited:
+            _API_BACKOFF[repo] = time.monotonic() + API_COOLDOWN_SECONDS
+        if 400 <= code < 500 and code != 408:
+            raise ApiRejected(str(exc), code, transient=limited,
+                              retry_after=API_COOLDOWN_SECONDS if limited else None) from exc
         raise
     try:
         return json.loads(output) if output.strip() else {}
@@ -480,7 +495,7 @@ def _read_automation(runtime, run_id, kind):
     raw = row["value"]
     try:
         data = json.loads(raw)
-        if not isinstance(data, dict) or not isinstance(data.get("state"), str) or not data["state"]:
+        if not isinstance(data, dict) or not isinstance(data.get("state"), str) or data["state"] not in AUTOMATION_STATES:
             raise ValueError("Invalid automation state")
         if any(field in data and not isinstance(data[field], dict) for field in ("rollback", "reconciliation")):
             raise ValueError("Invalid automation details")
@@ -489,6 +504,8 @@ def _read_automation(runtime, run_id, kind):
         if data.get("state") == "rolling_back" and "rollback" not in data:
             raise ValueError("Missing rollback details")
         for target in targets:
+            if not isinstance(target.get("state"), str) or target["state"] not in AUTOMATION_STATES:
+                raise ValueError("Invalid automation state")
             if target.get("state") in active and any(not isinstance(target.get(field), str) or not target[field]
                     for field in ("repository", "workflow", "ref", "sha", "workflow_sha", "operation_id")):
                 raise ValueError("Missing automation identity")
@@ -739,6 +756,10 @@ def _record_reconciliation(data, repo, remotes, state, reason, checked_at=None):
         "redispatch_allowed": False,
         "reason": reason,
     }
+    # Read-only diagnosis of a clock-skewed created window; it is not an event.
+    missed = data.get("created_window_missed_at")
+    if missed:
+        data["reconciliation"]["created_window_missed_at"] = missed
     return candidates
 
 
@@ -753,7 +774,7 @@ def _created_window(data):
     """Return the ISO lower bound for one dispatch receipt, or ``None``.
 
     Older receipts have no ``created_at`` (or a non-numeric one); those keep the
-    previous unfiltered listing behavior.
+    unbounded listing, which :func:`_remote_runs` narrows to the pinned head SHA.
     """
     try:
         created = float(data.get("created_at"))
@@ -768,6 +789,26 @@ def _created_window(data):
         return None
 
 
+def _unfiltered_fallback_ready(data, force):
+    """Return whether this receipt may spend one unfiltered listing page.
+
+    ``created`` is a lower bound evaluated against GitHub's clock, while the
+    receipt timestamp comes from this host's clock. A host clock ahead of
+    GitHub (or a GitHub clock behind it) by more than
+    ``RECONCILIATION_CREATED_MARGIN_SECONDS`` can exclude the target run even
+    when unrelated runs are visible, so a no-match listing gets one unfiltered page.
+    The receipt throttles that page to the recheck cadence: an operation that
+    truly has no run yet must not turn reconciliation into a full scan.
+    """
+    if force:
+        return True
+    try:
+        last = float(data.get("unfiltered_fallback_at"))
+    except (TypeError, ValueError):
+        return True
+    return time.time() - last >= RECONCILIATION_RECHECK_SECONDS
+
+
 def _remote_runs(repo, data, force=False):
     visibility = data.get("remote_visibility") or {}
     if (not force and visibility.get("state") == "workflow_not_visible"
@@ -775,6 +816,12 @@ def _remote_runs(repo, data, force=False):
         return None
     since = _created_window(data)
     endpoint = "actions/workflows/" + quote(data["workflow"].split("/")[-1], safe="") + "/runs?event=workflow_dispatch&per_page=100"
+    # Reconciliation already requires head_sha == workflow_sha, so filtering by
+    # the pinned commit server-side is equivalent and keeps a legacy receipt
+    # (no created_at lower bound) under GitHub's 1,000-result cap.
+    head_sha = data.get("workflow_sha")
+    if isinstance(head_sha, str) and head_sha:
+        endpoint += "&head_sha=" + quote(head_sha, safe="")
     if since:
         # Answer "did this dispatch start a run" from the dispatch window instead
         # of rescanning the repository's whole recent history. GitHub accepts the
@@ -782,8 +829,8 @@ def _remote_runs(repo, data, force=False):
         endpoint += "&created=" + quote(">=" + since, safe="")
     found = []
     full_page = False
+    scanned = 0
     try:
-        scanned = 0
         for page in range(1, 11):
             payload = api(repo, endpoint + "&page=" + str(page))
             runs = payload.get("workflow_runs", [])
@@ -796,6 +843,19 @@ def _remote_runs(repo, data, force=False):
             total = payload.get("total_count")
             if type(total) is int and 0 < total <= scanned:
                 break
+        # 只有「过滤后一页都没满」才值得再花一次无过滤读：满页说明 created
+        # 窗口里已经有大量 run，时钟偏差不足以把目标排除在外。
+        if since and not found and not full_page and _unfiltered_fallback_ready(data, force):
+            # A no-match filtered page can still contain unrelated runs. Because
+            # the lower bound comes from this host's clock, re-read the newest
+            # page without it before declaring the target invisible.
+            data["unfiltered_fallback_at"] = time.time()
+            payload = api(repo, endpoint.split("&created=")[0] + "&page=1")
+            runs = payload.get("workflow_runs", [])
+            runs = runs if isinstance(runs, list) else []
+            found.extend(item for item in runs if isinstance(item, dict) and item.get("display_title") == data["operation_id"])
+            if found:
+                data["created_window_missed_at"] = time.time()
     except ApiRejected as exc:
         if exc.status != 404:
             raise
@@ -851,6 +911,47 @@ def _existing_remote(repo, data):
     return remote
 
 
+def _job_timing(repo, remote, attempt, previous, page=20, limit=10, name_limit=120):
+    """Read one bounded page of per-job timings for a completed run attempt.
+
+    The workflow run object only carries run-level timestamps; GitHub exposes
+    ``started_at``/``completed_at`` per job. The read is best-effort: a rejection,
+    a malformed payload or a transport error only records a bounded reason, so it
+    never changes the operation state, the failure counter or the base timing.
+    """
+    run_id = _run_number(remote.get("id"))
+    if run_id is None:
+        return {}
+    cached = previous.get("jobs") if isinstance(previous.get("jobs"), list) else None
+    if cached is not None and previous.get("jobs_attempt") == attempt:
+        total = previous.get("jobs_total_count")
+        return {"jobs": cached, "jobs_attempt": attempt,
+                "jobs_total_count": total if type(total) is int and total >= len(cached) else len(cached)}
+    endpoint = ("actions/runs/%d/attempts/%d/jobs?per_page=%d" % (run_id, attempt, page) if attempt > 1 else
+                "actions/runs/%d/jobs?per_page=%d" % (run_id, page))
+    try:
+        payload = api(repo, endpoint)
+        jobs = payload.get("jobs") if isinstance(payload, dict) else None
+        if not isinstance(jobs, list):
+            raise ValueError("Job listing has no job list")
+        timing = [{"name": _bounded_text(job.get("name"), name_limit),
+                   "status": _bounded_text(job.get("status"), 40),
+                   "conclusion": _bounded_text(job.get("conclusion"), 40),
+                   "started_at": _bounded_text(job.get("started_at"), 64),
+                   "completed_at": _bounded_text(job.get("completed_at"), 64)}
+                  for job in jobs[:limit] if isinstance(job, dict)]
+        total = payload.get("total_count")
+        # Never claim more jobs than were normalized; a bogus count is repaired.
+        return {"jobs": timing, "jobs_attempt": attempt,
+                "jobs_total_count": total if type(total) is int and total >= len(timing) else len(timing)}
+    except Cancelled:
+        # Cancellation is control flow, not a timing-read failure: callers unwind
+        # to the explicit handler in advance() instead of persisting this attempt.
+        raise
+    except (ApiRejected, RuntimeError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        return {"jobs_error": _bounded_text(str(exc), 200) or "Job timing unavailable"}
+
+
 def reconcile(runtime, run, kind, data, persist=True):
     if not data.get("workflow_run_id") and _reconciliation_backoff_active(data):
         # A saturated no-match listing was just read; the scheduler re-checks
@@ -887,15 +988,21 @@ def reconcile(runtime, run, kind, data, persist=True):
             return None
     created, started = timestamp("created_at"), timestamp("run_started_at")
     finished = timestamp("updated_at") if remote.get("status") == "completed" else None
-    # Reconciled timing covers queue, execution, build and reverification phases.
-    # Missing phases stay explicit None (unknown) rather than omitted or defaulted to 0;
-    # GitHub workflow_run timestamps do not isolate build or reverification phases.
+    # Reconciled timing keeps queue and execution at run level. Missing phases stay
+    # explicit None (unknown) rather than omitted or defaulted to 0: the workflow run
+    # object does not isolate build or reverification, so per-job timings are read
+    # separately below and job names are never guessed into phases.
+    prior = data.get("timing") if isinstance(data.get("timing"), dict) else {}
     data["timing"] = {"created_at": remote.get("created_at"), "started_at": remote.get("run_started_at"),
                       "completed_at": remote.get("updated_at") if finished is not None else None,
                       "completed_at_basis": "updated_at" if finished is not None else None,
                       "queue_seconds": started - created if created is not None and started is not None and started >= created else None,
                       "execution_seconds": finished - started if started is not None and finished is not None and finished >= started else None,
                       "build_seconds": None, "reverification_seconds": None}
+    attempt = _run_number(remote.get("run_attempt")) or _run_number(data.get("attempt")) or 1
+    if remote.get("status") == "completed":
+        # One bounded request per finished attempt; a later reconcile reuses it.
+        data["timing"].update(_job_timing(repo, remote, attempt, prior))
     data.update(workflow_run_id=remote["id"], url=remote.get("html_url", ""),
                 attempt=remote.get("run_attempt", 1), checked_at=time.time(), conclusion=remote.get("conclusion"))
     if remote.get("status") == "completed":
@@ -1149,7 +1256,7 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
             raise ReconciliationRejected("GitHub did not return a confirmed status for the selected workflow run; query again before selecting")
         # 人工对账已成功读取 GitHub：恢复后的失败重新从零计数，避免一次瞬时错误
         # 立刻再次转入 reconciliation_blocked。
-        for field in ("advance_failures", "last_advance_error", "last_advance_error_at"):
+        for field in ("advance_failures", "last_advance_error", "last_advance_error_at", "retry_at"):
             target_data.pop(field, None)
             # 回滚子回执的失败计数记在操作回执上，恢复跟踪时一并清零。
             if target != "operation":
@@ -1180,7 +1287,9 @@ def abandon(runtime, project_id, run_id, kind, reason, target="operation", sourc
     ``ABANDON_GRACE_SECONDS`` is equally unbound: the request likely never
     reached GitHub. This is the single operator exit: it requires a written
     reason, re-reads GitHub first and refuses whenever a run is still visible,
-    then records ``failed`` plus an audit entry. It never dispatches or reruns.
+    then records ``failed`` plus an audit entry. An unconfirmed rerun request is
+    discarded with the operation, so ``retry`` cannot revive a closed receipt.
+    It never dispatches or reruns.
     """
     note = reason.strip()[:500] if isinstance(reason, str) else ""
     if not note:
@@ -1219,8 +1328,17 @@ def abandon(runtime, project_id, run_id, kind, reason, target="operation", sourc
                          "candidate_run_ids": reconciliation.get("candidate_run_ids", [])},
         })
         audit.update(outcome="failed", reason=note, visibility=visibility)
+        had_rerun = bool(target_data.get("rerun_pending") or target_data.get("rerun_receipt") or
+                         target_data.get("state") in {"rerunning", "rerun_unknown"})
         target_data["operator_abandon"] = audit
         target_data["state"] = "failed"
+        # 重跑请求随人工关闭一起作废：残留的 rerun_pending 会让下一次 retry 走进
+        # reconcile 的 rerun 分支，把已经收口的终态改回 rerun_unknown。
+        target_data.pop("rerun_pending", None)
+        target_data.pop("rerun_requested_at", None)
+        if had_rerun:
+            target_data["rerun_receipt"] = "abandoned"
+            target_data["rerun_abandoned_at"] = now
         if visibility == "workflow_not_visible":
             target_data["error"] = WORKFLOW_NOT_VISIBLE_REASON
             closed = "GitHub no longer exposes its workflow"
@@ -1248,28 +1366,118 @@ def abandon(runtime, project_id, run_id, kind, reason, target="operation", sourc
                 "operator_abandon": audit}
 
 
-def health_check(url, sha, timeout=15):
-    from .process import checked
+def health_check(target, sha, timeout=15):
+    """Probe every declared endpoint inside one isolated transport process.
+
+    ``target`` is a URL or a list of URLs. A list travels to the transport as a
+    JSON array so one child interpreter answers all endpoints concurrently,
+    instead of one interpreter (~29 MiB, ~0.16 s startup) per endpoint. The
+    parent still owns the absolute deadline and cancellation through
+    ``checked``, and the transport flushes each finished endpoint immediately:
+    when a stalled probe is killed at that deadline only the endpoints that
+    never answered stay unknown, instead of every conclusion being discarded.
+    """
+    from .process import checked, ProcessError
     argv = ([sys.executable, "internal-health-check"] if getattr(sys, "frozen", False)
             else [sys.executable, "-m", "adaptive_rsi.health_transport"])
+    urls = list(target) if isinstance(target, (list, tuple)) else [target]
+    payload = json.dumps(urls) if isinstance(target, (list, tuple)) else target
     try:
-        result = json.loads(checked([*argv, url, sha, str(timeout)],
-                                    cwd=Path(__file__).resolve().parents[1], timeout=timeout))
-        if not isinstance(result, dict) or result.get("sha") != sha:
-            raise ValueError("Invalid health transport result")
-        return result
+        output = checked([*argv, payload, sha, str(timeout)],
+                         cwd=Path(__file__).resolve().parents[1], timeout=timeout)
     except Cancelled:
         raise
+    except ProcessError as exc:
+        # 总时限（或输出上限）终止了传输进程：已刷出的端点结论仍然有效。
+        output = (exc.result or {}).get("stdout") or ""
     except (OSError, RuntimeError, ValueError):
-        return {"url": url, "sha": sha, "checked_at": time.time(), "healthy": None,
-                "error": "Health transport failed or exceeded its total deadline"}
+        output = ""
+    reports = _health_transport_reports(output, urls, sha)
+    if isinstance(target, (list, tuple)):
+        return _health_report(urls, sha, reports)
+    return reports[0]
+
+
+def _health_report(urls, sha, reports):
+    """Ordered aggregate: one conclusive failure outweighs any unknown endpoint."""
+    return {"url": urls[0], "sha": sha, "checked_at": time.time(), "checks": reports,
+            "healthy": (False if any(report.get("healthy") is False for report in reports) else
+                        None if any(report.get("healthy") is None for report in reports) else
+                        all(report.get("healthy") is True for report in reports))}
+
+
+def _health_transport_reports(output, urls, sha):
+    """Merge the per-endpoint reports the transport flushed before it stopped.
+
+    The transport writes one JSON object per finished endpoint and flushes it
+    at once, so a probe still blocked at the deadline cannot erase conclusions
+    the other endpoints already reached. Unreadable, missing or foreign-SHA
+    reports leave that endpoint unknown instead of turning it into a failure.
+    """
+    known = {}
+    for line in str(output or "").splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        # 也接受一次性输出整份聚合结果的传输（旧版本或冻结版命令）。
+        for report in (item["checks"] if isinstance(item.get("checks"), list) else [item]):
+            if isinstance(report, dict) and report.get("url") in urls and report.get("sha") == sha:
+                known[report["url"]] = report
+    return [known.get(url) or {"url": url, "sha": sha, "checked_at": time.time(), "healthy": None,
+                               "error": "Health transport failed or exceeded its total deadline"}
+            for url in urls]
 
 
 class _HealthDeadlineExceeded(ValueError):
     """The endpoint did not finish answering within the total deadline; its health stays unknown."""
 
 
-def direct_health_check(url, sha, timeout=15):
+def direct_health_check(target, sha, timeout=15, emit=None):
+    """Probe one endpoint — or every endpoint of a list/JSON array — in this process.
+
+    ``health_transport`` passes its target argument through unchanged, so one
+    child interpreter answers all declared endpoints concurrently here, instead
+    of the parent spawning one interpreter per endpoint. ``emit`` receives each
+    report as soon as it is conclusive so the transport can flush it before the
+    parent's deadline kills a probe that is still blocked.
+    """
+    if isinstance(target, str) and target.lstrip().startswith("["):
+        target = json.loads(target)
+    if isinstance(target, (list, tuple)):
+        return _direct_health_check_all(list(target), sha, timeout, emit)
+    report = _direct_health_check_one(target, sha, timeout)
+    if emit is not None:
+        emit(report)
+    return report
+
+
+def _direct_health_check_all(urls, sha, timeout, emit=None):
+    """Probe every endpoint concurrently under one shared deadline, preserving input order."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    deadline = time.monotonic() + timeout
+
+    def probe(url):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"url": url, "sha": sha, "checked_at": time.time(), "healthy": None,
+                    "error": "Shared health deadline exhausted"}
+        return _direct_health_check_one(url, sha, timeout=min(10, remaining))
+
+    reports = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(urls))) as executor:
+        pending = {executor.submit(probe, url): url for url in urls}
+        for future in as_completed(pending):
+            url = pending[future]
+            reports[url] = future.result()
+            if emit is not None:
+                emit(reports[url])
+    return _health_report(urls, sha, [reports[url] for url in urls])
+
+
+def _direct_health_check_one(url, sha, timeout=15):
     class SameOrigin(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, request, fp, code, msg, headers, newurl):
             original, target = urlsplit(url), urlsplit(newurl)
@@ -1443,37 +1651,41 @@ def target_wait_error(previous, owner_run, policy, waiting_since=None, now=None)
 
 
 def health_sample(policy, sha):
-    """All declared endpoints must agree on one SHA within a shared deadline."""
+    """All declared endpoints must agree on one SHA within a shared deadline.
+
+    One transport process probes every endpoint; the parent keeps the absolute
+    15 s deadline and cancellation semantics in :func:`health_check`.
+    """
     urls = [policy["health_url"], *policy.get("health_urls", [])]
     if len(urls) == 1:
         return health_check(urls[0], sha)
-    deadline = time.monotonic() + 15
-    from concurrent.futures import ThreadPoolExecutor
-    from contextvars import copy_context
-    def probe(url):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return {"url": url, "sha": sha, "healthy": None, "error": "Shared health deadline exhausted"}
-        return health_check(url, sha, timeout=min(10, remaining))
-    with ThreadPoolExecutor(max_workers=min(8, len(urls))) as executor:
-        futures = [executor.submit(copy_context().run, probe, url) for url in urls]
-        reports = [future.result() for future in futures]
-    return {"url": urls[0], "sha": sha, "checked_at": time.time(), "checks": reports,
-            "healthy": (False if any(report.get("healthy") is False for report in reports) else
-                        None if any(report.get("healthy") is None for report in reports) else
-                        all(report.get("healthy") is True for report in reports))}
+    return health_check(urls, sha)
 
 
 def observe_health(data, report, policy, now):
-    """Persist bounded observations; successes must be consecutive across ticks."""
+    """Persist bounded observations; successes must be consecutive across ticks.
+
+    Every probe consumes one configured round, including unknown outcomes
+    (timeouts); otherwise the round limit is never reached and tracking stops
+    early. The elapsed-time cap is only a stall guard for a scheduler that
+    stopped waking us, so its floor covers the real scheduled rounds at the
+    60-second advance cadence.
+    """
+    limit = policy.get("health_attempts", 1)
+    interval = policy.get("health_interval_seconds", 10)
     if report.get("healthy") is None:
         data["health_successes"] = 0
         data["health"] = report
         data["health_observations"] = [*data.get("health_observations", []), report][-10:]
+        data["health_attempts"] = data.get("health_attempts", 0) + 1
+        data["health_gate"] = {"required_consecutive": policy.get("health_consecutive_successes", 1),
+                               "observed_consecutive": 0,
+                               "round_limit": limit,
+                               "rounds": data["health_attempts"]}
         first = data.setdefault("health_observation_started_at", now)
-        if now - first >= max(60, policy.get("health_attempts", 1) * (15 + policy.get("health_interval_seconds", 10))):
+        if data["health_attempts"] >= limit or now - first >= max(60 * (limit + 1), limit * (15 + interval)):
             return "health_unconfirmed"
-        data["health_retry_at"] = now + policy.get("health_interval_seconds", 10)
+        data["health_retry_at"] = now + interval
         return "pending"
     data["health_attempts"] = data.get("health_attempts", 0) + 1
     data["health_successes"] = data.get("health_successes", 0) + 1 if report.get("healthy") is True else 0
@@ -1760,6 +1972,20 @@ def _advance_failure_count(data):
     return 0
 
 
+def _record_advance_retry(data, exc):
+    """Note a temporary limit without consuming the permanent-failure budget.
+
+    A rate limit or a cooldown that never sent the request says nothing about the
+    receipt's health: the run may still be live on GitHub. Only the retry hint and
+    the latest error are written, so the next tick reconciles again instead of
+    ending tracking of an operation that is still running.
+    """
+    data["last_advance_error"] = str(exc)[:500]
+    data["last_advance_error_at"] = time.time()
+    data["retry_at"] = time.time() + (getattr(exc, "retry_after", None) or API_COOLDOWN_SECONDS)
+    return data
+
+
 def _record_advance_failure(runtime, project, run, kind, data, exc, target=None):
     """Count one consecutive tracking failure and stop polling at the limit.
 
@@ -1790,6 +2016,33 @@ def _record_advance_failure(runtime, project, run, kind, data, exc, target=None)
     return data
 
 
+def _record_preflight_failure(runtime, project, run, kind, data, exc):
+    """Count one permanent pre-dispatch failure on the operation receipt.
+
+    ``authorized``/``compare``/``validate_pin`` failures happen before any write
+    reaches GitHub, so there is no remote run to reconcile and the receipt may
+    safely be retried. Repeating the same permanent error (403, renamed repo,
+    conflicting legacy owner) on every tick would otherwise write one
+    ``automation_error`` event each time and keep the receipt blocked forever.
+    Up to the shared limit the receipt stays ``blocked``; then it becomes a
+    ``failed`` receipt with a distinct marker, which stops automatic polling and
+    lets :func:`retry` open exactly one fresh dispatch attempt.
+    """
+    failures = _advance_failure_count(data) + 1
+    data["advance_failures"] = failures
+    data["last_advance_error"] = str(exc)[:500]
+    data["last_advance_error_at"] = time.time()
+    data["error"] = str(exc)[:500]
+    if failures >= ADVANCE_FAILURE_LIMIT:
+        data["state"] = "failed"
+        data["dispatch_receipt"] = "preflight_error"
+        runtime.store.event("automation_error", str(exc)[:500], project["id"], run["id"],
+                            {"kind": kind, "state": "failed", "stage": "preflight"})
+    else:
+        data["state"] = "blocked"
+    return data
+
+
 def advance(runtime, project, run, outcome, cancel=None):
     if not re.fullmatch(r"[a-f0-9]{40}", outcome.get("merged_sha", "")):
         return {}
@@ -1803,6 +2056,9 @@ def advance(runtime, project, run, outcome, cancel=None):
     for kind in KINDS:
         policy = saved.get("delivery", {}).get(kind, {})
         data, expected = _read_automation(runtime, run["id"], kind)
+        # 本 kind 的失败是否发生在任何派发写意图之前；只有这种失败才计入
+        # 派发前预算（派发后的失败已有各自的回执状态与重试语义）。
+        preflight = False
         if data and data.get("receipt_error"):
             result[kind] = data
             continue
@@ -1851,6 +2107,11 @@ def advance(runtime, project, run, outcome, cancel=None):
                 except Cancelled:
                     raise
                 except Exception as exc:
+                    # 临时限流（429/403 限流）或请求从未发出的本地冷却不消耗永久
+                    # 失败预算：GitHub 上的 run 可能仍在跑，等待后继续对账。
+                    if isinstance(exc, ApiRejected) and exc.transient:
+                        result[kind] = persist(runtime, run, kind, _record_advance_retry(data, exc))
+                        continue
                     # 永久性对账错误（403、身份不一致等）若原样上抛，下一次 tick 会
                     # 再次读取同一必然失败的远端，并每次写一条 automation_error。
                     # 连续失败达到上限后转入终态：停止自动轮询，只在转入时记一条事件，
@@ -1858,7 +2119,7 @@ def advance(runtime, project, run, outcome, cancel=None):
                     data = _record_advance_failure(runtime, project, run, kind, data, exc)
                     result[kind] = persist(runtime, run, kind, data)
                     continue
-                for field in ("advance_failures", "last_advance_error", "last_advance_error_at"):
+                for field in ("advance_failures", "last_advance_error", "last_advance_error_at", "retry_at"):
                     data.pop(field, None)
                 persist(runtime, run, kind, data)
             if kind == "deploy" and data and data["state"] in {"workflow_succeeded", "health_failed", "rolling_back"}:
@@ -1877,10 +2138,13 @@ def advance(runtime, project, run, outcome, cancel=None):
                         data = current
                         raise
                     # 回滚子回执同样受连续失败上限约束：永久 403/SSO 失权不再
-                    # 每个 tick 重读一次并写一条事件。
+                    # 每个 tick 重读一次并写一条事件；临时限流只记重试提示。
                     target = current.get("rollback") if entry_state == "rolling_back" else None
-                    data = _record_advance_failure(runtime, project, run, kind, current, exc,
-                                                   target if isinstance(target, dict) else None)
+                    if isinstance(exc, ApiRejected) and exc.transient:
+                        data = _record_advance_retry(current, exc)
+                    else:
+                        data = _record_advance_failure(runtime, project, run, kind, current, exc,
+                                                       target if isinstance(target, dict) else None)
                     result[kind] = persist(runtime, run, kind, data)
                     continue
                 persist(runtime, run, kind, data)
@@ -1905,6 +2169,9 @@ def advance(runtime, project, run, outcome, cancel=None):
                     data.pop("blocked_by_release", None)
                     result[kind] = persist(runtime, run, kind, data)
                     continue
+            # 从这里到写入 dispatching 写意图之间都属于派发前阶段：此时失败没有
+            # 任何远端副作用，连续永久失败应停止轮询而不是每 tick 重写事件。
+            preflight = True
             repo = authorized(runtime, project, run, kind, policy, cancel)
             if data:
                 data.pop("blocked_by_release", None)
@@ -1982,6 +2249,8 @@ def advance(runtime, project, run, outcome, cancel=None):
                 # Persist the write intent first. Ambiguous failures are reconciled, never re-dispatched.
                 data.update(state="dispatching", error="")
                 owner_name = owner_key(project["id"], repo, policy) if kind == "deploy" else None
+                # 写意图一旦落盘就不再是派发前失败；此后的错误按派发结果处理。
+                preflight = False
                 ownership = ((owner_name, expected_owner,
                               {"run": run["id"], "sha": data["sha"]}) if owner_name else None)
                 persist(runtime, run, kind, data, ownership=ownership)
@@ -2014,14 +2283,28 @@ def advance(runtime, project, run, outcome, cancel=None):
             if data and data.get("state") in {"pending", "blocked"}:
                 data.update(state="blocked", error="Project paused or operation cancelled")
         except Exception as exc:
-            if not data:
-                data = {"state": "blocked", "error": str(exc)[:500]}
-            else:
+            transient = (getattr(exc, "transient", False) or
+                         isinstance(exc, ApiRejected) and (exc.local or exc.status == 429))
+            if preflight and transient:
+                # 临时限流不消耗永久失败预算：保持原回执，等冷却结束后自动再试。
+                data = data or {"state": "pending"}
                 data["error"] = str(exc)[:500]
-                if data["state"] in {"pending", "blocked"}:
-                    data["state"] = "blocked"
-            if not isinstance(exc, _PinUnavailable) or not exc.deferred:
-                runtime.store.event("automation_error", str(exc)[:500], project["id"], run["id"], {"kind": kind})
+            elif (preflight and isinstance(exc, (ApiRejected, ValueError)) and
+                  not (data and data.get("dispatch_receipt") == "rejected")):
+                # 派发前的永久失败（权限、仓库改名、目标冲突）：复用连续失败预算，
+                # 达到上限才写一条事件并停止自动轮询；validate_pin 已落成
+                # failed+rejected 的明确拒绝保持原样。
+                data = _record_preflight_failure(runtime, project, run, kind, data or {}, exc)
+            else:
+                # 传输失败等非永久错误保持原语义：可自愈，按 tick 上报。
+                if not data:
+                    data = {"state": "blocked", "error": str(exc)[:500]}
+                else:
+                    data["error"] = str(exc)[:500]
+                    if data["state"] in {"pending", "blocked"}:
+                        data["state"] = "blocked"
+                if not isinstance(exc, _PinUnavailable) or not exc.deferred:
+                    runtime.store.event("automation_error", str(exc)[:500], project["id"], run["id"], {"kind": kind})
         if data:
             try:
                 result[kind] = persist(runtime, run, kind, data)
@@ -2058,6 +2341,20 @@ def retry(runtime, project_id, run_id, kind):
         data, raw = _read_automation(runtime, run_id, kind)
         if data and data.get("receipt_error"):
             raise ReconciliationRejected(data["error"])
+        if data and (data.get("operator_abandon") or data.get("rerun_receipt") == "abandoned"):
+            # 人工放弃已经收口这次操作；接受重试会撤销该决定并把回执拉回未确认重跑，
+            # 因此只允许新建操作，不再读取 GitHub 或重放任何请求。
+            raise ValueError("This operation was abandoned; open a new operation instead of retrying")
+        if data and data.get("state") == "failed" and data.get("dispatch_receipt") == "preflight_error":
+            # 派发前的永久失败从未写出任何远端副作用：清零连续失败预算并放回待发，
+            # 下一次调度只做一次新的派发尝试；目标归属与 compare 仍由 advance 复核。
+            data.update(state="pending", error="")
+            for field in ("dispatch_receipt", "dispatch_http_status", "advance_failures",
+                          "last_advance_error", "last_advance_error_at"):
+                data.pop(field, None)
+            save(runtime, run, kind, data, expected=raw)
+            runtime.wake.set()
+            return data
         repo = authorized(runtime, project, run, kind, policy)
         if not data or data.get("state") == "blocked":
             raise ValueError("Restore the original authorization and let tracking retry the pending operation")

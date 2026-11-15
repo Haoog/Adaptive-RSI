@@ -154,7 +154,7 @@ async function checkQueueEditor(page, evidence) {
   await page.getByRole('button', {name: '排队草稿验证', exact: true}).click();
   const box = page.getByRole('dialog', {name: '排队草稿验证', exact: true});
   await expandTaskEditor(box, '.task-queue-editor');
-  const select = box.getByRole('combobox', {name: '前置任务（合并后再开始）', exact: true});
+  const select = box.getByRole('listbox', {name: '前置任务（合并后再开始）', exact: true});
   await box.getByText('前置任务候选页 1', {exact: true}).waitFor();
   assert.equal(await select.getByRole('option', {name: '旧失败前置任务', exact: true}).count(), 0);
   await box.getByRole('button', {name: '下一页', exact: true}).click();
@@ -162,12 +162,28 @@ async function checkQueueEditor(page, evidence) {
   await select.selectOption({label: '旧失败前置任务'});
   const parent = await select.inputValue();
   await box.getByRole('checkbox', {name: '优先处理', exact: true}).uncheck();
-  await box.getByRole('button', {name: '上一页', exact: true}).click();
+  // Fail the history request during a language rebuild, edit the new form, then retry.
+  let failHistory = true;
+  const historyRoute = route => failHistory ? route.fulfill({status: 503, json: {error: 'history unavailable'}}) : route.continue();
+  await page.route('**/api/task-runs?*', historyRoute);
+  try {
+    await page.locator('#language-select').selectOption('en');
+    await box.getByText('Failed to load run records.', {exact: true}).waitFor();
+    const urgent = box.getByRole('checkbox', {name: 'Urgent', exact: true});
+    await urgent.check();
+    failHistory = false;
+    await box.getByRole('button', {name: 'Retry', exact: true}).click();
+    await box.getByText('Dependency candidate page 1', {exact: true}).waitFor();
+    assert.equal(await urgent.isChecked(), true, 'history retry preserves the latest queue edit');
+    await urgent.uncheck();
+    await page.locator('#language-select').selectOption('zh-CN');
+    await box.getByText('前置任务候选页 1', {exact: true}).waitFor();
+  } finally { await page.unroute('**/api/task-runs?*', historyRoute); }
   await box.getByText('前置任务候选页 1', {exact: true}).waitFor();
   assert.equal(await select.inputValue(), parent);
   assert.equal(await box.getByRole('checkbox', {name: '优先处理', exact: true}).isChecked(), false);
   await page.locator('#language-select').selectOption('en');
-  const english = box.getByRole('combobox', {name: 'Predecessor (start after it merges)', exact: true});
+  const english = box.getByRole('listbox', {name: 'Predecessor (start after it merges)', exact: true});
   await box.getByText('Dependency candidate page 1', {exact: true}).waitFor();
   assert.equal(await english.inputValue(), parent);
   assert.equal(await box.getByRole('checkbox', {name: 'Urgent', exact: true}).isChecked(), false);
@@ -175,6 +191,8 @@ async function checkQueueEditor(page, evidence) {
   await box.getByRole('textbox', {name: 'Supplement requirements (on this task)', exact: true}).fill('Queue supplement preserves original draft');
   await box.getByRole('button', {name: 'Save supplement and reassess', exact: true}).click();
   await box.getByText('Requirement revisions', {exact: true}).waitFor();
+  // A failed predecessor must be retried before the server accepts it as a dependency.
+  await page.evaluate(task => api('retry', {task}), parent);
   assert.equal(await english.inputValue(), parent);
   assert.equal(await box.getByRole('checkbox', {name: 'Urgent', exact: true}).isChecked(), false);
   const saved = page.waitForResponse(r => new URL(r.url()).pathname === '/api/task/schedule' && r.request().method() === 'POST');
@@ -200,14 +218,17 @@ async function checkQueueEditor(page, evidence) {
     await box.getByRole('button', {name: 'Next', exact: true}).click();
     await box.getByText('Dependency candidate page 2', {exact: true}).waitFor();
     await english.selectOption(parent); await urgent.check();
-    let release, committed, writes = 0;
+    let release, committed, finished, writes = 0;
     const arrived = new Promise(resolve => {committed = resolve;});
+    const completed = new Promise(resolve => {finished = resolve;});
     const gate = new Promise(resolve => {release = resolve;});
     const holdAck = async route => {
-      writes++;
-      const response = await route.fetch();
-      assert.equal(response.status(), 200, await response.text());
-      committed(); await gate; await route.fulfill({response});
+      try {
+        writes++;
+        const response = await route.fetch();
+        assert.equal(response.status(), 200, await response.text());
+        committed(); await gate; await route.fulfill({response});
+      } finally { finished(); }
     };
     await page.route('**/api/task/schedule', holdAck);
     const pollState = async route => {
@@ -249,7 +270,7 @@ async function checkQueueEditor(page, evidence) {
       await page.locator('#language-select').selectOption('en');
       await box.getByText('Dependency candidate page 1', {exact: true}).waitFor();
     } finally {
-      release(); await page.unroute('**/api/task/schedule', holdAck);
+      release(); if (writes) await completed; await page.unroute('**/api/task/schedule', holdAck);
       if (trigger === 'periodic') await page.unroute('**/api/task?id=*', pollState);
     }
     const undone = page.waitForResponse(r => new URL(r.url()).pathname === '/api/task/schedule' && r.request().method() === 'POST');

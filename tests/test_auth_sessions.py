@@ -165,6 +165,90 @@ class AuthSessionTests(unittest.TestCase):
             if 'reader' in locals():
                 reader.join(3)
 
+    def test_reserve_rejects_during_api_key_install(self):
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+        def factory(backend):
+            worker = FakeAuth(backend)
+            self.created.append(worker)
+            worker.capabilities = types.SimpleNamespace(modern=True)
+            worker.set_api_key = lambda *args: None
+            worker.export_credential = lambda *args: [{'fixture': True}]
+            def install(*args):
+                entered.set()
+                release.wait(5)
+            worker.install_credential = install
+            return worker
+        self.manager.factory = factory
+        def save():
+            try:
+                self.manager.set_api_key('opencode', 'openai', 'fixture')
+            except Exception as exc:
+                errors.append(exc)
+        writer = threading.Thread(target=save)
+        writer.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            with self.assertRaises(AuthError) as caught:
+                self.manager.reserve('opencode', 'openai')
+            self.assertEqual(caught.exception.code, 'auth_busy')
+        finally:
+            release.set()
+            writer.join(5)
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.manager.reserve('opencode', 'openai')['state'], 'starting')
+
+    def test_reserve_does_not_wait_for_blocked_credential_install(self):
+        entered, release = threading.Event(), threading.Event()
+        session = self.manager.reserve("opencode", "openai")
+        worker = FakeAuth("opencode")
+        self.created.append(worker)
+        worker.capabilities = types.SimpleNamespace(modern=True)
+        worker.export_credential = lambda provider: [{"fixture": True}]
+        installed = []
+
+        def install(provider, value):
+            entered.set()
+            release.wait(3)
+            installed.append((provider, value))
+
+        worker.install_credential = install
+        writer = threading.Thread(target=self.manager._save,
+                                  args=(worker, "opencode", "openai", session["id"], threading.Event()))
+        writer.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            started = time.monotonic()
+            # reserve() 在 /api/auth/start 的 dispatch_lock 临界区内调用；凭据写入
+            # （子进程/fsync）期间它必须立刻返回 auth_busy，而不是等满整段写入。
+            with self.assertRaises(AuthError) as raised:
+                self.manager.reserve("opencode", "openai")
+            self.assertEqual(raised.exception.code, "auth_busy")
+            self.assertLess(time.monotonic() - started, 0.2)
+            started = time.monotonic()
+            self.manager.snapshot()
+            self.assertLess(time.monotonic() - started, 0.1)
+            self.assertEqual(self.manager.status(session["id"])["state"], "starting")
+            self.assertEqual(self.manager.busy, 1)
+            self.assertEqual(installed, [])
+            # 写入中取消会被拒绝，避免「已取消却仍安装凭据」；不是新错误码。
+            with self.assertRaises(AuthError) as cancelled:
+                self.manager.cancel(session["id"])
+            self.assertEqual(cancelled.exception.code, "auth_credentials_busy")
+            with patch.object(self.manager, 'now', return_value=session['expires_at'] + 1):
+                self.assertEqual(self.manager.busy, 1)
+                with self.assertRaises(AuthError) as completed:
+                    self.manager.complete(session['id'], 'fixture')
+                self.assertEqual(completed.exception.code, 'invalid_auth_state')
+                self.assertEqual(self.manager.status(session['id'])['state'], 'starting')
+        finally:
+            release.set()
+            writer.join(3)
+        self.assertEqual(installed, [("openai", [{"fixture": True}])])
+        self.assertEqual(self.manager.status(session["id"])["state"], "completed")
+        self.assertEqual(self.manager.busy, 0)
+
     def test_busy_tolerates_session_pruned_during_status(self):
         session = self.manager.reserve('opencode', 'openai')
         original = self.manager.status
@@ -280,6 +364,112 @@ class AuthSessionTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, 'auth_protocol_error')
             self.assertEqual([item['integrationID'] for item in load_auth_export()],
                              ['openai', 'other'])
+        finally:
+            manager.close()
+
+    def test_logout_keeps_session_lock_free_while_provider_cli_logs_out(self):
+        # custom_factory=False 才走真实 CLI 登出分支；此时 _run 以 (backend, cancel)
+        # 调用 factory，仍注入假 worker。
+        manager = AuthSessions(self.root / 'logout-lock-scope', ttl=600,
+                               factory=lambda backend, cancel=None: self.factory(backend))
+        manager.custom_factory = False
+        entered, release = threading.Event(), threading.Event()
+        reserved = {}
+
+        def blocking_logout(provider, binary):
+            entered.set()
+            release.wait(1)
+            return True
+
+        def run_logout():
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value='/fixture/opencode'), \
+                 patch('adaptive_rsi.auth_sessions.remove_auth_export', return_value=True), \
+                 patch('adaptive_rsi.auth_sessions.logout_provider', side_effect=blocking_logout), \
+                 patch.object(manager, 'snapshot', return_value={}):
+                manager.logout('opencode', 'openai')
+
+        try:
+            session = manager.start('opencode', 'openai')
+            self.wait_state(session, 'awaiting_authorization', manager)
+            logout = threading.Thread(target=run_logout)
+            logout.start()
+            try:
+                self.assertTrue(entered.wait(2), 'logout_provider was not called')
+                started = time.monotonic()
+                try:
+                    reserved['value'] = manager.reserve('opencode', 'anthropic')['state']
+                except AuthError as exc:
+                    reserved['value'] = exc.code
+                reserved['ms'] = (time.monotonic() - started) * 1000
+                started = time.monotonic()
+                reserved['status'] = manager.status(session['id'])['state']
+                status_ms = (time.monotonic() - started) * 1000
+                # 放行前先断言：登出仍阻塞在子进程里。
+                self.assertTrue(logout.is_alive())
+            finally:
+                release.set()
+            logout.join(5)
+            self.assertFalse(logout.is_alive())
+            self.assertLess(reserved['ms'], 200, 'reserve() waited for the logout subprocess')
+            self.assertLess(status_ms, 100, 'status() waited for the logout subprocess')
+            self.assertEqual(reserved['status'], 'awaiting_authorization')
+            self.assertEqual(reserved['value'], 'auth_busy')
+            self.assertEqual(manager.status(session['id'])['state'], 'cancelled')
+        finally:
+            release.set()
+            manager.close()
+
+    def test_logout_other_provider_keeps_active_session(self):
+        path = auth_sessions.auth_path()
+        auth_sessions._write_json(path, {'openai': {'type': 'api', 'key': 'keep'},
+                                        'anthropic': {'type': 'api', 'key': 'drop'}})
+        manager = AuthSessions(self.root / 'logout-provider-scope', factory=self.factory, ttl=600)
+        try:
+            session = manager.start('opencode', 'openai')
+            self.wait_state(session, 'awaiting_authorization', manager)
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value=None), \
+                 patch('adaptive_rsi.auth_sessions.remove_auth_export', return_value=True):
+                manager.logout('opencode', 'anthropic')
+            # 退出 anthropic 不得取消正在为 openai 进行的设备授权。
+            self.assertEqual(manager.status(session['id'])['state'], 'awaiting_authorization')
+            self.assertEqual(auth_sessions._read_json(path), {'openai': {'type': 'api', 'key': 'keep'}})
+        finally:
+            manager.close()
+
+    def test_logout_provider_failure_keeps_active_session_running(self):
+        manager = AuthSessions(self.root / 'logout-cli-failure', ttl=600,
+                               factory=lambda backend, cancel=None: self.factory(backend))
+        manager.custom_factory = False
+        try:
+            session = manager.start('opencode', 'openai')
+            self.wait_state(session, 'awaiting_authorization', manager)
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value='/fixture/opencode'), \
+                 patch('adaptive_rsi.auth_sessions.remove_auth_export', return_value=True), \
+                 patch('adaptive_rsi.auth_sessions.logout_provider', side_effect=RuntimeError('cli failed')), \
+                 patch.object(manager, 'snapshot', return_value={}):
+                with self.assertRaises(AuthError) as caught:
+                    manager.logout('opencode', 'openai')
+            self.assertEqual(caught.exception.code, 'auth_protocol_error')
+            self.assertEqual(manager.status(session['id'])['state'], 'awaiting_authorization')
+            self.assertFalse(self.created[-1].closed)
+        finally:
+            manager.close()
+
+    def test_logout_marker_stops_pending_save_from_restoring_credentials(self):
+        path = auth_sessions.auth_path()
+        manager = AuthSessions(self.root / 'logout-save-race', factory=self.factory, ttl=600)
+        try:
+            session = manager.reserve('opencode', 'openai')
+            worker = FakeAuth('opencode')
+            self.created.append(worker)
+            worker.credentials.write_text(json.dumps(
+                {'openai': {'type': 'oauth', 'refresh': 'SECRET-REFRESH', 'access': 'SECRET-ACCESS'}}))
+            with manager.lock:
+                manager.logging_out.add(('opencode', 'openai'))
+            with self.assertRaises(AuthError) as caught:
+                manager._save(worker, 'opencode', 'openai', session['id'], threading.Event())
+            self.assertEqual(caught.exception.code, 'auth_protocol_error')
+            self.assertFalse(path.exists())
         finally:
             manager.close()
 
@@ -1856,6 +2046,34 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "cancelled")
         self.assertEqual(manager.snapshot()["sessions"][-1]["id"], session["id"])
 
+    def test_status_expiry_sweep_tolerates_persist_failure(self):
+        # 状态目录只读/磁盘满时，status() 的懒回收写盘失败不能让只读接口 500：
+        # 内存已回滚为 ACTIVE，status/busy/snapshot 继续可用；恢复可写后再落盘。
+        now = [1000.0]
+        manager = AuthSessions(self.root / "status-state", factory=lambda backend: None,
+                               ttl=60, now=lambda: now[0])
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        now[0] = 2000.0  # 已过 expires_at，但还没有人扫描
+        with self.state_write_error(manager):
+            # 确认状态文件写入真的失败、且该行确实满足回收条件，
+            # 否则下面的读路径断言可能因为没走到回收而假通过。
+            with self.assertRaises(OSError):
+                manager._update(session["id"], state="expired", error="auth_expired")
+            self.assertGreaterEqual(manager.now(), manager.sessions[session["id"]]["expires_at"])
+            self.assertEqual(manager.status(session["id"])["state"], "starting")
+            self.assertEqual(manager.busy, 0)
+            self.assertEqual([row["id"] for row in manager.snapshot()["sessions"]], [session["id"]])
+            # 读路径吞掉写盘失败，写路径仍把 OSError 交给调用方。
+            with self.assertRaises(OSError):
+                manager.cancel(session["id"])
+            with self.assertRaises(OSError):
+                manager.complete(session["id"], code="1234")
+        self.assertEqual(manager.sessions[session["id"]]["state"], "starting")
+        # 恢复可写后下一次 status() 把同一会话收成 expired 并落盘。
+        self.assertEqual(manager.status(session["id"])["state"], "expired")
+        self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "expired")
+
     def test_failed_terminal_write_preserves_old_session_beyond_history_limit(self):
         manager = AuthSessions(self.root / 'old-state', factory=self.factory, ttl=600)
         self.addCleanup(manager.close)
@@ -2087,6 +2305,58 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual(manager.threads, set())
         self.assertIsInstance(manager._close_error, OSError)
         self.assertEqual(manager.status(session["id"])["state"], "interrupted")
+
+    def test_worker_close_error_does_not_abort_close(self):
+        release, finished = threading.Event(), threading.Event()
+
+        class Broken(FakeAuth):
+            def close(worker):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        class Healthy(FakeAuth):
+            def close(worker):
+                try:
+                    super(Healthy, worker).close()
+                finally:
+                    release.set()
+
+        broken, healthy = Broken("codex"), Healthy("opencode")
+        self.created.extend([broken, healthy])
+        manager = AuthSessions(self.root / "close-worker-error", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        manager.workers["broken"] = (broken, threading.Event())
+        manager.workers["healthy"] = (healthy, threading.Event())
+        manager._thread(lambda: (release.wait(5), finished.set()))
+        manager.close()
+        # 首个 worker 抛错只记录诊断：其余 worker 与线程回收必须照常完成。
+        self.assertTrue(manager.closed)
+        self.assertIsInstance(manager._close_error, BrokenPipeError)
+        self.assertTrue(healthy.closed)
+        self.assertTrue(finished.is_set(), "close() skipped joining the remaining threads")
+        self.assertEqual(manager.threads, set())
+
+    def test_process_close_ignores_dead_child_with_buffered_stdin(self):
+        worker = auth_sessions._Process("codex")
+        worker.container = False
+        worker.container_name = ""
+        worker.process = subprocess.Popen([sys.executable, "-c", "pass"],
+                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        try:
+            # 8 字节留在用户态缓冲：子进程已退出后 close() 会再 flush 并抛 BrokenPipeError。
+            worker.process.stdin.write(b"01234567")
+            worker.process.wait(timeout=10)
+            worker.close()
+            self.assertTrue(worker.is_closed)
+            self.assertFalse(worker.home.exists())
+            self.assertTrue(any(isinstance(exc, BrokenPipeError) for exc in worker.close_errors))
+        finally:
+            for stream in (worker.process.stdin, worker.process.stdout):
+                if stream and not stream.closed:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+            worker.directory.cleanup()
 
     def test_reserve_registers_busy_session_before_any_worker_launch(self):
         session = self.manager.reserve("codex")

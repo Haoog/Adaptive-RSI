@@ -31,6 +31,12 @@ HARNESS_CONFIG_PREFIXES = ("jest.config.", "vitest.config.", "playwright.config.
                            "test.config.", "karma.conf.", "wdio.conf.", "ava.config.")
 HARNESS_CONFIGS = {".mocharc.js", ".mocharc.cjs", ".mocharc.mjs", ".mocharc.json", ".mocharc.yaml",
                    ".mocharc.yml", ".mocharc.toml"}
+# Fixture/golden data read by baseline tests is part of the frozen comparison
+# surface even though it is not harness configuration. `testdata` is the Go
+# convention; `fixtures` only counts beneath a test directory so ordinary
+# `src/fixtures/` application data is left to the candidate.
+TEST_DATA_DIRECTORIES = {"testdata", "__fixtures__", "snapshots", "__snapshots__"}
+TEST_DIRECTORIES = {"test", "tests", "spec", "specs", "__tests__"}
 BASELINE_CACHE_LIMIT = 4
 HOST_TOOL_DIGEST_CHUNK = 1024 * 1024
 HOST_TOOL_DIGEST_CACHE_LIMIT = 32
@@ -677,35 +683,126 @@ def configured_check_files(baseline, checks):
     return files
 
 
-def freeze_harness(baseline, target, checks=()):
+def _copy_frozen_fixture(source, destination, baseline, state=None, ancestors=()):
+    """Copy fixture data while materializing only project-owned symlink targets."""
+    source = Path(source)
+    destination = Path(destination)
+    baseline = Path(baseline).resolve()
+    resolved = source.resolve(strict=True)
+    try:
+        resolved.relative_to(baseline)
+    except ValueError:
+        raise RuntimeError("Baseline fixture symlink escapes project") from None
+    if state is not None:
+        try:
+            resolved.relative_to(Path(state).resolve())
+        except ValueError:
+            pass
+        else:
+            raise RuntimeError("Baseline fixture overlaps protected host state")
+    if resolved in ancestors:
+        raise RuntimeError("Baseline fixture symlink cycle")
+    if resolved.is_dir():
+        destination.mkdir(parents=True, exist_ok=True)
+        chain = (*ancestors, resolved)
+        for child in resolved.iterdir():
+            if child.name in {".git", ".rsi-agent", ".rsi-home", ".rsi-build", "__pycache__"}:
+                continue
+            _copy_frozen_fixture(child, destination / child.name, baseline, state, chain)
+        shutil.copystat(resolved, destination)
+        return
+    if not resolved.is_file():
+        raise RuntimeError("Baseline fixture is not a regular file")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(resolved, destination)
+
+
+def freeze_harness(baseline, target, checks=(), state=None):
     """Host-owned baseline tests/build entrypoints overwrite candidate-authored gate changes."""
+    baseline = Path(baseline).resolve()
+    target = Path(target)
+    from .process import scrub_tree
+    scrub_tree(baseline, state=state)
     protected = set()
     baseline_harness = set()
     explicit_checks = configured_check_files(baseline, checks)
     for parent, dirs, files in os.walk(baseline, followlinks=False):
         dirs[:] = [d for d in dirs if d not in {".git", ".rsi-agent", ".rsi-home"}]
-        for name in files:
+        for name in list(dirs):
             src = Path(parent) / name
-            relative = src.relative_to(baseline)
-            if not (test_path(relative) or relative in explicit_checks or _harness_path(relative) or
-                    name.endswith((".csproj", ".fsproj", ".sln"))):
+            if not src.is_symlink():
                 continue
+            relative = src.relative_to(baseline)
+            if not _test_data_path(relative / ".fixture"):
+                continue
+            try:
+                resolved = src.resolve(strict=True)
+                resolved.relative_to(baseline)
+            except (OSError, RuntimeError, ValueError):
+                raise RuntimeError("Baseline fixture symlink escapes project") from None
+            if not resolved.is_dir():
+                raise RuntimeError("Baseline fixture symlink is not a directory")
             dst = target / relative
-            # Reject directory/symlink tricks before the host copies protected files.
-            for item in [dst] + list(dst.parents):
+            for item in dst.parents:
                 if item == target.parent:
                     break
                 if item.is_symlink():
                     raise RuntimeError("Candidate symlink overlaps protected harness")
+            if dst.is_symlink():
+                if os.readlink(dst) != os.readlink(src):
+                    raise RuntimeError("Candidate symlink overlaps protected harness")
+                dst.unlink()
+            if dst.exists() and not dst.is_dir():
+                dst.unlink()
+            if dst.is_dir():
+                # 候选把同一路径做成真实目录时按普通目录路径处理：只覆盖基线拥有的
+                # 内容，保留候选新增的夹具文件，否则引用这些新夹具的回归会在冻结阶段
+                # 假失败。目录内出现符号链接仍然拒绝，避免写穿到候选选择的位置。
+                for child_parent, child_dirs, child_files in os.walk(dst, followlinks=False):
+                    for entry in list(child_dirs) + list(child_files):
+                        if (Path(child_parent) / entry).is_symlink():
+                            raise RuntimeError("Candidate symlink overlaps protected harness")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            _copy_frozen_fixture(resolved, dst, baseline, state)
+            for child_parent, _, child_files in os.walk(dst, followlinks=False):
+                baseline_harness.update((Path(child_parent) / name).relative_to(target)
+                                        for name in child_files)
+            protected.add(dst)
+            dirs.remove(name)
+        for name in files:
+            src = Path(parent) / name
+            relative = src.relative_to(baseline)
+            if not (test_path(relative) or _test_data_path(relative) or relative in explicit_checks or
+                    _harness_path(relative) or name.endswith((".csproj", ".fsproj", ".sln"))):
+                continue
+            dst = target / relative
+            # Only a leaf symlink identical to the baseline is baseline-owned.
+            # Check all ancestors before unlinking it; never follow candidate links.
+            for item in list(dst.parents):
+                if item == target.parent:
+                    break
+                if item.is_symlink():
+                    raise RuntimeError("Candidate symlink overlaps protected harness")
+            if dst.is_symlink():
+                if not src.is_symlink() or os.readlink(dst) != os.readlink(src):
+                    raise RuntimeError("Candidate symlink overlaps protected harness")
+                dst.unlink()
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.is_dir():
                 shutil.rmtree(dst)
             if src.is_symlink():
                 try:
-                    if not src.resolve().exists():
+                    resolved = src.resolve(strict=True)
+                    if _test_data_path(relative):
+                        resolved.relative_to(baseline)
+                    if not resolved.exists():
                         continue
-                except OSError:
+                except (OSError, RuntimeError, ValueError):
+                    if _test_data_path(relative):
+                        raise RuntimeError("Baseline fixture symlink escapes project") from None
                     continue
+                if _test_data_path(relative):
+                    resolved.relative_to(baseline)
             shutil.copy2(src, dst)
             baseline_harness.add(relative)
             parts = relative.parts
@@ -922,6 +1019,19 @@ def _harness_differs(baseline, candidate, checks):
     return False
 
 
+def _test_data_path(path):
+    """True for baseline fixture/golden data that tests read as expectations.
+
+    Unlike `_harness_path`, these files are only restored, never deleted: new
+    fixture files can belong to new candidate tests and must survive the freeze.
+    """
+    directories = [part.lower() for part in Path(path).parts[:-1]]
+    if any(part in TEST_DATA_DIRECTORIES for part in directories):
+        return True
+    return any(part == "fixtures" and any(parent in TEST_DIRECTORIES for parent in directories[:index])
+               for index, part in enumerate(directories))
+
+
 def _harness_path(path):
     name = Path(path).name.lower()
     parts = Path(path).parts
@@ -934,9 +1044,44 @@ def _harness_path(path):
 def _changed_harness(files, checks, baseline, added_tests=()):
     explicit_checks = configured_check_files(baseline, checks)
     additions = set(added_tests)
-    return any(path not in additions and
-               (test_path(path) or _harness_path(path) or Path(path) in explicit_checks)
-               for path in files)
+    root = Path(baseline).resolve()
+    fixture_links = []
+    for parent, dirs, _ in os.walk(root, followlinks=False):
+        for name in dirs:
+            link = Path(parent) / name
+            relative = link.relative_to(root)
+            if not link.is_symlink() or not _test_data_path(relative / ".fixture"):
+                continue
+            try:
+                resolved = link.resolve(strict=True)
+                resolved.relative_to(root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if resolved.is_dir():
+                fixture_links.append(resolved)
+    for path in files:
+        if path in additions:
+            continue
+        candidate = Path(path)
+        baseline_path = root / candidate
+        if test_path(path) or _harness_path(path) or candidate in explicit_checks:
+            return True
+        if _test_data_path(path) and (baseline_path.exists() or baseline_path.is_symlink()):
+            return True
+        # A changed file may be reached through a baseline fixture directory
+        # symlink whose virtual path has no matching entry in the baseline tree.
+        try:
+            resolved_candidate = baseline_path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            resolved_candidate = None
+        if resolved_candidate is not None:
+            for fixture_root in fixture_links:
+                try:
+                    resolved_candidate.relative_to(fixture_root)
+                    return True
+                except ValueError:
+                    continue
+    return False
 
 
 def _overlay_added_tests(candidate, target, paths):
@@ -1056,6 +1201,17 @@ def write_evaluation_report(directory, data):
         raise
 
 
+def _write_report(directory, data):
+    """Persist a report even for refusals that never execute checks.
+
+    Callers keep only a bounded inline summary plus a link to report.json; returning
+    an early refusal without writing the file would leave that link dangling and drop
+    the only copy of its reason and provenance.
+    """
+    write_evaluation_report(directory, data)
+    return data
+
+
 class Evaluator:
     def __init__(self, store):
         self.store = store
@@ -1084,7 +1240,7 @@ class Evaluator:
         def freeze(target):
             if baseline is None:
                 return []
-            protected = freeze_harness(baseline, target, checks)
+            protected = freeze_harness(baseline, target, checks, state=self.store.root)
             # Detection must come from the host-owned harness alone: test files
             # the candidate added (absent from the baseline) never run inside a
             # control, so they cannot decide whether a fixture was caught.
@@ -1111,7 +1267,7 @@ class Evaluator:
                 result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty_test_run(result["stdout"] + result["stderr"])
                 rows.append(result)
             return rows, True
-        positive_target = copy_source(source, root / "positive")
+        positive_target = copy_source(source, root / "positive", state=self.store.root)
         positive, ready = execute(positive_target, freeze(positive_target))
         outcomes = []
         seen = set()
@@ -1120,7 +1276,7 @@ class Evaluator:
                     or not control.get("source") or not control.get("criterion") or not control.get("files")):
                 raise ValueError("Controls require unique IDs, source, criterion and bounded fixture files")
             seen.add(control["id"])
-            target = copy_source(source, root / str(index))
+            target = copy_source(source, root / str(index), state=self.store.root)
             protected = freeze(target)
             total = 0
             for item in control["files"]:
@@ -1328,10 +1484,10 @@ class Evaluator:
 
     def _standard_stage(self, label, source, baseline, candidate, checks, directory, config, cancel,
                         overlay, seeds, hidden, test_first_files=(), test_first_check=None, run_checks=None):
-        target = copy_source(source, Path(directory) / label)
+        target = copy_source(source, Path(directory) / label, state=self.store.root)
         self._seed_target(target, seeds, config, clear=True)
         harness = candidate if label == "candidate_full" else baseline
-        protected = freeze_harness(harness, target, checks)
+        protected = freeze_harness(harness, target, checks, state=self.store.root)
         if label == "baseline" and test_first_files:
             protected.extend(_overlay_added_tests(candidate, target, test_first_files))
         elif label in {"candidate", "candidate_full"} and test_first_files:
@@ -1393,10 +1549,10 @@ class Evaluator:
 
     def _acceptance_stage(self, label, source, baseline, acceptance, directory, config, cancel, seeds, hidden):
         from .config import relative_path
-        target = copy_source(source, Path(directory) / label)
+        target = copy_source(source, Path(directory) / label, state=self.store.root)
         if (target / ".rsi-acceptance").exists():
             raise RuntimeError("Candidate overlaps independent acceptance namespace")
-        protected = freeze_harness(baseline, target, acceptance["checks"])
+        protected = freeze_harness(baseline, target, acceptance["checks"], state=self.store.root)
         for item in acceptance["spec"]["files"]:
             dst = target / relative_path(item["path"])
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1564,9 +1720,10 @@ class Evaluator:
             # Diff and committed history were both unavailable: the frozen
             # baseline harness may not be reused, and checks cannot prove a
             # pass, so treat the evaluation as insufficient evidence.
-            return {"decision": "insufficient_evidence",
-                    "reason": "Changed-file evidence is unavailable; harness freeze provenance cannot be established",
-                    "changed_files_available": False, "checks": {}}
+            return _write_report(directory, {
+                "decision": "insufficient_evidence",
+                "reason": "Changed-file evidence is unavailable; harness freeze provenance cannot be established",
+                "changed_files_available": False, "checks": {}})
         added_tests = _added_test_files(candidate) if test_first else []
         existing_test_files = ([path for path in git(baseline, "ls-files", "-z").split("\0") if path and test_path(path)]
                                if test_first else [])
@@ -1610,18 +1767,21 @@ class Evaluator:
             if not additions:
                 additions = None
         if test_first and changed_harness:
-            return {"decision": "insufficient_evidence",
-                    "reason": "Test-first proof cannot modify the existing test harness", "checks": {}}
+            return _write_report(directory, {
+                "decision": "insufficient_evidence",
+                "reason": "Test-first proof cannot modify the existing test harness", "checks": {}})
         test_first_check = None
         if test_first:
             if not 1 <= len(added_tests) <= 8:
-                return {"decision": "insufficient_evidence",
-                        "reason": "Test-first proof requires 1..8 new regression test files", "checks": {}}
+                return _write_report(directory, {
+                    "decision": "insufficient_evidence",
+                    "reason": "Test-first proof requires 1..8 new regression test files", "checks": {}})
             test_first_check = [_isolated_test_check(checks, baseline, filename, regression_test_symbols) for filename in added_tests]
             if any(check is None for check in test_first_check):
-                return {"decision": "insufficient_evidence",
-                        "reason": "Configured test runner cannot execute the new regression test in isolation",
-                        "checks": {}}
+                return _write_report(directory, {
+                    "decision": "insufficient_evidence",
+                    "reason": "Configured test runner cannot execute the new regression test in isolation",
+                    "checks": {}})
         reuse_full = (changed_files is not None and full_checks == list(checks) and not overlay and
                       not changed_harness and scheduled is None)
         baseline_key = None if test_first or overlay else self._cache_key(

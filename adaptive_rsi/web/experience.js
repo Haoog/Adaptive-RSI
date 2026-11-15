@@ -496,6 +496,10 @@ window.RSIExperience = (() => {
       label.append(input);
       const reasonLabel = el("label", t("干预原因（可选，保留原文）")), reason = el("textarea");
       reason.rows = 2;reason.maxLength = 2000;reasonLabel.append(reason);
+      // 详情轮询与语言切换会整块重建；按任务恢复未提交的审计原文，提交成功后清除。
+      reason.value = draftStore.get('task-reason', task.id) || '';
+      if (reason.value) supplement.open = true;
+      reason.addEventListener('input', () => draftStore.set('task-reason', task.id, reason.value));
       const submit = el("button", t("保存补充并重新评估"), "button");
       submit.type = "submit";
       form.append(label, reasonLabel, submit);
@@ -503,16 +507,17 @@ window.RSIExperience = (() => {
         event.preventDefault();
         safe(async () => {
           if (!current()) return;
-          const value = input.value;
+          const value = input.value, submittedReason = reason.value;
           if (!value.trim()) throw Error(t("补充需求不能为空，请输入需要保留或补充的要求。"));
           submit.disabled = true;
           try {
             const receipt = await api("task/revise", {
               task: task.id,
               supplement: value,
-              reason: reason.value,
+              reason: submittedReason,
             });
             if (draftStore.get('task-supplement', task.id) === value) draftStore.remove('task-supplement', task.id);
+            if (draftStore.get('task-reason', task.id) === submittedReason) draftStore.remove('task-reason', task.id);
             toast(t(receipt.pending ? "补充已收到，将在当前阶段结束后带入下一轮。" : "补充已保存，将重新评估。"));
             await refreshTaskDetail();
           } finally {
@@ -631,6 +636,11 @@ window.RSIExperience = (() => {
             // Rebase even if this form was rebuilt. Its editor still owns newer edits.
             editor.baseline = {dependencies: parents, urgency: !!submitted.urgency};
             editor.version++;
+            // A closed and reopened view owns a different editor for the same task.
+            if (queueEditor && queueEditor !== editor && queueEditor.key === editor.key) {
+              queueEditor.baseline = {dependencies: parents, urgency: !!submitted.urgency};
+              queueEditor.version++;
+            }
             if (!queueEditorCurrent(editor)) return;
             await refresh();
             if (queueEditorCurrent(editor)) toast(t("排队设置已保存"));
@@ -1143,6 +1153,8 @@ window.RSIExperience = (() => {
       }
     });
     box.append(rotateButton);
+    // 服务端校验没有截止时间；界面最多等待 10 分钟，超时后停止轮询并允许重试。
+    const restoreCheckTimeout = 10 * 60 * 1000;
     for (const saved of data.backups) {
       const link = el(
         "a",
@@ -1153,16 +1165,52 @@ window.RSIExperience = (() => {
       link.download = "adaptive-rsi-" + saved.id + ".sqlite3";
       desktopDownload(link, saved.id);
       box.append(link);
-      box.append(action(t("验证恢复点"), async () => {
-        const operation = await api("operations", {kind:"restore-check", parameters:{id:saved.id}});
-        let current;
-        do {
-          await new Promise(resolve => setTimeout(resolve, 300));
-          current = await api("operation?id=" + encodeURIComponent(operation.id));
-        } while (!current.ended);
-        toast(t(current.state === "completed" ? "恢复点验证通过。" : "恢复点验证未通过。"),
-              current.state !== "completed");
-      }, "text-button"));
+      let checking = false, status, timer, deadlineTimer;
+      const checkButton = action(t("验证恢复点"), async () => {
+        // 全库校验可能持续数十秒到数分钟：先禁用按钮，避免重复点击占满后台操作池。
+        if (checking) return;
+        checking = true;
+        checkButton.disabled = true;
+        if (!status) {
+          status = el("p", undefined, "muted");
+          status.setAttribute("role", "status");
+          checkButton.after(status);
+        }
+        status.textContent = t("正在验证恢复点…");
+        const controller = new AbortController();
+        let timedOut = false;
+        try {
+          const operation = await api("operations", {kind:"restore-check", parameters:{id:saved.id}}),
+            deadline = Date.now() + restoreCheckTimeout;
+          deadlineTimer = setTimeout(() => { timedOut = true; controller.abort(); }, restoreCheckTimeout);
+          let current;
+          do {
+            await new Promise(resolve => { timer = setTimeout(resolve, 300); });
+            current = await api("operation?id=" + encodeURIComponent(operation.id), undefined, {signal:controller.signal});
+          } while (!current.ended && Date.now() < deadline);
+          if (!current.ended) {
+            status.textContent = t("验证未完成，请重试。");
+            toast(status.textContent, true);
+            return;
+          }
+          status.textContent = t(current.state === "completed" ? "恢复点验证通过。" : "恢复点验证未通过。");
+          toast(status.textContent, current.state !== "completed");
+        } catch (error) {
+          // 轮询中断时保留错误提示，同时把状态行改成可重试，避免停在“正在验证”。
+          if (status) status.textContent = t("验证未完成，请重试。");
+          if (timedOut) {
+            toast(status.textContent, true);
+            return;
+          }
+          throw error;
+        } finally {
+          clearTimeout(timer);
+          clearTimeout(deadlineTimer);
+          checking = false;
+          checkButton.disabled = false;
+        }
+      }, "text-button");
+      box.append(checkButton);
       box.append(action(t("验证备份并生成清单"), async () => {
         const response = await fetch("/api/backup?id=" + encodeURIComponent(saved.id) + "&format=manifest");
         if (!response.ok) throw Error(t("备份清单生成失败"));

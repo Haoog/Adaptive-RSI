@@ -36,6 +36,46 @@ def _dict_field(mapping, key):
     return value if isinstance(value, dict) else {}
 
 
+def _check_counts(checks):
+    """每组的通过数/总数；坏行忽略，已知组按固定顺序排在前面便于评审对照。"""
+    groups = []
+    for label, rows in (checks.items() if isinstance(checks, dict) else []):
+        if not isinstance(rows, list):
+            continue
+        total = passed = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            total += 1
+            if row.get("passed") is True:
+                passed += 1
+        if total:
+            groups.append((label, passed, total))
+    known = ["baseline", "candidate", "candidate_full", "acceptance_baseline", "acceptance_candidate"]
+    return ([row for name in known for row in groups if row[0] == name] +
+            [row for row in groups if row[0] not in known])
+
+
+def _failure_count(checks):
+    if isinstance(checks, list):
+        rows = [row for row in checks if isinstance(row, dict)]
+    elif isinstance(checks, dict):
+        rows = [row for values in checks.values() if isinstance(values, list)
+                for row in values if isinstance(row, dict)]
+    else:
+        rows = []
+    return sum(1 for row in rows if row.get("passed") is not True)
+
+
+def _short_hash(value):
+    """验收契约与补丁哈希只公开前 12 位，且只保留字母数字。"""
+    digits = re.sub(r"[^0-9a-zA-Z]", "", value)[:12] if isinstance(value, str) else ""
+    return digits if len(digits) >= 6 else ""
+
+
+PR_CHECK_GROUPS = 8
+
+
 def pr_body(task, run, outcome):
     """Explain the delivered behavior and evidence without publishing private task text."""
     value = outcome.get("value")
@@ -60,10 +100,41 @@ def pr_body(task, run, outcome):
         if len(files) > 50:
             file_lines.append(f"- <code>... 还有 {len(files) - 50} 个文件 ...</code>")
         lines += ["修改文件：", "", *file_lines, ""]
+    evidence = []
+    groups = _check_counts(evaluation.get("checks"))
+    if groups:
+        shown = groups[:PR_CHECK_GROUPS]
+        line = "- 本地检查统计：" + "、".join(
+            _public_text(label, 40) + " %d/%d" % (passed, total) for label, passed, total in shown)
+        if len(groups) > len(shown):
+            line += "（仅列前 %d 组）" % len(shown)
+        evidence.append(line)
+    failures = bounded_failures(evaluation)
+    if failures:
+        line = "- 失败检查：" + "；".join(
+            " / ".join(part for part in (_public_text(row.get("group"), 80),
+                                         _public_text(row.get("name"), 200)) if part)
+            for row in failures)
+        failed = _failure_count(evaluation.get("checks"))
+        if failed > len(failures):
+            line += "（已截断：共 %d 项失败，仅列前 %d 条）" % (failed, len(failures))
+        evidence.append(line)
+    acceptance_hash = _short_hash(evaluation.get("acceptance_hash"))
+    if acceptance_hash:
+        evidence.append("- 验收契约哈希：`" + acceptance_hash + "`")
+    patch_hash = _short_hash(outcome.get("patch_hash"))
+    if patch_hash:
+        evidence.append("- 候选补丁哈希：`" + patch_hash + "`")
+    if evaluation.get("decision") != "pass" and evaluation.get("reason"):
+        evidence.append("- 未通过原因：" + _public_text(evaluation["reason"], 500))
+    # 读者只有 PR 页面：本地证据不能混同远端 CI，且运行目录会在保留期后删除。
+    evidence.append("- 本地固定检查与独立验收由本机执行，完整报告保存在本机状态目录（默认保留 30 天）；"
+                    "GitHub CI 结果以 PR 检查页为准。")
     lines += ["## 验证", "",
               "- 原始回归与候选完整检查：" + ("通过" if evaluation.get("decision") == "pass" else "未通过"),
               "- 独立验收：" + ("通过" if _dict_field(evaluation, "improvement").get("decision") == "pass" else "见运行记录"),
               "- 独立代码评审：" + ("通过" if review.get("decision") == "pass" else "未通过"),
+              *evidence,
               "", "## 运行信息", "",
               "- 运行：`" + run["id"] + "`",
               "- 基线：`" + run["base"] + "`"]
@@ -106,45 +177,16 @@ def baseline(runtime, project, config):
         return str(cache), sha, branch
 
 
-PR_FIELDS = ("url,state,headRefOid,headRefName,headRepositoryOwner,baseRefOid,baseRefName,"
+# 精确读同时承载合并门禁、superseded 身份校验与反馈观测，comments/reviews 只在
+# 单条读里取。曾用同一组字段做全仓库 gh pr list 批量索引，但本仓库 100 条查询
+# 稳定 502/504（GraphQL 网关约 10 秒上限），且满页无法证明没有下一页；受跟踪
+# PR 数量很小，逐条精确读（实测 PR #450 为 0.67 秒/9.7KB）比一次失败的批量读更可靠。
+PR_FIELDS = ("url,state,headRefOid,headRefName,headRepository,headRepositoryOwner,baseRefOid,baseRefName,"
              "mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,mergeCommit,isDraft,comments,reviews")
-# 列表页最多返回 100 条；正好满页时无法证明第 101 个受跟踪 PR 不存在，只能回退逐条精确读。
-PR_LIST_LIMIT = 100
 
 
 def pr_view(repo, url):
     return json.loads(checked(["gh", "pr", "view", url, "--repo", repo, "--json", PR_FIELDS]))
-
-
-def pr_index(store, repo, project=None):
-    """Read every tracked PR in one paged request; None means read each PR exactly.
-
-    tick() shares one index per (project, repository) so N tracked PRs cost one gh
-    process instead of N. Unknown URLs still fall back to pr_view, and a full page
-    cannot prove the next page absent, so it falls back instead of dropping PRs.
-    """
-    try:
-        rows = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "all",
-            "--limit", str(PR_LIST_LIMIT), "--json", PR_FIELDS]))
-    except Cancelled:
-        raise
-    except ProcessError as exc:
-        store.event("delivery_pr_list_error", str(exc), project)
-        return None
-    except Exception as exc:
-        # 批量读只是优化：任何异常都回退到逐条精确读，让每个 run 自己暴露真实错误，
-        # 不能因为一页列表坏了就中断整轮跟踪。
-        store.event("delivery_pr_list_error", "Invalid PR list response: %s" % exc, project)
-        return None
-    if not isinstance(rows, list):
-        store.event("delivery_pr_list_error", "PR list response is not a list", project)
-        return None
-    if len(rows) >= PR_LIST_LIMIT:
-        store.event("delivery_pr_page_full",
-                    "PR list page is full; tracked PRs are read individually", project)
-        return None
-    return {row["url"]: row for row in rows
-            if isinstance(row, dict) and isinstance(row.get("url"), str) and row["url"]}
 
 
 def _pr_feedback_prefix(project, task):
@@ -156,7 +198,7 @@ BOT_LOGINS = {"github-actions", "dependabot", "renovate", "copilot-pull-request-
               "copilot", "codex", "chatgpt-codex-connector"}
 
 
-def record_pr_feedback(store, run, url, pr):
+def record_pr_feedback(store, run, url, pr, actionable_ci=True):
     """Append distinct observations without changing task state or run evidence."""
     observations = []
     for field, kind in (("comments", "comment"), ("reviews", "review")):
@@ -174,7 +216,7 @@ def record_pr_feedback(store, run, url, pr):
                                      "state": row.get("state"), "url": row.get("url"),
                                      "author": row.get("author"), "updated_at": row.get("updatedAt")})
     for row in pr.get("statusCheckRollup") or []:
-        if not isinstance(row, dict) or (row.get("conclusion") or row.get("state")) not in ("FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED", "CANCELLED", "STALE"):
+        if not isinstance(row, dict) or (row.get("conclusion") or row.get("state")) not in CHECK_TERMINAL_STATES:
             continue
         if not (row.get("name") or row.get("context")):
             continue
@@ -198,11 +240,12 @@ def record_pr_feedback(store, run, url, pr):
         payload = encode(item)
         key = prefix + hashlib.sha256(payload.encode("utf-8")).hexdigest()
         store.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (key, payload))
-        # 只有客观信号才重排：失败检查，或仍未被后续批准覆盖的修改请求。
-        # 普通评论（包括「LGTM」这类赞许）只作为后续规划的上下文。
-        if item["kind"] == "ci" or (item["kind"] == "review" and
-                                    item.get("state") == "CHANGES_REQUESTED" and
-                                    pr.get("reviewDecision") != "APPROVED"):
+        # 只有客观信号才重排：可归因的失败检查，或仍未被后续批准覆盖的修改请求。
+        # 未决结论（取消/作废/启动失败）只作为后续规划的上下文，绝不触发重排与关 PR。
+        # 普通评论（包括「LGTM」这类赞许）同样只作为上下文。
+        if ((item["kind"] == "ci" and actionable_ci and item["state"] in CHECK_FAILURE_STATES) or
+                (item["kind"] == "review" and item.get("state") == "CHANGES_REQUESTED" and
+                 pr.get("reviewDecision") != "APPROVED")):
             actionable.append(identity)
     return actionable
 
@@ -226,6 +269,18 @@ def pr_feedback_context(store, project, task):
 
 
 _PROTECTION_CACHE = {}
+_PROTECTION_CACHE_SECONDS = 300
+_HTTP_STATUS = re.compile(r"\(HTTP (\d{3})\)")
+
+
+def _protection_definitive(exc):
+    """A 404 states that the branch has no classic protection; nothing else is an answer.
+
+    Timeouts, 5xx, 403 and malformed payloads are failed reads. Caching them
+    keeps the readiness page on a stale warning long after GitHub recovered.
+    """
+    status = _HTTP_STATUS.search(str(exc))
+    return bool(status and status[1] == "404")
 
 
 def merge_protection(config):
@@ -234,12 +289,15 @@ def merge_protection(config):
     branch = config["delivery"]["base_branch"]
     key = (repo, branch)
     cached = _PROTECTION_CACHE.get(key)
-    if cached and time.monotonic() - cached[0] < 300:
+    if cached and time.monotonic() - cached[0] < _PROTECTION_CACHE_SECONDS:
         return cached[1]
     result = {"state": "unknown", "strict_checks": None, "branch": branch,
               "merge_queue": None, "complete": False,
               "sources": {"classic": "unknown", "rulesets": "unknown"}}
     from urllib.parse import quote
+    # 只有每个来源都给出确定答案（读到规则，或 404「未保护」）才缓存；
+    # 传输层失败下一次必须重试，不能把一次抖动固定成 5 分钟的错误读数。
+    cacheable = True
     try:
         if not branch:
             branch = json.loads(checked(["gh", "api", "repos/" + repo], timeout=10))["default_branch"]
@@ -250,8 +308,10 @@ def merge_protection(config):
                                          "/protection"], timeout=10))
             strict_values.append(bool((policy.get("required_status_checks") or {}).get("strict")))
             result["sources"]["classic"] = "observed"
-        except (RuntimeError, OSError, ValueError, KeyError, TypeError, AttributeError):
-            pass
+        except Cancelled:
+            raise
+        except (ProcessError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            cacheable = cacheable and _protection_definitive(exc)
         try:
             # The effective branch rules endpoint includes inherited active rulesets.
             rules = json.loads(checked(["gh", "api", "repos/" + repo + "/rules/branches/" +
@@ -265,23 +325,36 @@ def merge_protection(config):
             result["merge_queue"] = any(rule.get("type") == "merge_queue" for rule in rules)
             strict_values.extend(bool((rule.get("parameters") or {}).get("strict_required_status_checks_policy"))
                                  for rule in rules if rule.get("type") == "required_status_checks")
-        except (RuntimeError, OSError, ValueError, KeyError, TypeError, AttributeError):
-            pass
+        except Cancelled:
+            raise
+        except (ProcessError, OSError, ValueError, KeyError, TypeError, AttributeError):
+            # A rules endpoint 404 does not establish that no rules apply.
+            cacheable = False
         result["complete"] = all(value == "observed" for value in result["sources"].values())
         if any(strict_values):
             result.update(state="strict", strict_checks=True)
         elif result["complete"]:
             result.update(state="review_rules", strict_checks=False)
-    except (RuntimeError, OSError, ValueError, KeyError, TypeError):
-        pass
-    if len(_PROTECTION_CACHE) >= 64:
-        _PROTECTION_CACHE.clear()
-    _PROTECTION_CACHE[key] = (time.monotonic(), result)
+    except Cancelled:
+        raise
+    except (ProcessError, OSError, ValueError, KeyError, TypeError):
+        cacheable = False
+    if cacheable:
+        if len(_PROTECTION_CACHE) >= 64:
+            _PROTECTION_CACHE.clear()
+        _PROTECTION_CACHE[key] = (time.monotonic(), result)
     return result
 
 
-CHECK_FAILURE_STATES = frozenset({"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT",
-                                  "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"})
+# 只有真正裁决了候选代码的检查结论才构成交付证据。`CANCELLED`/`STALE`/
+# `STARTUP_FAILURE` 描述的是这次检查有没有跑起来（runner 回收、被新提交作废、
+# 启动即失败），与候选对错无关：既不能据此关闭 PR 重排任务，也不能让 PR 永远
+# 停在 ci_failed。两个使用点共用这份定义，避免再各自维护一份结论列表。
+CHECK_FAILURE_STATES = frozenset({"FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED"})
+CHECK_INCONCLUSIVE_STATES = frozenset({"CANCELLED", "STALE", "STARTUP_FAILURE"})
+CHECK_TERMINAL_STATES = CHECK_FAILURE_STATES | CHECK_INCONCLUSIVE_STATES
+# 只有未决结论连续这么多轮时记一次事件交人工重跑；不关闭 PR、不重排任务。
+CI_INCONCLUSIVE_TICKS = 10
 CHECK_DETAIL_LIMIT = 20
 
 
@@ -292,7 +365,9 @@ def delivery_checks(pr):
     failure, so they are omitted and a fully green PR leaves no detail. Both
     check-run (`name`/`conclusion`/`detailsUrl`) and status-context
     (`context`/`state`/`targetUrl`) shapes are normalized; the cap keeps a large
-    matrix from growing run results without bound.
+    matrix from growing run results without bound. Inconclusive conclusions
+    (cancelled/stale/startup_failure) are not attributable failures but stay in
+    the detail so the panel can name the check that never ran.
     """
     failed, pending = [], []
     for row in pr.get("statusCheckRollup") or []:
@@ -309,14 +384,20 @@ def delivery_checks(pr):
 
 
 def merge_gate(pr, head, base):
-    if pr["headRefOid"] != head or pr["baseRefOid"] != base:
+    if pr["headRefOid"] != head:
         return "stale"
+    if pr["baseRefOid"] != base:
+        # 目标分支前进不等于候选失败：保留同一 PR，先更新分支再重跑检查。
+        return "behind"
     checks = pr.get("statusCheckRollup") or []
     if not checks:
         return "waiting_ci"
     statuses = {check.get("conclusion") or check.get("state") or check.get("status") for check in checks}
     if statuses & CHECK_FAILURE_STATES:
         return "ci_failed"
+    if statuses & CHECK_INCONCLUSIVE_STATES:
+        # 未决结论不是候选证据：不合并也不判失败，留在 waiting_ci 等人工重跑。
+        return "waiting_ci"
     if statuses - {"SUCCESS", "NEUTRAL", "SKIPPED"}:
         return "waiting_ci"
     if not any((c.get("conclusion") or c.get("state")) == "SUCCESS" for c in checks):
@@ -333,6 +414,65 @@ def merge_gate(pr, head, base):
     return "ready"
 
 
+STALE_REF_LIMIT = 12
+STALE_BRANCH_LIMIT = 120
+
+
+def _short_identity(value, limit=STALE_REF_LIMIT):
+    """Bounded identity fragment: full SHAs and long refs never enter run results."""
+    if not isinstance(value, str) or not value:
+        return None
+    return value[:limit]
+
+
+def stale_reason(pr, policy, configured_branch=None):
+    """Explain which sealed identity invalidated the candidate.
+
+    `merge_gate` already ranks a moved head above a moved base. A retargeted
+    base branch replaces `baseRefOid` with another branch's tip, so it is
+    classified before the base comparison: otherwise every retarget would look
+    like an ordinary base advance and the operator would re-verify the wrong
+    thing. Head/base/retarget need different remedies, so the audit record keeps
+    them apart instead of collapsing everything into `stale`.
+    """
+    expected_branch = policy.get("branch")
+    observed_branch = pr.get("baseRefName")
+    retargeted = observed_branch not in (None, expected_branch)
+    if not retargeted and configured_branch and configured_branch != expected_branch:
+        retargeted = True
+    if pr.get("headRefOid") != policy.get("head"):
+        cause = "head"
+    elif retargeted:
+        cause = "retarget"
+    else:
+        cause = "base"
+    reason = {
+        "cause": cause,
+        "expected_head": _short_identity(policy.get("head")),
+        "observed_head": _short_identity(pr.get("headRefOid")),
+        "expected_base": _short_identity(policy.get("base")),
+        "observed_base": _short_identity(pr.get("baseRefOid")),
+        "expected_branch": _short_identity(expected_branch, STALE_BRANCH_LIMIT),
+        "observed_branch": _short_identity(observed_branch, STALE_BRANCH_LIMIT),
+    }
+    if configured_branch and configured_branch != expected_branch:
+        # 配置层换目标时 PR 的 baseRefName 仍是旧分支，单独留下实际配置值。
+        reason["configured_branch"] = _short_identity(configured_branch, STALE_BRANCH_LIMIT)
+    return reason
+
+
+def _record_superseded(store, run, outcome):
+    """Audit one supersession: why it fired and whether the remote close landed."""
+    reason = outcome.get("delivery_stale")
+    cause = reason.get("cause") if isinstance(reason, dict) else None
+    close = "abandoned" if outcome.get("close_abandoned") else outcome.get("close_status")
+    if not close:
+        close = "pending" if outcome.get("close_pending") else "unknown"
+    store.event("delivery_superseded",
+                "PR superseded: cause=%s pr=%s close=%s" % (cause or "unknown", outcome.get("pr"), close),
+                run["project"], run["id"])
+
+
 def baseline_change(source, previous, current):
     """Diagnose a changed baseline using objects already fetched; never alter refs."""
     result = {"previous": previous, "current": current, "relation": "unknown",
@@ -347,6 +487,221 @@ def baseline_change(source, previous, current):
     except (RuntimeError, OSError):
         pass
     return result
+
+
+REBASE_ATTEMPT_LIMIT = 12  # 本地准备失败的上限；不限制结果不确定的远端推送重试。
+
+
+def _update_pr_identity(pr, repo, base_branch, head_branch, head):
+    return (pr.get("state") == "OPEN" and pr.get("baseRefName") == base_branch and
+            pr.get("headRefName") == head_branch and pr.get("headRefOid") == head and
+            str(_dict_field(pr, "headRepository").get("nameWithOwner", "")).lower() == repo.lower() and
+            str(_dict_field(pr, "headRepositoryOwner").get("login", "")).lower() == repo.split("/")[0].lower())
+
+
+def _reconcile_branch_update(store, run, policy, repo, pr):
+    key = "delivery-update:" + run["id"]
+    intent = store.setting(key)
+    if not isinstance(intent, dict):
+        return policy, False
+    branch = intent.get("head_branch")
+    old = intent.get("old_policy")
+    new = intent.get("new_policy")
+    if (old != policy or not isinstance(new, dict) or not isinstance(branch, str) or
+            new.get("repository") != repo or new.get("branch") != policy["branch"] or
+            pr.get("state") not in ("OPEN", "MERGED", "CLOSED") or
+            not _update_pr_identity({**pr, "state": "OPEN"}, repo, policy["branch"], branch, new.get("head"))):
+        # An old or unexpected observation is ambiguous: preserve the journal and PR.
+        return policy, True
+    with store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        live = db.execute("SELECT state FROM runs WHERE id=?", (run["id"],)).fetchone()
+        rows = {row["key"]: _json_object(row["value"]) for row in db.execute(
+            "SELECT key,value FROM settings WHERE key IN (?,?,?,?)",
+            (key, "delivery:" + run["id"], "run-baseline:" + run["id"], "delivery-push:" + run["id"]))}
+        push = rows.get("delivery-push:" + run["id"])
+        if (not live or live["state"] != "pr_open" or rows.get(key) != intent or
+                rows.get("delivery:" + run["id"]) != old or
+                not isinstance(push, dict) or push.get("repository") != repo or
+                push.get("branch") != branch or push.get("head") != policy["head"] or
+                rows.get("run-baseline:" + run["id"]) !=
+                {"repository": repo, "branch": policy["branch"], "sha": policy["base"]}):
+            return policy, True
+        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("delivery:" + run["id"], encode(new)))
+        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("run-baseline:" + run["id"], encode(
+            {"repository": repo, "branch": new["branch"], "sha": new["base"]})))
+        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("delivery-push:" + run["id"], encode(
+            {**push, "head": new["head"], "base": new["base"]})))
+        db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                   (run["project"], run["id"], "delivery_update_reconciled", "Branch update reconciled",
+                    encode({"old_policy": old, "new_policy": new, "head_branch": branch,
+                            "pr_state": pr["state"], "push_attempts": intent.get("push_attempts", 0)}), time.time()))
+        db.execute("DELETE FROM settings WHERE key=?", (key,))
+    return new, False
+
+
+def update_behind(runtime, project, run, outcome, policy, repo, now, pr, cancelled):
+    """把前进的目标分支并入候选分支并重封，保留同一个 PR 而不是关闭重排。
+
+    返回新的 gate：重封为 waiting_ci；暂不宜写远端为 waiting；工作区缺失、基线
+    被改写、冲突或退避用尽为 stale，交回关闭重排路径。
+    """
+    store = runtime.store
+    workspace = Path(store.root) / "runs" / run["id"] / "candidate"
+    if not workspace.is_dir():
+        if store.setting("delivery-update:" + run["id"]):
+            return "waiting"  # A prior push may have succeeded; preserve the PR for reconciliation.
+        store.event("delivery_rebase_unavailable", "Candidate workspace is missing", project["id"], run["id"])
+        return "stale"
+    push = store.setting("delivery-push:" + run["id"])
+    head_branch = push.get("branch") if isinstance(push, dict) else None
+    if (not isinstance(head_branch, str) or not head_branch or head_branch == policy["branch"] or
+            push.get("repository") != repo or
+            not _update_pr_identity(pr, repo, policy["branch"], head_branch, policy["head"])):
+        return "waiting"
+    intent_key = "delivery-update:" + run["id"]
+    intent = store.setting(intent_key)
+    if intent:
+        if (not isinstance(intent, dict) or intent.get("old_policy") != policy or
+                intent.get("head_branch") != head_branch):
+            return "waiting"
+        attempts = intent.get("push_attempts", 0)
+        last = intent.get("push_retry_at")
+        if not isinstance(attempts, int) or attempts < 0:
+            return "waiting"
+        if attempts and isinstance(last, (int, float)) and now - last < _write_retry_delay(attempts):
+            return "waiting"
+        if isinstance(intent.get("new_policy"), dict):
+            if git(workspace, "rev-parse", "HEAD") != intent["new_policy"].get("head"):
+                return "waiting"
+            current = intent["new_policy"].get("base")
+        else:
+            current = intent.get("target_base")
+            if not isinstance(current, str) or not current:
+                return "waiting"
+    else:
+        attempts, last = outcome.get("rebase_attempts"), outcome.get("rebase_retry_at")
+        if isinstance(attempts, int) and (attempts >= REBASE_ATTEMPT_LIMIT or (
+                isinstance(last, (int, float)) and now - last < _write_retry_delay(attempts))):
+            return "stale" if attempts >= REBASE_ATTEMPT_LIMIT else "waiting"
+        if git(workspace, "rev-parse", "HEAD") != policy["head"] or git(workspace, "status", "--porcelain"):
+            return "waiting"
+        config = merge(runtime.config(project["id"]), {"delivery": {"base_branch": policy["branch"]}})
+        source, current, branch = baseline(runtime, project, config)
+        change = baseline_change(source, policy["base"], current)
+        if branch != policy["branch"] or change["relation"] == "identical":
+            return "waiting"
+        if change["relation"] != "advanced":
+            store.event("baseline_changed", "Remote baseline rewrite invalidates the candidate",
+                        project["id"], run["id"], change)
+            return "stale"
+        attempts = (attempts if isinstance(attempts, int) else 0) + 1
+        outcome.update(rebase_attempts=attempts, rebase_retry_at=now)
+        store.execute("UPDATE runs SET result=? WHERE id=? AND state='pr_open'", (encode(outcome), run["id"]))
+        try:
+            github_git(workspace, "fetch", "--quiet", "--no-tags", "https://github.com/" + repo + ".git",
+                       "+refs/heads/" + policy["branch"] + ":refs/remotes/origin/" + policy["branch"], timeout=180)
+            if git(workspace, "rev-parse", "refs/remotes/origin/" + policy["branch"]) != current:
+                return "waiting"
+        except Exception as exc:
+            store.event("delivery_rebase_conflict", str(exc), project["id"], run["id"], change)
+            return "waiting"
+        intent = {"head_branch": head_branch, "old_policy": policy, "target_base": current}
+        # Record the operation before changing the candidate checkout.
+        store.put_setting(intent_key, intent)
+
+    if not isinstance(intent.get("new_policy"), dict):
+        head = git(workspace, "rev-parse", "HEAD")
+        merge_head = workspace / ".git" / "MERGE_HEAD"
+        # A partially completed merge may contain user edits. Leave it intact.
+        if git(workspace, "status", "--porcelain") or merge_head.exists():
+            return "waiting"
+        if head == policy["head"]:
+            try:
+                github_git(workspace, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
+                           "merge", "--no-edit", current, timeout=180)
+            except Exception as exc:
+                conflicted = merge_head.exists()
+                try:
+                    git(workspace, "merge", "--abort")
+                except Exception:
+                    pass
+                if conflicted:
+                    store.execute("DELETE FROM settings WHERE key=?", (intent_key,))
+                store.event("delivery_rebase_conflict", str(exc), project["id"], run["id"])
+                return "stale" if conflicted else "waiting"
+            head = git(workspace, "rev-parse", "HEAD")
+        else:
+            # Verify both the parents and independently reconstructed tree; never
+            # adopt an unrelated local commit merely because a journal exists.
+            try:
+                if head == current:
+                    if git(workspace, "merge-base", policy["head"], current) != policy["head"]:
+                        return "waiting"
+                else:
+                    parents = git(workspace, "show", "-s", "--format=%P", head).split()
+                    tree = git(workspace, "merge-tree", "--write-tree", policy["head"], current).splitlines()[0]
+                    if parents != [policy["head"], current] or git(workspace, "rev-parse", head + "^{tree}") != tree:
+                        return "waiting"
+            except (RuntimeError, OSError, IndexError):
+                return "waiting"
+        intent = {"head_branch": head_branch, "old_policy": policy,
+                  "new_policy": {"head": head, "base": current, "branch": policy["branch"], "repository": repo}}
+        store.put_setting(intent_key, intent)
+
+    # Fetch/merge can take minutes. Re-read the PR and all local authority immediately
+    # before the write, with configuration changes excluded until the push returns.
+    with runtime.dispatch_lock:
+        live_project = runtime.project(project["id"])
+        live_config = runtime.config(project["id"])
+        live_branch = live_config["delivery"]["base_branch"] or checked(
+            ["gh", "repo", "view", repo, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"])
+        live_run = store.one("SELECT * FROM runs WHERE id=? AND project=?", (run["id"], project["id"]))
+        task = store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))
+        newer = store.one("SELECT 1 FROM runs WHERE task=? AND (started>? OR (started=? AND id>?))",
+                          (run["task"], run["started"], run["started"], run["id"]))
+        fresh = pr_view(repo, outcome["pr"])
+        if (not live_run or live_run["state"] != "pr_open" or not task or task["state"] != "pr_open" or newer or
+                _json_object(live_run["result"]).get("pr") != outcome["pr"] or
+                not _dict_field(_json_object(live_run["config"]), "delivery").get("auto_merge") or
+                live_config["delivery"]["mode"] != "pr" or not live_config["delivery"]["auto_merge"] or
+                live_config["github"]["repository"] != repo or
+                live_branch != policy["branch"] or
+                live_project["paused"] or cancelled() or
+                origin_repository(live_project["path"]).lower() != repo.lower() or
+                store.setting("delivery:" + run["id"]) != policy or
+                store.setting("run-baseline:" + run["id"]) !=
+                {"repository": repo, "branch": policy["branch"], "sha": policy["base"]} or
+                store.setting("delivery-push:" + run["id"]) != push or
+                store.setting(intent_key) != intent or
+                git(workspace, "rev-parse", "HEAD") != intent["new_policy"]["head"] or
+                git(workspace, "status", "--porcelain") or
+                not _update_pr_identity(fresh, repo, policy["branch"], head_branch, policy["head"]) or
+                not fresh.get("baseRefOid")):
+            return "waiting"
+        # A lease is allowed only for a verified fast-forward, never a history rewrite.
+        if git(workspace, "merge-base", policy["head"], intent["new_policy"]["head"]) != policy["head"]:
+            return "waiting"
+        intent = {**intent, "push_attempts": intent.get("push_attempts", 0) + 1, "push_retry_at": now}
+        store.put_setting(intent_key, intent)
+        try:
+            github_git(workspace, "push", "--force-with-lease=refs/heads/" + head_branch + ":" + policy["head"],
+                       "https://github.com/" + repo + ".git",
+                       intent["new_policy"]["head"] + ":refs/heads/" + head_branch, timeout=180)
+        except Exception as exc:
+            store.event("delivery_update_push_error", str(exc), project["id"], run["id"],
+                        {"head_branch": head_branch, "old_head": policy["head"],
+                         "new_head": intent["new_policy"]["head"], "attempt": intent["push_attempts"]})
+            return "waiting"
+    # Do not assume a successful process exit or an exception reveals remote state.
+    fresh = pr_view(repo, outcome["pr"])
+    _, pending = _reconcile_branch_update(store, run, policy, repo, fresh)
+    if pending:
+        return "waiting"
+    outcome.pop("delivery_update_blocked", None)
+    outcome.pop("rebase_attempts", None)
+    outcome.pop("rebase_retry_at", None)
+    return "waiting_ci"
 
 
 def pushed_branch_journal(repo, store):
@@ -373,6 +728,30 @@ def pushed_branch_journal(repo, store):
     return journal
 
 
+PAGE_SIZE = 100
+PAGE_LIMIT = 10
+
+
+def _cleanup_inventory(api, repo, endpoint):
+    """Bounded read of one inventory; an unread page never yields partial truth.
+
+    A short page ends the inventory. Reaching PAGE_LIMIT full pages reports the
+    inventory as truncated instead of pretending the first page is all there is.
+    """
+    rows = []
+    for page in range(1, PAGE_LIMIT + 1):
+        try:
+            batch = api(repo, "%s&page=%d" % (endpoint, page))
+        except (RuntimeError, OSError):
+            return rows, True
+        if not isinstance(batch, list):
+            raise ValueError("Invalid branch cleanup response")
+        rows.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            return rows, False
+    return rows, True
+
+
 def branch_cleanup_preview(repo, recovery_refs=None, store=None):
     """Read-only, bounded preview. Omitted pages and unknown ownership stay protected.
 
@@ -380,14 +759,16 @@ def branch_cleanup_preview(repo, recovery_refs=None, store=None):
     deletion endpoint is provided; candidates must be rechecked before deletion.
     A pushed branch with no PR at all is reported as `pushed_no_pr` when the local
     delivery journal still records that push, so an interrupted publish stays
-    distinguishable from a branch of unknown origin.
+    distinguishable from a branch of unknown origin. `truncated` separates a
+    clipped inventory from a repository that genuinely fits in the page limit.
     """
     from .release import api
-    branches = api(repo, "branches?per_page=100")
-    prs = api(repo, "pulls?state=all&per_page=100")
-    if not isinstance(branches, list) or not isinstance(prs, list):
-        raise ValueError("Invalid branch cleanup response")
-    complete = len(branches) < 100 and len(prs) < 100
+    branches, branches_truncated = _cleanup_inventory(api, repo,
+                                                      "branches?per_page=%d" % PAGE_SIZE)
+    prs, prs_truncated = _cleanup_inventory(api, repo,
+                                            "pulls?state=all&per_page=%d" % PAGE_SIZE)
+    truncated = branches_truncated or prs_truncated
+    complete = not truncated
     candidates, protected = [], []
     recovery = set(recovery_refs or ())
     pushed = pushed_branch_journal(repo, store)
@@ -412,7 +793,9 @@ def branch_cleanup_preview(repo, recovery_refs=None, store=None):
         elif any(str(pr.get("state", "")).lower() == "open" for pr in matching):
             reason = "open_pr"
         elif not matching or not any(str(pr.get("state", "")).lower() == "closed" and
-                                     sha is not None and _dict_field(pr, "head").get("sha") == sha for pr in matching):
+                                     sha is not None and _dict_field(pr, "head").get("sha") == sha and
+                                     str(_dict_field(_dict_field(pr, "head"), "repo").get("full_name") or "").lower() == repo.lower()
+                                     for pr in matching):
             if not matching and any(head is not None and head == sha for head in pushed.get(name, ())):
                 reason = "pushed_no_pr"
             else:
@@ -422,7 +805,7 @@ def branch_cleanup_preview(repo, recovery_refs=None, store=None):
         else:
             candidates.append(name)
     return {"candidates": candidates, "protected": protected, "complete": complete,
-            "deletion_performed": False, "checked_at": time.time()}
+            "truncated": truncated, "deletion_performed": False, "checked_at": time.time()}
 
 
 def failure_attribution(merged, head, result):
@@ -689,8 +1072,16 @@ _CLOSE_PENDING = ("(r.state='superseded' AND json_valid(r.result) "
                   "AND coalesce(json_extract(r.result,'$.close_abandoned'),'')='')")
 
 
-def _close_retry_delay(attempts):
+def _write_retry_delay(attempts):
     return min(CLOSE_RETRY_MAX, CLOSE_RETRY_INITIAL * 2 ** max(0, min(attempts, 8) - 1))
+
+def _retry_delay(initial, cap, attempts):
+    """远端写共用的指数退避窗口：首次等待 initial，逐次翻倍，cap 封顶。"""
+    return min(cap, initial * 2 ** max(0, min(attempts, 8) - 1))
+
+
+def _close_retry_delay(attempts):
+    return _retry_delay(CLOSE_RETRY_INITIAL, CLOSE_RETRY_MAX, attempts)
 
 
 def _close_retry_due(outcome, now):
@@ -698,7 +1089,7 @@ def _close_retry_due(outcome, now):
     attempts = outcome.get("close_attempts")
     if not isinstance(last, (int, float)) or not isinstance(attempts, int):
         return True
-    return now - last >= _close_retry_delay(attempts)
+    return now - last >= _write_retry_delay(attempts)
 
 
 def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
@@ -787,6 +1178,53 @@ def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
     return False
 
 
+# 合并写失败的退避与上限：分支保护、仓库禁用 squash、合并队列策略都会持续拒绝，
+# 每个调度周期重发一次 `gh pr merge` 只会刷写事件并触发 GitHub 二次限流，界面还一直
+# 显示「可以合并」。首次失败 5 分钟后重试，逐次翻倍到 1 小时封顶；8 次后落终态交人工。
+MERGE_ATTEMPT_LIMIT = 8
+MERGE_RETRY_INITIAL = 300
+MERGE_RETRY_MAX = 3600
+
+
+def _merge_intent(value, head):
+    """只采信与当前密封 head 一致的意图；换 head 后的旧计数不阻塞新的合并写。"""
+    return value if isinstance(value, dict) and value.get("head") == head else {}
+
+
+def _merge_attempts(intent):
+    attempts = intent.get("attempts")
+    return attempts if isinstance(attempts, int) and not isinstance(attempts, bool) and attempts > 0 else 0
+
+
+def _merge_retry_due(intent, now):
+    attempts = _merge_attempts(intent)
+    last = intent.get("retry_at", intent.get("at"))
+    if not attempts or not isinstance(last, (int, float)):
+        return True
+    return now - last >= _retry_delay(MERGE_RETRY_INITIAL, MERGE_RETRY_MAX, attempts)
+
+
+def _merge_exhausted(intent):
+    return _merge_attempts(intent) >= MERGE_ATTEMPT_LIMIT
+
+
+def _abandon_merge(store, run, outcome, key, intent, reason):
+    """合并被持续拒绝：落可见终态并只记一条事件，此后不再发起远端写。
+
+    幂等：终态落盘后后续 tick 只刷新 status/明细，不重复写事件。意图键保留，
+    直到观测到 MERGED 被消费或人工重置，便于核对最后一次拒因。
+    """
+    attempts = _merge_attempts(intent)
+    outcome["delivery_status"] = "waiting"
+    details = [item for item in outcome.get("delivery_checks") or [] if item.get("name") != "merge"]
+    outcome["delivery_checks"] = details + [{"name": "merge", "state": "BLOCKED", "url": None}]
+    if intent.get("abandoned"):
+        return
+    store.put_setting(key, {**intent, "abandoned": reason})
+    store.event("merge_abandoned", "Merge abandoned after %s attempts: %s" % (attempts, reason),
+                run["project"], run["id"])
+
+
 # 对账放弃后该运行永久退出恢复候选：退避只限频，尝试次数上限才让无果的
 # 恢复收敛，也让 maintenance 的清理豁免同步放开 delivery-push 等键。
 _RECOVERY_CANDIDATE = ("(r.state='superseded' AND CASE WHEN json_valid(r.result) "
@@ -807,8 +1245,9 @@ def _recovery_due(outcome, now):
     return now - last >= (wait if isinstance(wait, (int, float)) and wait > 0 else 3600)
 
 
-def _abandon_recovery(store, run, now, reason):
-    """Mark recovery terminal so the run leaves the candidate query and its keys age out."""
+def _block_recovery(store, run, now, reason):
+    """Back off while preserving evidence until preconditions can be repaired."""
+    detail = 'recovery preconditions unavailable: ' + reason
     with store.connect() as db:
         db.execute('BEGIN IMMEDIATE')
         row = db.execute('SELECT state,result FROM runs WHERE id=?', (run['id'],)).fetchone()
@@ -817,11 +1256,14 @@ def _abandon_recovery(store, run, now, reason):
         outcome = parsed_result(row)
         if outcome.get('pr') or outcome.get('delivery_recovery_abandoned'):
             return
-        outcome['delivery_recovery_abandoned'] = reason
+        changed = outcome.get('delivery_recovery_blocked') != detail
+        outcome['delivery_recovery_blocked'] = detail
         outcome['delivery_recovery_at'] = now
+        outcome['delivery_recovery_retry'] = 3600
         db.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run['id']))
-    store.event('recovery_abandoned', 'Superseded delivery reconciliation stopped: ' + reason,
-                run['project'], run['id'])
+    if changed:
+        store.event('recovery_blocked', 'Superseded delivery reconciliation blocked: ' + detail,
+                    run['project'], run['id'])
 
 
 def _stamp_recovery(store, run_id, now, wait):
@@ -834,13 +1276,18 @@ def _stamp_recovery(store, run_id, now, wait):
         outcome = parsed_result(row)
         if outcome.get('pr') or outcome.get('delivery_recovery_abandoned'):
             return
-        outcome['delivery_recovery_at'] = now
-        outcome['delivery_recovery_retry'] = wait
+        outcome.pop('delivery_recovery_blocked', None)
         attempts = outcome.get('delivery_recovery_attempts', 0)
-        outcome['delivery_recovery_attempts'] = (attempts if isinstance(attempts, int) else 0) + 1
-        abandoned = outcome['delivery_recovery_attempts'] >= RECOVERY_ATTEMPT_LIMIT
+        attempts = attempts if isinstance(attempts, int) and attempts >= 0 else 0
+        abandoned = attempts >= RECOVERY_ATTEMPT_LIMIT
         if abandoned:
-            outcome['delivery_recovery_abandoned'] = 'exhausted %s attempts without a matching PR' % RECOVERY_ATTEMPT_LIMIT
+            # The previous attempt may have failed to read GitHub; do not claim
+            # that a matching PR was absent. Allow the last attempt to run first.
+            outcome['delivery_recovery_abandoned'] = 'exhausted %s attempts; matching PR not confirmed' % RECOVERY_ATTEMPT_LIMIT
+        else:
+            outcome['delivery_recovery_at'] = now
+            outcome['delivery_recovery_retry'] = wait
+            outcome['delivery_recovery_attempts'] = attempts + 1
         db.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run_id))
         return outcome, abandoned
 
@@ -848,29 +1295,25 @@ def _stamp_recovery(store, run_id, now, wait):
 def _recover_superseded_receipt(runtime, project, run, config, now):
     """Observe a journaled publication without relying on its workspace."""
     store = runtime.store
-    # 失败的远端读取同样要退避，否则每个调度周期都会重新发起查询。
-    stamped = _stamp_recovery(store, run['id'], now, 900)
-    if stamped is None:
-        return
-    outcome, abandoned = stamped
-    if abandoned:
-        store.event('recovery_abandoned',
-                    'Superseded delivery reconciliation stopped: ' + outcome['delivery_recovery_abandoned'],
-                    project['id'], run['id'])
-        return
     intent_key = 'delivery-push:' + run['id']
     intent = store.setting(intent_key)
     if not isinstance(intent, dict):
         row = store.one('SELECT value FROM settings WHERE key=?', (intent_key,))
         if row is not None:
-            # 日志存在但不可解析：损坏的意图永远匹配不到回执，重试只会按退避
-            # 无限刷写；落终态并停止查询远端。
-            _abandon_recovery(store, run, now, 'push journal is not a readable object')
+            # 损坏的意图暂时匹配不到回执；保留日志并退避，允许修复后恢复。
+            _block_recovery(store, run, now, 'push journal unreadable')
         return
     identity = store.setting('run-baseline:' + run['id'])
     task = store.one('SELECT source FROM tasks WHERE id=? AND project=?', (run['task'], run['project']))
     repo = config['github']['repository']
-    if not isinstance(identity, dict) or not task or not isinstance(repo, str):
+    if not isinstance(identity, dict):
+        _block_recovery(store, run, now, 'missing baseline identity')
+        return
+    if not task:
+        _block_recovery(store, run, now, 'missing task row')
+        return
+    if not isinstance(repo, str):
+        _block_recovery(store, run, now, 'missing repository')
         return
     prefix = 'fix' if task['source'] in ['issue', 'rollback', 'inspection'] else 'feat'
     branch = prefix + '/rsi-' + re.sub(r'[^a-zA-Z0-9._-]', '-', run['id'])
@@ -880,8 +1323,21 @@ def _recover_superseded_receipt(runtime, project, run, config, now):
             not isinstance(base_branch, str) or not base_branch or
             intent.get('branch') != branch or intent.get('repository') != repo or
             intent.get('base') != run['base'] or identity != {
-                'repository': repo, 'branch': base_branch, 'sha': run['base']} or
-            repo.lower() != origin_repository(project['path']).lower()):
+                'repository': repo, 'branch': base_branch, 'sha': run['base']}):
+        _block_recovery(store, run, now, 'push journal does not match the run baseline')
+        return
+    if repo.lower() != origin_repository(project['path']).lower():
+        _block_recovery(store, run, now, 'repository mismatch')
+        return
+    # 前置条件齐全后才计次：先落盘再远端读，失败的查询同样按退避重试。
+    stamped = _stamp_recovery(store, run['id'], now, 900)
+    if stamped is None:
+        return
+    outcome, abandoned = stamped
+    if abandoned:
+        store.event('recovery_abandoned',
+                    'Superseded delivery reconciliation stopped: ' + outcome['delivery_recovery_abandoned'],
+                    project['id'], run['id'])
         return
     records = json.loads(checked(['gh', 'pr', 'list', '--repo', repo, '--state', 'all',
         '--head', branch, '--limit', '100', '--json',
@@ -1022,27 +1478,15 @@ def tick(runtime, now=None, project_id=None, active_run=None):
     # 否则 main 的监控读数会让面向 release 的就绪 run 被静默跳过。
     tick_baselines = {}
     origins = {}
-    indexes = {}
     from .release import pending
 
     runs = store.query("SELECT r.* FROM runs r WHERE (r.state IN ('pr_open','merged') OR " +
                        _CLOSE_PENDING + " OR " + _RECOVERY_CANDIDATE + ")" +
                        (" AND r.project=?" if project_id else "") + " ORDER BY r.started",
                        (project_id,) if project_id else ())
-    # 单个受跟踪 PR 用 pr_view 更省一次列表读取；同一项目本轮有多个 PR 时才合并成
-    # 一次 gh pr list。索引按 (项目, 仓库) 缓存，配置换了仓库也不会读到别处的 PR。
-    tracked = {}
-    for row in runs:
-        if row["state"] in ("pr_open", "superseded"):
-            tracked[row["project"]] = tracked.get(row["project"], 0) + 1
-
-    def indexed_pr(project_id, repo, url):
-        key = (project_id, repo)
-        if key not in indexes:
-            indexes[key] = (pr_index(store, repo, project_id)
-                            if tracked.get(project_id, 0) > 1 else None)
-        index = indexes[key]
-        return index.get(url) if index else None
+    # 每个受跟踪 PR 精确读一次，同一份读数供合并门禁、superseded 身份校验与反馈
+    # 观测共用。批量 gh pr list 在 PR 较多的仓库会超出 GraphQL 网关时限（稳定
+    # 502/504），失败后仍要逐条补读并留下误导性事件，因此不再预读整页。
 
     def origin(path):
         # tick 内 origin 远端不会变化：同项目多个 run 共用首次探测结果。
@@ -1098,15 +1542,19 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     continue
             pr = None
             if run["state"] in ["pr_open", "superseded"]:
-                # 列表里缺该 URL（页面截断、仓库 PR 过多或刚创建）时回退单条精确读；
-                # 失败仍由外层记 delivery_error，只影响本 run，不波及其它跟踪项。
-                pr = indexed_pr(run["project"], repo, pr_url) or pr_view(repo, pr_url)
+                # 失败由外层记 delivery_error，只影响本 run，不波及其它跟踪项。
+                pr = pr_view(repo, pr_url)
             if run["state"] in ["pr_open", "superseded"] and pr is None:
                 continue
             feedback_keys = []
             if run["state"] == "pr_open":
                 try:
-                    feedback_keys = record_pr_feedback(store, run, pr_url, pr)
+                    # Preserve old CI observations as context, but do not replan on
+                    # checks that will be rerun after updating a behind branch.
+                    feedback_keys = record_pr_feedback(store, run, pr_url, pr,
+                        actionable_ci=not (pr.get("headRefOid") == policy["head"] and
+                                           pr.get("baseRefOid") is not None and
+                                           pr["baseRefOid"] != policy["base"]))
                 except Exception as exc:
                     store.event("pr_feedback_error", str(exc), project["id"], run["id"])
                 task = store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))
@@ -1138,13 +1586,36 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                   active_run, tracking_cancelled, tick_baselines)
                 continue
             if run["state"] == "pr_open":
+                update_intent = store.setting("delivery-update:" + run["id"])
+                if isinstance(update_intent, dict):
+                    policy, pending_update = _reconcile_branch_update(store, run, policy, repo, pr)
+                    if not pending_update:
+                        outcome.pop("delivery_update_blocked", None)
+                    if pending_update and pr.get("state") == "OPEN" and not _update_pr_identity(
+                            pr, repo, policy["branch"], update_intent.get("head_branch"), policy["head"]):
+                        outcome["delivery_status"] = "waiting"
+                        _persist_result(store, run, outcome)
+                        continue
+                    identity = store.setting("run-baseline:" + run["id"])
+                    sealed_target = identity == {"repository": repo, "branch": policy["branch"], "sha": policy["base"]}
                 gate = merge_gate(pr, policy["head"], policy["base"])
                 if pr.get("baseRefName", policy["branch"]) != policy["branch"] or (
                         config["delivery"]["base_branch"] and config["delivery"]["base_branch"] != policy["branch"]):
                     gate = "stale"
+                if gate == "behind" and not sealed_target:
+                    # 密封身份都对不上时不是「基线前进」，仍按原路径重排。
+                    gate = "stale"
+                if gate == "stale":
+                    # 落库判定依据而不只是结论：head 被推、主线前进、目标被改指
+                    # 三种成因的补救动作不同，只留一个 stale 会诱使人重做候选。
+                    outcome["delivery_stale"] = stale_reason(pr, policy, config["delivery"]["base_branch"])
                 # 与状态同点落库：读方不必跳 GitHub 就能分辨哪条检查在排队、哪条失败。
                 # 全绿或无可展示项时清掉上一 tick 的明细，避免状态前进后面板仍显示旧失败。
-                details = delivery_checks(pr) if gate != "stale" else []
+                # behind 的检查属于旧 head，更新分支后必然重跑，故不落库。
+                details = delivery_checks(pr) if gate != "behind" else []
+                if gate == "stale" and not feedback_keys and not any(
+                        item["state"] in CHECK_FAILURE_STATES for item in details):
+                    details = []
                 if details:
                     outcome["delivery_checks"] = details
                 else:
@@ -1226,13 +1697,40 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         previous = dict(outcome)
                         outcome["delivery_status"] = "feedback_replan"
                         if _supersede_pr(store, run, outcome, state, now, feedback_keys):
-                            if _close_superseded_pr(store, run, outcome, repo, pr,
-                                                    lambda: tracking_cancelled() or runtime.project(project["id"])["paused"], now):
-                                _finish_merge(runtime, project, run, outcome, config, now,
-                                              active_run, tracking_cancelled, tick_baselines)
+                            try:
+                                if _close_superseded_pr(store, run, outcome, repo, pr,
+                                                        lambda: tracking_cancelled() or runtime.project(project["id"])["paused"], now):
+                                    _finish_merge(runtime, project, run, outcome, config, now,
+                                                  active_run, tracking_cancelled, tick_baselines)
+                            finally:
+                                # 基线同时前进时同样要留下成因，否则反馈重排的日志
+                                # 会丢掉“为什么这个候选已经不能合并”。
+                                if gate == "stale":
+                                    _record_superseded(store, run, outcome)
                             continue
                         outcome = previous
                     outcome["delivery_status"] = gate
+                    # 基础设施没让检查裁决（runner 回收、被新提交作废、启动即失败）不构成
+                    # 候选证据：停在 waiting_ci，连续多轮只有未决结论时只记一次事件交人工
+                    # 重跑；不关闭 PR、不重排任务。结论一旦前进或退化为真实失败即清零。
+                    statuses = {check.get("conclusion") or check.get("state") or check.get("status")
+                                for check in pr.get("statusCheckRollup") or [] if isinstance(check, dict)}
+                    blockers = statuses - {"SUCCESS", "NEUTRAL", "SKIPPED"}
+                    if (gate == "waiting_ci" and statuses & CHECK_INCONCLUSIVE_STATES and
+                            not statuses & CHECK_FAILURE_STATES and blockers <= CHECK_INCONCLUSIVE_STATES):
+                        if not outcome.get("ci_inconclusive_reported"):
+                            ticks = outcome.get("ci_inconclusive_ticks")
+                            ticks = (ticks if isinstance(ticks, int) else 0) + 1
+                            outcome["ci_inconclusive_ticks"] = ticks
+                            if ticks >= CI_INCONCLUSIVE_TICKS:
+                                outcome["ci_inconclusive_reported"] = True
+                                store.event("delivery_ci_inconclusive",
+                                            "CI checks stayed inconclusive for %s ticks: %s" %
+                                            (ticks, ", ".join(sorted(statuses & CHECK_INCONCLUSIVE_STATES))),
+                                            project["id"], run["id"])
+                    else:
+                        outcome.pop("ci_inconclusive_ticks", None)
+                        outcome.pop("ci_inconclusive_reported", None)
                     # 同时要求运行时及当前项目授权，撤销授权立即阻止合并。
                     try:
                         run_config = json.loads(run["config"] or "{}")
@@ -1240,7 +1738,19 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         run_config = {}
                     authorized = _dict_field(run_config, "delivery").get("auto_merge") and config["delivery"]["auto_merge"]
                     authorized = authorized and sealed_target
-                    if gate == "ready" and authorized and not runtime.project(project["id"])["paused"]:
+                    if gate == "behind" and authorized and not tracking_cancelled():
+                        # 基线前进：先更新同一 PR 的分支再重跑检查，不再关闭重排整轮。
+                        gate = update_behind(runtime, project, run, outcome, policy, repo, now, pr, tracking_cancelled)
+                    outcome["delivery_status"] = "waiting" if gate == "behind" else gate
+                    intent_key = "merge-intent:" + run["id"]
+                    intent = _merge_intent(store.setting(intent_key), policy["head"])
+                    # 退避期内（或已达上限）不进入准入复核：既不 fetch/探测远端，也不重发
+                    # `gh pr merge`，更不重复写事件；到期后沿用同一意图计数再试。
+                    if gate == "ready" and authorized and _merge_exhausted(intent):
+                        _abandon_merge(store, run, outcome, intent_key, intent,
+                                       intent.get("last_error") or "remote merge rejected")
+                    if (gate == "ready" and authorized and not _merge_exhausted(intent) and
+                            _merge_retry_due(intent, now) and not runtime.project(project["id"])["paused"]):
                         # 同一 tick 内的就绪 run 共享一次真实 fetch：首个准入复核
                         # （或更早的监控观测）留下的本轮读数按目标分支复用，密封判定
                         # 仍逐 run 对共享值复核 sha/branch，不读跨 tick 陈旧值。
@@ -1302,15 +1812,28 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                     live_identity == {"repository": repo, "branch": policy["branch"], "sha": policy["base"]} and
                                     not live_project["paused"] and not tracking_cancelled()):
                                 merge_admitted = True
-                                store.put_setting("merge-intent:" + run["id"], {"head": policy["head"], "at": now})
+                                # 与关闭写同序：先在意图里落盘 attempts+1 再发请求，响应丢失或
+                                # 进程中断同样计入退避，下一 tick 不会立刻重发同一次失败写入。
+                                prior = _merge_intent(store.setting(intent_key), policy["head"])
+                                store.put_setting(intent_key, {
+                                    "head": policy["head"], "at": now,
+                                    "attempts": _merge_attempts(prior) + 1, "retry_at": now})
                         if merge_admitted:
+                            intent = _merge_intent(store.setting(intent_key), policy["head"])
+                            attempts = _merge_attempts(intent)
                             try:
                                 checked(["gh", "pr", "merge", outcome["pr"], "--repo", repo, "--squash",
                                          "--match-head-commit", policy["head"]])
                             except ProcessError as exc:
                                 # 提交失败时保留意图：远端可能已生效（响应丢失），
-                                # 由下一轮对账凭意图与 pr_view 澄清；明确失败则由用户人工重试。
-                                store.event("merge_intent_retry", str(exc), project["id"], run["id"])
+                                # 由下一轮对账凭意图与 pr_view 澄清；明确的拒绝按退避
+                                # 重试，达到上限后落终态交人工，不再每 tick 重发远端写。
+                                reason = str(exc)[:500]
+                                if attempts >= MERGE_ATTEMPT_LIMIT:
+                                    _abandon_merge(store, run, outcome, intent_key, intent, reason)
+                                else:
+                                    store.put_setting(intent_key, {**intent, "last_error": reason})
+                                    store.event("merge_intent_retry", reason, project["id"], run["id"])
                             else:
                                 outcome["delivery_status"] = "merge_submitted"
                     elif gate == "stale" and not outcome.get("replanned"):
@@ -1319,10 +1842,13 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         task = store.one("SELECT attempts FROM tasks WHERE id=?", (run["task"],))
                         state = "queued" if (task["attempts"] or 0) <= config["limits"]["retries"] else "blocked"
                         if _supersede_pr(store, run, outcome, state, now):
-                            if _close_superseded_pr(store, run, outcome, repo,
-                                                    pr_view(repo, outcome["pr"]), tracking_cancelled, now):
-                                _finish_merge(runtime, project, run, outcome, config, now,
-                                              active_run, tracking_cancelled, tick_baselines)
+                            try:
+                                if _close_superseded_pr(store, run, outcome, repo,
+                                                        pr_view(repo, outcome["pr"]), tracking_cancelled, now):
+                                    _finish_merge(runtime, project, run, outcome, config, now,
+                                                  active_run, tracking_cancelled, tick_baselines)
+                            finally:
+                                _record_superseded(store, run, outcome)
                         continue
                 status = outcome.get("delivery_status")
                 store.remote_wait(run["id"], status if status in ["waiting_ci", "waiting_review", "waiting", "merge_submitted"] else None, now)
@@ -1331,6 +1857,10 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                 _finish_merge(runtime, project, run, outcome, config, now,
                               active_run, tracking_cancelled, tick_baselines)
             _persist_result(store, run, outcome)
+        except Cancelled:
+            # 暂停项目/取消 run 是正常控制流：交给运行器把本次 run 收尾为
+            # interrupted，不能落进错误事件流污染真实失败信号。
+            raise
         except Exception as exc:
             store.event("delivery_error", str(exc), project["id"], run["id"])
 
@@ -1587,7 +2117,7 @@ FEEDBACK_RETRY_MAX = 3600
 
 
 def _feedback_retry_delay(attempts):
-    return min(FEEDBACK_RETRY_MAX, FEEDBACK_RETRY_INITIAL * 2 ** max(0, min(attempts, 8) - 1))
+    return _retry_delay(FEEDBACK_RETRY_INITIAL, FEEDBACK_RETRY_MAX, attempts)
 
 
 def _feedback_attempts(outcome):

@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from adaptive_rsi.store import MAX_CONNECTIONS, POOL_SIZE, Store, encode
+from adaptive_rsi.store import MAX_CONNECTIONS, POOL_SIZE, Store, StoreBusy, encode
 
 
 class StorePoolTest(unittest.TestCase):
@@ -306,6 +306,18 @@ class StorePoolTest(unittest.TestCase):
             self.store.execute("INSERT INTO tasks(id,project,title,state) VALUES ('t','missing','x','queued')")
         self.assertEqual(self.store.one("SELECT count(*) AS n FROM tasks")["n"], 0)
 
+    def test_transient_sqlite_busy_surfaces_as_store_busy(self):
+        # SQLITE_BUSY/LOCKED 与容量超时共用可重试语义：调用方只需捕获 StoreBusy。
+        with patch.object(Store, "_prepare", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertRaises(StoreBusy) as context:
+                self.store.query("SELECT 1")
+        self.assertIsInstance(context.exception, sqlite3.OperationalError)
+        # 真正的语句错误不能被当成瞬时拥塞吞掉。
+        with patch.object(Store, "_prepare", side_effect=sqlite3.OperationalError("no such column: nope")):
+            with self.assertRaises(sqlite3.OperationalError) as context:
+                self.store.query("SELECT 1")
+        self.assertNotIsInstance(context.exception, StoreBusy)
+
     def test_stream_returns_connection_and_abandoned_streams_do_not_leak(self):
         self.store.execute("INSERT INTO projects(id,name,path) VALUES ('p','p','/p')")
         for index in range(3):
@@ -328,7 +340,8 @@ class StorePoolTest(unittest.TestCase):
                 db.execute("SELECT missing_column FROM settings")
         self.assertEqual(self.store._pool.qsize(), 0)
         # 坏连接未被归还：下一次查询必须新建连接且结果正确。
-        self.assertEqual(self.store.query("SELECT count(*) AS n FROM settings"), [{"n": 1}])
+        # 打开状态目录时已写入 instance-id，用它验证新连接读到的是已提交状态。
+        self.assertEqual(self.store.query("SELECT count(*) AS n FROM settings WHERE key='instance-id'"), [{"n": 1}])
         self.assertEqual(len(created), 1)
         self.assertEqual(self.store._pool.qsize(), 1)
 
@@ -353,7 +366,8 @@ class StorePoolTest(unittest.TestCase):
         self.assertEqual(self.store._pool.qsize(), 1)
         self.store.close()
         self.assertEqual(self.store._pool.qsize(), 0)
-        self.assertEqual(self.store.query("SELECT count(*) AS n FROM settings"), [{"n": 1}])
+        # 池清空后重新借出连接：启动期写入的 instance-id 仍可读。
+        self.assertEqual(self.store.query("SELECT count(*) AS n FROM settings WHERE key='instance-id'"), [{"n": 1}])
         self.assertEqual(self.store._pool.qsize(), 1)
 
     def test_namespaced_setting_lazy_migration_and_corrupt_isolation(self):
@@ -916,20 +930,21 @@ class MigrationLedgerConcurrencyTest(unittest.TestCase):
     def test_migration_applied_between_precheck_and_lock_runs_once(self):
         from adaptive_rsi import schema_migrations
         Store(self.root).close()
-        # v10 迁移体照问题报告写成幂等形式（DDL 幂等 + 计数行）：重放不再报建表冲突，
+        # 迁移体照问题报告写成幂等形式（DDL 幂等 + 计数行）：重放不再报建表冲突，
         # 只能靠行数发现；同时复现报告的 IntegrityError 判据（仅当修复不完整时）。
+        next_version = max(version for version, _ in schema_migrations.scripts()) + 1
         pending = schema_migrations.scripts() + [
-            (10, b"CREATE TABLE IF NOT EXISTS race_probe(x INTEGER);\n"
+            (next_version, b"CREATE TABLE IF NOT EXISTS race_probe(x INTEGER);\n"
                  b"INSERT INTO race_probe VALUES (1);\n")]
         barrier = threading.Barrier(2, timeout=15)
         aligned = threading.local()
         real_ledger_has = schema_migrations._ledger_has
 
         def gated(db, version):
-            # 每个线程只在 v10 的锁外预检上对齐一次，把「预检之后、BEGIN IMMEDIATE
+            # 每个线程只在新迁移的锁外预检上对齐一次，把「预检之后、BEGIN IMMEDIATE
             # 之前」的窗口固定成必然发生，而不是靠 sleep 撞时序。
             result = real_ledger_has(db, version)
-            if version == 10 and not getattr(aligned, "done", False):
+            if version == next_version and not getattr(aligned, "done", False):
                 aligned.done = True
                 barrier.wait()
             return result
@@ -960,7 +975,7 @@ class MigrationLedgerConcurrencyTest(unittest.TestCase):
                 "SELECT version FROM schema_migrations GROUP BY version HAVING count(*) > 1").fetchall(), [])
             self.assertEqual([row[0] for row in db.execute(
                 "SELECT version FROM schema_migrations ORDER BY version")],
-                list(range(1, 11)))
+                list(range(1, next_version + 1)))
 
 
 if __name__ == "__main__":
