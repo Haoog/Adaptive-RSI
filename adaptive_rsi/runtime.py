@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .adapters import detect
 from .agent import CodexAgent
-from .config import BUILTIN_PROVIDERS, DEFAULTS, compatibility, fingerprint, merge, relative_path, validate, within_hours
+from .config import BUILTIN_PROVIDERS, DEFAULTS, InvalidDeploymentHealth, compatibility, fingerprint, merge, relative_path, validate, validate_legacy_schedule, within_hours
 from .evaluator import Evaluator, check_identity
 from .gitops import changes, git, origin_repository, repository, snapshot
 from .process import Cancelled, checked
@@ -513,28 +513,68 @@ class Runtime(Maintenance):
             raise ValueError("Parallel project limit is a global setting; select global defaults")
         if project and "updates" in values:
             raise ValueError("Software updates are a global setting")
-        previous = json.loads(self.project(project)["config"]) if project else self.store.setting("config", {})
-        projects = [self.project(project)] if project else self.store.query("SELECT * FROM projects")
+
+        global_config = self.store.setting("config", {})
+        if project:
+            project_row = self.project(project)
+            projects = [project_row]
+            previous = json.loads(project_row["config"])
+        else:
+            projects = self.store.query("SELECT * FROM projects")
+            previous = global_config
+
         schedules = {}
+        previously_valid = set()
+        invalid_health = set()
         for row in projects:
             try:
-                schedules[row["id"]] = self.config(row["id"])["schedule"]
-            except (ValueError, TypeError, KeyError, AttributeError):
-                if project:
+                override = previous if project else json.loads(row["config"])
+                old_effective = validate(merge(DEFAULTS, global_config, override))
+                schedules[row["id"]] = old_effective["schedule"]
+                previously_valid.add(row["id"])
+            except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                if project and not isinstance(exc, InvalidDeploymentHealth):
                     raise
+                if isinstance(exc, InvalidDeploymentHealth):
+                    # Schedule fields have already passed validation before the
+                    # health-URL check, so preserve their existing due times.
+                    old_raw = merge(DEFAULTS, global_config, previous if project else override)
+                    schedules[row["id"]] = old_raw["schedule"]
+                    invalid_health.add(row["id"])
+
         updated = copy.deepcopy(values) if replacement else merge(previous, values)
         for path in inherit:
             group, key = path.split(".")
             section = updated.get(group)
             if isinstance(section, dict):
                 section.pop(key, None)
-        validate(merge(self.store.setting("config", {}) if project else {}, updated))
-        if not project:
-            # Global changes must also remain valid for every existing project override.
+
+        effective_configs = {}
+        if project:
+            # Project saves remain strict: repairing an invalid project must produce a fully valid config.
+            effective_configs[project] = validate(merge(global_config, updated))["schedule"]
+        else:
+            validate(updated)
+            # Preflight every previously valid project strictly. For a project whose old config
+            # failed specifically on a health URL port, validate the entire candidate config
+            # while ignoring only that legacy URL-port exception. The helper returns only its
+            # schedule, so the result cannot authorize deployment or make the project valid.
             for row in projects:
+                try:
+                    override = json.loads(row["config"])
+                    candidate = merge(updated, override)
+                    if row["id"] in invalid_health:
+                        candidate_schedule = validate_legacy_schedule(candidate)
+                    else:
+                        candidate_schedule = validate(candidate)["schedule"]
+                except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                    # A formerly valid project must stay valid. A formerly health-invalid
+                    # project must pass every other check before a global write is allowed.
+                    if row["id"] in previously_valid or row["id"] in invalid_health:
+                        raise
+                    continue
                 if row["id"] in schedules:
-                    # 写入侧校验：行数据损坏时直接暴露错误，不静默降级通过验证。
-                    validate(merge(updated, json.loads(row["config"])))
+                    effective_configs[row["id"]] = candidate_schedule
         revision_key = "config-revision:" + (project or "global")
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -562,14 +602,16 @@ class Runtime(Maintenance):
                          data=revision_data)
         if "schedule" in values or inherit or replacement:
             for row in projects:
-                if row["id"] not in schedules:
+                project_id = row["id"]
+                if project_id not in schedules or project_id not in effective_configs:
                     continue
-                effective = self.config(row["id"])
+                effective = effective_configs[project_id]
                 for kind in ["light", "issues", "deep"]:
-                    if effective["schedule"][kind + "_minutes"] == schedules[row["id"]][kind + "_minutes"]:
+                    if effective[kind + "_minutes"] == schedules[project_id][kind + "_minutes"]:
                         continue
                     self.store.execute("UPDATE schedules SET due=? WHERE project=? AND kind=?",
-                                       (time.time() + effective["schedule"][kind + "_minutes"] * 60, row["id"], kind))
+                                       (time.time() + effective[kind + "_minutes"] * 60,
+                                        project_id, kind))
         self.wake.set()
         return {"saved": True, "revision": next_revision}
 
@@ -609,9 +651,9 @@ class Runtime(Maintenance):
         from .release import resolve
         return resolve(self, project, run, kind, workflow_run_id, target, source="console")
 
-    def workflow_choices(self, project):
+    def workflow_choices(self, project, refresh=False):
         from .release import workflow_choices
-        return workflow_choices(self, project)
+        return workflow_choices(self, project, refresh=refresh)
 
     def authorize_workflow(self, project, kind, workflow):
         from .release import authorize_workflow
@@ -1640,22 +1682,46 @@ class Runtime(Maintenance):
             try:
                 self._postprocess_run(key, identifier, record)
             except Exception as exc:
-                attempts += 1
-                record.update(attempts=attempts, last_error=str(exc)[:400], last_failed=time.time())
-                if attempts >= POSTPROCESS_MAX_ATTEMPTS:
-                    # 终态逃逸：损坏/确定性失败的回执不再每 5 秒热循环，摘除待办索引并
-                    # 记录放弃原因；原始回执连同 attempts/last_error 保留在 postprocess: 命名空间。
-                    record.update(state='failed', ended=time.time(),
-                                  reason='Postprocessing abandoned after %d attempts' % attempts)
-                    self.store.put_setting(key, record)
-                    if marker:
-                        self.store.execute('DELETE FROM settings WHERE key=?', (marker,))
+                abandoned = None
+                with self.store.connect() as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+                    if row is None:
+                        return
+                    try:
+                        record = json.loads(row['value'])
+                    except (TypeError, ValueError):
+                        return
+                    if (not isinstance(record, dict)
+                            or record.get('state') != 'pending'
+                            or not isinstance(record.get('steps'), list)):
+                        return
+
+                    attempts = record.get('attempts', 0)
+                    if not isinstance(attempts, int) or attempts < 0:
+                        attempts = 0
+                    attempts += 1
+                    last_error = str(exc)[:400]
+                    record.update(attempts=attempts, last_error=last_error, last_failed=time.time())
+                    if attempts >= POSTPROCESS_MAX_ATTEMPTS:
+                        # 终态逃逸：损坏/确定性失败的回执不再每 5 秒热循环，摘除待办索引并
+                        # 记录放弃原因；原始回执连同 attempts/last_error 保留在 postprocess: 命名空间。
+                        record.update(state='failed', ended=time.time(),
+                                      reason='Postprocessing abandoned after %d attempts' % attempts)
+                        abandoned = (attempts, last_error)
+
+                    db.execute('UPDATE settings SET value=? WHERE key=?',
+                               (encode(record), key))
+                    if abandoned is not None and marker:
+                        db.execute('DELETE FROM settings WHERE key=?', (marker,))
+
+                if abandoned is not None:
+                    attempts, last_error = abandoned
                     self.store.event('postprocess_abandoned',
                                      'Postprocessing gave up after %d attempts: %s' % (attempts, str(exc)[:300]),
                                      run=identifier, data={'key': key, 'attempts': attempts,
-                                                          'last_error': str(exc)[:400]})
+                                                          'last_error': last_error})
                     return
-                self.store.put_setting(key, record)
                 raise
         # 成功/obsolete 后移除索引；瞬时失败仍保持 pending 与索引，下一轮重试。
         if marker:
@@ -1681,7 +1747,33 @@ class Runtime(Maintenance):
 
     def _postprocess_run(self, key, identifier, record):
         run = self.store.one('SELECT * FROM runs WHERE id=?', (identifier,))
-        if not run or run['ended'] is None:
+        if not run:
+            # 回执指向的 run 行已在备份恢复或手工清理中消失。此前这里直接返回，回执
+            # 保持 pending、attempts 永不增加，孤儿会永久占用每轮的有界批次且无任何
+            # 事件痕迹；这里落到终态，让待办索引按 completed/obsolete 规则摘除。
+            # 回执与事件必须同时提交；失败时保留 pending，交由现有重试逻辑处理。
+            with self.store.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                current_run = db.execute('SELECT 1 FROM runs WHERE id=?', (identifier,)).fetchone()
+                latest_row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+                if current_run is not None or latest_row is None:
+                    return
+                try:
+                    latest_receipt = json.loads(latest_row['value'])
+                except (TypeError, ValueError):
+                    return
+                if (not isinstance(latest_receipt, dict)
+                        or latest_receipt.get('state') != 'pending'
+                        or not isinstance(latest_receipt.get('steps'), list)):
+                    return
+                terminal = {**latest_receipt, 'state': 'obsolete',
+                            'reason': 'Run record is missing; postprocessing terminated', 'ended': time.time()}
+                db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, encode(terminal)))
+                db.execute('INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)',
+                           (None, identifier, 'postprocess_orphaned',
+                            'Postprocessing terminated: run record is missing', encode({'key': key}), time.time()))
+            return
+        if run['ended'] is None:
             return
         if self.store.setting('project-archived:' + run['project']):
             record.update(state='obsolete', reason='Project archived; postprocessing terminated', ended=time.time())
@@ -2258,7 +2350,8 @@ class Runtime(Maintenance):
                     'failure': {'code': 'deadline', 'action': 'inspect_details', 'stage': stage}}, True)
             else:
                 self.store.transition(run["id"], "insufficient_evidence",
-                                      {"reason": str(exc), "failure": exc.failure()}, True)
+                                      {"reason": str(exc), "failure": exc.failure()}, True,
+                                      clear_failure_on_stop=True)
         except Cancelled as exc:
             if run.get('_timed_out_stage') and not self.stop.is_set():
                 stage = run['_timed_out_stage']

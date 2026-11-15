@@ -4,6 +4,11 @@ import re
 from urllib.parse import urlsplit
 
 
+class InvalidDeploymentHealth(ValueError):
+    # Health URL cannot supply a usable origin or port.
+    pass
+
+
 BUILTIN_PROVIDERS = [
     {"id": "openai", "name": "Codex", "protocol": "codex_login", "base_url": "", "env_key": ""},
     {"id": "opencode", "name": "OpenCode", "protocol": "opencode", "base_url": "", "env_key": ""},
@@ -71,7 +76,7 @@ def within_hours(hour, hours):
     return start <= hour < end if start < end else hour >= start or hour < end
 
 
-def validate(config):
+def _validate(config, *, _ignore_invalid_health_urls=False):
     def shape(values, template, path=""):
         for key, value in values.items():
             if key not in template:
@@ -245,11 +250,35 @@ def validate(config):
     if len([url for url in urls if url]) != len(set(url for url in urls if url)):
         raise ValueError("Deployment health URLs must be unique")
     for url in urls:
-        health = urlsplit(url)
-        if url and (health.scheme != "https" or not health.hostname or health.username is not None or
-                health.password is not None or health.query or health.fragment or
-                any(c.isspace() or ord(c) < 32 for c in url)):
-            raise ValueError("Deployment health URL requires HTTPS without credentials, query or fragment")
+        if url == "":
+            continue
+        try:
+            try:
+                health = urlsplit(url)
+            except ValueError:
+                raise InvalidDeploymentHealth(
+                    "Deployment health URL requires a valid HTTPS address and a port between 1 and 65535"
+                ) from None
+            if (health.scheme != "https" or not health.hostname or health.username is not None or
+                    health.password is not None or health.query or health.fragment or
+                    any(c.isspace() or ord(c) < 32 for c in url)):
+                raise ValueError("Deployment health URL requires HTTPS without credentials, query or fragment")
+            try:
+                port = health.port
+            except ValueError:
+                raise InvalidDeploymentHealth(
+                    "Deployment health URL requires a valid HTTPS address and a port between 1 and 65535"
+                ) from None
+            # Port 0 parses successfully but is treated as 443 by the deployment owner key.
+            if port is not None and not 1 <= port <= 65535:
+                raise InvalidDeploymentHealth(
+                    "Deployment health URL requires a valid HTTPS address and a port between 1 and 65535"
+                )
+        except InvalidDeploymentHealth:
+            if not _ignore_invalid_health_urls:
+                raise
+            # Continue checking every URL and all validation after the URL loop.
+            continue
     if delivery["deploy"]["automatic_rollback"] and not delivery["deploy"]["health_url"]:
         raise ValueError("Automatic deployment rollback requires an explicit health URL")
     if delivery["deploy"]["rollback_data_policy"] not in ("manual", "backward_compatible"):
@@ -291,6 +320,21 @@ def validate(config):
     if not 1 <= evo["max_cost_ratio"] <= 10:
         raise ValueError("Invalid evolution cost ratio")
     return config
+
+
+def validate(config):
+    """Validate configuration strictly, including every deployment health URL."""
+    return _validate(config)
+
+
+def validate_legacy_schedule(config):
+    """Validate legacy configuration for schedule comparison and return only its schedule.
+
+    This internal compatibility path ignores InvalidDeploymentHealth, including malformed origins.
+    It still raises every other validation error. Its result is only a schedule snapshot and
+    must never be used as an authorized or deployable configuration.
+    """
+    return _validate(config, _ignore_invalid_health_urls=True)["schedule"]
 
 
 def relative_path(value):

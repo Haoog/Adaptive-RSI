@@ -11,11 +11,13 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from adaptive_rsi.config import DEFAULTS, fingerprint
+from adaptive_rsi.config import DEFAULTS, InvalidDeploymentHealth, fingerprint, validate, validate_legacy_schedule
 from adaptive_rsi.delivery import StaleCandidate, publish, tick
 from adaptive_rsi.gitops import changes, git, snapshot
 from adaptive_rsi.process import Cancelled
 from adaptive_rsi.runtime import Runtime
+from adaptive_rsi.server import Server
+from urllib.error import HTTPError
 from adaptive_rsi.store import Store, encode
 from tests.test_runtime import FakeAgent, fixture
 
@@ -313,7 +315,981 @@ class ReleaseReconciliationRaceTest(unittest.TestCase):
                     self.assertEqual(posts, ["actions/runs/" + str(target["workflow_run_id"]) + "/rerun"])
 
 
+class WorkflowChoicesPreflightRegression(unittest.TestCase):
+    def setUp(self):
+        self.repo = 'example/project'
+        self.sha = 'b' * 40
+        with release._workflow_choices_cache_lock:
+            release._workflow_choices_cache.clear()
+        self.addCleanup(release._workflow_choices_cache.clear)
+
+    def setup_patches(self, api):
+        for name, kwargs in [('_validated_repository', {'return_value': self.repo}),
+                             ('api', {'side_effect': api}),
+                             ('workflow_content', {'return_value': 'valid'}),
+                             ('compatible_workflow', {'return_value': True})]:
+            patcher = patch.object(release, name, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def response(state):
+        return {'workflows': [{'path': '.github/workflows/deploy.yml',
+                               'name': 'deploy', 'state': state}]}
+
+    def test_preflight_refresh_failure_invalidates_cached_choices(self):
+        metadata_calls = []
+        list_calls = []
+
+        def api(repo, path):
+            if path == '':
+                metadata_calls.append(path)
+                if len(metadata_calls) == 2:
+                    raise RuntimeError('metadata outage')
+                return {'default_branch': 'main'}
+            if path == 'commits/main':
+                return {'sha': self.sha}
+            if path.startswith('actions/workflows?'):
+                list_calls.append(path)
+                return self.response('disabled_manually' if len(list_calls) == 1 else 'active')
+            raise AssertionError(path)
+
+        self.setup_patches(api)
+        initial = release.workflow_choices(object(), 'p')
+        self.assertFalse(initial['workflows'][0]['compatible'])
+        with self.assertRaisesRegex(RuntimeError, 'metadata outage'):
+            release.workflow_choices(object(), 'p', refresh=True)
+
+        later = release.workflow_choices(object(), 'p')
+        self.assertTrue(later['workflows'][0]['compatible'])
+        self.assertEqual(len(list_calls), 2)
+
+    def test_failed_preflight_refresh_prevents_older_cache_publication(self):
+        older_list_started = threading.Event()
+        allow_older_list = threading.Event()
+        main_metadata_calls = []
+        list_calls = []
+        older_results = {}
+        older_errors = []
+
+        def api(repo, path):
+            if path == '':
+                if threading.current_thread().name == 'MainThread':
+                    main_metadata_calls.append(path)
+                    if len(main_metadata_calls) == 1:
+                        raise RuntimeError('metadata outage')
+                return {'default_branch': 'main'}
+            if path == 'commits/main':
+                return {'sha': self.sha}
+            if path.startswith('actions/workflows?'):
+                list_calls.append(threading.current_thread().name)
+                if threading.current_thread().name == 'older-list':
+                    older_list_started.set()
+                    if not allow_older_list.wait(5):
+                        raise AssertionError('older list gate timed out')
+                    return self.response('disabled_manually')
+                return self.response('active')
+            raise AssertionError(path)
+
+        self.setup_patches(api)
+
+        def older_request():
+            try:
+                older_results['result'] = release.workflow_choices(object(), 'p')
+            except BaseException as error:
+                older_errors.append(error)
+
+        thread = threading.Thread(target=older_request, name='older-list')
+        thread.start()
+        try:
+            self.assertTrue(older_list_started.wait(3), 'older request did not reach workflow listing')
+            with self.assertRaisesRegex(RuntimeError, 'metadata outage'):
+                release.workflow_choices(object(), 'p', refresh=True)
+        finally:
+            allow_older_list.set()
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive(), 'older request did not finish')
+        self.assertEqual(older_errors, [])
+        self.assertFalse(older_results['result']['workflows'][0]['compatible'])
+        later = release.workflow_choices(object(), 'p')
+        self.assertTrue(later['workflows'][0]['compatible'])
+        self.assertEqual(len(list_calls), 2)
+
+    def test_delayed_preflight_older_refresh_cannot_replace_newer_success(self):
+        older_preflight_started = threading.Event()
+        allow_older_preflight = threading.Event()
+        list_calls = []
+        older_results = {}
+        older_errors = []
+
+        def api(repo, path):
+            if path == '':
+                if threading.current_thread().name == 'older-preflight':
+                    older_preflight_started.set()
+                    if not allow_older_preflight.wait(5):
+                        raise AssertionError('older preflight gate timed out')
+                return {'default_branch': 'main'}
+            if path == 'commits/main':
+                return {'sha': self.sha}
+            if path.startswith('actions/workflows?'):
+                list_calls.append(threading.current_thread().name)
+                if threading.current_thread().name == 'older-preflight':
+                    return self.response('disabled_manually')
+                return self.response('active')
+            raise AssertionError(path)
+
+        self.setup_patches(api)
+
+        def older_request():
+            try:
+                older_results['result'] = release.workflow_choices(
+                    object(), 'p', refresh=True
+                )
+            except BaseException as error:
+                older_errors.append(error)
+
+        thread = threading.Thread(target=older_request, name='older-preflight')
+        thread.start()
+        try:
+            self.assertTrue(
+                older_preflight_started.wait(3),
+                'older request did not reach repository metadata lookup',
+            )
+            newer = release.workflow_choices(object(), 'p', refresh=True)
+        finally:
+            allow_older_preflight.set()
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive(), 'older request did not finish')
+        self.assertEqual(older_errors, [])
+        self.assertFalse(older_results['result']['workflows'][0]['compatible'])
+        later = release.workflow_choices(object(), 'p')
+        self.assertEqual(later, newer)
+        self.assertTrue(later['workflows'][0]['compatible'])
+        self.assertEqual(len(list_calls), 3)
+
+
+    def test_ordinary_request_during_failed_refresh_cannot_publish_cache(self):
+        refresh_started = threading.Event()
+        finish_refresh = threading.Event()
+        errors = []
+        list_calls = []
+
+        def api(repo, path):
+            if path == '':
+                if threading.current_thread().name == 'refresh':
+                    refresh_started.set()
+                    if not finish_refresh.wait(5):
+                        raise AssertionError('refresh gate timed out')
+                    raise RuntimeError('metadata outage')
+                return {'default_branch': 'main'}
+            if path == 'commits/main':
+                return {'sha': self.sha}
+            if path.startswith('actions/workflows?'):
+                list_calls.append(path)
+                return self.response(
+                    'disabled_manually' if len(list_calls) == 1 else 'active'
+                )
+            raise AssertionError(path)
+
+        self.setup_patches(api)
+
+        def run_refresh():
+            try:
+                release.workflow_choices(object(), 'p', refresh=True)
+            except RuntimeError as error:
+                errors.append(str(error))
+
+        refresh_thread = threading.Thread(target=run_refresh, name='refresh')
+        refresh_thread.start()
+        try:
+            self.assertTrue(refresh_started.wait(3), 'refresh did not reach preflight')
+            during_refresh = release.workflow_choices(object(), 'p')
+            self.assertFalse(during_refresh['workflows'][0]['compatible'])
+        finally:
+            finish_refresh.set()
+            refresh_thread.join(5)
+
+        self.assertFalse(refresh_thread.is_alive(), 'refresh thread did not finish')
+        self.assertEqual(errors, ['metadata outage'])
+        after_failure = release.workflow_choices(object(), 'p')
+        self.assertTrue(after_failure['workflows'][0]['compatible'])
+        self.assertEqual(len(list_calls), 2)
+
+    def test_successful_refresh_overwrites_ordinary_result_started_during_refresh(self):
+        refresh_started = threading.Event()
+        finish_refresh = threading.Event()
+        errors = []
+        results = {}
+        list_calls = []
+
+        def api(repo, path):
+            if path == '':
+                if threading.current_thread().name == 'refresh':
+                    refresh_started.set()
+                    if not finish_refresh.wait(5):
+                        raise AssertionError('refresh gate timed out')
+                return {'default_branch': 'main'}
+            if path == 'commits/main':
+                return {'sha': self.sha}
+            if path.startswith('actions/workflows?'):
+                list_calls.append(threading.current_thread().name)
+                state = (
+                    'active'
+                    if threading.current_thread().name == 'refresh' or len(list_calls) >= 3
+                    else 'disabled_manually'
+                )
+                return self.response(state)
+            raise AssertionError(path)
+
+        self.setup_patches(api)
+
+        def run_refresh():
+            try:
+                results['refresh'] = release.workflow_choices(
+                    object(), 'p', refresh=True
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        refresh_thread = threading.Thread(target=run_refresh, name='refresh')
+        refresh_thread.start()
+        try:
+            self.assertTrue(refresh_started.wait(3), 'refresh did not reach preflight')
+            during_refresh = release.workflow_choices(object(), 'p')
+            self.assertFalse(during_refresh['workflows'][0]['compatible'])
+        finally:
+            finish_refresh.set()
+            refresh_thread.join(5)
+
+        self.assertFalse(refresh_thread.is_alive(), 'refresh thread did not finish')
+        self.assertEqual(errors, [])
+        self.assertTrue(results['refresh']['workflows'][0]['compatible'])
+        after_refresh = release.workflow_choices(object(), 'p')
+        self.assertTrue(after_refresh['workflows'][0]['compatible'])
+        self.assertEqual(len(list_calls), 3)
+
+    def test_normal_request_still_in_flight_when_refresh_fails_cannot_publish(self):
+        refresh_started = threading.Event()
+        finish_refresh = threading.Event()
+        normal_listing_started = threading.Event()
+        finish_normal_listing = threading.Event()
+        refresh_errors = []
+        normal_errors = []
+        list_calls = []
+
+        def api(repo, path):
+            if path == '':
+                if threading.current_thread().name == 'refresh':
+                    refresh_started.set()
+                    if not finish_refresh.wait(5):
+                        raise AssertionError('refresh gate timed out')
+                    raise RuntimeError('metadata outage')
+                return {'default_branch': 'main'}
+            if path == 'commits/main':
+                return {'sha': self.sha}
+            if path.startswith('actions/workflows?'):
+                list_calls.append(threading.current_thread().name)
+                if threading.current_thread().name == 'normal':
+                    normal_listing_started.set()
+                    if not finish_normal_listing.wait(5):
+                        raise AssertionError('normal listing gate timed out')
+                    return self.response('disabled_manually')
+                return self.response('active')
+            raise AssertionError(path)
+
+        self.setup_patches(api)
+
+        def run_refresh():
+            try:
+                release.workflow_choices(object(), 'p', refresh=True)
+            except RuntimeError as error:
+                refresh_errors.append(str(error))
+
+        def run_normal():
+            try:
+                release.workflow_choices(object(), 'p')
+            except BaseException as error:
+                normal_errors.append(error)
+
+        refresh_thread = threading.Thread(target=run_refresh, name='refresh')
+        normal_thread = threading.Thread(target=run_normal, name='normal')
+        refresh_thread.start()
+        try:
+            self.assertTrue(refresh_started.wait(3), 'refresh did not reach preflight')
+            normal_thread.start()
+            self.assertTrue(
+                normal_listing_started.wait(3), 'normal request did not reach listing'
+            )
+        finally:
+            finish_refresh.set()
+            refresh_thread.join(5)
+            finish_normal_listing.set()
+            if normal_thread.ident is not None:
+                normal_thread.join(5)
+
+        self.assertFalse(refresh_thread.is_alive(), 'refresh thread did not finish')
+        self.assertFalse(normal_thread.is_alive(), 'normal thread did not finish')
+        self.assertEqual(refresh_errors, ['metadata outage'])
+        self.assertEqual(normal_errors, [])
+        after_failure = release.workflow_choices(object(), 'p')
+        self.assertTrue(after_failure['workflows'][0]['compatible'])
+        self.assertEqual(len(list_calls), 2)
+
+    def test_older_overlapping_refresh_cannot_overwrite_newer_success(self):
+        older_listing_started = threading.Event()
+        finish_older_listing = threading.Event()
+        older_errors = []
+        older_results = {}
+        list_calls = []
+
+        def api(repo, path):
+            if path == '':
+                return {'default_branch': 'main'}
+            if path == 'commits/main':
+                return {'sha': self.sha}
+            if path.startswith('actions/workflows?'):
+                list_calls.append(threading.current_thread().name)
+                if threading.current_thread().name == 'older-refresh':
+                    older_listing_started.set()
+                    if not finish_older_listing.wait(5):
+                        raise AssertionError('older listing gate timed out')
+                    return self.response('disabled_manually')
+                return self.response('active')
+            raise AssertionError(path)
+
+        self.setup_patches(api)
+
+        def run_older_refresh():
+            try:
+                older_results['result'] = release.workflow_choices(
+                    object(), 'p', refresh=True
+                )
+            except BaseException as error:
+                older_errors.append(error)
+
+        older_thread = threading.Thread(
+            target=run_older_refresh, name='older-refresh'
+        )
+        older_thread.start()
+        try:
+            self.assertTrue(
+                older_listing_started.wait(3), 'older refresh did not reach listing'
+            )
+            newer_result = release.workflow_choices(object(), 'p', refresh=True)
+            self.assertTrue(newer_result['workflows'][0]['compatible'])
+        finally:
+            finish_older_listing.set()
+            older_thread.join(5)
+
+        self.assertFalse(older_thread.is_alive(), 'older refresh did not finish')
+        self.assertEqual(older_errors, [])
+        self.assertFalse(older_results['result']['workflows'][0]['compatible'])
+        after_refreshes = release.workflow_choices(object(), 'p')
+        self.assertTrue(after_refreshes['workflows'][0]['compatible'])
+        self.assertEqual(len(list_calls), 3)
+
+
+    def test_overlapping_refreshes_discard_results_when_older_observes_newer_state(self):
+        import threading
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        from adaptive_rsi import release
+
+        repo = 'example/project'
+        sha = 'b' * 40
+        older_preflight = threading.Event()
+        allow_older = threading.Event()
+        list_lock = threading.Lock()
+        list_calls = []
+        results = {}
+        errors = []
+
+        release._workflow_choices_cache.clear()
+
+        def api(api_repo, path):
+            if path == '':
+                if threading.current_thread().name == 'older-refresh':
+                    older_preflight.set()
+                    if not allow_older.wait(5):
+                        raise AssertionError('older preflight gate timed out')
+                return {'default_branch': 'main'}
+            if path == 'commits/main':
+                return {'sha': sha}
+            if path.startswith('actions/workflows?'):
+                with list_lock:
+                    list_calls.append(threading.current_thread().name)
+                    observation_number = len(list_calls)
+                states = {
+                    1: 'disabled_manually',
+                    2: 'active',
+                    3: 'active',
+                }
+                state = states.get(observation_number)
+                if state is None:
+                    raise AssertionError('unexpected workflow listing')
+                return {
+                    'workflows': [{
+                        'path': '.github/workflows/deploy.yml',
+                        'name': 'deploy',
+                        'state': state,
+                    }]
+                }
+            raise AssertionError(path)
+
+        def older_request():
+            try:
+                results['older'] = release.workflow_choices(
+                    object(), 'p', refresh=True
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        with ExitStack() as patches:
+            patches.enter_context(patch.object(
+                release, '_validated_repository', return_value=repo
+            ))
+            patches.enter_context(patch.object(release, 'api', side_effect=api))
+            patches.enter_context(patch.object(
+                release, 'workflow_content', return_value='valid'
+            ))
+            patches.enter_context(patch.object(
+                release, 'compatible_workflow', return_value=True
+            ))
+
+            thread = threading.Thread(target=older_request, name='older-refresh')
+            thread.start()
+            try:
+                self.assertTrue(older_preflight.wait(3))
+                results['newer'] = release.workflow_choices(
+                    object(), 'p', refresh=True
+                )
+            finally:
+                allow_older.set()
+                thread.join(5)
+
+            self.assertFalse(thread.is_alive(), 'older refresh did not finish')
+            self.assertEqual(errors, [])
+            self.assertFalse(results['newer']['workflows'][0]['compatible'])
+            self.assertTrue(results['older']['workflows'][0]['compatible'])
+
+            fresh = release.workflow_choices(object(), 'p')
+            self.assertTrue(fresh['workflows'][0]['compatible'])
+            self.assertEqual(len(list_calls), 3)
+
+
+    def test_overlapping_ordinary_requests_discard_observations_in_reverse_order(self):
+        import threading
+        from unittest.mock import patch
+        from adaptive_rsi import release
+
+        repo = 'example/project'
+        sha = 'b' * 40
+        older_started = threading.Event()
+        release_older = threading.Event()
+        calls = []
+        calls_lock = threading.Lock()
+        results = {}
+        errors = []
+
+        def clear_cache():
+            with release._workflow_choices_cache_lock:
+                release._workflow_choices_cache.clear()
+
+        clear_cache()
+        self.addCleanup(clear_cache)
+
+        def response(state):
+            return {
+                'workflows': [{
+                    'path': '.github/workflows/deploy.yml',
+                    'name': 'deploy',
+                    'state': state,
+                }]
+            }
+
+        def api(request_repo, path):
+            if path == '':
+                if threading.current_thread().name == 'older-ordinary':
+                    older_started.set()
+                    if not release_older.wait(5):
+                        raise AssertionError('older request gate timed out')
+                return {'default_branch': 'main'}
+            if path == 'commits/main':
+                return {'sha': sha}
+            if path.startswith('actions/workflows?'):
+                with calls_lock:
+                    calls.append(threading.current_thread().name)
+                    call_number = len(calls)
+                if threading.current_thread().name == 'older-ordinary':
+                    state = 'active'
+                elif call_number == 1:
+                    state = 'disabled_manually'
+                else:
+                    state = 'active'
+                return response(state)
+            raise AssertionError(path)
+
+        def run_older():
+            try:
+                results['older'] = release.workflow_choices(object(), 'p')
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(release, '_validated_repository', return_value=repo), patch.object(release, 'api', side_effect=api), patch.object(release, 'workflow_content', return_value='valid'), patch.object(release, 'compatible_workflow', return_value=True):
+            older = threading.Thread(target=run_older, name='older-ordinary')
+            older.start()
+            try:
+                self.assertTrue(older_started.wait(3), 'older request did not start')
+                newer_result = release.workflow_choices(object(), 'p')
+                self.assertEqual(
+                    newer_result['workflows'][0]['reason_code'],
+                    'workflow_disabled',
+                )
+            finally:
+                release_older.set()
+                older.join(5)
+
+            self.assertFalse(older.is_alive(), 'older request did not finish')
+            self.assertEqual(errors, [])
+            self.assertTrue(results['older']['workflows'][0]['compatible'])
+
+            after = release.workflow_choices(object(), 'p')
+            self.assertTrue(after['workflows'][0]['compatible'])
+            self.assertEqual(len(calls), 3)
+
+
+    def test_slow_inspection_does_not_extend_workflow_observation_ttl(self):
+        clock = [1000.0]
+        repo = 'example/project'
+        sha = 'b' * 40
+        list_calls = []
+        content_calls = []
+
+        def api(actual_repo, path):
+            if path == '':
+                return {'default_branch': 'main'}
+            if path == 'commits/main':
+                return {'sha': sha}
+            if path.startswith('actions/workflows?'):
+                list_calls.append(path)
+                state = 'active' if len(list_calls) == 1 else 'disabled_manually'
+                return {'workflows': [{'path': '.github/workflows/deploy.yml', 'name': 'deploy', 'state': state}]}
+            raise AssertionError(path)
+
+        def workflow_content(actual_repo, path, actual_sha):
+            content_calls.append(path)
+            if len(content_calls) == 1:
+                clock[0] = 1000.0 + release.WORKFLOW_CHOICES_TTL + 1
+            return 'valid'
+
+        with release._workflow_choices_cache_lock:
+            release._workflow_choices_cache.clear()
+        self.addCleanup(release._workflow_choices_cache.clear)
+
+        with patch.object(release, '_validated_repository', return_value=repo), \
+             patch.object(release, 'api', side_effect=api), \
+             patch.object(release, 'workflow_content', side_effect=workflow_content), \
+             patch.object(release, 'compatible_workflow', return_value=True), \
+             patch.object(release.time, 'time', side_effect=lambda: clock[0]):
+            first = release.workflow_choices(object(), 'p')
+            second = release.workflow_choices(object(), 'p')
+
+        self.assertTrue(first['workflows'][0]['compatible'])
+        self.assertEqual(second['workflows'][0]['reason_code'], 'workflow_disabled')
+        self.assertEqual(len(list_calls), 2)
+        self.assertEqual(len(content_calls), 1)
+
+
 class WorkflowChoicesFeedbackTest(unittest.TestCase):
+    def test_failed_refresh_invalidates_populated_cache(self):
+        from unittest.mock import patch
+        from adaptive_rsi import release
+
+        repo, sha = "example/failed-refresh", "b" * 40
+        key = (repo, sha)
+        with release._workflow_choices_cache_lock:
+            release._workflow_choices_cache.pop(key, None)
+        def clear_cache_entry():
+            with release._workflow_choices_cache_lock:
+                release._workflow_choices_cache.pop(key, None)
+        self.addCleanup(clear_cache_entry)
+
+        list_calls = 0
+        def api(_repo, path):
+            nonlocal list_calls
+            if path == "":
+                return {"default_branch": "main"}
+            if path == "commits/main":
+                return {"sha": sha}
+            if path.startswith("actions/workflows?"):
+                list_calls += 1
+                if list_calls == 2:
+                    raise RuntimeError("simulated list outage")
+                state = "disabled_manually" if list_calls == 1 else "active"
+                return {"workflows": [{"path": ".github/workflows/deploy.yml", "name": "deploy", "state": state}]}
+            raise AssertionError(path)
+
+        with patch.object(release, "_validated_repository", return_value=repo), patch.object(
+            release, "api", side_effect=api
+        ), patch.object(release, "workflow_content", return_value="valid"), patch.object(
+            release, "compatible_workflow", return_value=True
+        ):
+            cached = release.workflow_choices(object(), "p")
+            self.assertFalse(cached["workflows"][0]["compatible"])
+            with self.assertRaisesRegex(RuntimeError, "simulated list outage"):
+                release.workflow_choices(object(), "p", refresh=True)
+            with release._workflow_choices_cache_lock:
+                self.assertEqual(release._workflow_choices_active_requests, 0)
+            fresh = release.workflow_choices(object(), "p")
+
+        self.assertTrue(fresh["workflows"][0]["compatible"])
+        self.assertEqual(list_calls, 3)
+
+    def test_older_failed_refresh_preserves_newer_success(self):
+        import threading
+        from unittest.mock import patch
+        from adaptive_rsi import release
+
+        repo, sha = "example/overlap-refresh", "c" * 40
+        key = (repo, sha)
+        with release._workflow_choices_cache_lock:
+            release._workflow_choices_cache.pop(key, None)
+        def clear_cache_entry():
+            with release._workflow_choices_cache_lock:
+                release._workflow_choices_cache.pop(key, None)
+        self.addCleanup(clear_cache_entry)
+
+        started, release_old = threading.Event(), threading.Event()
+        list_calls, errors = [], []
+        def api(_repo, path):
+            if path == "":
+                return {"default_branch": "main"}
+            if path == "commits/main":
+                return {"sha": sha}
+            if path.startswith("actions/workflows?"):
+                list_calls.append(threading.current_thread().name)
+                if threading.current_thread().name == "old-failing-refresh":
+                    started.set()
+                    if not release_old.wait(5):
+                        raise AssertionError("old request gate timed out")
+                    raise RuntimeError("old list failure")
+                if len(list_calls) in (2, 3):
+                    return {"workflows": [{"path": ".github/workflows/deploy.yml", "name": "deploy", "state": "active"}]}
+                raise AssertionError("unexpected workflow list request")
+            raise AssertionError(path)
+
+        def old_request():
+            try:
+                release.workflow_choices(object(), "p", refresh=True)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(release, "_validated_repository", return_value=repo), patch.object(
+            release, "api", side_effect=api
+        ), patch.object(release, "workflow_content", return_value="valid"), patch.object(
+            release, "compatible_workflow", return_value=True
+        ):
+            thread = threading.Thread(target=old_request, name="old-failing-refresh")
+            thread.start()
+            try:
+                self.assertTrue(started.wait(3), "old refresh did not reach workflow listing")
+                newer = release.workflow_choices(object(), "p", refresh=True)
+            finally:
+                release_old.set()
+                thread.join(5)
+            self.assertFalse(thread.is_alive(), "old refresh thread did not finish")
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], RuntimeError)
+            self.assertEqual(str(errors[0]), "old list failure")
+            with release._workflow_choices_cache_lock:
+                self.assertEqual(release._workflow_choices_active_requests, 0)
+            after = release.workflow_choices(object(), "p")
+
+        self.assertEqual(after, newer)
+        self.assertEqual(len(list_calls), 3)
+
+    def test_workflow_choices_later_refresh_wins_over_slow_disabled_request(self):
+        key = ("owner/repo", "d" * 40)
+        with release._workflow_choices_cache_lock:
+            release._workflow_choices_cache.clear()
+        self.addCleanup(release._workflow_choices_cache.clear)
+
+        old_list_started = threading.Event()
+        release_old_list = threading.Event()
+        finished = {"old": threading.Event(), "new": threading.Event()}
+        results = {}
+        errors = {}
+        list_calls = []
+
+        def fake_api(repo, endpoint, method="GET", fields=None):
+            if endpoint == "":
+                return {"default_branch": "main"}
+            if endpoint == "commits/main":
+                return {"sha": key[1]}
+            if endpoint.startswith("actions/workflows?"):
+                caller = threading.current_thread().name
+                list_calls.append(caller)
+                if caller == "workflow-old-disabled-request":
+                    old_list_started.set()
+                    if not release_old_list.wait(3):
+                        raise RuntimeError("timed out waiting to release old list request")
+                    state = "disabled_manually"
+                else:
+                    state = "active"
+                return {
+                    "workflows": [{
+                        "path": ".github/workflows/deploy.yml",
+                        "name": "Deploy",
+                        "state": state,
+                    }]
+                }
+            raise AssertionError(endpoint)
+
+        def invoke(label, refresh):
+            try:
+                results[label] = release.workflow_choices("runtime", "project", refresh=refresh)
+            except BaseException as exc:
+                errors[label] = exc
+            finally:
+                finished[label].set()
+
+        old_thread = threading.Thread(
+            target=invoke,
+            args=("old", False),
+            name="workflow-old-disabled-request",
+            daemon=True,
+        )
+        new_thread = threading.Thread(
+            target=invoke,
+            args=("new", True),
+            name="workflow-new-active-refresh",
+            daemon=True,
+        )
+        with patch.object(release, "_validated_repository", return_value=key[0]), patch.object(
+            release, "api", side_effect=fake_api
+        ), patch.object(release, "workflow_content", return_value="content"), patch.object(
+            release, "compatible_workflow", return_value=True
+        ):
+            try:
+                old_thread.start()
+                self.assertTrue(old_list_started.wait(3))
+                new_thread.start()
+                self.assertTrue(finished["new"].wait(3))
+                release_old_list.set()
+                self.assertTrue(finished["old"].wait(3))
+            finally:
+                release_old_list.set()
+                for thread in (old_thread, new_thread):
+                    if thread.ident is not None:
+                        thread.join(timeout=4)
+
+            self.assertFalse(old_thread.is_alive())
+            self.assertFalse(new_thread.is_alive())
+            self.assertEqual(errors, {})
+            self.assertEqual(len(list_calls), 2)
+
+            self.assertEqual(results["old"]["workflows"][0]["reason_code"], "workflow_disabled")
+            self.assertTrue(results["new"]["workflows"][0]["compatible"])
+            ordinary = release.workflow_choices("runtime", "project")
+            self.assertEqual(ordinary, results["new"])
+            self.assertTrue(ordinary["workflows"][0]["compatible"])
+            self.assertEqual(len(list_calls), 3)
+
+    def test_workflow_choices_newer_transient_failure_blocks_older_success(self):
+        key = ("owner/repo", "e" * 40)
+        with release._workflow_choices_cache_lock:
+            release._workflow_choices_cache.clear()
+        self.addCleanup(release._workflow_choices_cache.clear)
+
+        old_content_started = threading.Event()
+        release_old_content = threading.Event()
+        finished = {"old": threading.Event(), "new": threading.Event()}
+        results = {}
+        errors = {}
+        list_calls = []
+
+        def fake_api(repo, endpoint, method="GET", fields=None):
+            if endpoint == "":
+                return {"default_branch": "main"}
+            if endpoint == "commits/main":
+                return {"sha": key[1]}
+            if endpoint.startswith("actions/workflows?"):
+                caller = threading.current_thread().name
+                list_calls.append(caller)
+                if caller == "workflow-older-healthy-request":
+                    path = ".github/workflows/older.yml"
+                elif caller == "workflow-newer-transient-request":
+                    path = ".github/workflows/newer.yml"
+                else:
+                    path = ".github/workflows/ordinary.yml"
+                return {"workflows": [{"path": path, "name": path, "state": "active"}]}
+            raise AssertionError(endpoint)
+
+        def fake_content(repo, path, sha):
+            if path.endswith("/older.yml"):
+                old_content_started.set()
+                if not release_old_content.wait(3):
+                    raise RuntimeError("timed out waiting to release old content request")
+                return "valid content"
+            raise RuntimeError("HTTP 429 rate limit")
+
+        def invoke(label, refresh):
+            try:
+                results[label] = release.workflow_choices("runtime", "project", refresh=refresh)
+            except BaseException as exc:
+                errors[label] = exc
+            finally:
+                finished[label].set()
+
+        old_thread = threading.Thread(
+            target=invoke,
+            args=("old", False),
+            name="workflow-older-healthy-request",
+            daemon=True,
+        )
+        new_thread = threading.Thread(
+            target=invoke,
+            args=("new", True),
+            name="workflow-newer-transient-request",
+            daemon=True,
+        )
+        with patch.object(release, "_validated_repository", return_value=key[0]), patch.object(
+            release, "api", side_effect=fake_api
+        ), patch.object(release, "workflow_content", side_effect=fake_content), patch.object(
+            release, "compatible_workflow", return_value=True
+        ):
+            try:
+                old_thread.start()
+                self.assertTrue(old_content_started.wait(3))
+                new_thread.start()
+                self.assertTrue(finished["new"].wait(3))
+                release_old_content.set()
+                self.assertTrue(finished["old"].wait(3))
+            finally:
+                release_old_content.set()
+                for thread in (old_thread, new_thread):
+                    if thread.ident is not None:
+                        thread.join(timeout=4)
+
+            self.assertFalse(old_thread.is_alive())
+            self.assertFalse(new_thread.is_alive())
+            self.assertEqual(errors, {})
+            self.assertTrue(results["old"]["workflows"][0]["compatible"])
+            self.assertEqual(
+                results["new"]["workflows"][0]["reason_code"],
+                "workflow_inspection_failed",
+            )
+            with release._workflow_choices_cache_lock:
+                self.assertNotIn(key, release._workflow_choices_cache)
+
+            ordinary = release.workflow_choices("runtime", "project")
+            self.assertEqual(
+                ordinary["workflows"][0]["reason_code"],
+                "workflow_inspection_failed",
+            )
+            self.assertEqual(len(list_calls), 3)
+
+    def test_workflow_choices_skips_malformed_rows_and_reports_unhashable_states(self):
+        key = ("owner/repo", "f" * 40)
+        with release._workflow_choices_cache_lock:
+            release._workflow_choices_cache.clear()
+        self.addCleanup(release._workflow_choices_cache.clear)
+
+        rows = [
+            {
+                "path": ".github/workflows/list-state.yml",
+                "name": "List state",
+                "state": [],
+            },
+            {
+                "path": ".github/workflows/dict-state.yml",
+                "name": "Dict state",
+                "state": {},
+            },
+            {"path": ".github/workflows/missing-state.yml", "name": "Missing state"},
+            ["not", "a", "workflow row"],
+            None,
+            {"path": [".github/workflows", "bad.yml"], "state": "active"},
+            {"path": {"value": ".github/workflows/bad.yml"}, "state": "active"},
+            {
+                "path": ".github/workflows/healthy.yml",
+                "name": "Healthy",
+                "state": "active",
+            },
+        ]
+
+        def fake_api(repo, endpoint, method="GET", fields=None):
+            if endpoint == "":
+                return {"default_branch": "main"}
+            if endpoint == "commits/main":
+                return {"sha": key[1]}
+            if endpoint.startswith("actions/workflows?"):
+                return {"workflows": rows}
+            raise AssertionError(endpoint)
+
+        with patch.object(release, "_validated_repository", return_value=key[0]), patch.object(
+            release, "api", side_effect=fake_api
+        ), patch.object(release, "workflow_content", return_value="content"), patch.object(
+            release, "compatible_workflow", return_value=True
+        ):
+            result = release.workflow_choices("runtime", "project")
+
+        choices = result["workflows"]
+        self.assertEqual(len(choices), 4)
+        self.assertEqual(
+            [item["workflow"] for item in choices],
+            [
+                ".github/workflows/list-state.yml",
+                ".github/workflows/dict-state.yml",
+                ".github/workflows/missing-state.yml",
+                ".github/workflows/healthy.yml",
+            ],
+        )
+        for item in choices[:3]:
+            self.assertFalse(item["compatible"])
+            self.assertEqual(item["reason_code"], "workflow_inspection_failed")
+        self.assertTrue(choices[3]["compatible"])
+
+    def test_workflow_choices_releases_inflight_tracking_after_base_exception(self):
+        key = ("owner/repo", "a" * 40)
+
+        class DeliberateAbort(BaseException):
+            pass
+
+        attempts = [0]
+
+        def fake_api(repo, endpoint, method="GET", fields=None):
+            if endpoint == "":
+                return {"default_branch": "main"}
+            if endpoint == "commits/main":
+                return {"sha": key[1]}
+            if endpoint.startswith("actions/workflows?"):
+                attempts[0] += 1
+                if attempts[0] == 1:
+                    raise DeliberateAbort("controlled failure")
+                return {"workflows": []}
+            raise AssertionError(endpoint)
+
+        with release._workflow_choices_cache_lock:
+            release._workflow_choices_cache.clear()
+        self.addCleanup(release._workflow_choices_cache.clear)
+        with patch.object(release, "_validated_repository", return_value=key[0]), patch.object(
+            release, "api", side_effect=fake_api
+        ):
+            with self.assertRaises(DeliberateAbort):
+                release.workflow_choices("runtime", "project")
+            with release._workflow_choices_cache_lock:
+                self.assertEqual(release._workflow_choices_active_requests, 0)
+
+            result = release.workflow_choices("runtime", "project")
+
+        self.assertEqual(result["workflows"], [])
+        self.assertEqual(attempts[0], 2)
+        with release._workflow_choices_cache_lock:
+            self.assertEqual(release._workflow_choices_active_requests, 0)
+
     def test_origin_mismatch_is_a_safe_actionable_validation_error(self):
         import http.client
         from adaptive_rsi import server as server_module
@@ -417,6 +1393,83 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                 self.assertTrue(res4["workflows"][0]["compatible"])
                 self.assertIsNot(res4, res3)
 
+    def test_release_workflows_http_refresh_bypasses_disabled_cache_without_sha_change(self):
+        import base64
+        import http.client
+        from adaptive_rsi import server as server_module
+
+        path = ".github/workflows/deploy.yml"
+        sha = "d" * 40
+        state = {"value": "disabled_manually"}
+        calls = []
+        content = base64.b64encode(("name: Deploy\n"
+                                    "run-name: ${{ inputs.rsi_operation_id }}\n"
+                                    "on:\n"
+                                    "  workflow_dispatch:\n"
+                                    "    inputs:\n"
+                                    "      rsi_operation_id:\n"
+                                    "        type: string\n"
+                                    "        required: true\n"
+                                    "      rsi_sha:\n"
+                                    "        type: string\n"
+                                    "        required: true\n").encode("utf-8")).decode("ascii")
+        with tempfile.TemporaryDirectory() as temp:
+            runtime, project = self._authorization_project(temp)
+            server = server_module.Server(runtime)
+            thread = threading.Thread(target=server.serve_forever,
+                                      kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            self.addCleanup(thread.join, 3)
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+
+            def mock_api(repo, endpoint, method="GET", fields=None):
+                calls.append(endpoint)
+                if endpoint == "":
+                    return {"default_branch": "main"}
+                if endpoint == "commits/main":
+                    return {"sha": sha}
+                if endpoint.startswith("actions/workflows?"):
+                    return {"workflows": [{"path": path, "name": "Deploy", "state": state["value"]}]}
+                if endpoint == "contents/" + path + "?ref=" + sha:
+                    return {"encoding": "base64", "type": "file", "content": content}
+                raise AssertionError("unexpected API call: " + endpoint)
+
+            def get_choices(refresh=False):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    query = "project=" + project + ("&refresh=true" if refresh else "")
+                    connection.request("GET", "/api/release-workflows?" + query,
+                                       headers={"Cookie": server.cookie + "=" + server.token})
+                    response = connection.getresponse()
+                    return response.status, json.loads(response.read())
+                finally:
+                    connection.close()
+
+            with patch("adaptive_rsi.release.api", side_effect=mock_api):
+                status, disabled = get_choices()
+                self.assertEqual(status, 200)
+                self.assertEqual(disabled["sha"], sha)
+                self.assertFalse(disabled["workflows"][0]["compatible"])
+                self.assertEqual(disabled["workflows"][0]["reason_code"], "workflow_disabled")
+                self.assertEqual(disabled["workflows"][0]["reason"],
+                                 "This workflow is disabled. Enable it in the repository before authorizing.")
+                self.assertEqual(calls.count("actions/workflows?per_page=100"), 1)
+
+                state["value"] = "active"
+                status, cached = get_choices()
+                self.assertEqual(status, 200)
+                self.assertIs(cached["workflows"][0]["compatible"], False)
+                self.assertEqual(calls.count("actions/workflows?per_page=100"), 1)
+
+                status, refreshed = get_choices(refresh=True)
+                self.assertEqual(status, 200)
+                self.assertEqual(refreshed["sha"], sha)
+                self.assertTrue(refreshed["workflows"][0]["compatible"])
+                self.assertEqual(refreshed["workflows"][0]["reason_code"], "")
+                self.assertEqual(calls.count("actions/workflows?per_page=100"), 2)
+                self.assertEqual(calls.count("contents/" + path + "?ref=" + sha), 1)
+
     def test_authorize_workflow_penetrates_cache_with_fresh_validation(self):
         import base64
         with tempfile.TemporaryDirectory() as temp:
@@ -459,6 +1512,8 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                     return {"default_branch": "main"}
                 if endpoint.startswith("commits/"):
                     return {"sha": commit_sha}
+                if endpoint == "actions/workflows/deploy.yml":
+                    return {"path": ".github/workflows/deploy.yml", "name": "Deploy", "state": "active"}
                 if endpoint.startswith("actions/workflows"):
                     return {"workflows": [{"path": ".github/workflows/deploy.yml", "name": "Deploy", "state": "active"}]}
                 if endpoint.startswith("contents/"):
@@ -517,6 +1572,8 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                     return {"sha": sha}
                 if endpoint == "contents/.github/workflows/deploy.yml?ref=" + sha:
                     return {"encoding": "base64", "type": "file", "content": content}
+                if endpoint == "actions/workflows/deploy.yml":
+                    return {"path": ".github/workflows/deploy.yml", "name": "Deploy", "state": "active"}
                 if endpoint.startswith("git/matching-refs/"):
                     return [{"ref": "refs/tags/rsi-workflow/" + sha, "object": {"type": "commit", "sha": sha}}]
                 if endpoint.startswith("actions/workflows?"):
@@ -529,8 +1586,10 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
             self.assertEqual(target["workflow"], ".github/workflows/deploy.yml")
             self.assertEqual(target["sha"], sha)
             self.assertEqual(target["ref"], "rsi-workflow/" + sha)
-            self.assertLessEqual(len(calls), 4)
-            self.assertFalse(any("actions/workflows" in endpoint for endpoint in calls))
+            self.assertLessEqual(len(calls), 5)
+            # 授权只读这一个文件的状态；不枚举整个 workflow 目录。
+            self.assertEqual([endpoint for endpoint in calls if endpoint.startswith("actions/workflows")],
+                             ["actions/workflows/deploy.yml"])
             self.assertEqual([endpoint for endpoint in calls if endpoint.startswith("contents/")],
                              ["contents/.github/workflows/deploy.yml?ref=" + sha])
 
@@ -589,6 +1648,81 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                 self.assertFalse(runtime.config(project)["delivery"]["release"]["enabled"])
                 self.assertFalse(runtime.store.query("SELECT 1 FROM events WHERE kind='workflow_authorized'"))
 
+    def test_authorize_workflow_http_distinguishes_state_lookup_failure_from_disabled(self):
+        import base64
+        import http.client
+        from adaptive_rsi import server as server_module
+
+        retry_message = "Unable to inspect this workflow right now; retry after the GitHub request succeeds"
+        incompatible_message = "Select a compatible existing workflow from this project"
+        path = ".github/workflows/deploy.yml"
+        content = base64.b64encode(("name: Deploy\n"
+                                    "run-name: ${{ inputs.rsi_operation_id }}\n"
+                                    "on:\n"
+                                    "  workflow_dispatch:\n"
+                                    "    inputs:\n"
+                                    "      rsi_operation_id:\n"
+                                    "        type: string\n"
+                                    "        required: true\n"
+                                    "      rsi_sha:\n"
+                                    "        type: string\n"
+                                    "        required: true\n").encode("utf-8")).decode("ascii")
+        cases = [
+            ("rate limit", release.ApiRejected("private response", 429), retry_message),
+            ("server error", release.ApiRejected("private response", 503), retry_message),
+            ("transport error", RuntimeError("private transport detail"), retry_message),
+            ("malformed response", [], retry_message),
+            ("missing state", {}, retry_message),
+            ("missing workflow", release.ApiRejected("not found", 404), incompatible_message),
+            ("disabled workflow", {"state": "disabled_manually"}, incompatible_message),
+        ]
+        for label, state_result, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as temp:
+                runtime, project = self._authorization_project(temp)
+                writes = []
+                server = server_module.Server(runtime)
+                thread = threading.Thread(target=server.serve_forever,
+                                          kwargs={"poll_interval": 0.01}, daemon=True)
+                thread.start()
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    def mock_api(repo, endpoint, method="GET", fields=None):
+                        if method != "GET":
+                            writes.append(endpoint)
+                            return {}
+                        if endpoint == "":
+                            return {"default_branch": "main"}
+                        if endpoint == "commits/main":
+                            return {"sha": "f" * 40}
+                        if endpoint.startswith("contents/"):
+                            return {"encoding": "base64", "type": "file", "content": content}
+                        if endpoint == "actions/workflows/deploy.yml":
+                            if isinstance(state_result, Exception):
+                                raise state_result
+                            return state_result
+                        raise AssertionError("unexpected API call: " + endpoint)
+
+                    with patch("adaptive_rsi.release.api", side_effect=mock_api):
+                        body = json.dumps({"project": project, "kind": "release", "workflow": path})
+                        connection.request("POST", "/api/release-authorize", body, {
+                            "Cookie": server.cookie + "=" + server.token,
+                            "Origin": server.origin, "X-RSI-CSRF": server.csrf,
+                            "Content-Type": "application/json"})
+                        response = connection.getresponse()
+                        payload = json.loads(response.read())
+                finally:
+                    connection.close()
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(3)
+
+                self.assertEqual(response.status, 400)
+                self.assertEqual(payload, {"error": expected, "error_code": "validation_error"})
+                self.assertNotIn("private", json.dumps(payload))
+                self.assertEqual(writes, [])
+                self.assertFalse(runtime.config(project)["delivery"]["release"]["enabled"])
+                self.assertFalse(runtime.store.query("SELECT 1 FROM events WHERE kind='workflow_authorized'"))
+
     def test_authorize_workflow_rejects_missing_or_incompatible_files(self):
         import base64
         sha = "f" * 40
@@ -617,6 +1751,95 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                     with self.assertRaises(ValueError) as caught:
                         release.authorize_workflow(runtime, project, "release", "../outside.yml")
                 self.assertEqual(str(caught.exception), "Select a compatible existing workflow from this project")
+
+    def test_workflow_choices_explains_disabled_state_instead_of_yaml(self):
+        import base64
+        compatible = (
+            "name: Deploy\n"
+            "run-name: ${{ inputs.rsi_operation_id }}\n"
+            "on:\n"
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      rsi_operation_id:\n"
+            "        type: string\n"
+            "        required: true\n"
+            "      rsi_sha:\n"
+            "        type: string\n"
+            "        required: true\n"
+        )
+        content = base64.b64encode(compatible.encode("utf-8")).decode("ascii")
+        sha = "a" * 40
+        with tempfile.TemporaryDirectory() as temp:
+            runtime, project = self._authorization_project(temp)
+            contents = []
+
+            def stub(repo, endpoint, method="GET", fields=None):
+                if endpoint == "":
+                    return {"default_branch": "main"}
+                if endpoint == "commits/main":
+                    return {"sha": sha}
+                if endpoint.startswith("actions/workflows?"):
+                    return {"workflows": [{"path": ".github/workflows/deploy.yml", "name": "Deploy",
+                                           "state": "disabled_manually"}]}
+                if endpoint.startswith("contents/"):
+                    contents.append(endpoint)
+                    return {"encoding": "base64", "type": "file", "content": content}
+                raise AssertionError(endpoint)
+
+            with patch("adaptive_rsi.release.api", side_effect=stub):
+                result = release.workflow_choices(runtime, project)
+            # 已禁用的文件不会被调度，内容是否合规与结论无关，也不该再去读。
+            self.assertEqual(contents, [])
+            item = result["workflows"][0]
+            self.assertFalse(item["compatible"])
+            self.assertIn("disabled", item["reason"])
+            self.assertNotIn("YAML", item["reason"])
+
+    def test_authorize_workflow_requires_active_state(self):
+        import base64
+        compatible = (
+            "name: Deploy\n"
+            "run-name: ${{ inputs.rsi_operation_id }}\n"
+            "on:\n"
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      rsi_operation_id:\n"
+            "        type: string\n"
+            "        required: true\n"
+            "      rsi_sha:\n"
+            "        type: string\n"
+            "        required: true\n"
+        )
+        content = base64.b64encode(compatible.encode("utf-8")).decode("ascii")
+        sha = "b" * 40
+        for label, state in [("disabled", "disabled_manually"), ("unreadable", None)]:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as temp:
+                runtime, project = self._authorization_project(temp)
+                writes = []
+
+                def stub(repo, endpoint, method="GET", fields=None):
+                    if endpoint == "":
+                        return {"default_branch": "main"}
+                    if endpoint == "commits/main":
+                        return {"sha": sha}
+                    if endpoint.startswith("contents/"):
+                        return {"encoding": "base64", "type": "file", "content": content}
+                    if endpoint == "actions/workflows/deploy.yml":
+                        if state is None:
+                            raise release.ApiRejected("not found", 404)
+                        return {"path": ".github/workflows/deploy.yml", "name": "Deploy", "state": state}
+                    if method != "GET":
+                        writes.append(endpoint)
+                        return {}
+                    raise AssertionError(endpoint)
+
+                with patch("adaptive_rsi.release.api", side_effect=stub):
+                    with self.assertRaises(ValueError) as caught:
+                        release.authorize_workflow(runtime, project, "release", ".github/workflows/deploy.yml")
+                # 与选择器同一规则：非 active 或读不到状态都按不可用处理，且不留下标记与配置。
+                self.assertEqual(str(caught.exception), "Select a compatible existing workflow from this project")
+                self.assertEqual(writes, [])
+                self.assertFalse(runtime.config(project)["delivery"]["release"]["enabled"])
 
     def test_authorize_workflow_reports_unreadable_files_as_retryable(self):
         sha = "f" * 40
@@ -1726,6 +2949,342 @@ class ReleaseAbandonTest(_ManualReconciliationFixture):
         self.assertEqual(self.saved()["workflow_run_id"], 17)
         self.assertEqual(self.saved()["operator_abandon"]["visibility"], "run_not_visible")
 
+
+class LegacyHealthConfigRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        repo = fixture(root / "project")
+        self.runtime = Runtime(Store(root / "state"))
+        self.addCleanup(self.runtime.close)
+        self.project = self.runtime.add_project(repo, enabled=False)
+        self.runtime.configure({"sources": {"issues": False}, "schedule": {"weight": 3}}, self.project)
+        raw = json.loads(self.runtime.project(self.project)["config"])
+        raw.setdefault("delivery", {}).setdefault("deploy", {})["health_url"] = "https://app.example:0/health"
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(raw), self.project))
+        self.invalid = raw
+
+    def _due_rows(self):
+        return {row["kind"]: row["due"] for row in self.runtime.store.query(
+            "SELECT kind,due FROM schedules WHERE project=?", (self.project,))}
+
+    def _seed_due(self):
+        for index, kind in enumerate(("light", "issues", "deep"), 1):
+            self.runtime.store.execute(
+                "INSERT OR REPLACE INTO schedules(project,kind,due,fingerprint) VALUES (?,?,?,?)",
+                (self.project, kind, index * 100.0, ""),
+            )
+
+    def test_repair_preserves_other_overrides_revision_and_pause(self):
+        before = self.runtime.store.config_revision(self.project)
+        result = self.runtime.configure(
+            {"delivery": {"deploy": {"health_url": "https://app.example:443/health"}}},
+            self.project, expected_revision=before,
+        )
+        saved = json.loads(self.runtime.project(self.project)["config"])
+        self.assertTrue(result["saved"])
+        self.assertEqual(result["revision"], before + 1)
+        self.assertEqual(saved["sources"], self.invalid["sources"])
+        self.assertEqual(saved["schedule"], self.invalid["schedule"])
+        self.assertEqual(saved["delivery"]["deploy"]["health_url"], "https://app.example:443/health")
+        self.assertTrue(self.runtime.project(self.project)["paused"])
+
+    def test_repair_reschedules_only_changed_interval(self):
+        self._seed_due()
+        with patch("adaptive_rsi.runtime.time.time", return_value=1000):
+            self.runtime.configure(
+                {"schedule": {"light_minutes": 61},
+                 "delivery": {"deploy": {"health_url": "https://app.example:443/health"}}},
+                self.project,
+            )
+        self.assertEqual(self._due_rows(), {"light": 4660.0, "issues": 200.0, "deep": 300.0})
+
+    def test_invalid_repair_and_stale_revision_leave_config_unchanged(self):
+        before = self.runtime.store.config_revision(self.project)
+        for values, revision in (
+            ({"delivery": {"deploy": {"health_url": "https://app.example:65536/health"}}}, before),
+            ({"delivery": {"deploy": {"health_url": "https://app.example:443/health"}}}, before + 1),
+        ):
+            with self.subTest(values=values, revision=revision), self.assertRaises(ValueError):
+                self.runtime.configure(values, self.project, expected_revision=revision)
+            self.assertEqual(json.loads(self.runtime.project(self.project)["config"]), self.invalid)
+            self.assertEqual(self.runtime.store.config_revision(self.project), before)
+
+    def test_other_invalid_configuration_does_not_use_health_recovery(self):
+        raw = dict(self.invalid)
+        raw["schedule"] = {"light_minutes": 60.0}
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(raw), self.project))
+        with self.assertRaisesRegex(ValueError, "schedule.light_minutes has the wrong type"):
+            self.runtime.configure(
+                {"schedule": {"light_minutes": 60},
+                 "delivery": {"deploy": {"health_url": "https://app.example:443/health"}}},
+                self.project,
+            )
+        self.assertEqual(json.loads(self.runtime.project(self.project)["config"]), raw)
+
+    def test_replacement_repair_preserves_replacement_and_schedule_semantics(self):
+        raw = json.loads(self.runtime.project(self.project)["config"])
+        raw["schedule"]["light_minutes"] = 70
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(raw), self.project))
+        self._seed_due()
+        revision = self.runtime.store.config_revision(self.project)
+        with patch("adaptive_rsi.runtime.time.time", return_value=1000), self.runtime.dispatch_lock:
+            self.runtime._configure({"sources": {"issues": True}}, self.project,
+                                    expected_revision=revision, replacement=True, source="undo")
+        self.assertEqual(json.loads(self.runtime.project(self.project)["config"]), {"sources": {"issues": True}})
+        self.assertEqual(self._due_rows(), {"light": 4600.0, "issues": 200.0, "deep": 300.0})
+        self.assertEqual(self.runtime.store.config_revision(self.project), revision + 1)
+
+    def test_combined_repair_of_legacy_health_and_retry_policy(self):
+        self.runtime.store.put_setting("config", {"delivery": {"deploy": {"health_attempts": 2}}})
+        raw = json.loads(self.runtime.project(self.project)["config"])
+        raw["delivery"]["deploy"]["health_consecutive_successes"] = 3
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(raw), self.project))
+        self.runtime.configure({"delivery": {"deploy": {"health_url": "https://app.example:443/health",
+                                                        "health_consecutive_successes": 2}}}, self.project)
+        effective = self.runtime.config(self.project)
+        self.assertEqual(effective["delivery"]["deploy"]["health_consecutive_successes"], 2)
+        self.assertEqual(effective["delivery"]["deploy"]["health_url"], "https://app.example:443/health")
+        self.assertFalse(effective["sources"]["issues"])
+
+    def test_health_repair_inheriting_global_interval_updates_only_affected_due(self):
+        raw = json.loads(self.runtime.project(self.project)["config"])
+        raw["schedule"]["light_minutes"] = 70
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(raw), self.project))
+        self._seed_due()
+        with patch("adaptive_rsi.runtime.time.time", return_value=1000):
+            self.runtime.configure({"delivery": {"deploy": {"health_url": "https://app.example:443/health"}}},
+                                   self.project, inherit=["schedule.light_minutes"])
+        self.assertEqual(self._due_rows(), {"light": 4600.0, "issues": 200.0, "deep": 300.0})
+        self.assertNotIn("light_minutes", json.loads(self.runtime.project(self.project)["config"])["schedule"])
+
+    def test_authenticated_config_endpoint_rejects_invalid_repair_without_write(self):
+        server = Server(self.runtime)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        try:
+            revision = self.runtime.store.config_revision(self.project)
+            body = {"project": self.project, "revision": revision,
+                    "values": {"delivery": {"deploy": {"health_url": "https://app.example:65536/health"}}}}
+            headers = {"Cookie": server.cookie + "=" + server.token, "Origin": server.origin,
+                       "X-RSI-CSRF": server.csrf, "Content-Type": "application/json"}
+            request = urllib.request.Request(server.origin + "/api/config", json.dumps(body).encode(), headers)
+            with self.assertRaises(HTTPError) as error:
+                urllib.request.urlopen(request, timeout=8)
+            self.assertEqual(error.exception.code, 400)
+            self.assertEqual(json.loads(self.runtime.project(self.project)["config"]), self.invalid)
+            self.assertEqual(self.runtime.store.config_revision(self.project), revision)
+            self.assertTrue(self.runtime.project(self.project)["paused"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_authenticated_config_endpoint_repairs_legacy_url(self):
+        server = Server(self.runtime)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        try:
+            revision = self.runtime.store.config_revision(self.project)
+            body = {"project": self.project, "revision": revision,
+                    "values": {"delivery": {"deploy": {"health_url": "https://app.example:443/health"}}}}
+            headers = {"Cookie": server.cookie + "=" + server.token, "Origin": server.origin,
+                       "X-RSI-CSRF": server.csrf, "Content-Type": "application/json"}
+            request = urllib.request.Request(server.origin + "/api/config", json.dumps(body).encode(), headers)
+            with urllib.request.urlopen(request, timeout=8) as response:
+                result = json.load(response)
+                self.assertEqual(response.status, 200)
+            self.assertTrue(result["saved"])
+            self.assertEqual(result["revision"], revision + 1)
+            saved = json.loads(self.runtime.project(self.project)["config"])
+            self.assertEqual(saved["delivery"]["deploy"]["health_url"], "https://app.example:443/health")
+            self.assertEqual(saved["sources"], self.invalid["sources"])
+            self.assertTrue(self.runtime.project(self.project)["paused"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+class LegacyGlobalHealthConfigRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.runtime = Runtime(Store(self.root / "state"))
+        self.addCleanup(self.runtime.close)
+        self.projects = [self.runtime.add_project(fixture(self.root / ("project" + str(i))), enabled=False)
+                         for i in range(4)]
+        overrides = [
+            {},
+            {"delivery": {"deploy": {"health_url": "https://app.example:443/health"}},
+             "schedule": {"light_minutes": 75}},
+            {"delivery": {"deploy": {"health_url": "https://app.example:65536/health"}}},
+            {"schedule": {"light_minutes": 60.0}},
+        ]
+        for project, override in zip(self.projects, overrides):
+            self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(override), project))
+            for index, kind in enumerate(("light", "issues", "deep"), 1):
+                self.runtime.store.execute(
+                    "INSERT OR REPLACE INTO schedules(project,kind,due,fingerprint) VALUES (?,?,?,?)",
+                    (project, kind, index * 100.0, ""),
+                )
+        self.runtime.store.put_setting("config", {"delivery": {"deploy": {
+            "health_url": "https://app.example:0/health"}}})
+
+    def test_continuing_invalid_url_does_not_hide_new_retry_policy_error(self):
+        global_before = {"delivery": {"deploy": {"health_attempts": 4}}}
+        self.runtime.store.put_setting("config", global_before)
+        override = {"delivery": {"deploy": {"health_url": "https://app.example:0/health",
+                                            "health_consecutive_successes": 3}}}
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(override), self.projects[1]))
+        revision = self.runtime.store.config_revision(None)
+        with self.assertRaisesRegex(ValueError, "Invalid deployment health retry policy"):
+            self.runtime.configure({"schedule": {"light_minutes": 61},
+                                    "delivery": {"deploy": {"health_attempts": 2}}})
+        self.assertEqual(self.runtime.store.setting("config"), global_before)
+        self.assertEqual(self.runtime.store.config_revision(None), revision)
+        # Fixing just the old URL must remain possible when the failed global save
+        # has not silently introduced an unrelated retry-policy error.
+        self.runtime.configure({"delivery": {"deploy": {"health_url": "https://app.example:443/health"}}},
+                               self.projects[1])
+
+    def test_global_stale_revision_preserves_project_revisions_and_due_rows(self):
+        before = self.runtime.store.setting("config")
+        revision = self.runtime.store.config_revision(None)
+        project_revisions = [self.runtime.store.config_revision(project) for project in self.projects]
+        with self.assertRaisesRegex(ValueError, "Configuration changed in another window"):
+            self.runtime.configure({"schedule": {"light_minutes": 61},
+                                    "delivery": {"deploy": {"health_url": "https://app.example/health"}}},
+                                   expected_revision=revision + 1)
+        self.assertEqual(self.runtime.store.setting("config"), before)
+        self.assertEqual(self.runtime.store.config_revision(None), revision)
+        self.assertEqual([self.runtime.store.config_revision(project) for project in self.projects], project_revisions)
+        for project in self.projects:
+            row = self.runtime.store.one("SELECT due FROM schedules WHERE project=? AND kind='light'", (project,))
+            self.assertEqual(row["due"], 100.0)
+
+    def test_global_health_repair_rejects_new_project_validation_failure(self):
+        old_global = {"delivery": {"deploy": {"health_url": "https://app.example:0/health", "health_attempts": 4}}}
+        self.runtime.store.put_setting("config", old_global)
+        override = {"delivery": {"deploy": {"health_consecutive_successes": 3}}}
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(override), self.projects[1]))
+        revision = self.runtime.store.config_revision(None)
+        with self.assertRaisesRegex(ValueError, "Invalid deployment health retry policy"):
+            self.runtime.configure(
+                {"schedule": {"light_minutes": 61}, "delivery": {"deploy": {
+                    "health_url": "https://app.example:443/health", "health_attempts": 2}}}
+            )
+        self.assertEqual(self.runtime.store.setting("config"), old_global)
+        self.assertEqual(self.runtime.store.config_revision(None), revision)
+        row = self.runtime.store.one("SELECT due FROM schedules WHERE project=? AND kind='light'", (self.projects[1],))
+        self.assertEqual(row["due"], 100.0)
+        # The same health/schedule repair can proceed with the compatible retry policy.
+        with patch("adaptive_rsi.runtime.time.time", return_value=1000):
+            self.runtime.configure({"schedule": {"light_minutes": 61}, "delivery": {"deploy": {
+                "health_url": "https://app.example:443/health"}}})
+        row = self.runtime.store.one("SELECT due FROM schedules WHERE project=? AND kind='light'", (self.projects[1],))
+        self.assertEqual(row["due"], 4660.0)
+
+    def test_global_update_rejects_invalidating_previously_valid_project(self):
+        global_before = {"delivery": {"deploy": {"health_attempts": 4}}}
+        self.runtime.store.put_setting("config", global_before)
+        override = {"delivery": {"deploy": {"health_consecutive_successes": 3}}}
+        self.runtime.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(override), self.projects[1]))
+        self.assertEqual(self.runtime.config(self.projects[1])["delivery"]["deploy"]["health_consecutive_successes"], 3)
+        revision = self.runtime.store.config_revision(None)
+        with self.assertRaisesRegex(ValueError, "Invalid deployment health retry policy"):
+            self.runtime.configure({"delivery": {"deploy": {"health_attempts": 2}}})
+        self.assertEqual(self.runtime.store.setting("config"), global_before)
+        self.assertEqual(self.runtime.store.config_revision(None), revision)
+
+    def test_global_repair_reschedules_only_valid_projects_and_changed_intervals(self):
+        with patch("adaptive_rsi.runtime.time.time", return_value=1000):
+            result = self.runtime.configure(
+                {"schedule": {"light_minutes": 61},
+                 "delivery": {"deploy": {"health_url": "https://app.example:443/health"}}}
+            )
+        self.assertTrue(result["saved"])
+        schedules = {project: {row["kind"]: row["due"] for row in self.runtime.store.query(
+            "SELECT kind,due FROM schedules WHERE project=?", (project,))} for project in self.projects}
+        self.assertEqual(schedules[self.projects[0]], {"light": 4660.0, "issues": 200.0, "deep": 300.0})
+        self.assertEqual(schedules[self.projects[1]], {"light": 100.0, "issues": 200.0, "deep": 300.0})
+        # A project with its own still-invalid health URL can be repaired later.
+        # Its valid inherited schedule must not retain the old global deadline.
+        self.assertEqual(schedules[self.projects[2]], {"light": 4660.0, "issues": 200.0, "deep": 300.0})
+        self.assertEqual(schedules[self.projects[3]], {"light": 100.0, "issues": 200.0, "deep": 300.0})
+        self.assertEqual(self.runtime.config(self.projects[0])["schedule"]["light_minutes"], 61)
+        self.assertEqual(self.runtime.config(self.projects[1])["schedule"]["light_minutes"], 75)
+        with self.assertRaises(ValueError):
+            self.runtime.config(self.projects[2])
+        with self.assertRaises(ValueError):
+            self.runtime.config(self.projects[3])
+        self.runtime.configure({"delivery": {"deploy": {"health_url": "https://app.example:443/health"}}},
+                               self.projects[2])
+        light = self.runtime.store.one("SELECT due FROM schedules WHERE project=? AND kind='light'", (self.projects[2],))
+        self.assertEqual(light["due"], 4660.0)
+
+class LegacyScheduleValidationTests(unittest.TestCase):
+    def test_strict_validation_and_legacy_schedule_with_multiple_bad_ports(self):
+        raw = {"delivery": {"deploy": {
+            "health_url": "https://app.example:0/health",
+            "health_urls": ["https://second.example:65536/health"],
+        }}}
+        original = copy.deepcopy(raw)
+
+        with self.assertRaises(InvalidDeploymentHealth):
+            validate(raw)
+
+        self.assertEqual(validate_legacy_schedule(raw), DEFAULTS["schedule"])
+        self.assertEqual(raw, original)
+
+    def test_legacy_schedule_does_not_ignore_other_health_url_errors(self):
+        for additional_url, message in (
+            ("http://app.example/health", "requires HTTPS"),
+            ("https://user:secret@app.example/health", "without credentials"),
+            ("https://app.example/health?token=example", "without credentials"),
+            ("https://app.example/health#fragment", "without credentials"),
+        ):
+            raw = {"delivery": {"deploy": {
+                "health_url": "https://primary.example:0/health",
+                "health_urls": [additional_url],
+            }}}
+            with self.subTest(additional_url=additional_url):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_legacy_schedule(raw)
+
+    def test_legacy_schedule_includes_malformed_origin_only_as_schedule_evidence(self):
+        # urlsplit cannot establish the complete authority here. This helper is
+        # allowed to recover only a schedule; strict config remains invalid.
+        raw = {"delivery": {"deploy": {"health_url": "http://[::1/health"}}}
+        with self.assertRaises(InvalidDeploymentHealth):
+            validate(raw)
+        self.assertEqual(validate_legacy_schedule(raw), DEFAULTS["schedule"])
+
+    def test_legacy_schedule_does_not_ignore_duplicate_health_urls(self):
+        url = "https://app.example:0/health"
+        raw = {"delivery": {"deploy": {"health_url": url, "health_urls": [url]}}}
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            validate_legacy_schedule(raw)
+
+    def test_legacy_schedule_continues_to_retry_policy_validation(self):
+        raw = {"delivery": {"deploy": {
+            "health_url": "https://app.example:0/health",
+            "health_attempts": 2,
+            "health_consecutive_successes": 3,
+        }}}
+        with self.assertRaises(InvalidDeploymentHealth):
+            validate(raw)
+        with self.assertRaisesRegex(ValueError, "Invalid deployment health retry policy"):
+            validate_legacy_schedule(raw)
+
+    def test_legacy_schedule_does_not_hide_earlier_shape_errors(self):
+        raw = {
+            "schedule": {"light_minutes": 60.0},
+            "delivery": {"deploy": {"health_url": "https://app.example:0/health"}},
+        }
+        with self.assertRaisesRegex(ValueError, "schedule.light_minutes has the wrong type"):
+            validate_legacy_schedule(raw)
 
 if __name__ == "__main__":
     unittest.main()

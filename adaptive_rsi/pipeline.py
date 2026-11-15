@@ -87,28 +87,40 @@ def _acceptance_baseline_outcome(future):
 
 
 def _acceptance_baseline_failed(future):
-    """并发验收基线是否已确定失败（不阻塞）。
+    """并发验收基线是否已确定失败或取消（不阻塞）。
 
-    只在 future.done() 后读取结果：基线评估抛出异常、或其结果是
-    insufficient_evidence（环境/setup 失败是确定性的），都说明候选实现
-    再跑完也无法通过验收。被评估线程的取消谓词轮询调用，必须无副作用。
+    只在 future.done() 后读取结果：基线评估抛出任何异常（包括取消），或其结果是
+    insufficient_evidence，都应停止候选实现。调用方会区分取消与环境/setup 故障。
+    被评估线程的取消谓词轮询调用，必须无副作用。
     """
     if future is None or not future.done():
         return False
     try:
         error = future.exception()
-        if isinstance(error, (Cancelled, concurrent.futures.CancelledError)):
-            return False
         if error is not None:
             return True
         outcome = future.result()
-    except concurrent.futures.CancelledError:
-        # Future 本身被取消与 evaluator 环境故障不同；让运行时保留取消语义。
-        return False
+    except (Cancelled, concurrent.futures.CancelledError):
+        return True
     except Exception:
         # Future 状态或结果读取异常按基线不可用兜底；取消谓词自身不许抛出。
         return True
     return isinstance(outcome, dict) and outcome.get("decision") == "insufficient_evidence"
+
+
+def _acceptance_baseline_cancelled(future):
+    """并发验收基线是否因取消结束；调用方据此保留取消语义。"""
+    if future is None or not future.done():
+        return False
+    if future.cancelled():
+        return True
+    try:
+        error = future.exception()
+    except (Cancelled, concurrent.futures.CancelledError):
+        return True
+    except Exception:
+        return False
+    return isinstance(error, (Cancelled, concurrent.futures.CancelledError))
 
 
 def _planned_scope(scope):
@@ -820,6 +832,26 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     else:
         transition("executing")
     acceptance_baseline = None
+    def settle_acceptance():
+        nonlocal acceptance_baseline, acceptance_executor
+        if acceptance_future is not None:
+            try:
+                acceptance_baseline = acceptance_future.result()
+            except Cancelled:
+                raise
+            except concurrent.futures.CancelledError:
+                raise Cancelled("Acceptance baseline evaluation cancelled") from None
+            except Exception:
+                if runtime.is_cancelled(run):
+                    raise Cancelled("Run cancelled") from None
+                # 实现已返回后，取消谓词不再有机会转换基线故障；保留 Future 中的原始异常原因。
+                raise AcceptanceBaselineUnavailable(_acceptance_baseline_outcome(acceptance_future)) from None
+            acceptance_executor.shutdown(wait=True)
+            acceptance_executor = None
+            if runtime.is_cancelled(run):
+                raise Cancelled("Run cancelled") from None
+            if isinstance(acceptance_baseline, dict) and acceptance_baseline.get("decision") == "insufficient_evidence":
+                raise AcceptanceBaselineUnavailable(_acceptance_baseline_outcome(acceptance_future)) from None
     try:
         if saved_candidate:
             result = {"summary": saved_candidate["summary"]}
@@ -856,14 +888,18 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                                      encode({"plan": plan, **implementation_context}), workspace, run,
                                      cancel=lambda: _acceptance_baseline_failed(acceptance_future))
             except Cancelled:
+                if runtime.is_cancelled(run):
+                    raise
+                if _acceptance_baseline_cancelled(acceptance_future):
+                    raise
                 if _acceptance_baseline_failed(acceptance_future):
-                    # 验收基线在实现期间已确定失败：中止的是一次注定白付的实现调用，
-                    # 按准确原因（验收环境/setup 故障）收尾而不是泛化的 cancel 文案。
+                    # 验收基线在实现期间已确定失败：按准确原因（验收环境/setup 故障）收尾。
                     raise AcceptanceBaselineUnavailable(_acceptance_baseline_outcome(acceptance_future)) from None
                 raise
         scrub_tree(workspace)
         files, patch = changes(workspace)
         if not files:
+            settle_acceptance()
             if not experiment:
                 transition("obsolete", {"reason": "No code changes produced", "summary": result["summary"]}, True)
                 return None
@@ -880,8 +916,10 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         # scope; an empty list for a non-empty patch means the read failed.
         touched = _touched_paths(workspace)
         if not touched:
+            settle_acceptance()
             raise RuntimeError("Cannot verify touched paths: git reported no staged paths for a non-empty patch")
         if change_type == "documentation" and not documentation_only(touched):
+            settle_acceptance()
             # A declared documentation scope must not launder source edits past
             # the normal acceptance gate.  Mixed patches are rejected instead
             # of trying to infer comment-only source changes.
@@ -893,15 +931,22 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         added_test_files = {path for path in git(workspace, "diff", "--cached", "--diff-filter=A", "--name-only", "-z").split("\0")
                             if path and test_path(path)}
         if test_first and not 1 <= len(added_test_files) <= 8:
+            settle_acceptance()
             raise RuntimeError("Test-first changes require 1..8 new regression test files")
         for path in sorted(touched):
-            relative_path(path)
+            try:
+                relative_path(path)
+            except ValueError:
+                settle_acceptance()
+                raise
             if test_first and test_path(path):
                 if path not in added_test_files or not _within_scope(path, regression_test_scope or ""):
+                    settle_acceptance()
                     raise RuntimeError("Test-first behavior changes may only add a regression test within its declared test scope")
                 continue
             allowed_scope = original_scope if test_first else plan["scope"]
             if not any(_within_scope(path, scope) for scope in allowed_scope):
+                settle_acceptance()
                 raise RuntimeError("Change escaped planned scope: " + path)
         (directory / "candidate.patch").write_text(patch + "\n", encoding="utf-8")
         # Seal the exact patch outside the executor's writable subtree before evaluation.
@@ -914,25 +959,13 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             save(runtime, run, "implementation", {"files": files, "patch": patch,
                                                   "patch_hash": fingerprint(patch),
                                                   "summary": result["summary"]}, candidate_key)
+        settle_acceptance()
         transition("evaluating")
         if experiment:
             # 实验路径不写 runs.state，必须在评估工作开始前显式起算评估相位。
             # 实现与并发的验收基线都按 preparation 计时（与生产路径一致），
             # 不能提前切到 evaluation，否则实现越慢，留给评估的预算越少。
             runtime.begin_phase(run, "evaluation")
-        if acceptance_future is not None:
-            try:
-                acceptance_baseline = acceptance_future.result()
-            except Cancelled:
-                raise
-            except concurrent.futures.CancelledError:
-                raise Cancelled("Acceptance baseline evaluation cancelled") from None
-            except Exception:
-                # 实现已返回后，取消谓词不再有机会转换基线故障；与实现期间
-                # 的失败保持同一环境故障分类，并保留 Future 中的原始异常原因。
-                raise AcceptanceBaselineUnavailable(_acceptance_baseline_outcome(acceptance_future)) from None
-            acceptance_executor.shutdown(wait=True)
-            acceptance_executor = None
         evaluation_source = _evaluation_source(config, base, checks, patch, environment["sha256"],
                                                acceptance, test_first, change_type)
         # A resumed candidate replays exactly the saved patch, so a stored

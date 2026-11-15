@@ -1170,6 +1170,212 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.store.setting('postprocess:' + run['id'])['state'], 'completed')
         self.assertEqual(self.store.one("SELECT value FROM settings WHERE key='postprocess:corrupt'")['value'], '{')
 
+    def test_orphan_concurrent_observers_emit_one_event(self):
+        identifier = 'missing-concurrent-run'
+        key = 'postprocess:' + identifier
+        record = {'state': 'pending', 'steps': [], 'created': time.time()}
+        self.store.put_setting(key, record)
+        barrier = threading.Barrier(2)
+        original = self.store.one
+        def synchronized(sql, args=()):
+            result = original(sql, args)
+            if sql == 'SELECT * FROM runs WHERE id=?' and tuple(args) == (identifier,):
+                barrier.wait(timeout=5)
+            return result
+        with patch.object(self.store, 'one', side_effect=synchronized):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
+                futures = [workers.submit(self.runtime._postprocess_run, key, identifier, dict(record))
+                           for _ in range(2)]
+                for future in futures:
+                    future.result(timeout=10)
+        self.assertEqual(self.store.setting(key)['state'], 'obsolete')
+        events = self.store.query("SELECT kind FROM events WHERE kind='postprocess_orphaned' AND run=?",
+                                  (identifier,))
+        self.assertEqual(len(events), 1)
+
+    def test_orphan_transition_does_not_replace_a_newer_receipt(self):
+        identifier = 'missing-receipt-race'
+        key = 'postprocess:' + identifier
+        pending = {'state': 'pending', 'steps': [], 'created': time.time()}
+        completed = {'state': 'completed', 'steps': ['delivery'], 'ended': time.time()}
+        self.store.put_setting(key, pending)
+        original = self.store.one
+        def update_after_read(sql, args=()):
+            row = original(sql, args)
+            if sql == 'SELECT * FROM runs WHERE id=?' and tuple(args) == (identifier,):
+                self.store.put_setting(key, completed)
+            return row
+        with patch.object(self.store, 'one', side_effect=update_after_read):
+            self.runtime._postprocess_run(key, identifier, dict(pending))
+        self.assertEqual(self.store.setting(key), completed)
+        self.assertEqual(self.store.query("SELECT kind FROM events WHERE kind='postprocess_orphaned' AND run=?",
+                                          (identifier,)), [])
+
+    def test_orphan_transition_rechecks_a_newly_restored_run(self):
+        identifier = 'restored-run-race'
+        task = self.runtime.goal(self.project, 'Restored task')
+        key = 'postprocess:' + identifier
+        pending = {'state': 'pending', 'steps': [], 'created': time.time()}
+        self.store.put_setting(key, pending)
+        original = self.store.one
+        def restore_after_read(sql, args=()):
+            row = original(sql, args)
+            if sql == 'SELECT * FROM runs WHERE id=?' and tuple(args) == (identifier,):
+                self.store.execute("INSERT INTO runs(id,task,project,state,config,started) VALUES (?,?,?,?,?,?)",
+                                   (identifier, task, self.project, 'planning', '{}', time.time()))
+            return row
+        with patch.object(self.store, 'one', side_effect=restore_after_read):
+            self.runtime._postprocess_run(key, identifier, dict(pending))
+        self.assertEqual(self.store.setting(key), pending)
+        self.assertEqual(self.store.query("SELECT kind FROM events WHERE kind='postprocess_orphaned' AND run=?",
+                                          (identifier,)), [])
+
+    def test_orphan_transient_failure_cannot_resurrect_completed_transition(self):
+        identifier = 'orphan-failure-race'
+        key, marker = 'postprocess:' + identifier, 'postprocess-pending:' + identifier
+        record = {'state': 'pending', 'steps': [], 'created': time.time()}
+        self.store.put_setting(key, record)
+        self.store.put_setting(marker, {'created': time.time()})
+        began, completed = threading.Event(), threading.Event()
+        original = self.runtime._postprocess_run
+        errors = []
+        def simulate_failure(key_arg, identifier_arg, receipt):
+            if threading.current_thread().name == 'orphan-failure':
+                began.set()
+                if not completed.wait(5):
+                    raise AssertionError('concurrent transition did not complete')
+                raise sqlite3.OperationalError('simulated transient event failure')
+            return original(key_arg, identifier_arg, receipt)
+        def drain(name):
+            try:
+                self.runtime._drain_postprocess_record(key, identifier, encode(record), marker)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                if name == 'success':
+                    completed.set()
+        with patch.object(self.runtime, '_postprocess_run', side_effect=simulate_failure):
+            failure = threading.Thread(target=drain, args=('failure',), name='orphan-failure')
+            success = threading.Thread(target=drain, args=('success',), name='orphan-success')
+            failure.start()
+            self.assertTrue(began.wait(5))
+            success.start()
+            success.join(8);failure.join(8)
+        self.assertFalse(failure.is_alive())
+        self.assertFalse(success.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.store.setting(key)['state'], 'obsolete')
+        self.assertIsNone(self.store.setting(marker))
+        self.assertEqual(len(self.store.query("SELECT kind FROM events WHERE kind='postprocess_orphaned' AND run=?",
+                                              (identifier,))), 1)
+
+    def test_orphan_transition_retains_newer_pending_progress(self):
+        identifier = 'orphan-progress-race'
+        key = 'postprocess:' + identifier
+        pending = {'state': 'pending', 'steps': [], 'created': time.time(), 'attempts': 0}
+        newer = {**pending, 'steps': ['observation'], 'attempts': 2}
+        self.store.put_setting(key, pending)
+        original = self.store.one
+        def update_after_read(sql, args=()):
+            row = original(sql, args)
+            if sql == 'SELECT * FROM runs WHERE id=?' and tuple(args) == (identifier,):
+                self.store.put_setting(key, newer)
+            return row
+        with patch.object(self.store, 'one', side_effect=update_after_read):
+            self.runtime._postprocess_run(key, identifier, dict(pending))
+        result = self.store.setting(key)
+        self.assertEqual(result['state'], 'obsolete')
+        self.assertEqual(result['steps'], ['observation'])
+        self.assertEqual(result['attempts'], 2)
+
+    def test_postprocess_error_counts_from_latest_durable_progress(self):
+        identifier = 'failure-progress-race'
+        key = 'postprocess:' + identifier
+        pending = {'state': 'pending', 'steps': [], 'created': time.time(), 'attempts': 0}
+        newer = {**pending, 'steps': ['observation'], 'attempts': 2}
+        self.store.put_setting(key, pending)
+        def fail_after_progress(*_args):
+            self.store.put_setting(key, newer)
+            raise sqlite3.OperationalError('transient failure')
+        with patch.object(self.runtime, '_postprocess_run', side_effect=fail_after_progress):
+            self.runtime._drain_postprocess_record(key, identifier, encode(pending))
+        result = self.store.setting(key)
+        self.assertEqual(result['state'], 'pending')
+        self.assertEqual(result['steps'], ['observation'])
+        self.assertEqual(result['attempts'], 3)
+
+    def test_postprocess_recovers_when_delivery_marker_write_fails_after_effect(self):
+        project = self.runtime.add_project(fixture(self.root / 'delivery-marker-failure'))
+        self.runtime.configure({'delivery': {'mode': 'pr'}, 'evolution': {'enabled': False}}, project)
+        self.runtime.pause(project, False)
+        self.runtime.goal(project, 'Delivery marker persistence failure')
+        run = self.store.claim(project, self.runtime.config(project))
+        self.runtime.queue_postprocess(run)
+        self.store.transition(run['id'], 'awaiting_approval', {
+            'summary': 'Verified outcome', 'evaluation': {'decision': 'pass'},
+            'review': {'decision': 'pass'}}, True)
+        key = 'postprocess:' + run['id']
+        original = self.store.put_setting
+        failures = []
+        def fail_marker_once(setting_key, value):
+            if setting_key == key and 'delivery' in value.get('steps', []) and not failures:
+                failures.append(True)
+                raise sqlite3.OperationalError('delivery marker write failed')
+            return original(setting_key, value)
+        with patch.object(self.store, 'put_setting', side_effect=fail_marker_once):
+            self.runtime.drain_postprocess()
+        self.assertEqual(failures, [True])
+        self.assertEqual(self.store.setting(key)['state'], 'pending')
+        publish = self.store.query('SELECT id FROM tasks WHERE project=? AND fingerprint=?',
+                                   (project, 'publish:' + run['id']))
+        self.assertEqual(len(publish), 1)
+        with patch.object(self.runtime, 'deliver', side_effect=AssertionError('delivery repeated')):
+            self.runtime.drain_postprocess()
+        self.assertEqual(self.store.setting(key)['state'], 'completed')
+        self.assertEqual(len(self.store.query('SELECT id FROM tasks WHERE project=? AND fingerprint=?',
+                                              (project, 'publish:' + run['id']))), 1)
+
+    def test_orphan_receipt_event_failure_keeps_receipt_pending_for_retry(self):
+        identifier = 'missing-run'
+        key = 'postprocess:' + identifier
+        self.store.put_setting(key, {'state': 'pending', 'steps': [], 'created': time.time()})
+        self.store.put_setting('postprocess-pending:' + identifier, {'created': time.time()})
+        # Fail the event INSERT via a SQLite trigger, preserving the normal transaction path.
+        self.store.execute("CREATE TRIGGER fail_orphan_event BEFORE INSERT ON events "
+                           "WHEN NEW.kind='postprocess_orphaned' BEGIN SELECT RAISE(ABORT, 'event failed'); END")
+        self.runtime.drain_postprocess()
+        self.assertEqual(self.store.setting(key)['state'], 'pending')
+        self.assertIsNotNone(self.store.setting('postprocess-pending:' + identifier))
+        self.store.execute('DROP TRIGGER fail_orphan_event')
+        self.runtime.drain_postprocess()
+        self.assertEqual(self.store.setting(key)['state'], 'obsolete')
+        self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='postprocess_orphaned'")), 1)
+
+    def test_postprocess_orphaned_receipt_reaches_terminal_state_and_leaves_index(self):
+        identifier = 'missing-run'
+        self.store.put_setting('postprocess:' + identifier,
+                               {'state': 'pending', 'steps': [], 'created': time.time()})
+        self.store.put_setting('postprocess-pending:' + identifier, {'created': time.time()})
+        self.runtime.drain_postprocess()
+        record = self.store.setting('postprocess:' + identifier)
+        self.assertEqual(record['state'], 'obsolete')
+        self.assertIn('missing', record['reason'])
+        self.assertIsNotNone(record['ended'])
+        self.assertIsNone(self.store.setting('postprocess-pending:' + identifier))
+        events = self.store.query("SELECT kind, run FROM events WHERE kind='postprocess_orphaned'")
+        self.assertEqual([(row['kind'], row['run']) for row in events],
+                         [('postprocess_orphaned', identifier)])
+        reads = []
+        original = self.store.one
+        def observe(sql, args=()):
+            if tuple(args) == ('postprocess:' + identifier,):
+                reads.append(sql)
+            return original(sql, args)
+        with patch.object(self.store, 'one', side_effect=observe):
+            self.runtime.drain_postprocess()
+        self.assertEqual(reads, [])
+        self.assertEqual(self.store.setting('postprocess:' + identifier)['state'], 'obsolete')
+
     def test_postprocess_archived_project_does_not_block_another_project(self):
         other = self.runtime.add_project(fixture(self.root / 'other'))
         runs = []
