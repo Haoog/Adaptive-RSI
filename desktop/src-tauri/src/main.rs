@@ -625,6 +625,8 @@ struct Session {
 struct Reply {
     status: u16,
     body: String,
+    #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
 }
 
 fn valid_api_path(path: &str) -> bool {
@@ -672,6 +674,11 @@ fn call_with_session(
         .send()
         .map_err(|_| "Cannot connect to the selected runtime".to_string())?;
     let status = response.status().as_u16();
+    let request_id = response
+        .headers()
+        .get("X-RSI-Request-ID")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let session_cookie = if rotating && response.status().is_success() {
         response
             .cookies()
@@ -697,6 +704,7 @@ fn call_with_session(
     let reply = Reply {
         status,
         body: String::from_utf8(data).map_err(|_| "Invalid response encoding")?,
+        request_id,
     };
     let credentials = if rotating && (200..300).contains(&status) {
         let value: Value =

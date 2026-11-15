@@ -88,6 +88,8 @@ async fn call(target: &Target, path: &str, body: Option<Value>) -> Result<(Reply
     let mut response = request.timeout(timeout).send().await
         .map_err(|_| "Cannot connect to the selected runtime")?;
     let status = response.status().as_u16();
+    let request_id = response.headers().get("X-RSI-Request-ID")
+        .and_then(|value| value.to_str().ok()).map(str::to_string);
     let cookie = if rotating { response.cookies().find(|cookie| {
         target.cookie.as_deref().and_then(|value| value.split_once('='))
             .map(|(name, _)| cookie.name() == name).unwrap_or_else(|| cookie.name().starts_with("rsi_"))
@@ -97,7 +99,7 @@ async fn call(target: &Target, path: &str, body: Option<Value>) -> Result<(Reply
         if data.len() + chunk.len() > 16 * 1024 * 1024 { return Err("Response too large".into()); }
         data.extend_from_slice(&chunk);
     }
-    let reply = Reply { status, body: String::from_utf8(data).map_err(|_| "Invalid response encoding")? };
+    let reply = Reply { status, body: String::from_utf8(data).map_err(|_| "Invalid response encoding")?, request_id };
     let credentials = if rotating && (200..300).contains(&status) {
         let value: Value = serde_json::from_str(&reply.body).map_err(|_| "Invalid session response")?;
         Some((cookie.ok_or("Missing runtime session cookie")?, value["csrf"].as_str()
