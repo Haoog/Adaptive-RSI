@@ -26,15 +26,20 @@ const {chromium} = require('playwright');
     let mode='fail', failures=0, held=0, releaseRetry;
     const waitRetry = new Promise(resolve => {releaseRetry=resolve;});
     await page.route('**/api/task-runs?*', async route => {
-      if (mode==='fail') {mode='pass';failures++;return route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'temporary outage'})});}
+      if (mode==='fail') {failures++;return route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'temporary outage'})});}
       if (mode==='hold') {mode='pass';held++;await waitRetry;}
       await route.continue();
     });
+    // A background history request can race the selected task's first request.
+    // Both must see the simulated outage until the user chooses to retry.
+    assert.equal(await page.evaluate(() => fetch('/api/task-runs?task=background-probe').then(response => response.status)), 503);
+    const firstOutageBaseline=failures;
     const row=page.locator('.task-row').filter({hasText:'普通排队任务'}).first();
     await row.getByRole('button',{name:'查看详情',exact:true}).click();
     await page.locator('#detail-dialog[open]').waitFor();
     const failed=page.locator('#detail-body .detail-section').filter({hasText:'运行记录加载失败。'});
     await failed.waitFor();
+    assert.ok(failures>firstOutageBaseline, 'the selected task also encountered the outage');
     await page.locator('#detail-body .task-controls').waitFor();
     await page.locator('.task-supplement-editor > summary').click();
     const reason=page.getByLabel('干预原因（可选，保留原文）',{exact:true});
@@ -55,20 +60,21 @@ const {chromium} = require('playwright');
     // disclosure edits made while recovery is visible must not be reverted by it.
     await page.locator('.task-supplement-editor').evaluate(node => {node.open=false;});
     await page.locator('.task-queue-editor').evaluate(node => {node.open=false;});
-    mode='fail';
+    const nextOutageBaseline=failures;mode='fail';
     await page.evaluate(() => showTask(detailTask, window.RSIExperience.detailsSnapshot(document.getElementById('detail-body'))));
     const nextFailure=page.locator('#detail-body .detail-section').filter({hasText:'运行记录加载失败。'});
     await nextFailure.waitFor();
+    assert.ok(failures>nextOutageBaseline, 'the second outage was observed');
     await page.locator('#detail-body .task-controls').waitFor();
     if (!await page.locator('.task-supplement-editor').evaluate(node => node.open)) await page.locator('.task-supplement-editor > summary').click();
     if (!await page.locator('.task-queue-editor').evaluate(node => node.open)) await page.locator('.task-queue-editor > summary').click();
     await page.getByLabel('干预原因（可选，保留原文）',{exact:true}).fill('保持展开并保留原因');
-    await nextFailure.getByRole('button',{name:'重试',exact:true}).click();
+    mode='pass';await nextFailure.getByRole('button',{name:'重试',exact:true}).click();
     await nextFailure.waitFor({state:'detached'});
     assert.equal(await page.locator('.task-supplement-editor').evaluate(node => node.open),true);
     assert.equal(await page.locator('.task-queue-editor').evaluate(node => node.open),true);
     assert.equal(await page.getByLabel('干预原因（可选，保留原文）',{exact:true}).inputValue(),'保持展开并保留原因');
-    assert.equal(failures,2);
+    assert.ok(failures>=2, 'both history outages were observed');
     // Exercise the continuation with a nonempty first page. The latest run is
     // held while the user edits, so the assertions run after the footer appears.
     await page.evaluate(() => document.getElementById('detail-dialog').close());
@@ -77,17 +83,18 @@ const {chromium} = require('playwright');
     await historyRow.getByRole('button',{name:'查看详情',exact:true}).click();
     await page.locator('#live-task-outcome').waitFor();
     await page.locator('#detail-body .task-controls').waitFor();
-    mode='fail';
+    const historyOutageBaseline=failures;mode='fail';
     await page.evaluate(() => showTask(detailTask, window.RSIExperience.detailsSnapshot(document.getElementById('detail-body'))));
     const historyFailure=page.locator('#detail-body .detail-section').filter({hasText:'运行记录加载失败。'});
     await historyFailure.waitFor();
+    assert.ok(failures>historyOutageBaseline, 'the history outage was observed');
     await page.locator('#detail-body .task-controls').waitFor();
     if (!await page.locator('.task-supplement-editor').evaluate(node => node.open)) await page.locator('.task-supplement-editor > summary').click();
     let releaseRun, runStarted;
     const waitRun=new Promise(resolve => {releaseRun=resolve;});
     const heldRun=new Promise(resolve => {runStarted=resolve;});
     await page.route('**/api/run?id=detail-h3', async route => {runStarted();await waitRun;await route.continue();});
-    await historyFailure.getByRole('button',{name:'重试',exact:true}).click();
+    mode='pass';await historyFailure.getByRole('button',{name:'重试',exact:true}).click();
     await heldRun;
     await page.getByLabel('干预原因（可选，保留原文）',{exact:true}).fill('运行详情加载期间的输入');
     releaseRun();
@@ -95,7 +102,7 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('.task-supplement-editor').evaluate(node => node.open),true);
     assert.equal(await page.getByLabel('干预原因（可选，保留原文）',{exact:true}).inputValue(),'运行详情加载期间的输入');
     assert.equal(await page.locator('#detail-body > details.detail-section[data-run]').count(),3);
-    assert.equal(failures,3);
+    assert.ok(failures>=3, 'all history outages were observed');
     assert.deepEqual(errors,[]);
     console.log('Browser history retry preserved inputs and disclosure state.');
   } finally {
