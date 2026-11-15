@@ -27,6 +27,10 @@ CONCLUSIVE_DECISIONS = ("pass", "fail")
 # 键时须同步扩充这里，避免执行参数变化被去重逻辑放过。
 EXPERIMENT_LIMITS = ("command_seconds", "max_output_mb", "concurrency", "retries",
                      "min_free_disk_mb", "min_available_memory_mb")
+# 技能正文的评估上限：配对试验与消融注入的候选技能、生产检索注入的已验证技能
+# （runtime.memories 使用同一数值）都按此截断。提案校验与晋升写库必须共用这个
+# 常量，否则晋升会把试验从未覆盖的正文标成「已验证」。
+SKILL_CONTENT_LIMIT = 2000
 
 
 def arm_decision(arm):
@@ -695,6 +699,10 @@ class Evolution:
         guidance = proposal.get("guidance")
         if not isinstance(guidance, str) or not guidance.strip():
             return False, "Model proposal guidance must be a non-empty string"
+        # 试验只注入前 SKILL_CONTENT_LIMIT 个字符；更长正文的尾部永远不会被评估，
+        # 因此直接拒绝，不把未经试验覆盖的内容晋升为已验证技能。
+        if len(guidance) > SKILL_CONTENT_LIMIT:
+            return False, "Model proposal guidance exceeds %d characters" % SKILL_CONTENT_LIMIT
         if not isinstance(proposal.get("triggers"), list):
             return False, "Model proposal triggers must be a list"
         return True, ""
@@ -703,8 +711,8 @@ class Evolution:
     def ablation_required(proposal):
         """策略候选同时写入可检索技能；引导与触发词都非空时两者才会共同生效。
 
-        triggers 为空的候选虽然也会写技能行，但检索永远不会命中，报告无从区分
-        两个模块，因此不排入消融，保留原来的 insufficient_evidence。
+        triggers 为空的候选不写技能行（检索永远不会命中），报告无从区分两个
+        模块，因此也不排入消融，保留原来的 insufficient_evidence。
         """
         if not isinstance(proposal, dict) or proposal.get("kind") not in ("strategy", "meta_strategy", "adapter"):
             return False
@@ -727,7 +735,7 @@ class Evolution:
         """构造候选提案对应的临时技能对象，用于初筛配对评估与受控消融。"""
         guidance = proposal.get("guidance", "") if isinstance(proposal, dict) else ""
         triggers = proposal.get("triggers", []) if isinstance(proposal, dict) else []
-        return {"content": str(guidance)[:2000],
+        return {"content": str(guidance)[:SKILL_CONTENT_LIMIT],
                 "evidence": {"candidate": candidate, "ablation": True},
                 "triggers": [trigger for trigger in triggers if isinstance(trigger, str)],
                 "created": time.time() if now is None else now}
@@ -2093,8 +2101,9 @@ class Evolution:
                     with self.store.connect() as db:
                         db.execute("BEGIN IMMEDIATE")
                         self.activate(db, candidate, promoted, evidence)
-                        db.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
-                                   self.skill_values(project["id"], candidate, proposal, config, promoted))
+                        skill = self.promoted_skill(project["id"], candidate, proposal, config, promoted)
+                        if skill is not None:
+                            db.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)", skill)
                 self.store.event("promotion", "Candidate passed paired validation and holdout; limited operational monitoring started",
                                  project["id"], run["id"], {"candidate": candidate})
                 state = "stable"
@@ -2132,12 +2141,30 @@ class Evolution:
 
     @staticmethod
     def skill_values(project, candidate, content, config, now):
-        """自动晋升与手动晋升写同一种已验证技能，避免两条路径产生不同字段。"""
+        """自动晋升与手动晋升写同一种已验证技能，避免两条路径产生不同字段。
+
+        正文与 candidate_skill 使用同一上限：试验只覆盖前 SKILL_CONTENT_LIMIT 个
+        字符，写库也就只写这一段（历史候选可能超过该上限，不能被标成整段已验证）。
+        """
         triggers = content.get("triggers", []) if isinstance(content, dict) else []
         guidance = content.get("guidance", "") if isinstance(content, dict) else ""
-        return (uid(), project, None, "verified", encode(triggers), guidance,
+        triggers = [trigger for trigger in triggers if isinstance(trigger, str)] if isinstance(triggers, list) else []
+        return (uid(), project, None, "verified", encode(triggers), str(guidance)[:SKILL_CONTENT_LIMIT],
                 encode({"candidate": candidate, "config_hash": fingerprint(config)}),
                 now + 30 * 86400, now)
+
+    @classmethod
+    def promoted_skill(cls, project, candidate, content, config, now):
+        """晋升时写入的技能行；没有可检索触发词时返回 None，不写 verified 技能。
+
+        与 ablation_required 一致：triggers 全为空（或只含空白）的候选永远不会被
+        runtime.memories 检索到，写入 verified 行只会多加一条无法审计效果的技能
+        记录并污染「已验证技能数」统计；策略晋升本身不受影响。
+        """
+        triggers = content.get("triggers", []) if isinstance(content, dict) else []
+        if not isinstance(triggers, list) or not any(isinstance(trigger, str) and trigger.strip() for trigger in triggers):
+            return None
+        return cls.skill_values(project, candidate, content, config, now)
 
     def promote(self, candidate):
         """启用一个已通过配对验证但等待人工确认的候选。"""
@@ -2228,8 +2255,9 @@ class Evolution:
             else:
                 # 与自动晋升一致：同项目同类型的旧稳定版让位，候选保留原有证据。
                 self.activate(db, candidate, now)
-            db.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
-                       self.skill_values(row["project"], candidate, content, config, now))
+            skill = self.promoted_skill(row["project"], candidate, content, config, now)
+            if skill is not None:
+                db.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)", skill)
         self.store.event("promotion", "Ready candidate manually promoted; limited operational monitoring started",
                          row["project"], data={"candidate": candidate})
         return {"candidate": candidate, "status": "stable"}
