@@ -1,4 +1,5 @@
 import concurrent.futures
+import errno
 import fcntl
 import json
 import os
@@ -338,6 +339,220 @@ class RuntimeTest(unittest.TestCase):
             fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:
             probe.close()
+
+    def test_flock_io_error_does_not_skip_contention_check_on_retry(self):
+        opened = []
+        real_open = Path.open
+
+        def track_lockfile(file_path, *args, **kwargs):
+            handle = real_open(file_path, *args, **kwargs)
+            if file_path.name == "runtime.lock":
+                opened.append(handle)
+            return handle
+
+        with patch("adaptive_rsi.runtime.fcntl.flock",
+                   side_effect=OSError(errno.EIO, "simulated lock I/O failure")), \
+                patch.object(Path, "open", new=track_lockfile):
+            with self.assertRaises(OSError) as raised:
+                self.runtime.start()
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        self.assertIsNone(self.runtime.lockfile)
+        self.assertIsNone(self.runtime.thread)
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].closed)
+
+        owner = (self.store.root / "runtime.lock").open("a+")
+        try:
+            fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch("adaptive_rsi.runtime.fcntl.flock", wraps=fcntl.flock) as acquire:
+                with self.assertRaisesRegex(RuntimeError, "Another runtime already owns") as raised:
+                    self.runtime.start()
+            self.assertEqual(acquire.call_count, 1)
+            self.assertIsInstance(raised.exception.__context__, BlockingIOError)
+            self.assertIsNone(self.runtime.lockfile)
+            self.assertIsNone(self.runtime.thread)
+        finally:
+            owner.close()
+
+        self.runtime.start()
+        self.assertTrue(self.runtime.thread.is_alive())
+        self.runtime.close()
+
+    def test_runtime_open_releases_lock_after_non_contention_flock_error(self):
+        root = self.root / "open-lock-error"
+        opened = []
+        real_open = Path.open
+
+        def track_lockfile(file_path, *args, **kwargs):
+            handle = real_open(file_path, *args, **kwargs)
+            if file_path.name == "runtime.lock":
+                opened.append(handle)
+            return handle
+
+        with patch("adaptive_rsi.runtime.fcntl.flock",
+                   side_effect=OSError(errno.EIO, "simulated lock I/O failure")), \
+                patch.object(Path, "open", new=track_lockfile):
+            with self.assertRaises(OSError) as raised:
+                Runtime.open(root, agent=self.agent)
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].closed)
+
+        probe = (root / "runtime.lock").open("a+")
+        try:
+            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            probe.close()
+
+        runtime = Runtime.open(root, agent=self.agent)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "Another runtime already owns"):
+                Runtime.open(root, agent=self.agent)
+        finally:
+            runtime.close()
+
+    def test_scheduler_thread_start_failure_can_still_close_runtime(self):
+        thread_start = threading.Thread.start
+
+        def fail_scheduler_start(thread):
+            if thread.name == "rsi-scheduler":
+                raise RuntimeError("scheduler thread failed to start")
+            return thread_start(thread)
+
+        with patch.object(threading.Thread, "start", new=fail_scheduler_start):
+            with self.assertRaisesRegex(RuntimeError, "scheduler thread failed to start"):
+                self.runtime.start()
+        self.runtime.close()
+        self.assertTrue(self.runtime._closed)
+        self.assertIsNone(self.runtime.thread)
+
+    def test_concurrent_start_runs_initialization_once(self):
+        entered = threading.Event()
+        release = threading.Event()
+        second_attempted = threading.Event()
+        second_returned = threading.Event()
+        recover_calls = []
+        errors = []
+
+        def recover():
+            recover_calls.append(True)
+            if len(recover_calls) == 1:
+                entered.set()
+                release.wait(5)
+
+        def start():
+            try:
+                self.runtime.start()
+            except Exception as exc:
+                errors.append(exc)
+
+        def second_start():
+            second_attempted.set()
+            try:
+                start()
+            finally:
+                second_returned.set()
+
+        first = threading.Thread(target=start)
+        second = threading.Thread(target=second_start)
+        with patch.object(self.runtime.operations, "recover", side_effect=recover), \
+                patch.object(self.runtime.updates, "restore_startup"), \
+                patch.object(self.runtime.store, "recover"), \
+                patch.object(self.runtime.store, "execute"), \
+                patch.object(self.runtime, "_index_postprocess_pending"), \
+                patch.object(self.runtime, "loop", side_effect=self.runtime.stop.wait):
+            try:
+                first.start()
+                self.assertTrue(entered.wait(5), "First start should enter initialization")
+                second.start()
+                self.assertTrue(second_attempted.wait(5), "Second start should attempt initialization")
+                self.assertFalse(second_returned.wait(0.1),
+                                 "Concurrent start must wait for the first initialization")
+            finally:
+                release.set()
+                first.join(5)
+                second.join(5)
+                self.runtime.close()
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(recover_calls), 1)
+
+    def test_close_waits_for_startup_before_closing_runtime(self):
+        entered = threading.Event()
+        release = threading.Event()
+        close_started = threading.Event()
+        close_finished = threading.Event()
+        errors = []
+
+        def recover():
+            entered.set()
+            release.wait(5)
+
+        def start():
+            try:
+                self.runtime.start()
+            except Exception as exc:
+                errors.append(exc)
+
+        def close():
+            close_started.set()
+            self.runtime.close()
+            close_finished.set()
+
+        starter = threading.Thread(target=start)
+        closer = threading.Thread(target=close)
+        with patch.object(self.runtime.operations, "recover", side_effect=recover), \
+                patch.object(self.runtime.updates, "restore_startup"), \
+                patch.object(self.runtime.store, "recover"), \
+                patch.object(self.runtime.store, "execute"), \
+                patch.object(self.runtime, "_index_postprocess_pending"), \
+                patch.object(self.runtime, "loop", side_effect=self.runtime.stop.wait):
+            try:
+                starter.start()
+                self.assertTrue(entered.wait(5), "Start should be held during initialization")
+                closer.start()
+                self.assertTrue(close_started.wait(5))
+                deadline = time.monotonic() + 5
+                while not self.runtime._closing and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                self.assertTrue(self.runtime._closing, "Close should close admission before waiting")
+                self.assertFalse(close_finished.wait(0.1),
+                                 "Close must not close storage while startup is in progress")
+            finally:
+                release.set()
+                starter.join(5)
+                if closer.ident is not None:
+                    closer.join(5)
+                self.runtime.close()
+        self.assertFalse(starter.is_alive())
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(self.runtime._closed)
+        self.assertIsNotNone(self.runtime.lockfile)
+        self.assertTrue(self.runtime.lockfile.closed)
+        self.assertFalse(self.runtime.thread.is_alive())
+
+    def test_start_is_idempotent_and_keeps_one_scheduler_thread(self):
+        self.runtime.configure({"updates": {"mode": "manual"}})
+        self.runtime.start()
+        self.runtime.start()
+        schedulers = [t for t in threading.enumerate() if t.name == "rsi-scheduler"]
+        self.assertEqual(len(schedulers), 1)
+        self.runtime.close()
+        self.assertEqual([t for t in threading.enumerate() if t.name == "rsi-scheduler"], [])
+
+    def test_second_start_does_not_change_project_paused_state(self):
+        self.runtime.configure({"updates": {"mode": "manual"}})
+        paused_project = self.runtime.add_project(fixture(self.root / "paused-project"))
+        self.runtime.pause(self.project, False)
+        self.runtime.start()
+        # 重复 start 是 no-op：不应把已在运行的项目再次批量置为暂停。
+        self.runtime.start(paused=True)
+        self.assertEqual(
+            self.store.one("SELECT paused FROM projects WHERE id=?", (paused_project,))["paused"], 1)
+        self.assertEqual(
+            self.store.one("SELECT paused FROM projects WHERE id=?", (self.project,))["paused"], 0)
 
     def test_active_strategies_fetches_evidence_without_extra_candidate_queries(self):
         key = compatibility(self.runtime.config(self.project))
