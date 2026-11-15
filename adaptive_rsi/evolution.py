@@ -2392,7 +2392,10 @@ class Evolution:
             recorded = db.execute("SELECT strategy,config FROM runs WHERE id=? AND project=?", (run["id"], project)).fetchone()
             if not recorded:
                 return
-            active = {c["id"] for c in json.loads(recorded["strategy"] or "[]") if c.get("id")}
+            # 记录生成时间：候选可能被重新晋升成同 id 的新一代，回滚必须对得上具体一代。
+            active = {c["id"]: c.get("_candidate_created")
+                      for c in json.loads(recorded["strategy"] or "[]")
+                      if isinstance(c, dict) and c.get("id")}
             shared = len(active) > 1
             if not passed and not attributable and not shared:
                 return
@@ -2407,8 +2410,12 @@ class Evolution:
             for row in db.execute("SELECT * FROM candidates WHERE project=? AND status='stable'", (project,)).fetchall():
                 if row["id"] not in active:
                     continue
-                current = db.execute("SELECT evidence FROM candidates WHERE id=? AND status='stable'", (row["id"],)).fetchone()
+                current = db.execute("SELECT evidence,created FROM candidates WHERE id=? AND status='stable'",
+                                     (row["id"],)).fetchone()
                 if not current:
+                    continue
+                expected_created = active[row["id"]]
+                if expected_created is not None and current["created"] != expected_created:
                     continue
                 try:
                     evidence = json.loads(current["evidence"] or "{}")
@@ -2459,7 +2466,8 @@ class Evolution:
                                 already_rolled_back = True
                                 break
                         if not already_rolled_back:
-                            self._rollback_in_transaction(db, row["id"], self._compat_for(config))
+                            self._rollback_in_transaction(db, row["id"], self._compat_for(config),
+                                                          active.get(row["id"]))
                     continue
                 sentinel = monitor["passed"] >= config["evolution"]["monitor_tasks"]
                 # Continue observing attributable failures indefinitely. Successful
@@ -2521,7 +2529,8 @@ class Evolution:
                     evidence["drift"]["attribution"] = attribution
                 db.execute("UPDATE candidates SET evidence=? WHERE id=? AND status='stable'", (encode(evidence), row["id"]))
                 if not passed and not shared:
-                    self._rollback_in_transaction(db, row["id"], self._compat_for(config))
+                    self._rollback_in_transaction(db, row["id"], self._compat_for(config),
+                                                  active.get(row["id"]))
 
     @staticmethod
     def _compat_for(config):
@@ -2531,10 +2540,13 @@ class Evolution:
         except (KeyError, TypeError):
             return None
 
-    def _rollback_in_transaction(self, db, candidate, current=None):
+    def _rollback_in_transaction(self, db, candidate, current=None, expected_created=None):
         row = db.execute("SELECT * FROM candidates WHERE id=?", (candidate,)).fetchone()
         if not row:
             raise ValueError("Candidate not found")
+        if expected_created is not None and row["created"] != expected_created:
+            # 候选已被新一代替换：这一代的失败证据不再适用于当前生效的策略。
+            return
         if row["status"] == "rolled_back":
             return
         if row["status"] != "stable":
@@ -2575,7 +2587,7 @@ class Evolution:
         db.execute("UPDATE candidates SET status='stable' WHERE id=?", (parent,))
         return {**detail, "outcome": "restored"}
 
-    def rollback(self, candidate):
+    def rollback(self, candidate, expected_created=None):
         # 恢复父候选前要按当前配置核对它的封存指纹；配置在事务外读取，避免持有
         # BEGIN IMMEDIATE 写事务时再从连接池借一条连接。
         row = self.store.one("SELECT project,parent FROM candidates WHERE id=?", (candidate,))
@@ -2584,7 +2596,7 @@ class Evolution:
         current = compatibility(self.runtime.config(row["project"])) if row["parent"] else None
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            self._rollback_in_transaction(db, candidate, current)
+            self._rollback_in_transaction(db, candidate, current, expected_created)
 
 
 reproduce_bundle = Evolution.reproduce_bundle
