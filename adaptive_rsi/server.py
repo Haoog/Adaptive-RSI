@@ -918,12 +918,15 @@ class Handler(BaseHTTPRequestHandler):
                                               "retry_at": None, "degraded": None}
                 self.respond(metrics)
             elif parsed.path == "/api/state":
+                legacy = "sections" not in params
+                requested = {part.strip() for value in params.get("sections", []) for part in value.split(",") if part.strip()}
+                unknown = requested - {"core", "candidates", "analytics"}
+                if unknown:
+                    raise RequestError("Unknown state section; expected core, candidates or analytics")
+                # 更新视图在 SQLite 快照外组装：旧的 is_busy() 要等全局 dispatch_lock，
+                # 在读事务内等待会占住连接许可，慢写端点会拖垮每一个控制台轮询。
+                update = runtime.updates.console_snapshot()
                 with store.snapshot():
-                    legacy = "sections" not in params
-                    requested = {part.strip() for value in params.get("sections", []) for part in value.split(",") if part.strip()}
-                    unknown = requested - {"core", "candidates", "analytics"}
-                    if unknown:
-                        raise RequestError("Unknown state section; expected core, candidates or analytics")
                     try:
                         global_config = runtime.config()
                     except (ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
@@ -1015,7 +1018,7 @@ class Handler(BaseHTTPRequestHandler):
                             "csrf": self.server.csrf, "projects": projects, **rows, "config": global_config,
                             "config_revision": store.config_revision(selected if selected else None),
                             "global_config_revision": store.config_revision(),
-                            "update": runtime.updates.snapshot(), "schedules": schedules,
+                            "update": update, "schedules": schedules,
                             "resource_admission": pressure}
                     include_candidates = legacy or "candidates" in requested
                     include_analytics = legacy or "analytics" in requested
