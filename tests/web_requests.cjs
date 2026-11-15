@@ -3814,6 +3814,22 @@ test('Codex completion preserves an in-flight OpenCode count refresh',async()=>{
   assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
 });
 
+test('starting another OpenCode login replaces an invalidated key count refresh',async()=>{
+  const page=browser(),walk=node=>[node,...(node.children||[]).flatMap(walk)],tick=()=>new Promise(setImmediate);let providerCalls=0,releaseProviders;
+  const held=new Promise(resolve=>{releaseProviders=resolve;});
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:['example']}});
+    if(url.includes('/api/auth/providers?')){const n=++providerCalls;if(n===2)await held;return response([{id:'example',name:'Example',connected:true,connection_count:n===1?1:2,methods:[{index:0,type:'api',label:'API key',supported:true}]},{id:'other',name:'Other',connected:false,methods:[{index:0,type:'oauth',label:'OAuth',supported:true}]}]);}
+    if(url.endsWith('/api/auth/key'))return response({ok:true});
+    if(url.endsWith('/api/auth/start'))return response({id:'other-login',backend:'opencode',provider:'other',state:'awaiting_authorization',method:'auto'});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);page.context.window.RSIAuth.show('opencode',async()=>{});await tick();await tick();
+  let select=walk(page.node('mc-auth')).find(node=>node.tagName==='SELECT');select.value='example';select.handlers.change();let form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='fixture';form.handlers.submit({preventDefault(){}});await tick();await tick();assert.equal(providerCalls,2);
+  select=walk(page.node('mc-auth')).find(node=>node.tagName==='SELECT');select.value='other';select.handlers.change();form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.handlers.submit({preventDefault(){}});await tick();await tick();releaseProviders();await tick();await tick();
+  assert.ok(providerCalls>=3,'an invalidated provider refresh must be replaced');assert.match(walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),/2 个账号/);
+});
+
 test('completed auth console expiry stays actionable and stops refresh retries',async()=>{
   const run=await authCompletionPage({failure:'session_required'});await run.finish();
   assert.match(run.text(),/控制台登录已失效/);assert.equal(run.calls.catalog,0);

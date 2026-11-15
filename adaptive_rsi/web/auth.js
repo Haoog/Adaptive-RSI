@@ -47,7 +47,7 @@ window.RSIAuth = (() => {
       }selectPreferredProvider();render();schedule();
     })().finally(()=>loading=null);return loading;
   }
-  let providerRequest=0,providerLoading=0,providerChanging=0;
+  let providerRequest=0,providerLoading=0,providerChanging=0,providerNeedsRefresh=false;
   function validateProviders(result){
     const list=Array.isArray(result)?result:result&&typeof result==='object'?result.providers:null;
     const isObject=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
@@ -60,7 +60,7 @@ window.RSIAuth = (() => {
     return list;
   }
   async function fetchProviders(sessionRequiredRelevant){
-    const request=++providerRequest;providerLoading++;providerCountsFresh=false;render();
+    const request=++providerRequest;providerLoading++;if(providerChanging)providerNeedsRefresh=true;providerCountsFresh=false;render();
     try{
       const result=await api('auth/providers?backend=opencode');if(request!==providerRequest)return;
       providers=validateProviders(result);
@@ -88,7 +88,7 @@ window.RSIAuth = (() => {
     if(!providers&&!providerLoading)return;
     try{await fetchProviders(sessionRequiredRelevant);}catch(error){if(error?.code==='session_required')throw error;}
   }
-  async function mutate(path,body){const providerMutation=body?.backend==='opencode'||(!body?.backend&&Array.from(sessions.values()).some(session=>session.id===body?.id&&session.backend==='opencode'));if(providerMutation){providerCountsFresh=false;providerRequest++;providerChanging++;}pending=true;render();try{return await api('auth/'+path,body);}catch(error){error.message=authMessage(error.code,error.message);throw error;}finally{pending=false;if(providerMutation){providerChanging--;providerCountsFresh=false;providerRequest++;if(providers===null&&context?.backend==='opencode')safe(getProviders);}render();}}
+  async function mutate(path,body){const providerMutation=body?.backend==='opencode'||(!body?.backend&&Array.from(sessions.values()).some(session=>session.id===body?.id&&session.backend==='opencode'));if(providerMutation){if(providerLoading)providerNeedsRefresh=true;providerCountsFresh=false;providerRequest++;providerChanging++;}pending=true;render();try{return await api('auth/'+path,body);}catch(error){error.message=authMessage(error.code,error.message);throw error;}finally{pending=false;if(providerMutation){providerChanging--;providerCountsFresh=false;providerRequest++;if(!providerChanging&&providerNeedsRefresh){providerNeedsRefresh=false;if(!['key','logout'].includes(path))safe(providers?refreshProviders:getProviders);}if(providers===null&&context?.backend==='opencode')safe(getProviders);}render();}}
   function schedule(){clearTimeout(timer);if(!pollingStopped&&[...sessions.values()].some(s=>!terminal.has(s.state)||s.refreshStage)){const delay=document.visibilityState==='hidden'?30000:1500;timer=setTimeout(()=>safe(poll),delay);}}
   async function refreshCompleted(id,session){
     if(session.refreshing||sessions.get(id)!==session)return;session.refreshing=true;
