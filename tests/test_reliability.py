@@ -772,6 +772,31 @@ class ReliabilityTest(unittest.TestCase):
                          {"state": "collected", "bytes": len(content), "sha256": "a" * 64})
         self.assertEqual(cached["artifacts"]["coverage.xml"], {"state": "rejected", "reason": "symlink"})
 
+    def test_early_refusal_evaluations_persist_their_report(self):
+        # 行内摘要只保留 decision 与 report.json 链接；提前返回也必须落盘，
+        # 否则 no-checks 与无法证明变更来源时的 reason/provenance 会永久丢失。
+        evaluator = Evaluator(self.store)
+        config = self.runtime.config(self.project)
+        empty = self.root / "no-checks"
+        result = evaluator.evaluate(self.repo, self.repo, [], empty, config)
+        self.assertEqual(result["decision"], "insufficient_evidence")
+        report = json.loads((empty / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual((report["decision"], report["reason"], report["checks"]),
+                         ("insufficient_evidence", result["reason"], {}))
+
+        test_first = self.root / "test-first"
+        evaluator.evaluate(self.repo, self.repo, CHECKS, test_first, config, test_first=True,
+                           changed_files=["calculator.py", "pyproject.toml", "tests/test_behavior.py"])
+        report = json.loads((test_first / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["decision"], "insufficient_evidence")
+        self.assertIn("test harness", report["reason"])
+
+        provenance = self.root / "unavailable-provenance"
+        result = evaluator.evaluate(self.repo, self.repo, CHECKS, provenance, config, changed_files=False)
+        report = json.loads((provenance / "report.json").read_text(encoding="utf-8"))
+        self.assertFalse(report["changed_files_available"])
+        self.assertEqual(report["reason"], result["reason"])
+
     def test_test_first_evaluation_blocks_changed_harness_before_running_checks(self):
         evaluator = Evaluator(self.store)
         with patch.object(evaluator, "_execution_environment", return_value=(self.runtime.config(self.project), None)), \

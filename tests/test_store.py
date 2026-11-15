@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from adaptive_rsi.store import MAX_CONNECTIONS, POOL_SIZE, Store, encode
+from adaptive_rsi.store import MAX_CONNECTIONS, POOL_SIZE, Store, StoreBusy, encode
 
 
 class StorePoolTest(unittest.TestCase):
@@ -306,6 +306,18 @@ class StorePoolTest(unittest.TestCase):
             self.store.execute("INSERT INTO tasks(id,project,title,state) VALUES ('t','missing','x','queued')")
         self.assertEqual(self.store.one("SELECT count(*) AS n FROM tasks")["n"], 0)
 
+    def test_transient_sqlite_busy_surfaces_as_store_busy(self):
+        # SQLITE_BUSY/LOCKED 与容量超时共用可重试语义：调用方只需捕获 StoreBusy。
+        with patch.object(Store, "_prepare", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertRaises(StoreBusy) as context:
+                self.store.query("SELECT 1")
+        self.assertIsInstance(context.exception, sqlite3.OperationalError)
+        # 真正的语句错误不能被当成瞬时拥塞吞掉。
+        with patch.object(Store, "_prepare", side_effect=sqlite3.OperationalError("no such column: nope")):
+            with self.assertRaises(sqlite3.OperationalError) as context:
+                self.store.query("SELECT 1")
+        self.assertNotIsInstance(context.exception, StoreBusy)
+
     def test_stream_returns_connection_and_abandoned_streams_do_not_leak(self):
         self.store.execute("INSERT INTO projects(id,name,path) VALUES ('p','p','/p')")
         for index in range(3):
@@ -328,7 +340,8 @@ class StorePoolTest(unittest.TestCase):
                 db.execute("SELECT missing_column FROM settings")
         self.assertEqual(self.store._pool.qsize(), 0)
         # 坏连接未被归还：下一次查询必须新建连接且结果正确。
-        self.assertEqual(self.store.query("SELECT count(*) AS n FROM settings"), [{"n": 1}])
+        # 打开状态目录时已写入 instance-id，用它验证新连接读到的是已提交状态。
+        self.assertEqual(self.store.query("SELECT count(*) AS n FROM settings WHERE key='instance-id'"), [{"n": 1}])
         self.assertEqual(len(created), 1)
         self.assertEqual(self.store._pool.qsize(), 1)
 
@@ -353,7 +366,8 @@ class StorePoolTest(unittest.TestCase):
         self.assertEqual(self.store._pool.qsize(), 1)
         self.store.close()
         self.assertEqual(self.store._pool.qsize(), 0)
-        self.assertEqual(self.store.query("SELECT count(*) AS n FROM settings"), [{"n": 1}])
+        # 池清空后重新借出连接：启动期写入的 instance-id 仍可读。
+        self.assertEqual(self.store.query("SELECT count(*) AS n FROM settings WHERE key='instance-id'"), [{"n": 1}])
         self.assertEqual(self.store._pool.qsize(), 1)
 
     def test_namespaced_setting_lazy_migration_and_corrupt_isolation(self):

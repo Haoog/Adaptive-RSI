@@ -51,6 +51,7 @@ const configReasonLabels={
  "config_invalid": "设置格式或字段无效，请检查配置后重试。"
 };
 const apiErrors={
+ "session_required_rate_limited":"尝试过于频繁，请稍候再试。",
  "patch_too_large":"补丁超过 2 MiB 的界面预览上限，请到该运行的目录下载完整补丁。",
  "Grouped requirements changed; reconcile revisions before splitting":"任务组的需求已修订，请先核对新增要求的归属，暂不自动拆分。",
  "Wait for the grouped run to stop before splitting":"任务组仍有运行，请先停止并等待运行结束，再拆分重做。",
