@@ -1,7 +1,7 @@
 'use strict';
 window.RSIBatch=(()=>{
- const selected=new Map(),pending=new Set();
- let historyBox=null;
+ const selected=new Map(),pending=new Set(),boxes=new Map();
+ let historyBox=null,visible=[],anchor=-1,pageKey='';
  const actionLabels={group:'合并任务',ungroup:'拆分任务',split_retry:'拆分失败任务组并重做',retry:'重试',cancel:'取消任务',approve:'批准交付'};
  const stateLabels={accepted:'已受理',unknown:'结果待核对',executing:'正在处理',grouped:'已合并',restored:'已恢复',failed:'操作失败',skipped:'已跳过'};
  async function history(){
@@ -31,6 +31,17 @@ window.RSIBatch=(()=>{
   box.append(download,close);box.onclose=()=>{if(historyBox===box)historyBox=null;box.remove();previousFocus?.focus?.();};document.body.append(box);box.showModal();filter.focus();
  }
  function ids(){if(!selected.has(projectId))selected.set(projectId,new Set());return selected.get(projectId);}
+// 选择只保留当前页仍可见的任务：筛选或翻页后不会再用用户看不见的 id 发起批量操作。
+function syncPage(tasks){
+ if(!Array.isArray(tasks))return;
+ const idsOnPage=tasks.filter(task=>!(task.source||'').startsWith('system_')).map(task=>task.id),key=idsOnPage.join('\n');
+ if(key!==pageKey){pageKey=key;anchor=-1;}
+ visible=idsOnPage;
+ const current=ids();
+ for(const id of current)if(!visible.includes(id))current.delete(id);
+ for(const id of [...boxes.keys()])if(!visible.includes(id))boxes.delete(id);
+}
+function paint(){for(const [id,box] of boxes)box.checked=ids().has(id);}
  function costText(cost){
   const seconds=value=>Number.isFinite(value)?value.toFixed(1)+' s':t('未知');
   return t('验证成本估计')+' · '+t('分别验证')+': '+seconds(cost?.separate_seconds)+' · '+t('共享检查收益')+': '+seconds(cost?.shared_savings_seconds)+' · '+t('失败重做代价')+': '+seconds(cost?.failure_redo_seconds)+'\n'+t('估计不保证加速；实际 CI 对照数据不足，每组仍需完整门禁。');
@@ -78,12 +89,19 @@ window.RSIBatch=(()=>{
   box.append(el('p',t('实际完整检查耗时')+' · '+(Number.isFinite(actual)?actual.toFixed(1)+' s':t('未知'))));
   const close=el('button',t('关闭'));close.onclick=()=>box.close();box.append(close);box.onclose=()=>{box.remove();previousFocus?.focus?.();};document.body.append(box);box.showModal();
  }
- function toolbar(){
+ function toolbar(tasks){
+  syncPage(tasks);
   const host=document.querySelector('.task-toolbar');if(!host)return;
   let panel=document.getElementById('batch-actions');
   if(!panel){panel=el('div',undefined,'task-actions');panel.id='batch-actions';host.after(panel);}
-  panel.dataset.selection=ids().size?'selected':'empty';
-  panel.replaceChildren(el('span',t('已选择任务')+' · '+ids().size,'muted'));
+  paint();
+  const count=ids().size,page=visible.length,countLabel=el('span',t('当前页已选')+' · '+count+' / '+page,'muted');countLabel.setAttribute('role','status');
+  panel.dataset.selection=count?'selected':'empty';
+  panel.replaceChildren(countLabel);
+  const selectAll=el('button',t('全选当前页'),'text-button');selectAll.id='batch-select-all';selectAll.type='button';selectAll.disabled=!page||count===page||pending.has(projectId);
+  selectAll.addEventListener('click',()=>{for(const id of visible)ids().add(id);anchor=-1;toolbar();});panel.append(selectAll);
+  const clear=el('button',t('清除选择'),'text-button');clear.type='button';clear.disabled=!count||pending.has(projectId);
+  clear.addEventListener('click',()=>{ids().clear();anchor=-1;toolbar();});panel.append(clear);
   for(const [kind,label] of [['group','合并任务'],['ungroup','拆分未开始的任务'],['split_retry','拆分失败任务组并重做'],['retry','批量重试'],['cancel','批量取消'],['approve','批量批准交付']]){
    const button=el('button',t(label),'text-button');button.type='button';button.disabled=!ids().size||pending.has(projectId);
    button.addEventListener('click',()=>safe(()=>perform(kind)));panel.append(button);
@@ -94,7 +112,19 @@ window.RSIBatch=(()=>{
  function row(task){
   const box=el('input');box.type='checkbox';box.checked=ids().has(task.id);
   box.setAttribute('aria-label',t('选择任务')+' · '+task.title);
-  box.addEventListener('change',()=>{if(box.checked)ids().add(task.id);else ids().delete(task.id);toolbar();});
+  boxes.set(task.id,box);
+  // Shift+点击按当前页渲染顺序连选；普通点击只切换该行，并成为下一次连选的起点。
+  box.addEventListener('click',event=>{
+   const index=visible.indexOf(task.id);
+   if(event.shiftKey&&anchor>=0&&index>=0&&anchor!==index){
+    const [from,to]=anchor<index?[anchor,index]:[index,anchor];
+    for(let position=from;position<=to;position++){if(box.checked)ids().add(visible[position]);else ids().delete(visible[position]);}
+    toolbar();return;
+   }
+   if(box.checked)ids().add(task.id);else ids().delete(task.id);
+   if(index>=0)anchor=index;
+   toolbar();
+  });
   if((task.fingerprint||'').startsWith('batch:')){const wrap=el('span');const button=el('button',t('逐条验收证据'),'text-button');button.type='button';button.onclick=()=>safe(()=>evidence(task));wrap.append(box,button);return wrap;}
   return box;
  }

@@ -53,7 +53,7 @@ select[multiple] option{display:block;padding:5px 8px;white-space:nowrap;overflo
 select[multiple] option:checked{background:var(--selected);color:var(--ink)}
 select[multiple] option:hover{background:var(--hover)}
 #batch-actions[data-selection=empty]>.muted{display:none}
-#batch-actions[data-selection=empty]>button:not(#batch-records){display:none}
+#batch-actions[data-selection=empty]>button:not(#batch-records):not(#batch-select-all){display:none}
 #batch-actions[data-selection=empty]>#batch-records{display:inline-block;margin-left:auto}
 /* Keep secondary copy readable without giving it the same weight as actions. */
 .workspace-status .badge{background:none}
