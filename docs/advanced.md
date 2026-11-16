@@ -210,6 +210,10 @@ python3 scripts/rsi doctor
 
 支持 **macOS Seatbelt** 与 **Linux Docker**。Codex、OpenCode CLI 在 Linux 的独立容器中执行，仅挂载本次快照和独立 HOME，不挂载 Docker socket、控制器、其他项目或评估样本；规划与评审的源代码只读，Git 元数据只读。CLI 可联网访问模型服务，OpenCode 只导入所选连接的 API/OAuth 配置，不继承项目插件或 MCP；CLI 的必要凭据位于本次独立 HOME。确定性检查和原生 API 的命令工具使用无网络容器。Windows 宿主暂不支持。镜像需预先构建，语言工具链可通过自定义镜像提供。
 
+检查容器保留 `sandbox.image` 的 ENTRYPOINT；自定义入口必须适应非 root、只读根文件系统和无网络环境，并用 `exec "$@"` 透传检查命令。仓库的 `deploy/Dockerfile.worker` 清除了基础 Node 镜像继承的入口，避免 `cargo` 被当作 Node 脚本；已有镜像不会自动改变。在运行检查的 Docker 宿主机上，用 `docker image inspect --format '{{json .Config.Entrypoint}}' IMAGE` 查看实际配置：`null` 或 `[]` 表示没有入口，旧版仓库镜像可能显示 `docker-entrypoint.sh`；非空入口也可能是有意的自定义初始化，不能仅凭 tag 或这一结果判断是否可移除。
+
+更新仓库镜像时，从可信的目标提交构建一个新标签，例如 `docker build -f deploy/Dockerfile.worker -t adaptive-rsi-worker:entrypoint-fixed .`，核对其 ENTRYPOINT 为空和所需工具链后，将 `sandbox.image` 指向该新镜像；有其他语言工具链的自定义镜像应在其 Dockerfile 中合并修复并自行验证初始化。先等待运行中的任务结束，保留旧镜像和配置以便回滚；多宿主部署需在每台执行机准备并核验相同镜像，建议通过不可变摘要固定版本。Docker 的 `--init` 依赖守护进程提供 init 可执行文件；当前运行准备仅检测 Docker 后端可用，不证明 `--init` 可启动，实际检查失败时应查看 Docker 错误并修复宿主配置。
+
 适配器覆盖 Java/Kotlin（Maven、Gradle）、JS/TS（npm、pnpm、Yarn）、Python、Go、Rust、C/C++、.NET、PHP、Ruby、Swift/Objective-C、Dart/Flutter，并扫描 SQL、Shell、PowerShell、HTML/CSS、Docker 和 CI。状态分为**待验证、可分析、环境阻塞**。Xcode、Make 等需要项目特定命令；依赖未缓存的项目需要先准备环境。识别到语言不代表该语言的全部项目都已验证可执行。
 
 当前验收以项目的固定检查为依据。项目没有合适测试时，应在设置中明确配置；不能把模型审查当作测试。固定测试、不同会话和操作系统沙箱降低篡改风险，但不构成抵御任意恶意代码的正式安全证明。模型认证和网络连接由所选执行路径处理；代码上下文会发往你选择的模型服务，其数据政策由对应服务决定。本地控制台、日志和经验不会被运行器自行公开上传。
