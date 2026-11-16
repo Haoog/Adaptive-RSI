@@ -817,13 +817,22 @@ class Runtime(Maintenance):
                         "after": {"state": "queued", "attempts": 0, "available": 0}, "force": force}), now))
         self.wake.set()
 
-    def revise_task(self, task, supplement, reason=None):
+    def revise_task(self, task, supplement, reason=None, request_id=None):
         from .task_lifecycle import intervention_reason
         intervention_reason(reason)
         if not isinstance(supplement, str) or not supplement.strip() or len(supplement) > 10000:
             raise ValueError("Supplement must contain 1..10000 characters")
+        if request_id is not None and (not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 100):
+            raise ValueError("request_id must contain 1..100 characters")
+        signature = fingerprint({"task": task, "supplement": supplement, "reason": reason})
         with self.dispatch_lock, self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if request_id is not None:
+                prior = db.execute("SELECT task,signature,response FROM revision_requests WHERE request=?", (request_id,)).fetchone()
+                if prior:
+                    if prior["task"] != task or prior["signature"] != signature:
+                        raise ValueError("Revision request ID was already used with different content")
+                    return json.loads(prior["response"])
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
             if not row:
                 raise ValueError("Pause or finish active work before supplementing this task")
@@ -883,8 +892,12 @@ class Runtime(Maintenance):
                         "pending": bool(active),
                         "before": {"state": row["state"], "body_hash": fingerprint(row["body"])},
                         "after": {"state": row["state"] if active else "queued", "body_hash": fingerprint(body)}}), now))
+            response = {"saved": True, "pending": bool(active)}
+            if request_id is not None:
+                db.execute("INSERT INTO revision_requests VALUES (?,?,?,?,?)",
+                           (request_id, task, signature, revision, encode(response)))
         self.wake.set()
-        return {"saved": True, "pending": bool(active)}
+        return response
 
     def schedule_task(self, task, local_time, timezone, fold=None):
         """Authorize one absolute instant; reject missing and unspecified repeated hours."""

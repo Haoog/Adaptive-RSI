@@ -112,7 +112,7 @@ jobs:
             modules: tests.test_audit_environment tests.test_audit_evaluation tests.test_issue_480_safety tests.test_audit_evolution tests.test_batch_planning tests.test_cleanup_recovery tests.test_delivery_readiness_audit tests.test_desktop_update_boundaries tests.test_frontend_capabilities tests.test_native_audit_contracts tests.test_runtime_handoff tests.test_storage_acceptance
           - name: 运行时适配与服务
             os: ubuntu-latest
-            modules: tests.test_runtime.ConfigurationAndAdapterTest tests.test_runtime.ServerTest
+            modules: tests.test_runtime.ConfigurationAndAdapterTest tests.test_runtime.ServerTest tests.test_revision_idempotency
           - name: 隔离、调度与体验
             os: ubuntu-latest
             modules: tests.test_runtime_safety tests.test_sandbox_docker_command tests.test_scheduler_isolation tests.test_schedule_consistency tests.test_experience tests.test_workflow_experience

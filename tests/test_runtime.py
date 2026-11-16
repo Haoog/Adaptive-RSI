@@ -2820,6 +2820,26 @@ class ServerTest(unittest.TestCase):
         with urllib.request.urlopen(request) as response:
             return json.load(response)
 
+    def test_revision_request_id_http_contract(self):
+        repo = tempfile.TemporaryDirectory()
+        self.addCleanup(repo.cleanup)
+        project = self.runtime.add_project(fixture(Path(repo.name) / 'repo'))
+        task = self.runtime.goal(project, 'Original')
+        body = {'task': task, 'supplement': 'extra', 'request_id': '  key  '}
+        self.assertEqual(self.post('/api/task/revise', body), {'saved': True, 'pending': False})
+        self.assertEqual(self.post('/api/task/revise', body), {'saved': True, 'pending': False})
+        with self.assertRaises(urllib.error.HTTPError) as conflict:
+            self.post('/api/task/revise', {**body, 'supplement': 'different'})
+        self.assertEqual(conflict.exception.code, 400)
+        conflict.exception.close()
+        for invalid in (None, 1, {}, '', '   ', 'x' * 101):
+            with self.subTest(invalid=invalid), self.assertRaises(urllib.error.HTTPError) as error:
+                self.post('/api/task/revise', {**body, 'request_id': invalid})
+            self.assertEqual(error.exception.code, 400)
+            error.exception.close()
+        self.post('/api/task/revise', {'task': task, 'supplement': 'legacy'})
+        self.assertEqual(len(self.runtime.store.query('SELECT * FROM task_revisions WHERE task=?', (task,))), 2)
+
     def test_project_api_reports_duplicate_path_and_normalizes_blank_names(self):
         with tempfile.TemporaryDirectory() as temp:
             repo = fixture(Path(temp) / "repo")

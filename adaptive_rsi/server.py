@@ -263,7 +263,7 @@ _POST_FIELD_TYPES = {
     "/api/release-abandon": {"project": str, "run": str, "kind": str, "reason": str, "target": str},
     "/api/release-authorize": {"project": str, "kind": str, "workflow": str},
     "/api/goal": {"project": str, "text": str, "request_id": str},
-    "/api/task/revise": {"task": str, "supplement": str, "reason": str},
+    "/api/task/revise": {"task": str, "supplement": str, "reason": str, "request_id": str},
     "/api/task/value-feedback": {"project": str, "task": str, "run": str, "rating": str, "note": str},
     "/api/tasks/batch": {"project": str, "tasks": list, "action": str, "request_id": str},
     "/api/task/schedule-time": {"task": str},
@@ -1397,6 +1397,10 @@ class Handler(BaseHTTPRequestHandler):
                     name = {str: "a string", bool: "a boolean", int: "an integer",
                             dict: "an object", list: "a list"}.get(expected, "a scalar")
                     raise RequestError(field + " must be " + name)
+            if path == "/api/task/revise" and "request_id" in body:
+                request_id = body["request_id"]
+                if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 100:
+                    raise RequestError("request_id must contain 1..100 characters")
             response_code, response_headers, response_lock = 200, None, None
             if path == "/api/operations":
                 options = {"reuse_active": True} if body.get("reuse_active") is True else {}
@@ -1611,7 +1615,11 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/goal":
                     result = {"id": runtime.goal(body["project"], body["text"], body.get("overrides"), body.get("request_id"))}
                 elif path == "/api/task/revise":
-                    result = runtime.revise_task(body["task"], body["supplement"], body.get("reason"))
+                    revision_args = (body["task"], body["supplement"], body.get("reason"))
+                    if "request_id" in body:
+                        result = runtime.revise_task(*revision_args, request_id=body["request_id"])
+                    else:
+                        result = runtime.revise_task(*revision_args)
                 elif path == "/api/task/value-feedback":
                     from .task_feedback import save as save_value_feedback
                     result = save_value_feedback(runtime.store, body.get("project"), body.get("task"),
