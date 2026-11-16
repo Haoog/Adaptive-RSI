@@ -5,7 +5,7 @@ import re
 import time
 from pathlib import Path
 
-from .config import merge
+from .config import fingerprint, merge
 from .gitops import git, origin_repository, snapshot
 from .process import Cancelled, ProcessError, checked
 from .store import encode, uid
@@ -837,20 +837,33 @@ def publish(runtime, project, task, run, workspace, config):
         authorization = json.loads(approval["evidence"] or "[]")
     except (TypeError, ValueError):
         authorization = []
+    if (not isinstance(authorization, list) or len(authorization) != 1 or
+            not isinstance(authorization[0], dict)):
+        raise RuntimeError("Publishing authorization is malformed")
+    run_fields = ("task", "project", "base", "result", "config", "path")
+    task_fields = ("id", "project", "source", "fingerprint", "title", "body", "evidence", "acceptance", "overrides")
+    if task["id"] != run["task"] or task["project"] != project["id"] or run["project"] != project["id"]:
+        raise RuntimeError("Publishing source identity does not match the approved run")
+
     def authorize_write():
         live = runtime.config(project["id"])
         job = store.one("SELECT * FROM runs WHERE task=? AND ended IS NULL", (approval["id"],))
-        pending = store.one("SELECT state FROM tasks WHERE id=?", (approval["id"],))
-        source = store.one("SELECT state FROM tasks WHERE id=?", (task["id"],))
-        original = store.one("SELECT state FROM runs WHERE id=? AND project=?", (run["id"], project["id"]))
+        pending = store.one("SELECT * FROM tasks WHERE id=?", (approval["id"],))
+        source = store.one("SELECT * FROM tasks WHERE id=?", (task["id"],))
+        original = store.one("SELECT * FROM runs WHERE id=? AND project=?", (run["id"], project["id"]))
         if not original or original["state"] != "awaiting_approval":
             raise Cancelled("Approved candidate was superseded; publishing stopped")
+        if any(original[key] != run[key] for key in run_fields):
+            raise Cancelled("Approved run evidence changed; publishing stopped")
+        if (not pending or pending["project"] != project["id"] or
+                pending["source"] != "system_publish" or pending["body"] != run["id"] or
+                pending["evidence"] != approval["evidence"]):
+            raise Cancelled("Publishing authorization identity changed; publishing stopped")
+        if not source or source["state"] != "awaiting_approval" or any(source[key] != task[key] for key in task_fields):
+            raise Cancelled("Source task identity changed; publishing stopped")
         if (runtime.stop.is_set() or runtime.project(project["id"])["paused"] or
                 not pending or pending["state"] != "planning" or (job and runtime.is_cancelled(job))):
             raise Cancelled("Publishing cancelled or project paused")
-        if not source or source["state"] in ["cancelled", "expired", "obsolete"]:
-            # 批准之后、发出外部写操作之前源任务被取消/过期时，授权不再成立。
-            raise Cancelled("Source task is cancelled or expired; publishing stopped")
         grant = authorization[0] if authorization else None
         if not isinstance(grant, dict) or grant.get("authorization") not in ["project_policy", "per_candidate"]:
             raise RuntimeError("Publishing authorization is missing")
@@ -901,11 +914,31 @@ def publish(runtime, project, task, run, workspace, config):
     # push 是唯一没有回执的远端写：崩溃可发生在 push 成功之后、PR 创建之前，
     # 远端会留下没有 PR 的记录。推之前先落盘交付意图，重试与清理预览才能凭本地
     # 记录判断该分支属于哪次交付，而不是只靠「分支名确定性 + 重新观察远端」。
-    pushed_intent = store.setting("delivery-push:" + run["id"])
-    if not isinstance(pushed_intent, dict):
-        pushed_intent = None
-    if pushed_intent and pushed_intent.get("branch") and pushed_intent["branch"] != branch:
+    # Read the raw row: Store.setting deliberately treats corrupt JSON as absent.
+    push_row = store.one("SELECT value FROM settings WHERE key=?", ("delivery-push:" + run["id"],))
+    pushed_intent = None
+    if push_row:
+        try:
+            pushed_intent = json.loads(push_row["value"])
+        except (TypeError, ValueError):
+            pass
+        if not isinstance(pushed_intent, dict) or not pushed_intent:
+            raise RuntimeError("Delivery push journal is malformed; reconcile it before retrying")
+    if pushed_intent and pushed_intent.get("branch") != branch:
         raise RuntimeError("Delivery push journal records a different branch; reconcile it before retrying")
+
+    def evaluated_tree():
+        # Only the staged, evaluated delta may become a delivery commit. A
+        # passing verdict alone does not bind a mutable worktree to evidence.
+        if (git(workspace, "diff", "--no-ext-diff", "--no-textconv") or
+                git(workspace, "ls-files", "--others", "--exclude-standard", "-z")):
+            raise RuntimeError("Candidate has unstaged or untracked changes; delivery refused")
+        patch = git(workspace, "diff", run["base"], "--binary", "--no-ext-diff", "--no-textconv")
+        if not patch or fingerprint(patch) != outcome.get("patch_hash"):
+            raise RuntimeError("Candidate changed after evaluation; delivery refused")
+        return git(workspace, "write-tree")
+
+    tree = evaluated_tree()
     if git(workspace, "branch", "--show-current") != branch:
         # 重试可复用同一候选提交上的分支，不能覆盖已有分支指向的其他提交。
         existing_head = git(workspace, "branch", "--list", branch, "--format=%(objectname)")
@@ -920,9 +953,54 @@ def publish(runtime, project, task, run, workspace, config):
         git(workspace, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
             "commit", "-m", "完成任务：" + title)
     sha = git(workspace, "rev-parse", "HEAD")
-    if pushed_intent and pushed_intent.get("head") and pushed_intent["head"] != sha:
-        # 该分支上一次已被推过别的提交；不覆盖远端引用，交人工按意图记录对账。
-        raise RuntimeError("Delivery push journal records a different candidate head; reconcile it before retrying")
+    candidate_identity = {"branch": branch, "head": sha, "tree": tree,
+                          "base": run["base"], "repository": repo,
+                          "evidence": fingerprint({key: run[key] for key in run_fields})}
+    # Keep the version-1 journal readable across upgrades. Approval fields are
+    # an audit snapshot of that attempt, not immutable candidate identity:
+    # a failed policy publication may be explicitly reapproved by the user.
+    binding = {"version": 1, **candidate_identity, "approval": approval["id"],
+               "authorization": fingerprint(authorization)}
+
+    def matches_binding(saved, push=False):
+        required = binding.keys()
+        return (isinstance(saved, dict) and required <= saved.keys() and
+                saved.keys() <= required | ({"created"} if push else set()) and
+                type(saved.get("version")) is int and saved["version"] == 1 and
+                isinstance(saved.get("approval"), str) and bool(saved["approval"]) and
+                isinstance(saved.get("authorization"), str) and
+                re.fullmatch(r"[0-9a-f]{64}", saved["authorization"]) is not None and
+                all(saved.get(key) == value for key, value in candidate_identity.items()))
+
+    def verify_candidate():
+        authorize_write()
+        if (git(workspace, "rev-parse", "HEAD") != sha or
+                git(workspace, "rev-parse", sha + "^{tree}") != tree or
+                git(workspace, "diff", "HEAD", "--no-ext-diff", "--no-textconv") or
+                evaluated_tree() != tree):
+            raise RuntimeError("Delivery commit differs from evaluated candidate")
+
+    verify_candidate()
+    if pushed_intent is not None:
+        # Only the original unversioned schema may omit the new binding fields.
+        # Rebuild those fields from freshly verified evidence, never from HEAD alone.
+        legacy_keys = {"branch", "head", "base", "repository"}
+        legacy = (legacy_keys <= pushed_intent.keys() and
+                  pushed_intent.keys() <= legacy_keys | {"created"})
+        if pushed_intent.get("head") != sha:
+            raise RuntimeError("Delivery push journal records a different candidate head; reconcile it before retrying")
+        if ((legacy and any(pushed_intent.get(key) != binding[key] for key in legacy_keys)) or
+                (not legacy and not matches_binding(pushed_intent, push=True))):
+            raise RuntimeError("Delivery push journal identity differs; reconcile it before retrying")
+    # This receipt survives a push/PR failure and a new Runtime instance. Never
+    # replace it with a newly observed HEAD on retry, even for an identical tree.
+    with store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        prior = db.execute("SELECT value FROM settings WHERE key=?", ("delivery-candidate:" + run["id"],)).fetchone()
+        if prior and not matches_binding(_json_object(prior["value"])):
+            raise RuntimeError("Delivery candidate identity changed; reconcile it before retrying")
+        if not prior:
+            db.execute("INSERT INTO settings(key,value) VALUES (?,?)", ("delivery-candidate:" + run["id"], encode(binding)))
     existing = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "all", "--head", branch,
                                    "--limit", "1", "--json", "url"]))
     if existing:
@@ -959,21 +1037,15 @@ def publish(runtime, project, task, run, workspace, config):
             store.event("baseline_changed", "Remote baseline evidence invalidated", project["id"], run["id"], change)
             raise StaleCandidate("Remote baseline changed (" + change["relation"] + "); " + change["recovery"])
         git(workspace, "remote", "set-url", "origin", "https://github.com/" + repo + ".git")
-        authorize_write()
-        pushed_intent = pushed_intent or {
-            "branch": branch,
-            "head": sha,
-            "base": run["base"],
-            "repository": repo,
-            "created": time.time(),
-        }
+        verify_candidate()
+        pushed_intent = {**(pushed_intent if pushed_intent is not None else {"created": time.time()}), **binding}
         # 意图先于远端写落地：进程在 push 后消失时，重试仍能看到同一分支、同一
         # 提交的既有意图；重复 push 指向同一引用，不会产生第二个远端分支。
         store.put_setting("delivery-push:" + run["id"], pushed_intent)
-        github_git(workspace, "push", "origin", "HEAD:refs/heads/" + branch)
+        github_git(workspace, "push", "origin", sha + ":refs/heads/" + branch)
         body = Path(workspace).parent / "pr-body.md"
         body.write_text(pr_body(task, run, outcome), encoding="utf-8")
-        authorize_write()
+        verify_candidate()
         url = checked(["gh", "pr", "create", "--repo", repo, "--head", branch, "--base", base_branch,
                        "--title", "完成任务：" + task["title"], "--body-file", str(body)])
     store.put_setting("delivery:" + run["id"], {"head": sha, "base": run["base"], "branch": base_branch,

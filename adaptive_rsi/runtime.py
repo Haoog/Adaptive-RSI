@@ -2603,10 +2603,19 @@ class Runtime(Maintenance):
                             db.execute("UPDATE tasks SET state=?,available=0,updated=? WHERE id=? "
                                        "AND state='awaiting_approval'", (state, time.time(), original["task"]))
                     raise
-                outcome["pr"] = url
                 with self.store.connect() as db:
                     db.execute("BEGIN IMMEDIATE")
-                    current = db.execute("SELECT state FROM runs WHERE id=?", (original["id"],)).fetchone()
+                    current = db.execute("SELECT state,result FROM runs WHERE id=?", (original["id"],)).fetchone()
+                    # publish may have recovered a receipt while another writer
+                    # added evidence. Merge only our receipt into the current
+                    # result under the write lock; the cached outcome is stale.
+                    try:
+                        outcome = json.loads(current["result"] or "{}")
+                    except (TypeError, ValueError):
+                        outcome = {}
+                    if not isinstance(outcome, dict):
+                        outcome = {}
+                    outcome["pr"] = url
                     # 已发 PR 的回执必须落盘，但不能把重试后的新任务改回 pr_open。
                     state = "pr_open" if current["state"] in ["awaiting_approval", "pr_open"] else "superseded"
                     if state == "superseded":

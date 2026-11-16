@@ -75,6 +75,12 @@ class DeliveryRecoveryTest(unittest.TestCase):
         self.workspace = snapshot(self.repo, self.root / "candidate")
         (self.workspace / "calculator.py").write_text("def add(a,b):\n    return a+b\n")
         changes(self.workspace)
+        # Production records the evaluated patch hash before publication.
+        outcome = json.loads(self.run["result"])
+        outcome["patch_hash"] = fingerprint(git(self.workspace, "diff", base, "--binary",
+                                                "--no-ext-diff", "--no-textconv"))
+        self.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), self.run["id"]))
+        self.run = self.store.one("SELECT * FROM runs WHERE id=?", (self.run["id"],))
         git(self.workspace, "checkout", "-b", "feat/rsi-" + self.run["id"])
         git(self.workspace, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", "candidate")
         self.head = git(self.workspace, "rev-parse", "HEAD")
@@ -86,7 +92,9 @@ class DeliveryRecoveryTest(unittest.TestCase):
 
     def test_lost_receipt_recovers_open_or_merged_pr_after_baseline_advances(self):
         for state in ["OPEN", "MERGED"]:
-            self.store.execute("UPDATE runs SET state='awaiting_approval' WHERE id=?", (self.run["id"],))
+            self.store.execute("UPDATE runs SET state='awaiting_approval',result=? WHERE id=?",
+                               (self.run["result"], self.run["id"]))
+            self.store.execute("DELETE FROM settings WHERE key=?", ("delivery:" + self.run["id"],))
             self.store.execute("UPDATE tasks SET state='awaiting_approval' WHERE id=?", (self.task["id"],))
             with self.subTest(state=state), \
                     patch("adaptive_rsi.delivery.baseline", return_value=("unused", "new-base", "main")), \
@@ -102,7 +110,7 @@ class DeliveryRecoveryTest(unittest.TestCase):
                 self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (self.task["id"],))["state"], "pr_open")
                 self.assertEqual(json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (self.run["id"],))["result"])["pr"], self.url)
 
-    def recover_existing_pr_at_view_barrier(self, retry):
+    def recover_existing_pr_at_view_barrier(self, retry, concurrent_evidence=False):
         outcome = json.loads(self.run["result"])
         outcome["patch_hash"] = fingerprint(git(self.workspace, "diff", self.run["base"], "--binary", "--no-ext-diff", "--no-textconv"))
         self.store.execute("UPDATE runs SET path=?,result=? WHERE id=?",
@@ -121,6 +129,14 @@ class DeliveryRecoveryTest(unittest.TestCase):
             saved = self.store.one("SELECT state,result FROM runs WHERE id=?", (self.run["id"],))
             self.assertEqual(json.loads(saved["result"])["pr"], self.url)
             self.assertEqual(saved["state"], "superseded" if retry else "pr_open")
+            if concurrent_evidence:
+                self.assertEqual(json.loads(saved['result'])['concurrent_evidence'],
+                                 {'source': 'independent observer', 'checks': ['new check']})
+                # Also exercise a writer after publish persisted its merged
+                # receipt but before _process handles the returned URL.
+                receipt = json.loads(saved['result'])
+                receipt['after_publish'] = {'retained': True}
+                self.store.execute('UPDATE runs SET result=? WHERE id=?', (encode(receipt), self.run['id']))
             self.assertEqual(self.store.setting("delivery:" + self.run["id"]),
                              {"repository": "example/project", "branch": "main", "base": self.run["base"], "head": self.head})
             return url
@@ -136,6 +152,13 @@ class DeliveryRecoveryTest(unittest.TestCase):
                 if retry:
                     self.runtime.cancel_task(self.task["id"])
                     self.runtime.retry(self.task["id"])
+                if concurrent_evidence:
+                    with self.store.connect() as db:
+                        db.execute('BEGIN IMMEDIATE')
+                        latest = db.execute('SELECT result FROM runs WHERE id=?', (self.run['id'],)).fetchone()
+                        evidence = json.loads(latest['result'])
+                        evidence['concurrent_evidence'] = {'source': 'independent observer', 'checks': ['new check']}
+                        db.execute('UPDATE runs SET result=? WHERE id=?', (encode(evidence), self.run['id']))
             finally:
                 released.set()
             worker.result(timeout=10)
@@ -145,6 +168,11 @@ class DeliveryRecoveryTest(unittest.TestCase):
         saved = self.store.one("SELECT state,result FROM runs WHERE id=?", (self.run["id"],))
         self.assertEqual(saved["state"], "superseded" if retry else "pr_open")
         self.assertEqual(json.loads(saved["result"])["pr"], self.url)
+        if concurrent_evidence:
+            result = json.loads(saved['result'])
+            self.assertEqual(result['concurrent_evidence'],
+                             {'source': 'independent observer', 'checks': ['new check']})
+            self.assertEqual(result['after_publish'], {'retained': True})
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (job["id"],))["state"], "completed")
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (self.task["id"],))["state"],
                          "queued" if retry else "pr_open")
@@ -166,6 +194,12 @@ class DeliveryRecoveryTest(unittest.TestCase):
 
     def test_existing_pr_normal_recovery_persists_receipt_before_return_without_remote_writes(self):
         self.recover_existing_pr_at_view_barrier(retry=False)
+
+    def test_process_preserves_concurrent_evidence_during_pr_recovery(self):
+        self.recover_existing_pr_at_view_barrier(retry=False, concurrent_evidence=True)
+
+    def test_process_preserves_concurrent_evidence_and_retry_close_receipt(self):
+        self.recover_existing_pr_at_view_barrier(retry=True, concurrent_evidence=True)
 
     def test_advanced_baseline_without_existing_pr_never_publishes(self):
         with patch("adaptive_rsi.delivery.baseline", return_value=("unused", "new-base", "main")), \
@@ -203,7 +237,9 @@ class DeliveryRecoveryTest(unittest.TestCase):
         for change in ["pause", "cancel", "revoke", "supersede"]:
             self.runtime.pause(self.project, False)
             self.runtime.configure({"delivery": {"mode": "pr"}}, self.project)
-            self.store.execute("UPDATE runs SET state='awaiting_approval' WHERE id=?", (self.run["id"],))
+            self.store.execute("UPDATE runs SET state='awaiting_approval',result=? WHERE id=?",
+                               (self.run["result"], self.run["id"]))
+            self.store.execute("DELETE FROM settings WHERE key=?", ("delivery:" + self.run["id"],))
             self.store.execute("UPDATE tasks SET state='awaiting_approval' WHERE id=?", (self.task["id"],))
             def view(*args):
                 if change == "pause":

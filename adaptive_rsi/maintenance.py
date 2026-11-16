@@ -702,7 +702,8 @@ class Maintenance:
         # legal hold 同样保留全部派生证据键（基线、推送、合并意图、交付），
         # 只有显式 JSON false 解除。
         # 已清理的运行不能继续占据 LIMIT，否则后续周期永远无法排空积压。
-        prefixes = ("run-baseline:", "automation:", "delivery:", "merge-intent:", "delivery-push:")
+        prefixes = ("run-baseline:", "automation:", "delivery:", "merge-intent:", "delivery-push:",
+                    "delivery-candidate:")
         # 在一致读快照中按索引扫描键；最长匹配的运行 ID 拥有该键。
         runs = set()
         with self.store.connect() as db:

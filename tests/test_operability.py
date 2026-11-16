@@ -458,18 +458,67 @@ class OperabilityTest(unittest.TestCase):
             self.runtime.maintenance()
         self.assertIsNotNone(self.store.one("SELECT key FROM settings WHERE key='automation:state-race'"))
 
+    def test_delivery_candidate_retention_obeys_lifecycle_and_legal_holds(self):
+        now = 2_000_000_000
+        stale = now - 120 * 86400
+        cases = [
+            ('completed', 'completed', stale, {}, False),
+            ('fresh', 'completed', now, {}, True),
+            ('active', 'executing', None, {}, True),
+            *[(state, state, stale, {}, True) for state in
+              ('pr_open', 'merged', 'unverified_merge', 'releasing', 'deploying', 'pr_closed')],
+            ('closing', 'superseded', stale, {'close_pending': True}, True),
+            ('push-recovery', 'superseded', stale, {}, True),
+            ('abandoned', 'superseded', stale, {'delivery_recovery_abandoned': True}, False),
+        ]
+        expected = set()
+        for run, state, ended, result, keep in cases:
+            self.store.execute("INSERT INTO runs(id,state,ended,result) VALUES (?,?,?,?)",
+                               (run, state, ended, json.dumps(result)))
+            if run in ('push-recovery', 'abandoned'):
+                self.store.put_setting('delivery-push:' + run, {})
+            for suffix in ('', ':receipt'):
+                key = 'delivery-candidate:' + run + suffix
+                self.store.put_setting(key, {})
+                if keep:
+                    expected.add(key)
+        # Only explicit JSON false releases either scope of legal hold.
+        for scope in ('run', 'project'):
+            for index, raw in enumerate(('true', 'false', '{broken', 'null', '0')):
+                run = 'hold-%s-%d' % (scope, index)
+                project = 'project-' + run
+                self.store.execute("INSERT INTO runs(id,project,state,ended) VALUES (?,?,'completed',?)",
+                                   (run, project, stale))
+                hold = 'legal-hold:' + run if scope == 'run' else 'legal-hold-project:' + project
+                self.store.execute("INSERT INTO settings VALUES (?,?)", (hold, raw))
+                for suffix in ('', ':receipt'):
+                    key = 'delivery-candidate:' + run + suffix
+                    self.store.put_setting(key, {})
+                    if raw != 'false':
+                        expected.add(key)
+        with patch('adaptive_rsi.runtime.time.time', return_value=now):
+            self.runtime.maintenance()
+        keys = {row['key'] for row in self.store.query(
+            "SELECT key FROM settings WHERE key>='delivery-candidate:' AND key<'delivery-candidate;'")}
+        self.assertEqual(keys, expected)
+
     def test_retention_preserves_keys_owned_by_protected_nested_run(self):
         now = 2_000_000_000
         stale = now - 120 * 86400
         with self.store.connect() as db:
             db.execute("INSERT INTO runs(id,state,ended) VALUES ('parent','completed',?)", (stale,))
             db.execute("INSERT INTO runs(id,state,ended) VALUES ('parent:child','pr_open',?)", (stale,))
-        for key in ('automation:parent', 'automation:parent:release', 'automation:parent:child', 'automation:parent:child:deploy'):
-            self.store.put_setting(key, {})
+        prefixes = ('automation:', 'delivery-candidate:')
+        for prefix in prefixes:
+            for suffix in ('parent', 'parent:release', 'parent:child', 'parent:child:deploy'):
+                self.store.put_setting(prefix + suffix, {})
         with patch('adaptive_rsi.runtime.time.time', return_value=now):
             self.runtime.maintenance()
-        keys = {row['key'] for row in self.store.query("SELECT key FROM settings WHERE key>='automation:' AND key<'automation;' ")}
-        self.assertEqual(keys, {'automation:parent:child', 'automation:parent:child:deploy'})
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                keys = {row['key'] for row in self.store.query(
+                    "SELECT key FROM settings WHERE key>=? AND key<?", (prefix, prefix[:-1] + ';'))}
+                self.assertEqual(keys, {prefix + 'parent:child', prefix + 'parent:child:deploy'})
 
     def test_retention_protected_children_do_not_starve_other_runs(self):
         now = 2_000_000_000
