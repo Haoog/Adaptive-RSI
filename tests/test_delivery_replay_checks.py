@@ -3,7 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from adaptive_rsi import delivery_replay_checks as replay_checks
 from adaptive_rsi.config import fingerprint
 from adaptive_rsi.delivery_replay_checks import ReplayRefused, replay_on_advanced_baseline
 from adaptive_rsi.environment import capture
@@ -14,6 +16,22 @@ from adaptive_rsi.store import Store
 from tests.test_runtime import CHECKS, FakeAgent, fixture
 
 
+# Test-only identity for real local evaluator gates. This stub does NOT prove
+# the identity of Docker images or the host toolchain.
+TEST_EXECUTION_IDENTITY = {'backend': 'controlled-test-stub', 'identity': 'replay-fixture-v1'}
+
+
+def controlled_execution_environment(config):
+    return config, dict(TEST_EXECUTION_IDENTITY)
+
+
+def install_test_identity(test):
+    stub = patch.object(test.runtime.evaluator, '_execution_environment',
+                        side_effect=controlled_execution_environment)
+    stub.start()
+    test.addCleanup(stub.stop)
+
+
 class ReplayIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -21,6 +39,7 @@ class ReplayIntegrationTest(unittest.TestCase):
         self.repo = fixture(self.root / 'repo')
         self.store = Store(self.root / 'state')
         self.runtime = Runtime(self.store, FakeAgent())
+        install_test_identity(self)
         self.project_id = self.runtime.add_project(self.repo)
         self.runtime.configure({'checks': CHECKS, 'environment': {'seed_paths': ['deps']}}, self.project_id)
         self.config = self.runtime.config(self.project_id)
@@ -72,6 +91,34 @@ class ReplayIntegrationTest(unittest.TestCase):
         self.assertTrue(result['checks']['test_first_candidate'][0]['passed'])
         self.assertEqual(self.run['base'], self.base)
         self.assertEqual(json.loads((tree.parent / 'replay-evidence.json').read_text())['source']['base'], self.current)
+
+    def test_late_staged_change_does_not_rebind_evidence_to_unevaluated_tree(self):
+        improvement = replay_checks.improvement
+        def stage_during_final_gate(*args, **kwargs):
+            gate = improvement(*args, **kwargs)
+            self.assertEqual(gate['decision'], 'pass')
+            candidate = self.root / 'replay1/candidate'
+            self.evaluated_tree = git(candidate, 'write-tree')
+            (candidate / 'advance.txt').write_text('concurrent staged change')
+            git(candidate, 'add', 'advance.txt')
+            return gate
+        with patch.object(replay_checks, 'improvement', side_effect=stage_during_final_gate):
+            candidate, result = self.replay()
+        self.assertNotEqual(git(candidate, 'write-tree'), self.evaluated_tree)
+        self.assertEqual(result['source']['tree'], self.evaluated_tree)
+        self.assertEqual(result['source']['patch_hash'], fingerprint(git(
+            candidate, 'diff', self.current, self.evaluated_tree, '--binary', '--no-ext-diff', '--no-textconv')))
+        self.assertNotEqual(result['source']['patch_hash'], fingerprint(git(
+            candidate, 'diff', self.current, '--binary', '--no-ext-diff', '--no-textconv')))
+
+    def test_unresolved_original_or_current_execution_identity_refuses(self):
+        for original, current in ((None, None), (None, TEST_EXECUTION_IDENTITY),
+                                  (TEST_EXECUTION_IDENTITY, None)):
+            with self.subTest(original=original, current=current):
+                self.outcome['evaluation']['execution_environment'] = original
+                with patch.object(self.runtime.evaluator, 'execution_identity', return_value=current):
+                    with self.assertRaisesRegex(ReplayRefused, 'execution environment'):
+                        self.replay()
 
     def test_missing_tampered_or_different_seed_digest_refuses(self):
         seed = self.run_dir / 'dependencies/deps/data'

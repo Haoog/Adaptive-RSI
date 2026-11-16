@@ -75,7 +75,7 @@ def replay_on_advanced_baseline(runtime, project, run, workspace, outcome, sourc
         identity = runtime.evaluator.execution_identity(config)
     except Exception:
         raise ReplayRefused("execution environment cannot be verified") from None
-    if identity != evaluation["execution_environment"]:
+    if not identity or not evaluation["execution_environment"] or identity != evaluation["execution_environment"]:
         raise ReplayRefused("execution environment changed; re-evaluation required")
     checks = sealed.get("checks")
     if (not isinstance(checks, list) or not checks or not all(isinstance(x, dict) for x in checks)
@@ -153,7 +153,9 @@ def replay_on_advanced_baseline(runtime, project, run, workspace, outcome, sourc
         if gate.get("decision") != "pass":
             raise ReplayRefused("independent test-first improvement gate did not pass")
         result["replay_test_first_improvement"] = gate
-    result["source"] = {**sealed, "base": current, "patch_hash": fingerprint(
-        git(candidate, "diff", current, "--binary", "--no-ext-diff", "--no-textconv"))}
+    # Bind evidence to the immutable tree that was actually evaluated, even if
+    # another process stages changes during the file/symbol checks above.
+    result["source"] = {**sealed, "base": current, "tree": evaluated_tree, "patch_hash": fingerprint(
+        git(candidate, "diff", current, evaluated_tree, "--binary", "--no-ext-diff", "--no-textconv"))}
     (directory / "replay-evidence.json").write_text(json.dumps(result, sort_keys=True, indent=2), encoding="utf-8")
     return candidate, result

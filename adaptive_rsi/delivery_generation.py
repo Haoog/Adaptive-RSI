@@ -36,6 +36,12 @@ def _setting(db, key):
     return value
 
 
+def _raw_setting(db, key):
+    """Compare persisted bytes, including absent versus explicitly empty config."""
+    row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+    return tuple(row) if row is not None else None
+
+
 def _snapshot(db, run_id, approval_id):
     def row(sql, args):
         value = db.execute(sql, args).fetchone()
@@ -57,12 +63,31 @@ def _snapshot(db, run_id, approval_id):
         grants = json.loads(approval['evidence'])
         outcome = json.loads(run['result'])
         fields = ('task', 'project', 'base', 'result', 'config', 'path')
+        config = json.loads(run['config'])
+        # An empty setting resolves to the GitHub default at baseline capture.
+        # Local recovery trusts that sealed target; a future remote writer must
+        # resolve the live target again and compare it before any publication.
+        configured_branch = config['delivery']['base_branch']
+        prefix = 'fix' if task['source'] in ('issue', 'rollback', 'inspection') else 'feat'
+        branch = prefix + '/rsi-' + re.sub(r'[^a-zA-Z0-9._-]', '-', run_id)
         keys = {'version', 'branch', 'head', 'tree', 'base', 'repository', 'evidence', 'approval', 'authorization'}
+        # The live grant must be explicit. Version-1 approval fields retain the
+        # first attempt's audit snapshot, as in delivery.publish.matches_binding.
         if (grants != [{'authorization': 'per_candidate'}] or not binding or set(binding) != keys or
                 type(binding['version']) is not int or binding['version'] != 1 or
-                binding['approval'] != approval_id or binding['authorization'] != fingerprint(grants) or
+                not isinstance(binding['approval'], str) or not binding['approval'] or
+                not isinstance(binding['authorization'], str) or
+                not re.fullmatch('[0-9a-f]{64}', binding['authorization']) or
+                binding['branch'] != branch or
                 binding['evidence'] != fingerprint({key: run[key] for key in fields}) or
-                baseline != {'repository': binding['repository'], 'branch': json.loads(run['config'])['delivery']['base_branch'], 'sha': run['base']} or
+                not baseline or set(baseline) != {'repository', 'branch', 'sha'} or
+                any(not isinstance(baseline[key], str) or not baseline[key].strip()
+                    for key in ('repository', 'branch', 'sha')) or
+                baseline['repository'] != binding['repository'] or
+                baseline['repository'] != config['github']['repository'] or
+                baseline['sha'] != run['base'] or not re.fullmatch('[0-9a-f]{40,64}', baseline['sha']) or
+                not isinstance(configured_branch, str) or
+                (configured_branch and configured_branch != baseline['branch']) or
                 binding['base'] != run['base'] or outcome['evaluation']['decision'] != 'pass' or
                 outcome['review']['decision'] != 'pass'):
             raise ValueError()
@@ -106,10 +131,15 @@ def _environment(runtime, snap, config):
     outcome = json.loads(run['result'])
     evaluation = outcome['evaluation']
     sealed = evaluation.get('source')
+    try:
+        identity = runtime.evaluator.execution_identity(config)
+    except Exception:
+        raise GenerationError('Generation execution environment cannot be verified') from None
     if (runtime.is_cancelled(dict(run)) or config != json.loads(run['config']) or
             config != runtime.config(run['project']) or
             not isinstance(sealed, dict) or
-            runtime.evaluator.execution_identity(config) != evaluation.get('execution_environment') or
+            not identity or not evaluation.get('execution_environment') or
+            identity != evaluation['execution_environment'] or
             sealed.get('validation') != config.get('validation') or
             sealed_dependency_digest(Path(run['path']) / 'dependencies', config) != sealed.get('environment')):
         raise GenerationError('Generation execution or dependency evidence changed')
@@ -143,8 +173,9 @@ def create_generation(runtime, project, run_id, approval_id, workspace, source, 
     `directory` must be a new caller-owned persistent directory.
     """
     with runtime.store.connect() as db:
-        db.execute('BEGIN IMMEDIATE')
+        db.execute('BEGIN')
         snap = _snapshot(db, run_id, approval_id)
+        global_config = _raw_setting(db, 'config')
         if (db.execute('SELECT 1 FROM settings WHERE key IN (?,?)',
                        ('delivery-generation:' + run_id, 'delivery-push:' + run_id)).fetchone()):
             raise GenerationError('Generation or unresolved push already exists')
@@ -161,14 +192,19 @@ def create_generation(runtime, project, run_id, approval_id, workspace, source, 
     candidate, evaluation = replay_on_advanced_baseline(
         runtime, project, dict(snap['run']), workspace, json.loads(snap['run']['result']),
         source, current, config, directory)
-    tree = git(candidate, 'write-tree')
+    tree = evaluation['source'].get('tree')
+    if (not isinstance(tree, str) or not re.fullmatch('[0-9a-f]{40,64}', tree) or
+            git(candidate, 'write-tree') != tree):
+        raise GenerationError('Replay evaluated tree changed before registration')
     if (git(candidate, 'diff', '--no-ext-diff', '--no-textconv') or
             git(candidate, 'ls-files', '--others', '--exclude-standard', '-z')):
         raise GenerationError('Replay evaluator changed the worktree')
-    # Re-run index/worktree identity after evaluation; commit-tree avoids hooks
-    # or a mutable checkout becoming the durable identity.
+    # Only the evaluated immutable tree may become the durable commit.
     commit = git(candidate, '-c', 'user.name=Adaptive RSI', '-c', 'user.email=adaptive-rsi@localhost',
                  'commit-tree', tree, '-p', current, '-m', '持久保存跨基线重放候选')
+    patch_hash = fingerprint(git(candidate, 'diff', current, commit, '--binary', '--no-ext-diff', '--no-textconv'))
+    if patch_hash != evaluation['source'].get('patch_hash'):
+        raise GenerationError('Generation commit patch differs from evaluated evidence')
     generation = uuid.uuid4().hex
     ref = 'refs/adaptive-rsi/generations/' + generation
     git(candidate, 'update-ref', ref, commit, '0' * len(commit))
@@ -177,19 +213,32 @@ def create_generation(runtime, project, run_id, approval_id, workspace, source, 
               'directory': str(Path(directory).resolve()), 'snapshot': fingerprint(snap),
               'environment': environment, 'evaluation': evaluation,
               'evidence_hash': fingerprint(evaluation),
-              'patch_hash': fingerprint(git(candidate, 'diff', current, commit, '--binary', '--no-ext-diff', '--no-textconv'))}
+              'patch_hash': patch_hash}
+    # External writers do not honor SQLite locks. Retain the final checks, but
+    # never run Docker, dependency/file reads or Git under the database write lock.
+    # The durable payload binds only the evaluated immutable tree and commit.
+    if _environment(runtime, snap, config) != environment:
+        raise GenerationError('Generation evidence changed during evaluation')
+    _original(snap)
+    _commit(candidate, commit, current, tree)
+    if git(candidate, 'rev-parse', '--verify', ref) != commit:
+        raise GenerationError('Generation ref changed before registration')
+    if (git(candidate, 'write-tree') != tree or
+            git(candidate, 'diff', '--no-ext-diff', '--no-textconv') or
+            git(candidate, 'ls-files', '--others', '--exclude-standard', '-z')):
+        raise GenerationError('Replay evaluated tree changed before registration')
+    payload = encode(record)
     with runtime.store.connect() as db:
         db.execute('BEGIN IMMEDIATE')
-        if _snapshot(db, run_id, approval_id) != snap or _environment(runtime, snap, config) != environment:
+        if (_snapshot(db, run_id, approval_id) != snap or
+                _raw_setting(db, 'config') != global_config):
             raise GenerationError('Generation evidence changed during evaluation')
         if db.execute('SELECT 1 FROM settings WHERE key IN (?,?)',
                       ('delivery-generation:' + run_id, 'delivery-push:' + run_id)).fetchone():
             raise GenerationError('Generation or push appeared during evaluation')
-        _original(snap)
-        _commit(candidate, commit, current, tree)
-        if git(candidate, 'rev-parse', '--verify', ref) != commit:
-            raise GenerationError('Generation ref changed before registration')
-        db.execute('INSERT INTO settings(key,value) VALUES (?,?)', ('delivery-generation:' + run_id, encode(record)))
+        if runtime.stop.is_set():
+            raise GenerationError('Generation stopped before registration')
+        db.execute('INSERT INTO settings(key,value) VALUES (?,?)', ('delivery-generation:' + run_id, payload))
     recover_generation(runtime, run_id, generation, config)
     return record
 
@@ -198,33 +247,56 @@ def recover_generation(runtime, run_id, generation, config):
     """Recover the same generation, allowing only its exact version-2 push intent."""
     try:
         with runtime.store.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
+            db.execute('BEGIN')
             record = _setting(db, 'delivery-generation:' + run_id)
             if (not record or type(record['version']) is not int or record['version'] != 1 or
                     not re.fullmatch('[0-9a-f]{32}', generation) or record['generation'] != generation or
                     record['ref'] != 'refs/adaptive-rsi/generations/' + generation):
                 raise GenerationError('Generation identity is invalid')
             snap = _snapshot(db, run_id, record['approval'])
-            _original(snap)
-            if fingerprint(snap) != record['snapshot'] or _environment(runtime, snap, config) != record['environment']:
-                raise GenerationError('Generation authorization or environment evidence changed')
-            candidate = Path(record['directory']) / 'candidate'
-            _commit(candidate, record['commit'], record['parent'], record['tree'])
-            if git(candidate, 'rev-parse', '--verify', record['ref']) != record['commit']:
-                raise GenerationError('Generation ref changed')
-            if (git(candidate, 'rev-parse', 'HEAD') != record['parent'] or
-                    git(candidate, 'write-tree') != record['tree'] or
-                    git(candidate, 'diff', '--no-ext-diff', '--no-textconv') or
-                    git(candidate, 'ls-files', '--others', '--exclude-standard', '-z')):
-                raise GenerationError('Generation workspace changed')
-            evaluation = json.loads((Path(record['directory']) / 'replay-evidence.json').read_text())
-            if (evaluation != record['evaluation'] or evaluation.get('decision') != 'pass' or
-                    fingerprint(evaluation) != record['evidence_hash'] or
-                    sealed_dependency_digest(Path(record['directory']) / 'dependencies', config) !=
-                    evaluation['source']['environment'] or
-                    fingerprint(git(candidate, 'diff', record['parent'], record['commit'], '--binary', '--no-ext-diff', '--no-textconv')) != record['patch_hash']):
-                raise GenerationError('Generation evaluation evidence changed')
+            global_config = _raw_setting(db, 'config')
+            generation_value = _raw_setting(db, 'delivery-generation:' + run_id)
+            push_value = _raw_setting(db, 'delivery-push:' + run_id)
             _check_push(db, record, snap)
+        # Release the consistent read snapshot before any external validation.
+        _original(snap)
+        if fingerprint(snap) != record['snapshot'] or _environment(runtime, snap, config) != record['environment']:
+            raise GenerationError('Generation authorization or environment evidence changed; prepare a new generation')
+        candidate = Path(record['directory']) / 'candidate'
+        _commit(candidate, record['commit'], record['parent'], record['tree'])
+        if git(candidate, 'rev-parse', '--verify', record['ref']) != record['commit']:
+            raise GenerationError('Generation ref changed')
+        if (git(candidate, 'rev-parse', 'HEAD') != record['parent'] or
+                git(candidate, 'write-tree') != record['tree'] or
+                git(candidate, 'diff', '--no-ext-diff', '--no-textconv') or
+                git(candidate, 'ls-files', '--others', '--exclude-standard', '-z')):
+            raise GenerationError('Generation workspace changed')
+        evaluation = json.loads((Path(record['directory']) / 'replay-evidence.json').read_text())
+        # Legacy patch hashes may describe a tree staged after evaluation.
+        # This unpublished prototype requires fresh preparation, not migration
+        # by copying the registered tree into old evaluation evidence.
+        if not evaluation['source'].get('tree'):
+            raise GenerationError('Generation evaluated tree is missing; prepare a new generation')
+        if (evaluation != record['evaluation'] or evaluation.get('decision') != 'pass' or
+                fingerprint(evaluation) != record['evidence_hash'] or
+                evaluation['source'].get('base') != record['parent'] or
+                evaluation['source'].get('tree') != record['tree'] or
+                evaluation['source'].get('patch_hash') != record['patch_hash'] or
+                evaluation.get('execution_environment') != json.loads(snap['run']['result'])['evaluation']['execution_environment'] or
+                sealed_dependency_digest(Path(record['directory']) / 'dependencies', config) !=
+                evaluation['source']['environment'] or
+                fingerprint(git(candidate, 'diff', record['parent'], record['commit'], '--binary', '--no-ext-diff', '--no-textconv')) != record['patch_hash']):
+            raise GenerationError('Generation evaluation evidence changed')
+        with runtime.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if (_snapshot(db, run_id, record['approval']) != snap or
+                    _raw_setting(db, 'config') != global_config or
+                    _raw_setting(db, 'delivery-generation:' + run_id) != generation_value or
+                    _raw_setting(db, 'delivery-push:' + run_id) != push_value):
+                raise GenerationError('Generation evidence changed during recovery')
+            _check_push(db, record, snap)
+            if runtime.stop.is_set():
+                raise GenerationError('Generation stopped before recovery')
             return record
     except (KeyError, TypeError, ValueError, OSError) as exc:
         raise GenerationError('Generation evidence is invalid') from exc
