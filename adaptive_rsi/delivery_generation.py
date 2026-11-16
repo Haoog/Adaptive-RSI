@@ -1,4 +1,4 @@
-"""Durable local replay preparation. Remote publication is deliberately gated.
+"""Durable replay preparation and journaled publication of immutable generations.
 
 Original run/base/candidate bindings stay immutable: runtime retries still verify
 that original workspace. A generation is a separate evaluated commit and ref.
@@ -73,7 +73,9 @@ def _snapshot(db, run_id, approval_id):
         keys = {'version', 'branch', 'head', 'tree', 'base', 'repository', 'evidence', 'approval', 'authorization'}
         # The live grant must be explicit. Version-1 approval fields retain the
         # first attempt's audit snapshot, as in delivery.publish.matches_binding.
-        if (grants != [{'authorization': 'per_candidate'}] or not binding or set(binding) != keys or
+        if (grants not in ([{'authorization': 'per_candidate'}], [{'authorization': 'project_policy'}]) or
+                (grants == [{'authorization': 'project_policy'}] and config['delivery']['mode'] != 'pr') or
+                not binding or set(binding) != keys or
                 type(binding['version']) is not int or binding['version'] != 1 or
                 not isinstance(binding['approval'], str) or not binding['approval'] or
                 not isinstance(binding['authorization'], str) or
@@ -93,7 +95,7 @@ def _snapshot(db, run_id, approval_id):
             raise ValueError()
     except (KeyError, TypeError, ValueError):
         raise GenerationError('Approved version-1 publication binding is missing or changed') from None
-    for prefix in ('revision-pending:', 'issue-revision-pending:', 'run-stop:'):
+    for prefix in ('revision-pending:', 'issue-revision-pending:', 'run-stop:', 'delivery-update:'):
         if db.execute('SELECT 1 FROM settings WHERE key=?', (prefix + run_id,)).fetchone():
             raise GenerationError('Revision or stop is pending')
     # Push is intentionally outside this snapshot. Recovery validates it against
@@ -135,7 +137,13 @@ def _environment(runtime, snap, config):
         identity = runtime.evaluator.execution_identity(config)
     except Exception:
         raise GenerationError('Generation execution environment cannot be verified') from None
-    if (runtime.is_cancelled(dict(run)) or config != json.loads(run['config']) or
+    original_config = json.loads(run['config'])
+    # Publishing policy may be revoked and then replaced by explicit approval.
+    # These two delivery switches do not alter the sealed evaluator contract;
+    # all execution, dependency, target and validation inputs must still match.
+    sealed_policy = {key: original_config['delivery'][key] for key in ('mode', 'auto_merge')}
+    comparable = {**config, 'delivery': {**config['delivery'], **sealed_policy}}
+    if (runtime.is_cancelled(dict(run)) or comparable != original_config or
             config != runtime.config(run['project']) or
             not isinstance(sealed, dict) or
             not identity or not evaluation.get('execution_environment') or
@@ -152,7 +160,7 @@ def _push_binding(record, snap):
     return {'version': 2, 'generation': record['generation'], 'ref': record['ref'],
             'branch': snap['binding']['branch'], 'head': record['commit'], 'tree': record['tree'],
             'base': record['parent'], 'repository': snap['binding']['repository'],
-            'approval': snap['approval']['id'], 'authorization': snap['binding']['authorization'],
+            'approval': snap['approval']['id'], 'authorization': fingerprint(json.loads(snap['approval']['evidence'])),
             'evidence': record['evidence_hash'], 'environment': record['environment']}
 
 
@@ -176,8 +184,8 @@ def create_generation(runtime, project, run_id, approval_id, workspace, source, 
         db.execute('BEGIN')
         snap = _snapshot(db, run_id, approval_id)
         global_config = _raw_setting(db, 'config')
-        if (db.execute('SELECT 1 FROM settings WHERE key IN (?,?)',
-                       ('delivery-generation:' + run_id, 'delivery-push:' + run_id)).fetchone()):
+        if (db.execute('SELECT 1 FROM settings WHERE key IN (?,?,?)',
+                       ('delivery-generation:' + run_id, 'delivery-push:' + run_id, 'delivery-generation-pr:' + run_id)).fetchone()):
             raise GenerationError('Generation or unresolved push already exists')
     if project['id'] != snap['run']['project']:
         raise GenerationError('Generation project changed')
@@ -210,6 +218,7 @@ def create_generation(runtime, project, run_id, approval_id, workspace, source, 
     git(candidate, 'update-ref', ref, commit, '0' * len(commit))
     record = {'version': 1, 'generation': generation, 'ref': ref, 'commit': commit,
               'parent': current, 'tree': tree, 'approval': approval_id,
+              'authorization': fingerprint(json.loads(snap['approval']['evidence'])),
               'directory': str(Path(directory).resolve()), 'snapshot': fingerprint(snap),
               'environment': environment, 'evaluation': evaluation,
               'evidence_hash': fingerprint(evaluation),
@@ -233,8 +242,8 @@ def create_generation(runtime, project, run_id, approval_id, workspace, source, 
         if (_snapshot(db, run_id, approval_id) != snap or
                 _raw_setting(db, 'config') != global_config):
             raise GenerationError('Generation evidence changed during evaluation')
-        if db.execute('SELECT 1 FROM settings WHERE key IN (?,?)',
-                      ('delivery-generation:' + run_id, 'delivery-push:' + run_id)).fetchone():
+        if db.execute('SELECT 1 FROM settings WHERE key IN (?,?,?)',
+                      ('delivery-generation:' + run_id, 'delivery-push:' + run_id, 'delivery-generation-pr:' + run_id)).fetchone():
             raise GenerationError('Generation or push appeared during evaluation')
         if runtime.stop.is_set():
             raise GenerationError('Generation stopped before registration')
@@ -275,6 +284,8 @@ def recover_generation(runtime, run_id, generation, config):
         # Legacy patch hashes may describe a tree staged after evaluation.
         # This unpublished prototype requires fresh preparation, not migration
         # by copying the registered tree into old evaluation evidence.
+        if evaluation.get('source') is None:
+            raise GenerationError('Generation evaluation evidence is missing')
         if not evaluation['source'].get('tree'):
             raise GenerationError('Generation evaluated tree is missing; prepare a new generation')
         if (evaluation != record['evaluation'] or evaluation.get('decision') != 'pass' or
@@ -300,3 +311,281 @@ def recover_generation(runtime, run_id, generation, config):
             return record
     except (KeyError, TypeError, ValueError, OSError) as exc:
         raise GenerationError('Generation evidence is invalid') from exc
+
+
+def journal_policy(store, run, intent):
+    """Validate a v2 receipt without live approval or a surviving workspace.
+
+    Superseded runs must still observe remote facts after authorization is gone.
+    This function grants no authority to write a branch or create a PR.
+    """
+    with store.connect() as db:
+        return journal_policy_db(db, run, intent)
+
+
+def journal_policy_db(db, run, intent):
+    """Same receipt validation on the caller's consistent transaction."""
+    try:
+        record = _setting(db, 'delivery-generation:' + run['id'])
+        binding = _setting(db, 'delivery-candidate:' + run['id'])
+        baseline = _setting(db, 'run-baseline:' + run['id'])
+        expected = {'version': 2, 'generation': record['generation'], 'ref': record['ref'],
+                    'branch': binding['branch'], 'head': record['commit'], 'tree': record['tree'],
+                    'base': record['parent'], 'repository': binding['repository'],
+                    'approval': record['approval'], 'authorization': record['authorization'],
+                    'evidence': record['evidence_hash'], 'environment': record['environment']}
+        if (type(intent.get('version')) is not int or
+                set(intent) not in (set(expected), set(expected) | {'created'}) or
+                any(intent.get(k) != v for k, v in expected.items()) or
+                baseline != {'repository': binding['repository'], 'branch': baseline['branch'], 'sha': run['base']} or
+                binding['base'] != run['base'] or
+                record['ref'] != 'refs/adaptive-rsi/generations/' + record['generation'] or
+                fingerprint(record['evaluation']) != record['evidence_hash'] or
+                record['evaluation']['source']['base'] != record['parent'] or
+                record['evaluation']['source']['tree'] != record['tree']):
+            raise GenerationError('Generation journal identity differs')
+        return {'head': record['commit'], 'base': record['parent'],
+                'branch': baseline['branch'], 'repository': binding['repository']}
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise GenerationError('Generation receipt evidence is invalid') from exc
+
+
+def _publication_root(runtime, run):
+    """Only managed run directories may own replay publication artifacts."""
+    root = runtime.store.root / 'runs'
+    directory = Path(run['path'])
+    if (Path(run['id']).parts != (run['id'],) or run['id'] in ('.', '..') or
+            root.is_symlink() or directory.is_symlink() or
+            directory.resolve() != root.resolve() / run['id']):
+        raise GenerationError('Generation publication requires a managed run directory')
+    generations = directory / 'generations'
+    if generations.is_symlink():
+        raise GenerationError('Generation directory is a symlink')
+    generations.mkdir(exist_ok=True)
+    return generations.resolve()
+
+
+def prepare_publication(runtime, project, run, approval_id, workspace, source, current, config):
+    # Each attempt has a fresh name. A crash before registration leaves evidence,
+    # never a directory that a later attempt can adopt as evaluated output.
+    # The journal proves ownership even if evaluation dies before registration.
+    # A directory lock spans external evaluation without holding a SQLite lock.
+    import os
+    import time
+    from .generation_retention import managed_directory, fcntl
+    if fcntl is None or not all(hasattr(os, name) for name in ('O_DIRECTORY', 'O_NOFOLLOW')):
+        raise GenerationError('Generation preparation requires no-follow directory locking')
+    root = _publication_root(runtime, run)
+    directory = root / uuid.uuid4().hex
+    with managed_directory(runtime.store, run['id']) as parent:
+        fd = os.open('generations', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with runtime.store.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                _snapshot(db, run['id'], approval_id)
+                if _raw_setting(db, 'delivery-generation-pr:' + run['id']) is not None:
+                    raise GenerationError('Unresolved PR receipt blocks generation preparation')
+                db.execute('INSERT INTO settings(key,value) VALUES (?,?)',
+                    ('delivery-generation-preparing:' + run['id'] + ':' + directory.name,
+                     encode({'version': 1, 'directory': str(directory), 'created': time.time()})))
+            return create_generation(runtime, project, run['id'], approval_id, workspace,
+                                     source, current, config, directory)
+        finally:
+            os.close(fd)
+
+
+def publish_generation(runtime, project, task, run, config, approval_id, authorize_write):
+    """Publish a sealed replay through the existing runtime approval boundary.
+
+    Version-2 intents are immutable. Every write verifies live authority, both
+    candidate identities, the resolved remote target and the fetched baseline.
+    Receipt recovery is read-only and may observe an already completed write.
+    """
+    from . import delivery
+    import time
+    store = runtime.store
+    key = 'delivery-generation:' + run['id']
+    push_key = 'delivery-push:' + run['id']
+    with store.connect() as db:
+        record = _setting(db, key)
+        push = _setting(db, push_key)
+    if not record:
+        raise GenerationError('Generation record is missing')
+    # Explicit new approval can replace only an unpublished generation. Preserve
+    # the old record and files for audit; an uncertain push always blocks this.
+    if record.get('approval') != approval_id:
+        if push is not None or store.one('SELECT 1 FROM settings WHERE key=?', ('delivery-generation-pr:' + run['id'],)):
+            raise GenerationError('Old generation has an unresolved push or PR receipt; reconcile before reapproval')
+        authorize_write()
+        source, current, branch = delivery.baseline(runtime, project, config)
+        identity = store.setting('run-baseline:' + run['id'])
+        if identity != {'repository': config['github']['repository'], 'branch': branch, 'sha': run['base']}:
+            raise GenerationError('Generation target changed')
+        with store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if (_setting(db, key) != record or _raw_setting(db, push_key) is not None or
+                    _raw_setting(db, 'delivery-generation-pr:' + run['id']) is not None):
+                raise GenerationError('Generation changed during reapproval')
+            db.execute('INSERT INTO settings(key,value) VALUES (?,?)',
+                       ('delivery-generation-history:' + run['id'] + ':' + record['generation'], encode(record)))
+            db.execute('INSERT INTO settings(key,value) VALUES (?,?)',
+                       ('delivery-generation-history-proof:' + run['id'] + ':' + record['generation'],
+                        encode({'unpublished': True, 'record': fingerprint(record)})))
+            db.execute('DELETE FROM settings WHERE key=?', (key,))
+        record = prepare_publication(runtime, project, run, approval_id,
+                                     Path(run['path']) / 'candidate', source, current, config)
+    generation = record.get('generation')
+    record = recover_generation(runtime, run['id'], generation, config)
+    directory = Path(record['directory'])
+    owned = _publication_root(runtime, run)
+    if directory.is_symlink() or directory.resolve().parent != owned:
+        raise GenerationError('Generation workspace is outside the managed run')
+    candidate = directory / 'candidate'
+    repo = config['github']['repository']
+    identity = store.setting('run-baseline:' + run['id'])
+    target = identity['branch']
+    with store.connect() as db:
+        snap = _snapshot(db, run['id'], approval_id)
+    intent = _push_binding(record, snap)
+    branch = intent['branch']
+
+    def verify(require_remote=False):
+        authorize_write()
+        if delivery.origin_repository(runtime.project(project['id'])['path']).lower() != repo.lower():
+            raise GenerationError('Generation repository changed')
+        _, current, resolved = delivery.baseline(runtime, runtime.project(project['id']), config)
+        if resolved != target or current != record['parent']:
+            raise GenerationError('Generation target or baseline changed; reapproval and new replay required')
+        if recover_generation(runtime, run['id'], generation, config) != record:
+            raise GenerationError('Generation identity changed')
+        remote_ref = 'refs/heads/' + branch
+        observed = delivery.github_git(candidate, 'ls-remote', '--heads',
+                                       'https://github.com/' + repo + '.git', remote_ref).splitlines()
+        expected_remote = record['commit'] + '\t' + remote_ref
+        if observed not in ([], [expected_remote]) or (require_remote and observed != [expected_remote]):
+            raise GenerationError('Remote generation branch differs; reconcile before retrying')
+        authorize_write()
+
+    # Full identity inspection, including repository ownership, prevents a PR
+    # from a fork or a different head from masquerading as our lost receipt.
+    records = json.loads(delivery.checked(['gh', 'pr', 'list', '--repo', repo, '--state', 'all',
+        '--head', branch, '--limit', '100', '--json', 'url']))
+    if not isinstance(records, list) or len(records) >= 100 or len(records) > 1:
+        raise GenerationError('Ambiguous or incomplete generation PR inventory')
+    receipt_key = 'delivery-generation-pr:' + run['id']
+    receipt = store.setting(receipt_key)
+    if receipt is not None and (not isinstance(receipt, dict) or
+            receipt.get('generation') != generation or not isinstance(receipt.get('url'), str)):
+        raise GenerationError('Generation PR receipt is invalid; reconcile before retrying')
+    url = None
+    if records or receipt:
+        url = receipt['url'] if receipt else records[0]['url']
+        if records and records[0]['url'] != url:
+            raise GenerationError('Generation PR inventory differs from saved receipt')
+        if not isinstance(url, str) or not re.fullmatch(
+                r'https://github\.com/' + re.escape(repo) + r'/pull/[1-9][0-9]*', url, re.I):
+            raise GenerationError('Generation PR URL does not match repository')
+        # A PR receipt must have a preceding, exactly matching push intent.
+        with store.connect() as db:
+            if _setting(db, push_key) is None:
+                raise GenerationError('Generation PR has no local push intent')
+            _check_push(db, record, snap)
+    else:
+        with runtime.dispatch_lock:
+            verify()
+            with store.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                if (_snapshot(db, run['id'], approval_id) != snap or _setting(db, key) != record):
+                    raise GenerationError('Generation approval changed before push intent')
+                _check_push(db, record, snap)
+                if _raw_setting(db, push_key) is None:
+                    db.execute('INSERT INTO settings(key,value) VALUES (?,?)',
+                               (push_key, encode({**intent, 'created': time.time()})))
+            verify()
+            delivery.github_git(candidate, 'push', 'https://github.com/' + repo + '.git',
+                                record['commit'] + ':refs/heads/' + branch)
+        outcome = json.loads(run['result'])
+        body = directory / 'pr-body.md'
+        # The PR describes the replay gates; the original run evidence remains
+        # untouched and continues to validate every runtime retry.
+        body.write_text(delivery.pr_body(task, {**run, 'base': record['parent']},
+            {**outcome, 'evaluation': record['evaluation'], 'patch_hash': record['patch_hash']}), encoding='utf-8')
+        with runtime.dispatch_lock:
+            verify(require_remote=True)
+            url = delivery.checked(['gh', 'pr', 'create', '--repo', repo, '--head', branch,
+                '--base', target, '--title', '完成任务：' + task['title'], '--body-file', str(body)])
+        if not isinstance(url, str) or not re.fullmatch(
+                r'https://github\.com/' + re.escape(repo) + r'/pull/[1-9][0-9]*', url, re.I):
+            raise GenerationError('Generation PR response is invalid; recover receipt before retrying')
+    # Keep an unverified receipt separate from successful delivery state. A
+    # failed identity read must retry this URL even if PR inventory is delayed.
+    receipt = {**(receipt or {}), 'generation': generation, 'url': url}
+    store.put_setting(receipt_key, receipt)
+    try:
+        pr = delivery.pr_view(repo, url)
+        store.put_setting(receipt_key, {**receipt, 'observation': pr})
+        if (pr.get('url') != url or pr.get('state') not in ('OPEN', 'MERGED') or
+                not delivery._update_pr_identity({**pr, 'state': 'OPEN'}, repo, target, branch, record['commit'])):
+            raise GenerationError('Generation PR identity differs or is closed; reconcile saved receipt')
+    except Exception as exc:
+        observed = store.setting(receipt_key)
+        store.put_setting(receipt_key, {**observed, 'error': str(exc)[:500]})
+        raise
+    # Save observed facts atomically, even when supersession raced with the
+    # remote response. Runtime then completes the system_publish job as usual.
+    with store.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        if _setting(db, key) != record:
+            raise GenerationError('Generation record changed before receipt')
+        _check_push(db, record, snap)
+        row = db.execute('SELECT state,result FROM runs WHERE id=?', (run['id'],)).fetchone()
+        outcome = delivery._json_object(row['result'])
+        if outcome.get('pr') not in (None, url):
+            raise GenerationError('Run already records another PR')
+        outcome.update(pr=url, delivery_generation=generation)
+        state = 'pr_open' if row['state'] in ('awaiting_approval', 'pr_open') else 'superseded'
+        if state == 'superseded':
+            outcome.update(replanned=True, close_pending=True)
+        db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('delivery:' + run['id'], encode(
+            {'head': record['commit'], 'base': record['parent'], 'branch': target, 'repository': repo})))
+        db.execute('UPDATE runs SET state=?,result=? WHERE id=?', (state, encode(outcome), run['id']))
+        if state == 'pr_open':
+            db.execute("UPDATE tasks SET state='pr_open',updated=? WHERE id=? AND state='awaiting_approval'",
+                       (time.time(), task['id']))
+    store.event('pr', 'Generation PR receipt recorded', project['id'], run['id'],
+                {'url': url, 'head': record['commit'], 'generation': generation})
+    return url
+
+
+def record_verified_merge(db, run, policy, pr):
+    """Persist full remote merge identity atomically with a tracking transition.
+
+    Return False on any ambiguity; never promote an unchecked publication URL.
+    This helper performs database reads and pure comparisons only.
+    """
+    from .delivery import _update_pr_identity
+    try:
+        record = _setting(db, 'delivery-generation:' + run['id'])
+        if not record:
+            return False
+        intent = _setting(db, 'delivery-push:' + run['id'])
+        receipt = _setting(db, 'delivery-generation-pr:' + run['id'])
+        if (not receipt or receipt.get('generation') != record['generation'] or
+                receipt.get('url') != pr.get('url') or pr.get('state') != 'MERGED' or
+                not isinstance(pr.get('mergeCommit'), dict) or
+                not re.fullmatch('[0-9a-f]{40,64}', pr['mergeCommit'].get('oid', '')) or
+                journal_policy_db(db, run, intent) != policy or
+                not re.fullmatch(r'https://github\.com/' + re.escape(policy['repository']) + r'/pull/[1-9][0-9]*', receipt['url'], re.I) or
+                not _update_pr_identity({**pr, 'state': 'OPEN'}, policy['repository'],
+                                        policy['branch'], intent['branch'], policy['head'])):
+            return False
+        receipt.pop('error', None)
+        receipt['observation'] = pr
+        receipt['verified_merge'] = {'observation': pr, 'binding': fingerprint(
+            {'generation': record, 'intent': intent, 'policy': policy})}
+        db.execute('UPDATE settings SET value=? WHERE key=?',
+                   (encode(receipt), 'delivery-generation-pr:' + run['id']))
+        return True
+    except (GenerationError, KeyError, TypeError, ValueError, AttributeError):
+        return False

@@ -217,10 +217,9 @@ def retention_hold(store, run_id, project):
     Every removal entry point uses this check.  An unreadable value counts as a
     hold, so a corrupt setting can never unlock deletion of retained evidence.
     """
-    for key in ('legal-hold:' + run_id, 'legal-hold-project:' + project):
-        if _cleanup_hold(store, key):
-            return key
-    return None
+    with store.connect() as db:
+        db.execute('BEGIN')
+        return _held_in_transaction(db, run_id, project)
 
 
 def _legal_hold_guard(alias):
@@ -234,7 +233,15 @@ def _legal_hold_guard(alias):
     return ("AND NOT EXISTS (SELECT 1 FROM settings AS held WHERE "
             "held.key IN ('legal-hold:'||%s.id, 'legal-hold-project:'||%s.project) "
             "AND CASE WHEN json_valid(held.value) THEN json_type(held.value)='false' "
-            "ELSE 0 END=0) " % (alias, alias))
+            "ELSE 0 END=0) " % (alias, alias) +
+            "AND NOT EXISTS (SELECT 1 FROM settings g WHERE g.key='delivery-generation:'||%s.id "
+            "OR (g.key>='delivery-generation-history:'||%s.id||':' "
+            "AND g.key<'delivery-generation-history:'||%s.id||':~') "
+            "OR g.key='delivery-generation-pr:'||%s.id "
+            "OR (g.key>='delivery-generation-preparing:'||%s.id||':' "
+            "AND g.key<'delivery-generation-preparing:'||%s.id||';') "
+            "OR (g.key>='delivery-generation-history-proof:'||%s.id||':' "
+            "AND g.key<'delivery-generation-history-proof:'||%s.id||';')) " % ((alias,) * 8))
 
 
 def _remove_owned_tree(parent, name):
@@ -343,6 +350,9 @@ def _held_in_transaction(db, run_id, project):
     transaction ends.  An unreadable value counts as a hold, exactly like
     retention_hold, so a corrupt setting can never unlock retained evidence.
     """
+    from .generation_retention import settings, releasable
+    if settings(db, run_id) and not releasable(db, run_id, project):
+        return 'delivery-generation:' + run_id
     for key in ('legal-hold:' + run_id, 'legal-hold-project:' + project):
         row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
         if row is None:
@@ -365,22 +375,26 @@ def _run_directory_settled(directory):
     it; detaching first would orphan it behind ``path IS NOT NULL``.
     """
     try:
-        entries = list(os.scandir(directory))
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name not in RETAINED_RUN_ARTIFACTS:
+                    return False
+                if not entry.is_file(follow_symlinks=False):
+                    return False
     except FileNotFoundError:
         return True
-    for entry in entries:
-        if entry.name not in RETAINED_RUN_ARTIFACTS:
-            return False
-        try:
-            if not entry.is_file(follow_symlinks=False):
-                return False
-        except OSError:
-            return False
+    except OSError:
+        return False
     return True
 
 
 def _remove_run_artifacts(store, run_id, project, directory, stored=None):
-    """Delete a finished run's own artifacts, one write transaction per artifact.
+    """Delete finished artifacts, with bounded steps for generation-managed runs.
+
+    Generation-managed runs pin original directory identities here and carry
+    them through every deletion. Their traversal is outside write transactions;
+    each filesystem mutation has its own authorization transaction. The legacy
+    path below retains its per-artifact behavior.
 
     Re-reading the legal hold under BEGIN IMMEDIATE serialises the check with
     the unlink/rmdir it authorises: a hold committed first stops the remaining
@@ -394,6 +408,22 @@ def _remove_run_artifacts(store, run_id, project, directory, stored=None):
     ``stored`` is the exact runs.path value from the database, which may differ
     from the resolved ``directory`` by a symlink layer (e.g. /var on macOS).
     """
+    from .generation_retention import settings, remove_run_artifacts, DirectorySnapshot
+    # The generation path uses bounded mutations with separate authorization
+    # transactions; never call it from inside the legacy recursive transaction.
+    with store.connect() as db:
+        generation_managed = bool(settings(db, run_id))
+    if generation_managed:
+        try:
+            snapshot = DirectorySnapshot(store, run_id)
+        except OSError:
+            return False
+        try:
+            return remove_run_artifacts(store, run_id, project, directory, snapshot, stored)
+        finally:
+            snapshot.close()
+    if (directory / 'generations').exists() or (directory / 'generations').is_symlink():
+        return False
     for name in CLEANUP_NAMES + RUN_FILE_ARTIFACTS:
         target = directory / name
         if target.is_symlink():
@@ -668,6 +698,11 @@ class Maintenance:
                     for candidate in archive[config["evolution"]["archive_limit"]:]:
                         if candidate["id"] not in referenced:
                             db.execute("DELETE FROM candidates WHERE id=? AND status NOT IN ('stable','evaluating')", (candidate["id"],))
+        from .generation_retention import retire_settings
+        # Full generation proof remains available until both the disk cleanup
+        # and the existing 90-day settings retention window have completed.
+        with self.dispatch_lock:
+            retire_settings(self.store, now)
         # 数据保留：清理过期技能、已结束运行的派生数据及其 settings 键；
         # 每类带 LIMIT，首次升级后由后续周期逐步追平历史积压。
         stale = now - 90 * 86400

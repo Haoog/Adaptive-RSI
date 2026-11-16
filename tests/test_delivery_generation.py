@@ -20,6 +20,7 @@ class GenerationFixture(unittest.TestCase):
     base_branch = 'main'
     initial_automatic = False
     reapprove_before_generation = False
+    prepare_generation = True
 
     def setUp(self):
         replay_tests.ReplayIntegrationTest.setUp(self)
@@ -28,11 +29,15 @@ class GenerationFixture(unittest.TestCase):
         git(self.repo, 'remote', 'add', 'origin', 'https://github.com/example/project.git')
         self.runtime.configure({'github': {'repository': 'example/project'},
                                 'delivery': {'base_branch': self.base_branch,
+                                             'auto_merge': getattr(self, 'automatic_merge', False),
                                              'mode': 'pr' if self.initial_automatic else 'local'}}, self.project_id)
         self.config = self.runtime.config(self.project_id)
         self.runtime.pause(self.project_id, False)
         task = self.runtime.goal(self.project_id, 'Verified replay')
         run = self.store.claim(self.project_id, self.config)
+        managed = self.store.root / 'runs' / run['id']
+        managed.parent.mkdir(exist_ok=True)
+        self.run_dir = self.run_dir.rename(managed)
         self.candidate = self.candidate.rename(self.run_dir / 'candidate')
         self.outcome['review'] = {'decision': 'pass'}
         self.store.execute('UPDATE runs SET base=?,path=? WHERE id=?',
@@ -47,17 +52,20 @@ class GenerationFixture(unittest.TestCase):
         self.project = self.runtime.project(self.project_id)
         # Obtain the real, current version-1 publish binding, not the obsolete
         # {commit,result_sha256} fixture. Direct publish leaves the run intact.
-        with patch.object(delivery, 'baseline', return_value=(self.repo, self.current, 'main')), \
+        with patch.object(delivery, 'baseline', return_value=(self.repo, self.base, 'main')), \
                 patch.object(delivery, 'checked', return_value='[]'), \
-                patch.object(delivery, 'github_git') as push:
-            with self.assertRaises(delivery.StaleCandidate):
+                patch.object(delivery, 'github_git', side_effect=RuntimeError('fixture offline')) as push:
+            with self.assertRaisesRegex(RuntimeError, 'fixture offline'):
                 self.publish()
-        push.assert_not_called()
+        push.assert_called_once()
+        # The stub above performed no remote write; remove only its fixture intent.
+        self.store.execute('DELETE FROM settings WHERE key=?', ('delivery-push:' + run['id'],))
         self.before = self.store.one('SELECT * FROM runs WHERE id=?', (run['id'],))
         self.binding = self.store.setting('delivery-candidate:' + run['id'])
         if self.reapprove_before_generation:
             self.reapprove()
-        self.record = self.prepare(self.root / 'generation')
+        if self.prepare_generation:
+            self.record = self.prepare(generations._publication_root(self.runtime, self.run) / 'fixture')
 
     def reapprove(self):
         self.store.execute("UPDATE tasks SET state='blocked' WHERE id=?", (self.approval,))
@@ -301,20 +309,22 @@ finally:
         self.assertIsNone(self.store.setting('delivery-generation:' + self.run['id']))
         self.assertEqual(self.store.one('SELECT * FROM runs WHERE id=?', (self.run['id'],)), self.before)
 
-    def test_runtime_retry_refuses_generation_remote_write_and_keeps_original_evidence(self):
+    def test_runtime_retry_refuses_changed_generation_baseline_and_keeps_original_evidence(self):
         self.store.execute("UPDATE tasks SET state='queued' WHERE id=?", (self.approval,))
         self.restart()
         job = self.store.claim(self.project_id, self.config)
         self.assertEqual(job['task'], self.approval)
-        with patch.object(delivery, 'checked') as remote, patch.object(delivery, 'github_git') as push:
+        with patch.object(delivery, 'checked', return_value='[]') as remote, \
+                patch.object(delivery, 'baseline', return_value=(self.repo, self.base, 'main')), \
+                patch.object(delivery, 'github_git') as push:
             self.runtime.process(job)
-        remote.assert_not_called()
+        self.assertEqual(remote.call_count, 1)  # Read-only PR inventory.
         push.assert_not_called()
         original = self.store.one('SELECT * FROM runs WHERE id=?', (self.run['id'],))
         self.assertEqual(original, self.before)
         failed = self.store.one('SELECT * FROM runs WHERE id=?', (job['id'],))
         self.assertEqual(failed['state'], 'blocked')
-        self.assertIn('generation publication is not connected', failed['result'])
+        self.assertIn('Generation target or baseline changed', failed['result'])
         self.assertIsNone(self.store.setting('delivery-push:' + self.run['id']))
 
     def test_replaced_generation_tree_and_evidence_are_rejected(self):
@@ -564,10 +574,12 @@ class DefaultBranchGenerationTest(GenerationFixture):
         self.assertEqual(self.store.setting('run-baseline:' + self.run['id'])['branch'], 'main')
         self.restart()
         self.assertEqual(self.recover(), self.record)
-        with patch.object(delivery, 'checked') as remote, patch.object(delivery, 'github_git') as push:
-            with self.assertRaisesRegex(RuntimeError, 'generation publication is not connected'):
+        with patch.object(delivery, 'checked', return_value='[]') as remote, \
+                patch.object(delivery, 'baseline', return_value=(self.repo, self.current, 'release')), \
+                patch.object(delivery, 'github_git') as push:
+            with self.assertRaisesRegex(RuntimeError, 'Generation target or baseline changed'):
                 self.publish()
-        remote.assert_not_called()
+        self.assertEqual(remote.call_count, 1)  # Reading is allowed; writing is refused.
         push.assert_not_called()
 
     def test_explicit_different_branch_refused_before_evaluation(self):
@@ -613,12 +625,19 @@ class ReapprovedGenerationTest(GenerationFixture):
         self.restart()
         self.assertEqual(self.recover(), self.record)
 
-    def test_same_manual_reapproval_after_registration_preserves_exact_snapshot(self):
+    def test_manual_reapproval_retires_only_unpublished_generation_and_keeps_history(self):
         self.reapprove()
         self.restart()
-        self.assertEqual(self.recover(), self.record)
+        self.assertIsNone(self.store.setting('delivery-generation:' + self.run['id']))
+        history = self.store.query("SELECT value FROM settings WHERE key LIKE ?",
+                                   ('delivery-generation-history:' + self.run['id'] + ':%',))
+        self.assertEqual([json.loads(row['value']) for row in history], [self.record])
+        self.assertTrue(Path(self.record['directory']).is_dir())
+        with self.assertRaises(generations.GenerationError):
+            self.recover()
 
-    def test_new_approval_after_registration_requires_new_preparation(self):
+    def test_new_approval_after_push_intent_requires_reconciliation(self):
+        self.store.put_setting('delivery-push:' + self.run['id'], self.push_binding())
         self.store.execute("UPDATE tasks SET state='blocked',fingerprint='retired-publish' WHERE id=?", (self.approval,))
         new_approval = self.runtime.deliver(self.run['id'], automatic=False)
         self.assertNotEqual(new_approval, self.approval)
@@ -651,7 +670,6 @@ class ReapprovedGenerationTest(GenerationFixture):
                 evaluate.assert_not_called()
         self.store.put_setting(key, self.binding)
         for state, evidence in [('cancelled', [{'authorization': 'per_candidate'}]),
-                                ('planning', [{'authorization': 'project_policy'}]),
                                 ('planning', [])]:
             with self.subTest(state=state, evidence=evidence):
                 self.store.execute('UPDATE tasks SET state=?,evidence=? WHERE id=?',
