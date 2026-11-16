@@ -38,7 +38,7 @@ class DeliveryBindingTest(unittest.TestCase):
         self.assertEqual(job['task'], self.approval)
         return job
 
-    def reapprove_failed_policy_publication(self, lost_receipt, legacy=False):
+    def reapprove_failed_policy_publication(self, lost_receipt, legacy=False, restart=False):
         job = self.publication_job()
         def command(argv, **kwargs):
             if argv[1:3] == ['pr', 'list']:
@@ -55,6 +55,14 @@ class DeliveryBindingTest(unittest.TestCase):
         if legacy:
             self.store.put_setting(self.key, self.legacy)
             self.store.execute('DELETE FROM settings WHERE key=?', ('delivery-candidate:' + self.run['id'],))
+        if restart:
+            self.runtime.close()
+            from adaptive_rsi.runtime import Runtime
+            from adaptive_rsi.store import Store
+            from tests.test_runtime import FakeAgent
+            self.store = Store(self.root / 'state')
+            self.runtime = Runtime(self.store, FakeAgent())
+            self.addCleanup(self.runtime.close)
         # Revoke automatic policy, then approve through the public human path.
         self.runtime.configure({'delivery': {'mode': 'local'}}, self.project)
         self.assertEqual(self.runtime.deliver(self.run['id'], automatic=False), self.approval)
@@ -86,6 +94,12 @@ class DeliveryBindingTest(unittest.TestCase):
         self.assertEqual(self.store.setting('delivery:' + self.run['id'])['head'], self.head)
         if not legacy:
             self.assertEqual(self.store.setting('delivery-candidate:' + self.run['id']), saved)
+
+    def test_push_failure_recovers_through_runtime_after_process_restart(self):
+        self.reapprove_failed_policy_publication(lost_receipt=False, restart=True)
+
+    def test_pr_creation_failure_recovers_through_runtime_after_process_restart(self):
+        self.reapprove_failed_policy_publication(lost_receipt=True, restart=True)
 
     def test_failed_automatic_push_can_be_manually_reapproved_through_runtime(self):
         self.reapprove_failed_policy_publication(lost_receipt=False)

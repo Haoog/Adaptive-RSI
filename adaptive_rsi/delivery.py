@@ -902,6 +902,14 @@ def publish(runtime, project, task, run, workspace, config):
     repo = config["github"]["repository"]
     if not repo or repo.lower() != origin_repository(project["path"]).lower():
         raise RuntimeError("PR repository must match project origin")
+    generation_row = store.one("SELECT value FROM settings WHERE key=?", ("delivery-generation:" + run["id"],))
+    if generation_row:
+        from .delivery_generation import recover_generation
+        generation = _json_object(generation_row["value"]).get("generation")
+        recover_generation(runtime, run["id"], generation, config)
+        # A prepared replay must never fall through to the original candidate.
+        # Generation remote writes need their own receipt/state transition.
+        raise RuntimeError("Replay generation is prepared; generation publication is not connected yet")
     source, current, base_branch = baseline(runtime, project, config)
     authorize_write()
     identity = store.setting("run-baseline:" + run["id"])
