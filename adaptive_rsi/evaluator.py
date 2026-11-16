@@ -724,6 +724,33 @@ def _copy_frozen_fixture(source, destination, baseline, state=None, ancestors=()
     shutil.copy2(resolved, destination)
 
 
+def _copy_added_link_fixtures(source, destination, baseline_source):
+    """Preserve new regular files without following candidate-controlled links."""
+    additions = []
+    for parent, dirs, files in os.walk(source, followlinks=False):
+        relative = Path(parent).relative_to(source)
+        for name in list(dirs) + files:
+            candidate = Path(parent) / name
+            original = baseline_source / relative / name
+            if candidate.is_symlink():
+                if not original.is_symlink() or os.readlink(candidate) != os.readlink(original):
+                    raise RuntimeError("Candidate symlink overlaps protected harness")
+                continue
+            if candidate.is_dir():
+                if name in {".git", ".rsi-agent", ".rsi-home", ".rsi-build", "__pycache__"}:
+                    dirs.remove(name)
+                elif original.is_symlink() or (original.exists() and not original.is_dir()):
+                    dirs.remove(name)
+                continue
+            if not candidate.is_file():
+                raise RuntimeError("Candidate fixture is not a regular file")
+            if not original.exists() and not original.is_symlink():
+                additions.append((candidate, destination / relative / name))
+    for candidate, dest in additions:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(candidate, dest)
+
+
 def freeze_harness(baseline, target, checks=(), state=None):
     """Host-owned baseline tests/build entrypoints overwrite candidate-authored gate changes."""
     baseline = Path(baseline).resolve()
@@ -758,7 +785,15 @@ def freeze_harness(baseline, target, checks=(), state=None):
             if dst.is_symlink():
                 if os.readlink(dst) != os.readlink(src):
                     raise RuntimeError("Candidate symlink overlaps protected harness")
+                candidate_source = target / resolved.relative_to(baseline)
+                for item in (candidate_source, *candidate_source.parents):
+                    if item == target.parent:
+                        break
+                    if item.is_symlink():
+                        raise RuntimeError("Candidate symlink overlaps protected harness")
                 dst.unlink()
+                if candidate_source.is_dir():
+                    _copy_added_link_fixtures(candidate_source, dst, resolved)
             if dst.exists() and not dst.is_dir():
                 dst.unlink()
             if dst.is_dir():
