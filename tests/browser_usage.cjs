@@ -116,6 +116,46 @@ const {chromium}=require('playwright');
   const otherProject=await page.locator('#project-select option').evaluateAll(options=>options.find(option=>option.textContent.includes('另一个独立项目')).value);
   await page.locator('#project-select').selectOption(otherProject);await page.waitForFunction(()=>!document.getElementById('usage-refresh').disabled);assert.equal(await page.locator('#usage-detail').isVisible(),false);
   resolveDetail();await page.waitForTimeout(100);assert.equal(await page.locator('#usage-detail').isVisible(),false,'a delayed detail must not reopen after the project changes');
+  // 明细翻页在途时关闭：响应不能重开弹窗，也不能抢走恢复后的焦点。
+  let holdPage=false,releasePage,pageStarted;
+  const paginationRoute=async route=>{
+   const params=new URL(route.request().url()).searchParams;
+   if(!params.has('task'))return route.fallback();
+   const offset=Number(params.get('offset'));
+   if(holdPage&&offset===25){pageStarted();await new Promise(resolve=>releasePage=resolve);}
+   const call={role:'planning',model:'page-'+offset,provider:'fixture',effort:'high',state:'done',created:100,usage_known:true,tokens:1,input_tokens:1,output_tokens:0,cache_read_tokens:0,cache_write_tokens:0,seconds:1,unit:'http_request'};
+   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({roles:[],calls:[call],call_total:30})});
+  };
+  await page.route('**/api/usage?*',paginationRoute);
+  const openDetail=page.getByRole('button',{name:'查看用量明细',exact:true}),dialog=page.locator('#usage-detail');
+  const nextPage=dialog.getByRole('button',{name:'下一页',exact:true});
+  for(const close of ['button','escape','backdrop']){
+   holdPage=false;await openDetail.click();await dialog.locator('.usage-call').filter({hasText:'page-0'}).waitFor();
+   if(close==='button'){
+    await nextPage.click();await dialog.locator('.usage-call').filter({hasText:'page-25'}).waitFor();
+    await dialog.getByRole('button',{name:'上一页',exact:true}).click();await dialog.locator('.usage-call').filter({hasText:'page-0'}).waitFor();
+   }
+   holdPage=true;const started=new Promise(resolve=>pageStarted=resolve);await nextPage.click();await started;
+   if(close==='button')await dialog.locator('.close-dialog').click();
+   else if(close==='escape')await page.keyboard.press('Escape');
+   else {const box=await dialog.boundingBox();await page.mouse.click(box.x-5,box.y-5);}
+   await dialog.waitFor({state:'hidden'});
+   await page.waitForFunction(()=>document.activeElement===document.querySelector('#usage-tasks .text-button'));
+   const response=page.waitForResponse(response=>new URL(response.url()).searchParams.get('task')&&new URL(response.url()).searchParams.get('offset')==='25');
+   releasePage();await response;await page.waitForTimeout(100);
+   assert.equal(await dialog.isVisible(),false,close+' must stay closed after pagination');
+   assert.equal(await openDetail.evaluate(node=>document.activeElement===node),true,close+' must retain restored focus');
+  }
+  holdPage=false;await openDetail.click();await dialog.locator('.usage-call').filter({hasText:'page-0'}).waitFor();
+  holdPage=true;const startedAgain=new Promise(resolve=>pageStarted=resolve);await nextPage.click();await startedAgain;
+  await dialog.locator('.close-dialog').click();await dialog.waitFor({state:'hidden'});
+  await openDetail.click();await dialog.locator('.usage-call').filter({hasText:'page-0'}).waitFor();
+  const lateResponse=page.waitForResponse(response=>new URL(response.url()).searchParams.get('task')&&new URL(response.url()).searchParams.get('offset')==='25');
+  releasePage();await lateResponse;await page.waitForTimeout(100);
+  assert.equal(await dialog.locator('.usage-call').filter({hasText:'page-25'}).count(),0,'old pagination must not overwrite a reopened dialog');
+  assert.equal(await dialog.isVisible(),true);
+  await dialog.locator('.close-dialog').click();await page.unroute('**/api/usage?*',paginationRoute);
+  assert.deepEqual(errors,[]);
   const dstContext=await browser.newContext({timezoneId:'America/New_York'}),dstPage=await dstContext.newPage();const requests=[];
   await dstPage.route('**/api/usage?*',async route=>{
    requests.push(Object.fromEntries(new URL(route.request().url()).searchParams));
