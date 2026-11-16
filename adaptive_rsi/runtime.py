@@ -41,6 +41,9 @@ BUDGET_WAIT_RETRIES = 3
 ADMISSION_BACKOFF_SECONDS = 30
 # 阶段预算跨尝试累计时，崩溃最多丢失一个检查点间隔的已耗时间。
 STAGE_BUDGET_CHECKPOINT_SECONDS = 15
+# 预算账本读不出来时把任务按基础设施故障退避重排；否则每个调度节拍都会新建
+# 一条 interrupted run，或让运行永远停在 planning。
+STAGE_BUDGET_BACKOFF_SECONDS = 30
 # 检查点写库只争取这么久的写锁：DB 忙时放弃本轮检查点（下个间隔重试），
 # 不把取消轮询和阶段切换拖到 store 的 15 秒 busy timeout。
 STAGE_BUDGET_CHECKPOINT_BUSY_MS = 50
@@ -2495,7 +2498,28 @@ class Runtime(Maintenance):
         from .process import operation_cancellation
         # 阶段预算按任务累计：中断/重启后的新 run 续用已耗时间，而不是从零重计；
         # 上一尝试已结案时载入会丢弃残留键，按满额度重新开始。
-        run['_stage_used'] = self._load_stage_budget(run)
+        try:
+            run['_stage_used'] = self._load_stage_budget(run)
+        except Exception as error:
+            # 额度读不出来（DB 忙、磁盘 I/O、库损坏）时不能继续执行：worker future
+            # 抛异常不会写终态，run 会一直占住 planning，同项目普通任务直到重启都
+            # 领不到。按基础设施故障收尾、归还尝试次数并退避重排，与准入失败一致。
+            backoff = time.time() + STAGE_BUDGET_BACKOFF_SECONDS
+            self.store.execute("UPDATE tasks SET attempts=max(0,attempts-1) WHERE id=?",
+                               (run["task"],))
+            transitioned = self.store.transition(
+                run["id"], "interrupted",
+                {"reason": "Stage budget ledger could not be read; retry scheduled after backoff",
+                 "failure": {"code": "stage_budget", "stage": "preparation"}},
+                True, task_fields={"state": "queued", "available": backoff})
+            if transitioned:
+                self.store.event(
+                    "infrastructure_retry",
+                    "Stage budget ledger could not be read; retry scheduled",
+                    run["project"], run["id"],
+                    {"code": "stage_budget", "retry_at": backoff,
+                     "error": f"{type(error).__name__}: {error}"[:200]})
+            return
         now = time.monotonic()
         with _clock_lock(run):
             run['_deadline_started'] = now
