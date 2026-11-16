@@ -345,8 +345,8 @@ class Sandbox:
                         command += ["--mount", docker_mount(item, "/workspace/" + relative)]
             for mount in protected_mounts.values():
                 command += ["--mount", mount]
-            # Override image entrypoints without a shell; Docker passes the remaining arguments verbatim.
-            return command + ["--entrypoint", argv[0], image] + list(argv[1:]), None
+            # Preserve custom image initialization; the image must forward the command arguments.
+            return command + [image] + list(argv), None
         # Read only toolchains/system files; tests get no network, credentials, or controller data.
         allowed = ["/System", "/Library", "/usr", "/bin", "/sbin", "/opt", "/dev", "/private/var/db", "/private/var/select",
                    "/private/etc", "/Applications", str(workspace), str(Path.home() / ".local/share/uv"), sys.base_prefix]

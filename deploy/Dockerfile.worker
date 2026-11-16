@@ -2,6 +2,9 @@
 # Pin the official multi-platform OCI index; verify the registry manifest before overriding NODE_IMAGE.
 ARG NODE_IMAGE=node:22-bookworm@sha256:63538dfe497cc29dfafdda25ada09b46db68a3f4cc205abf1f5d6bf0913f3384
 FROM ${NODE_IMAGE}
+# 检查命令直接执行；清除基础 Node 镜像将命令传给 node 的入口。
+# Execute check commands directly instead of passing them to the base image's Node entrypoint.
+ENTRYPOINT []
 ARG CODEX_VERSION=0.163.0
 # 固定为已验证的最低支持版本以保证可复现构建；代码同时兼容 OpenCode 2.x，
 # 升级本镜像前需在 Linux CI 完整通过 tests.test_opencode_integration。

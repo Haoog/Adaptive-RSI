@@ -27,8 +27,9 @@ class DockerCheckCommandTest(unittest.TestCase):
         args = ["cargo", "test", "$(touch /tmp/injected); *", "", "--name"]
         command, cwd = self.box.command(args, self.workspace)
         self.assertIsNone(cwd)
-        index = command.index("--entrypoint")
-        self.assertEqual(command[index:], ["--entrypoint", "cargo", self.config["sandbox"]["image"], *args[1:]])
+        index = command.index(self.config["sandbox"]["image"])
+        self.assertNotIn("--entrypoint", command[:index])
+        self.assertEqual(command[index:], [self.config["sandbox"]["image"], *args])
         for flag in ("--init", "--network=none", "--read-only", "--cap-drop=ALL",
                      "--security-opt=no-new-privileges"):
             self.assertIn(flag, command[:index])
