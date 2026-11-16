@@ -602,6 +602,163 @@ class PublishedGenerationAdvanceTest(PublicationFixture):
         self.tick_local(11000)
         self.assertEqual(self.original()['state'], 'superseded')
 
+    def assert_second_observation_refused(self, mutate):
+        record = self.advance_published()
+        policy = self.store.setting('delivery:' + self.run['id'])
+        intent = self.store.setting('delivery-push:' + self.run['id'])
+        observations = []
+        def view(repo, url):
+            pr = self.remote.pr_view(repo, url)
+            observations.append(pr['headRefOid'])
+            if len(observations) >= 2:
+                mutate(pr)
+            return pr
+        with self.remote.install(), patch.object(delivery, 'pr_view', side_effect=view), \
+                patch.object(delivery, 'checked', side_effect=self.remote.checked) as command:
+            delivery.tick(self.runtime, now=10000, project_id=self.project_id)
+            row = self.original()
+            outcome = json.loads(row['result'])
+            self.assertEqual(len(observations), 2)
+            self.assertEqual(observations[0], record['commit'])
+            self.assertEqual(row['state'], 'superseded')
+            self.assertTrue(outcome['close_pending'])
+            self.assertIn('close_blocked_reason', outcome)
+            self.assertNotIn('close_attempts', outcome)
+            self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (row['task'],))['state'], 'blocked')
+            # 退避后仍不能将不明身份当作已结束，也不能重新入队。
+            delivery.tick(self.runtime, now=18000, project_id=self.project_id)
+            self.assertFalse(any(call.args[0][:3] == ['gh', 'pr', 'close'] for call in command.call_args_list))
+        self.assertTrue(json.loads(self.original()['result'])['close_pending'])
+        self.assertEqual(self.record(), record)
+        self.assertEqual(self.store.setting('delivery:' + row['id']), policy)
+        self.assertEqual(self.store.setting('delivery-push:' + row['id']), intent)
+        self.assertIsNotNone(self.store.one("SELECT 1 FROM events WHERE run=? AND kind='delivery_close_blocked'", (row['id'],)))
+        self.assertEqual(json.loads(self.remote.api.read_text())['pr']['state'], 'OPEN')
+
+    def test_second_observation_changed_head_never_closes_or_requeues(self):
+        self.assert_second_observation_refused(lambda pr: pr.update(headRefOid='f' * 40))
+
+    def test_second_observation_all_identity_fields_fail_closed(self):
+        self.advance_published()
+        original = self.original()
+        valid = self.remote.pr_view('example/project', json.loads(original['result'])['pr'])
+        cases = [('missing ' + key, key, None) for key in
+                 ('url', 'headRefOid', 'headRefName', 'baseRefName', 'headRepository', 'headRepositoryOwner')]
+        cases += [('changed ' + key, key, value) for key, value in (
+            ('url', 'https://github.com/example/project/pull/2'),
+            ('url', 'https://github.com/other/project/pull/1'),
+            ('headRefName', 'other-source'), ('baseRefName', 'release'),
+            ('headRepository', {'nameWithOwner': 'example/other'}),
+            ('headRepositoryOwner', {'login': 'other'}), ('state', 'UNKNOWN'))]
+        for index, (label, key, value) in enumerate(cases):
+            with self.subTest(label=label):
+                self.store.execute("UPDATE runs SET state='pr_open',result=? WHERE id=?",
+                                   (original['result'], original['id']))
+                self.store.execute("UPDATE tasks SET state='pr_open' WHERE id=?", (original['task'],))
+                changed = {**valid, key: value}
+                if value is None:
+                    changed.pop(key)
+                with self.remote.install(), patch.object(delivery, 'pr_view', side_effect=[valid, changed]), \
+                        patch.object(delivery, 'checked') as command:
+                    delivery.tick(self.runtime, now=10000 + index * 8000, project_id=self.project_id)
+                command.assert_not_called()
+                outcome = json.loads(self.original()['result'])
+                self.assertTrue(outcome['close_pending'])
+                self.assertIn('close_blocked_reason', outcome)
+                self.assertNotIn('close_attempts', outcome)
+                self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (original['task'],))['state'], 'blocked')
+
+    def test_second_observation_sealed_records_change_blocks_close(self):
+        self.advance_published()
+        original = self.original()
+        prefixes = ('delivery:', 'run-baseline:', 'delivery-push:',
+                    'delivery-generation:', 'delivery-candidate:')
+        records = {prefix: self.store.setting(prefix + original['id']) for prefix in prefixes}
+        for index, prefix in enumerate(prefixes):
+            with self.subTest(prefix=prefix):
+                for key, value in records.items():
+                    self.store.put_setting(key + original['id'], value)
+                self.store.execute("UPDATE runs SET state='pr_open',result=? WHERE id=?",
+                                   (original['result'], original['id']))
+                self.store.execute("UPDATE tasks SET state='pr_open' WHERE id=?", (original['task'],))
+                count = 0
+                changed = {**records[prefix], 'unexpected': 'concurrent edit'}
+                def view(repo, url):
+                    nonlocal count
+                    count += 1
+                    if count == 2:
+                        self.store.put_setting(prefix + original['id'], changed)
+                    return self.remote.pr_view(repo, url)
+                with self.remote.install(), patch.object(delivery, 'pr_view', side_effect=view), \
+                        patch.object(delivery, 'checked') as command:
+                    delivery.tick(self.runtime, now=10000 + index * 8000, project_id=self.project_id)
+                command.assert_not_called()
+                self.assertEqual(self.store.setting(prefix + original['id']), changed)
+                self.assertTrue(json.loads(self.original()['result'])['close_pending'])
+                self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (original['task'],))['state'], 'blocked')
+
+    def test_second_observation_live_query_failure_fails_closed_without_write_lock(self):
+        # 第二次 view 开始后才模拟 origin 查询失败；查询回调能写独立连接，
+        # 也证明准入没有跨 Git 查询持有 SQLite 写锁。
+        origin = delivery.origin_repository
+        def fail_origin(path):
+            self.store.put_setting('test:close-admission-lock-probe', True)
+            raise RuntimeError('origin unavailable')
+        with patch.object(delivery, 'origin_repository', side_effect=origin) as probe:
+            def mutate(pr):
+                probe.side_effect = fail_origin
+            self.assert_second_observation_refused(mutate)
+        self.assertTrue(self.store.setting('test:close-admission-lock-probe'))
+
+    def test_legacy_generation_replan_without_target_preserves_pr_and_blocks_queue(self):
+        self.advance_published()
+        row = self.original()
+        outcome = json.loads(row['result'])
+        outcome.update(generation_replan=True, replanned=True, close_pending=True)
+        self.store.execute("UPDATE runs SET state='superseded',result=? WHERE id=?", (encode(outcome), row['id']))
+        self.store.execute("UPDATE tasks SET state='queued' WHERE id=?", (row['task'],))
+        with self.remote.install(), patch.object(delivery, 'checked') as command:
+            delivery.tick(self.runtime, now=10000, project_id=self.project_id)
+        command.assert_not_called()
+        self.assertTrue(json.loads(self.original()['result'])['close_pending'])
+        self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (row['task'],))['state'], 'blocked')
+        self.assertEqual(json.loads(self.remote.api.read_text())['pr']['state'], 'OPEN')
+
+    def test_second_observation_repository_switch_never_closes(self):
+        def switch(pr):
+            self.runtime.configure({'github': {'repository': 'example/replacement'}}, self.project_id)
+        self.assert_second_observation_refused(switch)
+
+    def test_second_observation_global_repository_switch_never_closes(self):
+        def switch(pr):
+            self.runtime.configure({'github': {'repository': ''}}, self.project_id)
+            self.runtime.configure({'github': {'repository': 'example/replacement'}})
+        self.assert_second_observation_refused(switch)
+
+    def test_second_observation_base_branch_switch_never_closes(self):
+        def switch(pr):
+            self.runtime.configure({'delivery': {'base_branch': 'release'}}, self.project_id)
+        self.assert_second_observation_refused(switch)
+
+    def test_second_observation_origin_switch_never_closes(self):
+        def switch(pr):
+            git(self.repo, 'remote', 'set-url', 'origin', 'https://github.com/example/replacement.git')
+        self.assert_second_observation_refused(switch)
+
+    def test_second_observation_revocation_blocks_task_until_authorized_retry(self):
+        self.assert_second_observation_refused(
+            lambda pr: self.runtime.configure({'delivery': {'auto_merge': False}}, self.project_id))
+        self.runtime.configure({'delivery': {'auto_merge': True}}, self.project_id)
+        self.tick_local(26000)
+        outcome = json.loads(self.original()['result'])
+        self.assertFalse(outcome['close_pending'])
+        self.assertNotIn('close_blocked_reason', outcome)
+        self.assertEqual(outcome['close_attempts'], 1)
+        self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (self.run['task'],))['state'], 'queued')
+
+    def test_second_observation_cancellation_blocks_task(self):
+        self.assert_second_observation_refused(lambda pr: self.runtime.stop.set())
+
     def test_second_advance_without_current_authority_does_not_close(self):
         self.advance_published()
         self.runtime.configure({'delivery': {'auto_merge': False}}, self.project_id)

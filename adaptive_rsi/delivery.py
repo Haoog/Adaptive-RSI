@@ -565,6 +565,13 @@ def update_behind(runtime, project, run, outcome, policy, repo, now, pr, cancell
                 not _update_pr_identity(pr, repo, policy['branch'], intent.get('branch'), policy['head'])):
             outcome['delivery_update_blocked'] = 'Published generation PR identity differs'
             return 'waiting'
+        # 密封首次已验证的目标；后续 tick 和关闭前不得重新绑定身份。
+        outcome['generation_replan_target'] = {
+            'policy': policy, 'intent': intent,
+            'baseline': store.setting('run-baseline:' + run['id']),
+            'generation': fingerprint(store.setting('delivery-generation:' + run['id'])),
+            'candidate': fingerprint(store.setting('delivery-candidate:' + run['id'])),
+            'base_branch': live['delivery']['base_branch'], 'pr': outcome.get('pr')}
         outcome['generation_replan'] = True
         outcome['delivery_stale'] = stale_reason(pr, policy, live['delivery']['base_branch'])
         store.event('delivery_generation_stale',
@@ -1142,6 +1149,10 @@ def _update_pr_task(store, run, state, now):
 def _supersede_pr(store, run, outcome, task_state, now, feedback_keys=None):
     """Detach tracking from the task and persist close intent before remote writes."""
     outcome.update(replanned=True, close_pending=True)
+    if outcome.get('generation_replan'):
+        # 关闭被拒绝、响应丢失或退避期间，禁止调度同一任务再次交付。
+        outcome['generation_replan_task_state'] = task_state
+        task_state = 'blocked'
     with store.connect() as db:
         db.execute("BEGIN IMMEDIATE")
         if feedback_keys is not None:
@@ -1199,7 +1210,16 @@ def _close_retry_due(outcome, now):
     return now - last >= _write_retry_delay(attempts)
 
 
-def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
+def _release_generation_replan(store, run, outcome, now):
+    state = outcome.get('generation_replan_task_state')
+    if outcome.get('generation_replan') and state in ('queued', 'blocked'):
+        store.execute("UPDATE tasks SET state=?,available=0,updated=? WHERE id=? AND state='blocked' "
+                      "AND NOT EXISTS (SELECT 1 FROM runs WHERE task=? AND "
+                      "(started>? OR (started=? AND id>?)))",
+                      (state, now, run['task'], run['task'], run['started'], run['started'], run['id']))
+
+
+def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now, generation_admitted=None):
     """Observe a superseded PR and record a merge instead of discarding it.
 
     Returns True when the run was advanced to merged, so the caller still runs
@@ -1207,6 +1227,9 @@ def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
     """
     # A failed/lost response leaves the intent durable. Always observe remote state
     # before retrying, including manual closes and merges while the worker was down.
+    if outcome.get('generation_replan') and (
+            not generation_admitted or not generation_admitted(pr)):
+        return
     if pr["state"] == "OPEN":
         if cancelled():
             return
@@ -1234,6 +1257,7 @@ def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
                         run["project"], run["id"])
             store.remote_wait(run["id"], None, time.time())
             return
+        _release_generation_replan(store, run, outcome, now)
         outcome["close_status"] = "close_submitted"
         outcome["close_pending"] = False
         store.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run["id"]))
@@ -1279,6 +1303,7 @@ def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
         if state == "merged":
             run["state"] = "merged"
         return state == "merged"
+    _release_generation_replan(store, run, outcome, now)
     outcome["close_pending"] = False
     store.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run["id"]))
     store.remote_wait(run["id"], None, time.time())
@@ -1646,15 +1671,64 @@ def tick(runtime, now=None, project_id=None, active_run=None):
         current = store.one("SELECT * FROM runs WHERE id=?", (active_run,))
         return not current or runtime.is_cancelled(current)
 
-    def generation_replan_cancelled(run, outcome):
+    def generation_replan_cancelled(run, outcome, pr=None):
         if not outcome.get('generation_replan'):
             return False
-        live_run = store.one('SELECT config FROM runs WHERE id=?', (run['id'],))
-        live = runtime.config(run['project'])
-        return (not live_run or
-                not _dict_field(_json_object(live_run['config']), 'delivery').get('auto_merge') or
-                not live['delivery']['auto_merge'] or live['delivery']['mode'] != 'pr' or
-                runtime.project(run['project'])['paused'])
+        try:
+            from .delivery_generation import journal_policy
+            target = outcome['generation_replan_target']
+            sealed = target['policy']
+            repo = sealed['repository']
+            # Git 在任何 SQLite 写事务之外执行，不复用 tick 的 origin 缓存。
+            live_project = runtime.project(run['project'])
+            live_origin = origin_repository(live_project['path'])
+            live = runtime.config(run['project'])
+            live_run = store.one('SELECT * FROM runs WHERE id=?', (run['id'],))
+            intent = store.setting('delivery-push:' + run['id'])
+            identity = store.setting('run-baseline:' + run['id'])
+            valid = (live_run and live_run['state'] in ('pr_open', 'superseded') and
+                     live['github']['repository'] == repo and live_origin.lower() == repo.lower() and
+                     live['delivery']['base_branch'] == target['base_branch'] and
+                     (not live['delivery']['base_branch'] or live['delivery']['base_branch'] == sealed['branch']) and
+                     store.setting('delivery:' + run['id']) == sealed and
+                     identity == target['baseline'] ==
+                     {'repository': repo, 'branch': sealed['branch'], 'sha': live_run['base']} and
+                     intent == target['intent'] and journal_policy(store, live_run, intent) == sealed and
+                     fingerprint(store.setting('delivery-generation:' + run['id'])) == target['generation'] and
+                     fingerprint(store.setting('delivery-candidate:' + run['id'])) == target['candidate'] and
+                     outcome.get('pr') == target['pr'] == _json_object(live_run['result']).get('pr') and
+                     isinstance(target['pr'], str) and
+                     re.fullmatch(r'https://github\.com/' + re.escape(repo) + r'/pull/[1-9][0-9]*', target['pr'], re.I))
+            if pr is None or pr.get('state') == 'OPEN':
+                valid = (valid and not tracking_cancelled() and not live_project['paused'] and
+                         _dict_field(_json_object(live_run['config']), 'delivery').get('auto_merge') and
+                         live['delivery']['auto_merge'] and live['delivery']['mode'] == 'pr')
+            if pr is not None:
+                valid = (valid and pr.get('state') in ('OPEN', 'CLOSED', 'MERGED') and
+                         pr.get('url') == target['pr'] and
+                         _update_pr_identity({**pr, 'state': 'OPEN'}, repo, sealed['branch'],
+                                             intent['branch'], sealed['head']))
+            if valid:
+                if pr is not None:
+                    outcome.pop('close_blocked_at', None)
+                    outcome.pop('close_blocked_reason', None)
+                return False
+            reason = 'Generation replan target, PR identity or authority changed; close withheld'
+        except Exception as exc:
+            reason = 'Generation replan admission unavailable; close withheld: ' + str(exc)[:300]
+        outcome['close_blocked_at'] = now
+        outcome['close_blocked_reason'] = reason
+        # 同时收住旧版本已入队但关闭未完成的 generation 重排；新 run
+        # 已取得任务时仅保留证据，不能改写它持有的任务状态。
+        store.execute("UPDATE tasks SET state='blocked',updated=? WHERE id=? "
+                      "AND state IN ('queued','pr_open') "
+                      "AND EXISTS (SELECT 1 FROM runs WHERE id=? AND state='superseded') "
+                      "AND NOT EXISTS (SELECT 1 FROM runs WHERE task=? AND "
+                      "(started>? OR (started=? AND id>?)))",
+                      (now, run['task'], run['id'], run['task'], run['started'], run['started'], run['id']))
+        _persist_result(store, run, outcome)
+        store.event('delivery_close_blocked', reason, run['project'], run['id'])
+        return True
 
     # 同一 tick 内多个就绪 PR / 到期监控共享同一份基线读数：首个调用触发一次
     # 真实 fetch，其余直接复用。publish 不在此路径；合并准入/监控的密封目标
@@ -1784,7 +1858,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     continue
                 if _close_superseded_pr(store, run, outcome, repo, pr,
                                         lambda: tracking_cancelled() or runtime.project(project['id'])['paused'] or
-                                        generation_replan_cancelled(run, outcome), now):
+                                        generation_replan_cancelled(run, outcome), now,
+                                        generation_admitted=lambda observed: not generation_replan_cancelled(run, outcome, observed)):
                     _finish_merge(runtime, project, run, outcome, config, now,
                                   active_run, tracking_cancelled, tick_baselines)
                 continue
@@ -2066,7 +2141,9 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                 if _close_superseded_pr(store, run, outcome, repo,
                                                         pr_view(repo, outcome["pr"]),
                                                         lambda: tracking_cancelled() or runtime.project(project['id'])['paused'] or
-                                                        generation_replan_cancelled(run, outcome), now):
+                                                        generation_replan_cancelled(run, outcome), now,
+                                                        generation_admitted=lambda observed:
+                                                        not generation_replan_cancelled(run, outcome, observed)):
                                     _finish_merge(runtime, project, run, outcome, config, now,
                                                   active_run, tracking_cancelled, tick_baselines)
                             finally:
