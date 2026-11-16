@@ -310,6 +310,8 @@ class Sandbox:
             writes = None
         backend = self.backend()
         if backend == "docker":
+            if not argv or not argv[0]:
+                raise ValueError("Sandbox command requires a non-empty executable")
             limits = self.config["sandbox"]
             image = limits["image"]
             docker = shutil.which("docker")
@@ -317,7 +319,7 @@ class Sandbox:
                 ["docker", "image", "inspect", image], timeout=10))
             if found["exit_code"]:
                 raise RuntimeError("Sandbox image is not cached. Pull it explicitly: " + image)
-            command = ["docker", "run", "--rm", "--network=none", "--read-only", "--cap-drop=ALL",
+            command = ["docker", "run", "--rm", "--init", "--network=none", "--read-only", "--cap-drop=ALL",
                     "--security-opt=no-new-privileges", "--pids-limit=" + str(limits["pids"]),
                     "--memory=" + str(limits["memory_mb"]) + "m", "--cpus=" + str(limits["cpus"]),
                     "--user=" + str(os.getuid()) + ":" + str(os.getgid()),
@@ -343,7 +345,8 @@ class Sandbox:
                         command += ["--mount", docker_mount(item, "/workspace/" + relative)]
             for mount in protected_mounts.values():
                 command += ["--mount", mount]
-            return command + [image] + list(argv), None
+            # Override image entrypoints without a shell; Docker passes the remaining arguments verbatim.
+            return command + ["--entrypoint", argv[0], image] + list(argv[1:]), None
         # Read only toolchains/system files; tests get no network, credentials, or controller data.
         allowed = ["/System", "/Library", "/usr", "/bin", "/sbin", "/opt", "/dev", "/private/var/db", "/private/var/select",
                    "/private/etc", "/Applications", str(workspace), str(Path.home() / ".local/share/uv"), sys.base_prefix]
