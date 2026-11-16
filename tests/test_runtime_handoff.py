@@ -15,7 +15,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from adaptive_rsi.config import validate
-from adaptive_rsi.runtime import Runtime, STAGE_BUDGET_CHECKPOINT_SECONDS
+from adaptive_rsi.runtime import (Runtime, STAGE_BUDGET_BACKOFF_SECONDS,
+                                 STAGE_BUDGET_CHECKPOINT_SECONDS)
 from adaptive_rsi.store import Store, encode
 from tests.test_runtime import FakeAgent, fixture
 
@@ -420,6 +421,35 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual((failure['code'], failure['stage']), ('deadline', 'preparation'))
         # 已按超时收尾的尝试不再把额度带给下一次人工重试。
         self.assertIsNone(store.setting('stage-budget:' + task))
+
+    def test_unreadable_stage_budget_interrupts_the_run_and_requeues_with_backoff(self):
+        """额度读不出来时不能让 run 永远停在 planning（be-500）。
+
+        worker future 抛异常不会写终态；这里按基础设施故障收尾、归还尝试次数
+        并退避重排，同项目的其他任务不会因此被冻到重启。
+        """
+        task, run = self.claim()
+        error = sqlite3.OperationalError("disk I/O error")
+        before = time.time()
+        with patch.object(self.runtime, "_load_stage_budget", side_effect=error):
+            self.runtime.process(run)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "interrupted")
+        result = json.loads(row["result"])
+        self.assertEqual(result["failure"]["code"], "stage_budget")
+        self.assertEqual(result["failure"]["stage"], "preparation")
+        queued = self.store.one("SELECT state,available,attempts FROM tasks WHERE id=?", (task,))
+        self.assertEqual(queued["state"], "queued")
+        self.assertGreaterEqual(queued["available"], before + STAGE_BUDGET_BACKOFF_SECONDS - 1)
+        event = self.store.one("SELECT * FROM events WHERE kind='infrastructure_retry' AND run=?",
+                               (run["id"],))
+        self.assertIsNotNone(event)
+        self.assertIn("disk I/O error", json.loads(event["data"])["error"])
+        # 退避到期后同一任务可以重新领取，run 不再是未结状态。
+        self.store.execute("UPDATE tasks SET available=0 WHERE id=?", (task,))
+        fresh = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertEqual(fresh["task"], task)
+        self.assertNotEqual(fresh["id"], run["id"])
 
     def test_stage_budget_write_failure_leaves_structured_evidence(self):
         """落盘失败不能只留一行 warning：事件与计数要让下一次尝试的满额度可解释。"""
