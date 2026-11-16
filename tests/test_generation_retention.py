@@ -440,17 +440,229 @@ class GenerationRetentionTest(unittest.TestCase):
         for path, content in remaining.items():
             self.assertEqual(path.read_text(), content)
 
-    def test_oversized_authorization_namespace_retains_files_and_path(self):
-        # Valid, aged preparation journals: it is the workload bound, rather
-        # than a corrupt receipt, that must stop this cleanup before unlink.
-        for index in range(retention.CLEANUP_RECORDS + 1):
+    def test_many_preparing_journals_progress_across_validation_pages(self):
+        for index in range(257):
             path = self.directory / 'generations' / ('%032x' % index)
             self.store.put_setting('delivery-generation-preparing:r:' + path.name,
                 {'version': 1, 'directory': str(path), 'created': self.old})
         self.assertFalse(maintenance._remove_run_artifacts(self.store, 'r', 'p', self.directory))
         self.assertEqual((self.child / 'candidate' / 'derived').read_text(), 'ours')
-        self.assertIsNotNone(self.store.one("SELECT path FROM runs WHERE id='r'")['path'])
+        for _ in range(180):
+            self.cycle()
+            if not self.store.setting('delivery-generation:r'):
+                break
+        else:
+            self.fail('valid preparation journals never retired')
+        self.assertFalse(self.child.exists())
+        self.assertFalse(self.store.query("SELECT key FROM settings WHERE key LIKE 'delivery-generation%:r:%'"))
+
+    def add_history(self, count):
+        # Distinct, fully evidenced unpublished generations, not dummy journals.
+        for index in range(count):
+            generation = '%032x' % (index + 100)
+            directory = self.directory / 'generations' / generation
+            directory.mkdir(parents=True)
+            (directory / 'evidence').write_text('history-' + generation)
+            record = {**self.record, 'generation': generation,
+                      'ref': 'refs/adaptive-rsi/generations/' + generation, 'directory': str(directory)}
+            self.store.put_setting('delivery-generation-history:r:' + generation, record)
+            self.store.put_setting('delivery-generation-history-proof:r:' + generation,
+                                   {'unpublished': True, 'record': fingerprint(record)})
+
+    def test_more_than_256_evidenced_history_records_eventually_retire(self):
+        self.add_history(257)
+        self.assertEqual(len(self.store.query("SELECT key FROM settings WHERE key LIKE 'delivery-generation-history:r:%'")), 257)
+        for _ in range(420):
+            self.cycle()
+            if not self.store.setting('delivery-generation:r'):
+                break
+        else:
+            self.fail('valid history never retired')
+        self.assertFalse((self.directory / 'generations').exists())
+        self.assertIsNone(self.store.one("SELECT path FROM runs WHERE id='r'")['path'])
+        self.assertFalse(self.store.query("SELECT key FROM settings WHERE key LIKE 'delivery-generation%:r:%'"))
+        self.assertEqual(self.patch.read_text(), 'rollback survives')
+
+    def test_large_history_damaged_unconfirmed_and_hold_never_delete(self):
+        self.add_history(257)
+        key = 'delivery-generation-history-proof:r:' + ('%032x' % 356)
+        original = self.store.setting(key)
+        for mode in ('missing-proof', 'corrupt-proof', 'legal-hold'):
+            with self.subTest(mode=mode):
+                self.store.put_setting(key, original)
+                self.store.put_setting('legal-hold:r', mode == 'legal-hold')
+                if mode == 'missing-proof':
+                    self.store.execute('DELETE FROM settings WHERE key=?', (key,))
+                elif mode == 'corrupt-proof':
+                    self.store.put_setting(key, {'unpublished': True, 'record': 'f' * 64})
+                for _ in range(22):
+                    self.assertFalse(maintenance._remove_run_artifacts(self.store, 'r', 'p', self.directory))
+                self.assertEqual(len(list((self.directory / 'generations').iterdir())), 258)
+                self.assertTrue(self.child.exists())
+                self.assertIsNotNone(self.store.setting('delivery-generation:r'))
+
+    def test_registration_between_large_validation_pages_invalidates_progress(self):
+        self.add_history(257)
+        for _ in range(4):
+            self.assertIsNotNone(maintenance.retention_hold(self.store, 'r', 'p'))
+        late = self.directory / 'generations' / ('9' * 32)
+        late.mkdir()
+        (late / 'sentinel').write_text('late preparation')
+        self.store.put_setting('delivery-generation-preparing:r:' + late.name,
+            {'version': 1, 'directory': str(late), 'created': time.time()})
+        for _ in range(22):
+            self.assertFalse(maintenance._remove_run_artifacts(self.store, 'r', 'p', self.directory))
+        self.assertEqual((late / 'sentinel').read_text(), 'late preparation')
+        self.assertTrue(self.child.exists())
+        self.assertEqual(len(list((self.directory / 'generations').iterdir())), 259)
+
+    def test_progress_survives_interleaving_more_than_eight_runs(self):
+        for index in range(9):
+            run_id = 'paged-%02d' % index
+            self.store.execute("INSERT INTO tasks(id,project,state,created,updated) VALUES (?,'p','failed',1,1)", (run_id,))
+            self.store.execute("INSERT INTO runs(id,task,project,state,config,ended,result) "
+                               "VALUES (?,?,'p','failed',?,?,'{}')", (run_id, run_id, encode(DEFAULTS), self.old))
+            for generation in range(34):
+                path = self.store.root / 'runs' / run_id / 'generations' / ('%032x' % generation)
+                self.store.put_setting('delivery-generation-preparing:' + run_id + ':' + path.name,
+                    {'version': 1, 'directory': str(path), 'created': self.old})
+        for index in range(9):
+            self.assertIsNone(retention.authorization(self.store, 'paged-%02d' % index, 'p'))
+        for index in range(9):
+            self.assertIsNotNone(retention.authorization(self.store, 'paged-%02d' % index, 'p'))
+
+    def test_single_record_over_supported_bound_is_not_loaded_or_deleted(self):
+        record = copy.deepcopy(self.record)
+        record['evaluation']['checks'] = {'stdout': 'x' * (128 * 1024)}
+        record['evidence_hash'] = fingerprint(record['evaluation'])
+        self.store.put_setting('delivery-generation:r', record)
+        with patch.object(retention, 'MAX_RECORD_BYTES', 64 * 1024), \
+                patch.object(retention, 'object_value', wraps=retention.object_value) as parse:
+            self.assertIsNotNone(maintenance.retention_hold(self.store, 'r', 'p'))
+            self.assertTrue(all(len(call.args[0]) <= 64 * 1024 for call in parse.call_args_list))
+        self.assertTrue(self.child.exists())
         self.assertIsNotNone(self.store.setting('delivery-generation:r'))
+
+    def paused_validation(self, entry):
+        paused, resume = threading.Event(), threading.Event()
+        errors = []
+        def boundary():
+            paused.set()
+            if not resume.wait(5):
+                raise AssertionError('validation resume timeout')
+        def worker():
+            try:
+                entry()
+            except BaseException as exc:
+                errors.append(exc)
+        return paused, resume, errors, boundary, worker
+
+    def test_slow_validation_all_entry_points_release_sqlite_writer(self):
+        for entry in ('hold', 'maintenance', 'retire'):
+            for change in ('hold', 'registration'):
+                with self.subTest(entry=entry, change=change):
+                    self.store.put_setting('legal-hold:r', False)
+                    if entry == 'retire':
+                        self.store.execute("UPDATE runs SET path=NULL WHERE id='r'")
+                        call = lambda: retention.retire_settings(self.store, time.time())
+                    else:
+                        self.store.execute("UPDATE runs SET path=? WHERE id='r'", (str(self.directory),))
+                        call = self.cycle if entry == 'maintenance' else lambda: maintenance.retention_hold(self.store, 'r', 'p')
+                    paused, resume, errors, boundary, work = self.paused_validation(call)
+                    with patch.object(retention, '_validation_boundary', side_effect=boundary):
+                        thread = threading.Thread(target=work)
+                        thread.start()
+                        try:
+                            self.assertTrue(paused.wait(5))
+                            with self.store.connect() as db:
+                                db.execute('PRAGMA busy_timeout=250')
+                                db.execute('BEGIN IMMEDIATE')
+                                db.execute("INSERT OR REPLACE INTO settings VALUES ('unrelated-writer','true')")
+                            if change == 'hold':
+                                self.store.put_setting('legal-hold:r', True)
+                            else:
+                                late = self.directory / 'generations' / ('8' * 32)
+                                late.mkdir(exist_ok=True)
+                                (late / 'sentinel').write_text('new registration')
+                                self.store.put_setting('delivery-generation-preparing:r:' + late.name,
+                                    {'version': 1, 'directory': str(late), 'created': time.time()})
+                        finally:
+                            resume.set()
+                            thread.join(5)
+                    self.assertFalse(thread.is_alive())
+                    self.assertEqual(errors, [])
+                    self.assertTrue(self.child.exists())
+                    self.assertIsNotNone(self.store.setting('delivery-generation:r'))
+                    # The newly inserted preparation is recent and must remain
+                    # a hold even once the previous proof is invalidated.
+                    self.assertIsNotNone(maintenance.retention_hold(self.store, 'r', 'p'))
+                    if change == 'registration':
+                        self.store.execute('DELETE FROM settings WHERE key=?', ('delivery-generation-preparing:r:' + late.name,))
+                        (late / 'sentinel').unlink()
+                        late.rmdir()
+
+    def test_real_maintenance_pins_run_before_cleanup_entry_and_closes_fds(self):
+        original = maintenance._remove_run_artifacts
+        moved = self.directory.with_name('original-run')
+        snapshots = []
+        closed = []
+        close = retention.DirectorySnapshot.close
+        def checked_close(snapshot):
+            descriptors = list(snapshot.fds)
+            close(snapshot)
+            for fd in descriptors:
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+            closed.extend(descriptors)
+        def replace(store, run_id, project, directory, stored=None, snapshot=None):
+            self.assertIsNotNone(snapshot)
+            snapshots.append(snapshot)
+            # We are outside dispatch_lock and before the real delete entry.
+            available = []
+            def lock_probe():
+                acquired = self.rt.dispatch_lock.acquire(blocking=False)
+                available.append(acquired)
+                if acquired:
+                    self.rt.dispatch_lock.release()
+            probe = threading.Thread(target=lock_probe)
+            probe.start()
+            probe.join(1)
+            self.assertEqual(available, [True])
+            directory.rename(moved)
+            foreign = directory / 'generations' / self.child.name / 'candidate'
+            foreign.mkdir(parents=True)
+            (foreign / 'derived').write_text('foreign sentinel')
+            return original(store, run_id, project, directory, stored=stored, snapshot=snapshot)
+        with patch.object(maintenance, '_remove_run_artifacts', side_effect=replace), \
+                patch.object(retention.DirectorySnapshot, 'close', checked_close):
+            self.cycle()
+        self.assertEqual((self.child / 'candidate' / 'derived').read_text(), 'foreign sentinel')
+        self.assertEqual((moved / 'generations' / self.child.name / 'candidate' / 'derived').read_text(), 'ours')
+        self.assertIsNotNone(self.store.one("SELECT path FROM runs WHERE id='r'")['path'])
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0].fds, [])
+        self.assertEqual(len(closed), 4)
+
+    def test_maintenance_exception_and_completed_batch_close_snapshots(self):
+        close = retention.DirectorySnapshot.close
+        snapshots = []
+        def checked_close(snapshot):
+            fds = list(snapshot.fds)
+            close(snapshot)
+            for fd in fds:
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+            snapshots.append(snapshot)
+        with patch.object(retention.DirectorySnapshot, 'close', checked_close), \
+                patch.object(maintenance, '_remove_run_artifacts', side_effect=OSError('simulated deletion failure')):
+            self.cycle()
+        self.assertEqual(len(snapshots), 1)
+        self.assertIsNotNone(self.store.one("SELECT path FROM runs WHERE id='r'")['path'])
+        with patch.object(retention.DirectorySnapshot, 'close', checked_close):
+            self.cycle()
+        self.assertEqual(len(snapshots), 2)
+        self.assertTrue(all(not snapshot.fds for snapshot in snapshots))
+        self.assertIsNone(self.store.one("SELECT path FROM runs WHERE id='r'")['path'])
 
     def test_unexpected_artifact_types_keep_files_and_lookup_path(self):
         workspace = self.directory / 'workspace'
@@ -597,7 +809,10 @@ class GenerationRetentionTest(unittest.TestCase):
         self.cycle()
         self.assertFalse(self.child.exists())
         self.assertIsNotNone(self.store.setting('delivery-generation:r'))
-        self.cycle()
+        for _ in range(30):
+            self.cycle()
+            if self.store.setting('delivery-generation:r') is None:
+                break
         self.assertIsNone(self.store.setting('delivery-generation:r'))
         self.assertIsNotNone(self.store.setting('delivery-generation:blocked-000'))
 
@@ -758,3 +973,31 @@ class SupersededPublicationRetirementIntegrationTest(PublicationFixture):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LargeEvaluationRetirementIntegrationTest(PublicationFixture):
+    def setUp(self):
+        from tests import test_delivery_replay_checks as replay_tests
+        from adaptive_rsi.gitops import git
+        original = replay_tests.fixture
+        def noisy_fixture(root):
+            repo = original(root)
+            path = repo / 'tests/test_calculator.py'
+            path.write_text("import sys\nsys.stdout.write('x' * (1024 * 1024 + 64) + '\\n')\n" + path.read_text())
+            git(repo, 'add', '.')
+            git(repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost',
+                'commit', '--quiet', '-m', 'large legitimate check output')
+            return repo
+        with patch.object(replay_tests, 'fixture', side_effect=noisy_fixture):
+            super().setUp()
+
+    def process_approval(self):
+        result = super().process_approval()
+        record = self.record()
+        self.assertGreater(len(encode(record['evaluation']).encode()), 1024 * 1024)
+        self.assertEqual(record['evidence_hash'], fingerprint(record['evaluation']))
+        self.assertEqual(record['evaluation']['decision'], 'pass')
+        return result
+
+    def test_real_large_evaluation_retires_after_verified_merge_and_monitoring(self):
+        PublicationRetirementIntegrationTest.test_tracking_records_verified_merge_then_offline_maintenance_retires(self)
