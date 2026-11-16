@@ -24,6 +24,7 @@ mod update_receipt;
 #[cfg(test)]
 mod update_boundary_tests;
 mod transport;
+mod update_check_race;
 
 #[derive(Clone)]
 struct Connection {
@@ -43,6 +44,7 @@ struct RuntimeState {
     child: Mutex<Option<Child>>,
     error: Mutex<String>,
     update: Mutex<Option<DesktopUpdate>>,
+    download_starts: AtomicU64,
     transport: transport::Control,
     generation: AtomicU64,
     pid: AtomicU32,
@@ -142,49 +144,24 @@ fn should_preserve_update(current: &DesktopUpdate, force: bool) -> bool {
 }
 
 fn check_desktop_update_blocking(app: &tauri::AppHandle, force: bool) -> Option<Value> {
-    {
-        let state = app.state::<RuntimeState>();
-        let guard = state.update.lock().unwrap();
-        if let Some(current) = guard.as_ref() {
-            if should_preserve_update(current, force) {
-                return Some(current.json());
-            }
-        }
-    }
-    // 检查失败必须与「没有新版」区分：返回带 check_error 的结构，由前端提示重试。
-    let check_failed =
-        || -> Option<Value> { Some(json!({"check_error": true, "error": "check_failed"})) };
-    let client = match update_client() {
-        Ok(client) => client,
-        Err(_) => return check_failed(),
-    };
-    let response = match client
-        .get(format!(
-            "https://api.github.com/repos/{}/releases/latest",
-            UPDATE_REPO
-        ))
-        .header("User-Agent", "Adaptive-RSI-updater")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-    {
-        Ok(response) => response,
-        Err(_) => return check_failed(),
-    };
-    if !response.status().is_success() {
-        return check_failed();
-    }
-    let release: Value = match response.json() {
-        Ok(value) => value,
-        Err(_) => return check_failed(),
-    };
-    let update = match desktop_release(&release, &app.package_info().version.to_string()) {
-        Ok(update) => update,
-        Err(()) => return check_failed(),
-    };
     let state = app.state::<RuntimeState>();
-    let mut guard = state.update.lock().unwrap();
-    *guard = update;
-    guard.as_ref().map(DesktopUpdate::json)
+    let (preserved, observed) = update_check_race::inspect(&state.update, &state.download_starts,
+        |current| should_preserve_update(current, force).then(|| current.json()));
+    if preserved.is_some() { return preserved; }
+    // All outcomes, including network errors, pass through the same late-result guard.
+    let result = (|| -> Result<Option<DesktopUpdate>, ()> {
+        let client = update_client().map_err(|_| ())?;
+        let response = client
+            .get(format!("https://api.github.com/repos/{}/releases/latest", UPDATE_REPO))
+            .header("User-Agent", "Adaptive-RSI-updater")
+            .header("Accept", "application/vnd.github+json")
+            .send().map_err(|_| ())?;
+        if !response.status().is_success() { return Err(()); }
+        let release: Value = response.json().map_err(|_| ())?;
+        desktop_release(&release, &app.package_info().version.to_string())
+    })().map_err(|()| json!({"check_error": true, "error": "check_failed"}));
+    update_check_race::publish(&state.update, &state.download_starts, observed, result,
+        |current| should_preserve_update(current, force), DesktopUpdate::json)
 }
 
 fn desktop_release(release: &Value, current: &str) -> Result<Option<DesktopUpdate>, ()> {
@@ -262,6 +239,8 @@ fn begin_desktop_download<'a>(
             update.percent.store(0, Ordering::Relaxed);
             update.error.clear();
             update.error_code.clear();
+            update.opened.store(false, Ordering::Relaxed);
+            update_check_race::started(&state.download_starts);
             Ok((
                 update.url.clone(),
                 update.sha_url.clone(),
@@ -415,13 +394,6 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
             .and_then(|output| String::from_utf8(output.stdout).ok())
             .and_then(|text| text.split_whitespace().next().map(str::to_lowercase))
             .unwrap_or_default();
-        {
-            let state = app.state::<RuntimeState>();
-            let mut guard = state.update.lock().unwrap();
-            if let Some(update) = guard.as_mut() {
-                update.downloading.store(false, Ordering::Relaxed);
-            }
-        }
         if digest.is_empty() || digest != expected {
             // A corrupt part must not be resumed on the next attempt.
             let _ = std::fs::remove_file(&part);
@@ -454,6 +426,7 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
             if let Some(update) = guard.as_mut() {
                 update.percent.store(10000, Ordering::Relaxed);
                 update.opened.store(true, Ordering::Relaxed);
+                update.downloading.store(false, Ordering::Relaxed);
             }
         }
         #[cfg(not(target_os = "macos"))]
