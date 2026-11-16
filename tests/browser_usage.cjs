@@ -117,12 +117,12 @@ const {chromium}=require('playwright');
   await page.locator('#project-select').selectOption(otherProject);await page.waitForFunction(()=>!document.getElementById('usage-refresh').disabled);assert.equal(await page.locator('#usage-detail').isVisible(),false);
   resolveDetail();await page.waitForTimeout(100);assert.equal(await page.locator('#usage-detail').isVisible(),false,'a delayed detail must not reopen after the project changes');
   // 明细翻页在途时关闭：响应不能重开弹窗，也不能抢走恢复后的焦点。
-  let holdPage=false,releasePage,pageStarted;
+  let holdPage=false,releasePage,pageStarted,pageFailure=null;
   const paginationRoute=async route=>{
    const params=new URL(route.request().url()).searchParams;
    if(!params.has('task'))return route.fallback();
    const offset=Number(params.get('offset'));
-   if(holdPage&&offset===25){pageStarted();await new Promise(resolve=>releasePage=resolve);}
+   if(holdPage&&offset===25){const failure=pageFailure;pageStarted();await new Promise(resolve=>releasePage=resolve);if(failure==='503')return route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Delayed usage failure'})});if(failure==='json')return route.fulfill({status:200,contentType:'application/json',body:'{invalid'});if(failure==='network')return route.abort('failed');}
    const call={role:'planning',model:'page-'+offset,provider:'fixture',effort:'high',state:'done',created:100,usage_known:true,tokens:1,input_tokens:1,output_tokens:0,cache_read_tokens:0,cache_write_tokens:0,seconds:1,unit:'http_request'};
    await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({roles:[],calls:[call],call_total:30})});
   };
@@ -154,7 +154,25 @@ const {chromium}=require('playwright');
   releasePage();await lateResponse;await page.waitForTimeout(100);
   assert.equal(await dialog.locator('.usage-call').filter({hasText:'page-25'}).count(),0,'old pagination must not overwrite a reopened dialog');
   assert.equal(await dialog.isVisible(),true);
-  await dialog.locator('.close-dialog').click();await page.unroute('**/api/usage?*',paginationRoute);
+  await dialog.locator('.close-dialog').click();
+  // 延迟失败也必须遵守相同的生命周期；有效请求的错误仍交给全局提示。
+  for(const [failure,reopen] of [['503',false],['503',true],['json',true],['network',true]]){
+   await page.evaluate(()=>document.getElementById('toast').hidden=true);
+   holdPage=false;await openDetail.click();await dialog.locator('.usage-call').filter({hasText:'page-0'}).waitFor();
+   pageFailure=failure;holdPage=true;const started=new Promise(resolve=>pageStarted=resolve);await nextPage.click();await started;
+   await dialog.locator('.close-dialog').click();await dialog.waitFor({state:'hidden'});
+   if(reopen){await openDetail.click();await dialog.locator('.usage-call').filter({hasText:'page-0'}).waitFor();}
+   const finished=failure==='network'?page.waitForEvent('requestfailed',request=>new URL(request.url()).searchParams.get('offset')==='25'):page.waitForResponse(response=>new URL(response.url()).searchParams.get('task')&&new URL(response.url()).searchParams.get('offset')==='25');
+   releasePage();await finished;await page.waitForTimeout(150);
+   assert.equal(await page.locator('#toast').isHidden(),true,`${failure} from a stale page must not show a toast (reopen=${reopen})`);
+   assert.equal(await dialog.isVisible(),reopen);
+   if(reopen){assert.equal(await dialog.locator('.usage-call').filter({hasText:'page-0'}).count(),1);await dialog.locator('.close-dialog').click();}
+  }
+  holdPage=false;await openDetail.click();await dialog.locator('.usage-call').filter({hasText:'page-0'}).waitFor();
+  pageFailure='503';holdPage=true;const currentStarted=new Promise(resolve=>pageStarted=resolve);await nextPage.click();await currentStarted;
+  releasePage();await page.locator('#toast').filter({hasText:'操作未完成'}).waitFor();
+  assert.equal(await dialog.isVisible(),true,'current failure must leave the dialog open');
+  await dialog.locator('.close-dialog').click();await page.locator('#toast .toast-close').click();await page.unroute('**/api/usage?*',paginationRoute);
   assert.deepEqual(errors,[]);
   const dstContext=await browser.newContext({timezoneId:'America/New_York'}),dstPage=await dstContext.newPage();const requests=[];
   await dstPage.route('**/api/usage?*',async route=>{
