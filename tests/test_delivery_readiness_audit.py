@@ -226,7 +226,8 @@ class BaselineAndCleanupTest(unittest.TestCase):
             self.assertEqual(intent['repository'], 'example/project')
             self.assertIsNone(self.store.setting('delivery:' + self.run['id']))
             self.assertEqual(len(push_calls), 1)
-            self.assertEqual(push_calls[0], ('push', 'origin', 'HEAD:refs/heads/' + expected_branch))
+            # 推送按已验证提交的 SHA 发起，而不是当时的 HEAD。
+            self.assertEqual(push_calls[0], ('push', 'origin', self.head + ':refs/heads/' + expected_branch))
             self.assertEqual(intent_at_push, [intent])
 
             res = self.publish()
@@ -234,7 +235,7 @@ class BaselineAndCleanupTest(unittest.TestCase):
             self.assertEqual(self.store.setting('delivery:' + self.run['id'])['head'], self.head)
             pr_event = self.store.one("SELECT * FROM events WHERE kind='pr' AND run=?", (self.run['id'],))
             self.assertIsNotNone(pr_event)
-            self.assertEqual({c[2] for c in push_calls}, {'HEAD:refs/heads/' + expected_branch})
+            self.assertEqual({c[2] for c in push_calls}, {self.head + ':refs/heads/' + expected_branch})
 
     def test_publish_refuses_to_push_over_a_journaled_candidate_and_stays_read_only(self):
         self.store.put_setting('delivery-push:' + self.run['id'],

@@ -53,6 +53,14 @@ class RuntimeSafetyTest(unittest.TestCase):
         return (self.runtime.project(self.project), self.store.one("SELECT * FROM tasks WHERE id=?", (task,)),
                 self.store.one("SELECT * FROM runs WHERE id=?", (run["id"],)), workspace, job)
 
+    def record_patch_hash(self, run, workspace):
+        """绑定评估时的补丁哈希：发布只接受与评估一致的工作树。"""
+        _, patch = changes(workspace)
+        result = json.loads(run["result"])
+        result["patch_hash"] = fingerprint(patch)
+        self.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(result), run["id"]))
+        return self.store.one("SELECT * FROM runs WHERE id=?", (run["id"],))
+
     def test_pause_resume_interrupts_inflight_invoke_and_preserves_cancel_retry(self):
         provider = {"id": "fixture_api", "name": "Fixture", "base_url": "https://example.invalid/v1",
                     "protocol": "chat_completions", "env_key": "", "credential": "none"}
@@ -902,6 +910,7 @@ class RuntimeSafetyTest(unittest.TestCase):
 
     def test_pause_during_push_prevents_pr_creation(self):
         project, task, run, workspace, _ = self.candidate()
+        run = self.record_patch_hash(run, workspace)
         with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), run["base"], "main")), \
                 patch("adaptive_rsi.delivery.checked", return_value="[]") as command, \
                 patch("adaptive_rsi.delivery.github_git", side_effect=lambda *args: self.runtime.pause(self.project, True)) as push:
@@ -1018,6 +1027,7 @@ class RuntimeSafetyTest(unittest.TestCase):
         project, task, run, workspace, _ = self.candidate()
         git(workspace, "checkout", "-b", "feat/rsi-" + run["id"])
         changes(workspace)
+        run = self.record_patch_hash(run, workspace)
         def command(args, **kwargs):
             return "[]" if "list" in args else "https://github.com/example/project/pull/1"
         with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), run["base"], "main")), \
