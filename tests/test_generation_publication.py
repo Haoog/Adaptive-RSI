@@ -566,7 +566,8 @@ class PublishedGenerationAdvanceTest(PublicationFixture):
         git(self.repo, 'checkout', '--quiet', 'main')
         (self.repo / 'later.txt').write_text('second baseline advance')
         git(self.repo, 'add', 'later.txt')
-        git(self.repo, 'commit', '--quiet', '-m', 'second advance')
+        git(self.repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost',
+            'commit', '--quiet', '-m', 'second advance')
         current = git(self.repo, 'rev-parse', 'HEAD')
         git(self.remote.bare, 'fetch', str(self.repo), current)
         git(self.remote.bare, 'update-ref', 'refs/heads/main', current)
