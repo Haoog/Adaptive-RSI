@@ -283,7 +283,10 @@ class ServerHardeningTest(unittest.TestCase):
         def small_socket_buffer(handler):
             original_setup(handler)
             handler.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
-            handler.connection.settimeout(.25)
+            # 这个超时同样作用于读取请求本身：0.25s 在并行跑测试、runner 被抢占时
+            # 会让请求还没读完就超时，handler 走不到应答，测试就以「POST 响应未开始」
+            # 偶发失败。放宽到 2s 给读取留出余量，写仍然会在背压下超时收尾。
+            handler.connection.settimeout(2)
             handler.wfile = ObservedWriter(handler.wfile)
 
         def observe_response(handler, *args, **kwargs):
