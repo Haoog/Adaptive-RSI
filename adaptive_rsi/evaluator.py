@@ -823,12 +823,13 @@ def freeze_harness(baseline, target, checks=(), state=None):
     return sorted(protected, key=str)
 
 
-def _added_test_files(candidate):
+def _added_test_files(candidate, baseline=None):
     try:
-        raw = git(candidate, "diff", "HEAD", "--diff-filter=A", "--name-only", "-z")
+        base = git(baseline, "rev-parse", "HEAD") if baseline and _is_repository(baseline) else "HEAD"
+        raw = git(candidate, "diff", base, "--diff-filter=A", "--name-only", "-z")
         untracked = git(candidate, "ls-files", "--others", "--exclude-standard", "-z")
     except RuntimeError:
-        return []
+        return None
     return sorted({path for path in (raw + "\0" + untracked).split("\0") if path and test_path(path)})
 
 
@@ -1690,32 +1691,22 @@ class Evaluator:
             report_state["execution_environment"] = execution_identity
         if changed_files is None:
             changed_files = _changed_files(candidate)
-            if changed_files is None:
-                # Failed worktree inspection cannot see uncommitted edits, so
-                # committed history cannot complete the delta: reusing the
-                # frozen harness on a nonempty committed diff would ignore
-                # unknown worktree changes. Report unavailable evidence when a
-                # repository exists; without one the executed harness files are
-                # compared below instead.
-                if _is_repository(candidate):
-                    changed_files = False
-            elif not changed_files and _is_repository(candidate):
-                # A clean snapshot hides committed edits; committed history
-                # decides between a proven empty set and unavailable evidence.
-                committed = _committed_changes(baseline, candidate)
-                if committed is False:
-                    changed_files = False
-                else:
-                    changed_files = committed
-        elif not changed_files and _is_repository(baseline) and _is_repository(candidate):
-            # A clean snapshot reports no working-tree delta even when the
-            # candidate committed test or harness edits; compare committed
-            # history so frozen regression evidence cannot be reused.
-            committed = _committed_changes(baseline, candidate)
-            if committed:
-                changed_files = committed
-            elif committed is False:
+            if changed_files is None and _is_repository(candidate):
+                # Committed history cannot recover an unreadable worktree delta.
                 changed_files = False
+            elif not changed_files and _is_repository(candidate) and not _is_repository(baseline):
+                # A clean repository alone does not prove equality with a tree
+                # whose baseline commit cannot be identified.
+                changed_files = False
+        if changed_files is not False and _is_repository(baseline) and _is_repository(candidate):
+            # A candidate may contain both committed and uncommitted changes.
+            # The supplied/discovered worktree paths cannot establish that the
+            # committed part left the baseline harness untouched.
+            committed = _committed_changes(baseline, candidate)
+            if committed is False:
+                changed_files = False
+            elif committed:
+                changed_files = sorted(set(changed_files or ()) | set(committed))
         if changed_files is False:
             # Diff and committed history were both unavailable: the frozen
             # baseline harness may not be reused, and checks cannot prove a
@@ -1724,7 +1715,11 @@ class Evaluator:
                 "decision": "insufficient_evidence",
                 "reason": "Changed-file evidence is unavailable; harness freeze provenance cannot be established",
                 "changed_files_available": False, "checks": {}})
-        added_tests = _added_test_files(candidate) if test_first else []
+        added_tests = _added_test_files(candidate, baseline) if test_first else []
+        if added_tests is None:
+            return _write_report(directory, {
+                "decision": "insufficient_evidence",
+                "reason": "Added-test evidence is unavailable", "checks": {}})
         existing_test_files = ([path for path in git(baseline, "ls-files", "-z").split("\0") if path and test_path(path)]
                                if test_first else [])
         existing_test_symbols = ({symbol for path in existing_test_files

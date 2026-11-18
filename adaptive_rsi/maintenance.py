@@ -10,6 +10,7 @@ import zlib
 from pathlib import Path
 import os
 import stat
+from contextlib import ExitStack
 
 
 CLEANUP_NAMES = ("workspace", "candidate", "baseline", "evaluation", "experiments",
@@ -217,10 +218,14 @@ def retention_hold(store, run_id, project):
     Every removal entry point uses this check.  An unreadable value counts as a
     hold, so a corrupt setting can never unlock deletion of retained evidence.
     """
-    for key in ('legal-hold:' + run_id, 'legal-hold-project:' + project):
-        if _cleanup_hold(store, key):
-            return key
-    return None
+    from .generation_retention import Evidence, authorization
+    with store.connect() as db:
+        generation_managed = bool(Evidence(db, run_id))
+    if generation_managed:
+        return None if authorization(store, run_id, project) is not None else 'delivery-generation:' + run_id
+    with store.connect() as db:
+        db.execute('BEGIN')
+        return _held_in_transaction(db, run_id, project)
 
 
 def _legal_hold_guard(alias):
@@ -234,7 +239,15 @@ def _legal_hold_guard(alias):
     return ("AND NOT EXISTS (SELECT 1 FROM settings AS held WHERE "
             "held.key IN ('legal-hold:'||%s.id, 'legal-hold-project:'||%s.project) "
             "AND CASE WHEN json_valid(held.value) THEN json_type(held.value)='false' "
-            "ELSE 0 END=0) " % (alias, alias))
+            "ELSE 0 END=0) " % (alias, alias) +
+            "AND NOT EXISTS (SELECT 1 FROM settings g WHERE g.key='delivery-generation:'||%s.id "
+            "OR (g.key>='delivery-generation-history:'||%s.id||':' "
+            "AND g.key<'delivery-generation-history:'||%s.id||':~') "
+            "OR g.key='delivery-generation-pr:'||%s.id "
+            "OR (g.key>='delivery-generation-preparing:'||%s.id||':' "
+            "AND g.key<'delivery-generation-preparing:'||%s.id||';') "
+            "OR (g.key>='delivery-generation-history-proof:'||%s.id||':' "
+            "AND g.key<'delivery-generation-history-proof:'||%s.id||';')) " % ((alias,) * 8))
 
 
 def _remove_owned_tree(parent, name):
@@ -343,6 +356,10 @@ def _held_in_transaction(db, run_id, project):
     transaction ends.  An unreadable value counts as a hold, exactly like
     retention_hold, so a corrupt setting can never unlock retained evidence.
     """
+    from .generation_retention import Evidence
+    # The legacy path cannot validate generation evidence under a write lock.
+    if Evidence(db, run_id):
+        return 'delivery-generation:' + run_id
     for key in ('legal-hold:' + run_id, 'legal-hold-project:' + project):
         row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
         if row is None:
@@ -365,22 +382,27 @@ def _run_directory_settled(directory):
     it; detaching first would orphan it behind ``path IS NOT NULL``.
     """
     try:
-        entries = list(os.scandir(directory))
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name not in RETAINED_RUN_ARTIFACTS:
+                    return False
+                if not entry.is_file(follow_symlinks=False):
+                    return False
     except FileNotFoundError:
         return True
-    for entry in entries:
-        if entry.name not in RETAINED_RUN_ARTIFACTS:
-            return False
-        try:
-            if not entry.is_file(follow_symlinks=False):
-                return False
-        except OSError:
-            return False
+    except OSError:
+        return False
     return True
 
 
-def _remove_run_artifacts(store, run_id, project, directory, stored=None):
-    """Delete a finished run's own artifacts, one write transaction per artifact.
+def _remove_run_artifacts(store, run_id, project, directory, stored=None, snapshot=None):
+    """Delete finished artifacts, with bounded steps for generation-managed runs.
+
+    Maintenance pins original directory identities during its initial path
+    check and passes them here; direct callers pin at this entry point. Both
+    carry the same descriptors through every deletion. Their traversal is outside write transactions;
+    each filesystem mutation has its own authorization transaction. The legacy
+    path below retains its per-artifact behavior.
 
     Re-reading the legal hold under BEGIN IMMEDIATE serialises the check with
     the unlink/rmdir it authorises: a hold committed first stops the remaining
@@ -394,6 +416,24 @@ def _remove_run_artifacts(store, run_id, project, directory, stored=None):
     ``stored`` is the exact runs.path value from the database, which may differ
     from the resolved ``directory`` by a symlink layer (e.g. /var on macOS).
     """
+    from .generation_retention import Evidence, remove_run_artifacts, DirectorySnapshot
+    # The generation path uses bounded mutations with separate authorization
+    # transactions; never call it from inside the legacy recursive transaction.
+    with store.connect() as db:
+        generation_managed = bool(Evidence(db, run_id))
+    if generation_managed:
+        own_snapshot = snapshot is None
+        try:
+            if own_snapshot:
+                snapshot = DirectorySnapshot(store, run_id)
+            return remove_run_artifacts(store, run_id, project, directory, snapshot, stored)
+        except OSError:
+            return False
+        finally:
+            if own_snapshot and snapshot is not None:
+                snapshot.close()
+    if (directory / 'generations').exists() or (directory / 'generations').is_symlink():
+        return False
     for name in CLEANUP_NAMES + RUN_FILE_ARTIFACTS:
         target = directory / name
         if target.is_symlink():
@@ -565,6 +605,7 @@ class Maintenance:
                 "Maintenance degraded evidence persistence failed")
 
     def maintenance(self):
+        from .generation_retention import MAX_RECORD_BYTES
         now = time.time()
         if now - self.store.setting("maintenance-last", 0) < MAINTENANCE_INTERVAL:
             return
@@ -585,8 +626,8 @@ class Maintenance:
                 # 匹配跳过；运维修正 path 后标记失配，该运行自动回到清理候选。
                 # 符号链接等文件系统条件可在 path 不变时变化，因此只屏蔽一个
                 # 重验窗口：超窗标记回到候选，仍不安全则重新标记，恢复则清除。
-                for run in self.store.query(
-                        "SELECT id,path,state,task,result FROM runs WHERE project=? AND ended<? AND path IS NOT NULL "
+                for run in self.store.stream(
+                        "SELECT id,path,state,task FROM runs WHERE project=? AND ended<? AND path IS NOT NULL "
                         "AND NOT EXISTS (SELECT 1 FROM settings WHERE key='retention_path_rejected:' || runs.id "
                         "AND json_valid(value) AND json_extract(value,'$.path')=runs.path "
                         "AND json_extract(value,'$.rejected')>?)",
@@ -594,68 +635,79 @@ class Maintenance:
                     if getattr(self, "maintenance_stop", None) and self.maintenance_stop.is_set():
                         return
                     with self.scheduler_scope("maintenance_run", project["id"], run["id"]):
-                        with self.dispatch_lock:
-                            run = self.store.one("SELECT id,path,state,task,result FROM runs WHERE id=? AND ended<?",
-                                                 (run["id"], cutoff))
-                            if not run or not run["path"]:
-                                continue
-                            # 保留标记与手动清理共享同一判断；损坏值按已保留处理。
-                            if retention_hold(self.store, run["id"], project["id"]):
-                                continue
-                            if (run["state"] == "pr_open" or run["state"] == "merged" and not _merged_monitoring_completed(run["result"]) or
-                                    self.store.one("SELECT 1 FROM tasks WHERE project=? AND source='system_publish' AND body=? "
-                                                   "AND state IN ('queued','planning','executing','evaluating','waiting_budget')",
-                                                   (project["id"], run["id"]))):
-                                continue
-                            # 存储的 path 与 store.root 可能相差一层 OS 符号链接（如 macOS
-                            # /var→/private/var），但 store.root 内部不允许任何符号链接：
-                            # runs 目录或运行目录为链接时按越界拒绝，存疑路径保留不修。
-                            directory = Path(run["path"])
-                            runs_root = self.store.root / "runs"
-                            # runs_root 自身是环境故障（或为链接、或 stat 失败），影响全部运行，
-                            # 仍走 scheduler_error 周期性重试；目录不可读时的 OSError 同样冒泡。
-                            if runs_root.is_symlink():
-                                raise ValueError("Unsafe retention run path")
-                            # 以下拒绝只由该行数据决定，属确定性拒绝：写运维证据后跳过本运行，
-                            # 下个周期由 SQL 预检过滤，不再每小时重复 scheduler_error。
-                            if (directory.is_symlink() or
-                                    Path(run["id"]).parts != (run["id"],) or run["id"] in (".", "..") or
-                                    directory.name != run["id"]):
-                                self._reject_retention_path(run, project["id"], directory, "unsafe run path")
-                                continue
-                            inside = directory.parent.resolve() == runs_root
-                            if not inside:
-                                self._reject_retention_path(run, project["id"], directory, "outside runs root")
-                                continue
-                            directory = runs_root / run["id"]
-                            # 到达这里说明路径本轮已通过全部文件系统检查：清理同一 path
-                            # 的过期拒绝标记，让修复后的运行不再被旧证据挡住。仅删过期
-                            # 标记；新鲜标记（刚由本轮或并发轮写入）原样保留。
-                            self.store.execute(
-                                "DELETE FROM settings WHERE key=? AND json_valid(value) "
-                                "AND json_extract(value,'$.path')=? AND json_extract(value,'$.rejected')<=?",
-                                ("retention_path_rejected:" + run["id"], run["path"], revalidate))
-                            if run["state"] == "awaiting_approval":
-                                with self.store.connect() as db:
-                                    db.execute("BEGIN IMMEDIATE")
-                                    db.execute("UPDATE runs SET state='expired' WHERE id=?", (run["id"],))
-                                    db.execute("UPDATE tasks SET state='expired' WHERE id=? AND state='awaiting_approval'", (run["task"],))
-                        # Publication admission is now closed for this expired candidate.
-                        # 删除仍不持有调度/配置锁，但每个工件在各自的 BEGIN IMMEDIATE 内
-                        # 用同一连接重查 hold：预检后提交的 hold 会阻止余下删除，删除期间
-                        # 的 hold 写入会等到该事务结束后才提交。
-                        # 单个运行删除失败（EACCES、只读挂载、网络文件系统错误）
-                        # 不阻塞同批其他运行；path 保留，下一轮自然重试。
-                        try:
-                            _remove_run_artifacts(self.store, run["id"], project["id"], directory,
-                                                  stored=run["path"])
-                        except (OSError, sqlite3.Error) as exc:
-                            degraded.append({"run": run["id"], "project": project["id"],
-                                             "error_type": type(exc).__name__,
-                                             "message": str(exc)[:200]})
-                            logging.getLogger(__name__).warning(
-                                "Maintenance kept run %s for retry (%s: %s)",
-                                run["id"], type(exc).__name__, exc)
+                        if retention_hold(self.store, run["id"], project["id"]):
+                            continue
+                        # A merged result may itself contain large evaluation
+                        # output. Load at most one bounded result and parse it
+                        # outside dispatch_lock, never all candidate results.
+                        observed = self.store.one(
+                            "SELECT state,CASE WHEN length(CAST(result AS BLOB))<=? THEN result END AS result "
+                            "FROM runs WHERE id=?", (MAX_RECORD_BYTES, run["id"]))
+                        monitoring = bool(observed and observed["state"] == "merged" and
+                                          _merged_monitoring_completed(observed["result"]))
+                        with ExitStack() as descriptors:
+                            with self.dispatch_lock:
+                                run = self.store.one("SELECT id,path,state,task FROM runs WHERE id=? AND ended<?",
+                                                     (run["id"], cutoff))
+                                if not run or not run["path"]:
+                                    continue
+                                if (run["state"] == "pr_open" or run["state"] == "merged" and not monitoring or
+                                        self.store.one("SELECT 1 FROM tasks WHERE project=? AND source='system_publish' AND body=? "
+                                                       "AND state IN ('queued','planning','executing','evaluating','waiting_budget')",
+                                                       (project["id"], run["id"]))):
+                                    continue
+                                # 存储的 path 与 store.root 可能相差一层 OS 符号链接（如 macOS
+                                # /var→/private/var），但 store.root 内部不允许任何符号链接：
+                                # runs 目录或运行目录为链接时按越界拒绝，存疑路径保留不修。
+                                directory = Path(run["path"])
+                                runs_root = self.store.root / "runs"
+                                # runs_root 自身是环境故障（或为链接、或 stat 失败），影响全部运行，
+                                # 仍走 scheduler_error 周期性重试；目录不可读时的 OSError 同样冒泡。
+                                if runs_root.is_symlink():
+                                    raise ValueError("Unsafe retention run path")
+                                # 以下拒绝只由该行数据决定，属确定性拒绝：写运维证据后跳过本运行，
+                                # 下个周期由 SQL 预检过滤，不再每小时重复 scheduler_error。
+                                if (directory.is_symlink() or
+                                        Path(run["id"]).parts != (run["id"],) or run["id"] in (".", "..") or
+                                        directory.name != run["id"]):
+                                    self._reject_retention_path(run, project["id"], directory, "unsafe run path")
+                                    continue
+                                inside = directory.parent.resolve() == runs_root
+                                if not inside:
+                                    self._reject_retention_path(run, project["id"], directory, "outside runs root")
+                                    continue
+                                directory = runs_root / run["id"]
+                                from .generation_retention import DirectorySnapshot
+                                snapshot = DirectorySnapshot(self.store, run["id"])
+                                descriptors.callback(snapshot.close)
+                                # 到达这里说明路径本轮已通过全部文件系统检查：清理同一 path
+                                # 的过期拒绝标记，让修复后的运行不再被旧证据挡住。仅删过期
+                                # 标记；新鲜标记（刚由本轮或并发轮写入）原样保留。
+                                self.store.execute(
+                                    "DELETE FROM settings WHERE key=? AND json_valid(value) "
+                                    "AND json_extract(value,'$.path')=? AND json_extract(value,'$.rejected')<=?",
+                                    ("retention_path_rejected:" + run["id"], run["path"], revalidate))
+                                if run["state"] == "awaiting_approval":
+                                    with self.store.connect() as db:
+                                        db.execute("BEGIN IMMEDIATE")
+                                        db.execute("UPDATE runs SET state='expired' WHERE id=?", (run["id"],))
+                                        db.execute("UPDATE tasks SET state='expired' WHERE id=? AND state='awaiting_approval'", (run["task"],))
+                            # Publication admission is now closed for this expired candidate.
+                            # 删除仍不持有调度/配置锁，但每个工件在各自的 BEGIN IMMEDIATE 内
+                            # 用同一连接重查 hold：预检后提交的 hold 会阻止余下删除，删除期间
+                            # 的 hold 写入会等到该事务结束后才提交。
+                            # 单个运行删除失败（EACCES、只读挂载、网络文件系统错误）
+                            # 不阻塞同批其他运行；path 保留，下一轮自然重试。
+                            try:
+                                _remove_run_artifacts(self.store, run["id"], project["id"], directory,
+                                                      stored=run["path"], snapshot=snapshot)
+                            except (OSError, sqlite3.Error) as exc:
+                                degraded.append({"run": run["id"], "project": project["id"],
+                                                 "error_type": type(exc).__name__,
+                                                 "message": str(exc)[:200]})
+                                logging.getLogger(__name__).warning(
+                                    "Maintenance kept run %s for retry (%s: %s)",
+                                    run["id"], type(exc).__name__, exc)
                 # Freeze promotion/rollback while choosing and deleting retired candidates.
                 with self.store.connect() as db:
                     db.execute("BEGIN IMMEDIATE")
@@ -668,6 +720,10 @@ class Maintenance:
                     for candidate in archive[config["evolution"]["archive_limit"]:]:
                         if candidate["id"] not in referenced:
                             db.execute("DELETE FROM candidates WHERE id=? AND status NOT IN ('stable','evaluating')", (candidate["id"],))
+        from .generation_retention import retire_settings
+        # Full generation proof remains available until both the disk cleanup
+        # and the existing 90-day settings retention window have completed.
+        retire_settings(self.store, now)
         # 数据保留：清理过期技能、已结束运行的派生数据及其 settings 键；
         # 每类带 LIMIT，首次升级后由后续周期逐步追平历史积压。
         stale = now - 90 * 86400
@@ -702,7 +758,8 @@ class Maintenance:
         # legal hold 同样保留全部派生证据键（基线、推送、合并意图、交付），
         # 只有显式 JSON false 解除。
         # 已清理的运行不能继续占据 LIMIT，否则后续周期永远无法排空积压。
-        prefixes = ("run-baseline:", "automation:", "delivery:", "merge-intent:", "delivery-push:")
+        prefixes = ("run-baseline:", "automation:", "delivery:", "merge-intent:", "delivery-push:",
+                    "delivery-candidate:")
         # 在一致读快照中按索引扫描键；最长匹配的运行 ID 拥有该键。
         runs = set()
         with self.store.connect() as db:

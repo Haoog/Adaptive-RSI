@@ -33,7 +33,9 @@ CHECKS = [{"name": "real unittest regression", "cwd": ".", "argv": ["python3", "
 
 def fixture(root):
     root.mkdir(exist_ok=True)
-    checked(["git", "init", "--quiet", str(root)])
+    # 显式指定分支名：测试与交付流程假定 main，不能依赖 runner 的
+    # init.defaultBranch 配置（macOS 本机是 main，CI 上可能是 master）。
+    checked(["git", "init", "--quiet", "--initial-branch=main", str(root)])
     (root / "calculator.py").write_text("def add(a, b):\n    return a - b\n")
     (root / "tests").mkdir()
     (root / "tests/test_calculator.py").write_text(

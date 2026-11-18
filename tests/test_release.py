@@ -2037,7 +2037,10 @@ class WorkflowConfigurationTest(unittest.TestCase):
         workflow = self.workflow("checks.yml")
         jobs = workflow["jobs"]
         self.assertEqual(jobs["python"]["runs-on"], "${{ matrix.os }}")
-        self.assertTrue(all(item["os"] == "ubuntu-latest" for item in jobs["python"]["strategy"]["matrix"]["include"]))
+        # 3.9 需要固定在 24.04（ubuntu-latest 已切到 26.04，没有 3.9 构建），
+        # 其余条目仍跟随 ubuntu-latest。
+        self.assertTrue(all(item["os"].startswith("ubuntu-")
+                            for item in jobs["python"]["strategy"]["matrix"]["include"]))
         self.assertEqual(jobs["browser"]["runs-on"], "macos-latest")
         self.assertEqual(jobs["macos_sandbox_core"]["runs-on"], "macos-latest")
         self.assertEqual(jobs["macos_sandbox_flows"]["runs-on"], "macos-latest")

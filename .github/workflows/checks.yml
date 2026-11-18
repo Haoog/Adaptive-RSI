@@ -93,7 +93,8 @@ jobs:
       matrix:
         include:
           - name: Python 3.9 兼容
-            os: ubuntu-latest
+            # ubuntu-latest 已切到 26.04，setup-python 没有 3.9 构建；固定在 24.04。
+            os: ubuntu-24.04
             python: '3.9'
             modules: tests.test_comprehensive_audit tests.test_store tests.test_usage_report tests.test_updates_recovery tests.test_auth_sessions tests.test_server_hardening tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability tests.test_config_history
           - name: Python 3.14 兼容
@@ -108,7 +109,7 @@ jobs:
             modules: tests.test_runtime.RuntimeTest
           - name: 交接审计补齐
             os: ubuntu-latest
-            modules: tests.test_audit_environment tests.test_audit_evaluation tests.test_audit_evolution tests.test_batch_planning tests.test_cleanup_recovery tests.test_delivery_readiness_audit tests.test_desktop_update_boundaries tests.test_frontend_capabilities tests.test_native_audit_contracts tests.test_runtime_handoff tests.test_storage_acceptance
+            modules: tests.test_audit_environment tests.test_audit_evaluation tests.test_issue_480_safety tests.test_audit_evolution tests.test_batch_planning tests.test_cleanup_recovery tests.test_delivery_readiness_audit tests.test_desktop_update_boundaries tests.test_frontend_capabilities tests.test_native_audit_contracts tests.test_runtime_handoff tests.test_storage_acceptance
           - name: 运行时适配与服务
             os: ubuntu-latest
             modules: tests.test_runtime.ConfigurationAndAdapterTest tests.test_runtime.ServerTest
@@ -117,10 +118,10 @@ jobs:
             modules: tests.test_runtime_safety tests.test_sandbox_docker_command tests.test_scheduler_isolation tests.test_schedule_consistency tests.test_experience tests.test_workflow_experience
           - name: 交付循环
             os: ubuntu-latest
-            modules: tests.test_delivery_loop tests.test_superseded_delivery_recovery tests.test_pr_feedback_context
+            modules: tests.test_delivery_loop tests.test_delivery_generation tests.test_generation_publication tests.test_generation_retention tests.test_delivery_replay_checks tests.test_superseded_delivery_recovery tests.test_pr_feedback_context
           - name: 发布与数据
             os: ubuntu-latest
-            modules: tests.test_audit_ledger tests.test_error_details tests.test_blocking_causes tests.test_history_budget tests.test_resource_pressure tests.test_resource_priority tests.test_deployment_observation tests.test_release tests.test_release_parallel tests.test_validation_planning tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening tests.test_store tests.test_comprehensive_audit tests.test_audit_round3 tests.test_audit_round4 tests.test_audit_round5 tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability tests.test_config_history
+            modules: tests.test_audit_ledger tests.test_error_details tests.test_blocking_causes tests.test_history_budget tests.test_resource_pressure tests.test_resource_priority tests.test_deployment_observation tests.test_release tests.test_release_parallel tests.test_validation_planning tests.test_release_endpoints tests.test_delivery_binding tests.test_release_smoke tests.test_data_hardening tests.test_store tests.test_comprehensive_audit tests.test_audit_round3 tests.test_audit_round4 tests.test_audit_round5 tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability tests.test_config_history
           - name: 模型与可靠性
             os: ubuntu-latest
             modules: tests.test_model_center tests.test_reliability tests.test_recovery tests.test_task_value_feedback tests.test_tool_artifacts
@@ -137,6 +138,14 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python || '3.12' }}
+      - name: 预热 Docker 沙箱镜像
+        # 交付链的集成测试会真的在沙箱里跑检查；镜像没预热时 process.Sandbox
+        # 会按设计拒绝执行，测试会以 RuntimeError 失败而不是跳过。
+        run: |
+          if docker info >/dev/null 2>&1; then
+            docker image inspect python:3.12-slim >/dev/null 2>&1 ||
+              docker pull --quiet python:3.12-slim
+          fi
       - run: python3 -m unittest -v ${{ matrix.modules }}
 
   quick_python:

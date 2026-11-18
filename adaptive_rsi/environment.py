@@ -96,6 +96,20 @@ def dependencies(source, config):
     return {"bytes": size, "sha256": digest.hexdigest()}
 
 
+def frozen_dependencies(source, config):
+    """Identify run-owned frozen seeds, without Git discovery or scrubbing."""
+    source = Path(source).resolve()
+    digest, size = hashlib.sha256(SEED_DIGEST_PREFIX), 0
+    maximum = config["environment"]["max_seed_mb"] * 1024 * 1024
+    for relative in config["environment"]["seed_paths"]:
+        path = (source / relative).resolve()
+        path.relative_to(source)
+        if not path.is_dir():
+            raise RuntimeError("Frozen dependency directory missing: " + relative)
+        size = _seed_identity(digest, _seed_list(path, relative), maximum, size)
+    return {"bytes": size, "sha256": digest.hexdigest()}
+
+
 def capture(source, destination, config):
     """Freeze explicitly selected, untracked dependencies outside candidate write access.
 

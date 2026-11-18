@@ -26,6 +26,7 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
         self.prepare()
         pr = {'url': self.url, 'state': 'OPEN', 'headRefOid': self.head,
               'headRefName': 'feat/rsi-' + self.run['id'], 'baseRefName': 'main',
+              'headRepository': {'nameWithOwner': 'example/project'},
               'headRepositoryOwner': {'login': 'example'}}
         before = self.store.one('SELECT * FROM tasks WHERE id=?', (self.task['id'],))
         with patch.object(delivery, 'checked', return_value=json.dumps([pr])) as command, \
@@ -46,6 +47,7 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
         self.prepare()
         pr = {'url': self.url, 'state': 'OPEN', 'headRefOid': self.head,
               'headRefName': 'feat/rsi-' + self.run['id'], 'baseRefName': 'main',
+              'headRepository': {'nameWithOwner': 'example/project'},
               'headRepositoryOwner': {'login': 'example'}}
         with patch.object(delivery, 'checked', side_effect=[json.dumps([]), json.dumps([pr])]) as command:
             delivery.tick(self.runtime, now=10000000000, project_id=self.project)
@@ -63,6 +65,7 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
                            (json.dumps({'delivery_recovery_checked': True}), self.run['id']))
         pr = {'url': self.url, 'state': 'MERGED', 'headRefOid': self.head,
               'headRefName': 'feat/rsi-' + self.run['id'], 'baseRefName': 'main',
+              'headRepository': {'nameWithOwner': 'example/project'},
               'headRepositoryOwner': {'login': 'example'}}
         with patch.object(delivery, 'checked', return_value=json.dumps([pr])):
             delivery.schedule(self.runtime, now=10000000000)
@@ -80,6 +83,7 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
         merged_sha = 'c' * 40
         pr = {'url': self.url, 'state': 'MERGED', 'headRefOid': self.head,
               'headRefName': 'feat/rsi-' + self.run['id'], 'baseRefName': 'main',
+              'headRepository': {'nameWithOwner': 'example/project'},
               'headRepositoryOwner': {'login': 'example'}, 'mergeCommit': {'oid': merged_sha}}
         with patch.object(delivery, 'checked', return_value=json.dumps([pr])):
             delivery.tick(self.runtime, now=10000000000, project_id=self.project)
@@ -101,7 +105,8 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
     def test_no_pr_or_mismatched_pr_waits_without_remote_writes(self):
         for records in ([], [{'url': 'https://evil.test/pull/1', 'state': 'OPEN',
                               'headRefOid': self.head, 'headRefName': 'feat/rsi-' + self.run['id'],
-                              'baseRefName': 'main', 'headRepositoryOwner': {'login': 'example'}}]):
+                              'baseRefName': 'main', 'headRepository': {'nameWithOwner': 'example/project'},
+              'headRepositoryOwner': {'login': 'example'}}]):
             with self.subTest(records=records):
                 self.prepare()
                 self.store.execute('UPDATE runs SET result=? WHERE id=?', (self.run['result'], self.run['id']))
@@ -121,7 +126,8 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
                 self.store.execute('UPDATE runs SET result=? WHERE id=?', (self.run['result'], self.run['id']))
                 pr = {'url': self.url, 'state': state, 'headRefOid': self.head,
                       'headRefName': 'feat/rsi-' + self.run['id'], 'baseRefName': 'main',
-                      'headRepositoryOwner': {'login': 'example'}}
+                      'headRepository': {'nameWithOwner': 'example/project'},
+              'headRepositoryOwner': {'login': 'example'}}
                 with patch.object(delivery, 'checked', return_value=json.dumps([pr])) as command:
                     delivery.tick(self.runtime, now=10000000000, project_id=self.project)
                     delivery.tick(self.runtime, now=10000000100, project_id=self.project)
@@ -135,6 +141,7 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
         self.prepare()
         pr = {'url': self.url, 'state': 'OPEN', 'headRefOid': self.head,
               'headRefName': 'feat/rsi-' + self.run['id'], 'baseRefName': 'main',
+              'headRepository': {'nameWithOwner': 'example/project'},
               'headRepositoryOwner': {'login': 'example'}}
         with patch.object(delivery, 'checked', side_effect=[RuntimeError('offline'), json.dumps([pr])]) as command:
             delivery.tick(self.runtime, now=10000000000, project_id=self.project)
@@ -153,6 +160,7 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
         self.prepare()
         pr = {'url': self.url, 'state': 'OPEN', 'headRefOid': self.head,
               'headRefName': 'feat/rsi-' + self.run['id'], 'baseRefName': 'main',
+              'headRepository': {'nameWithOwner': 'example/project'},
               'headRepositoryOwner': {'login': 'example'}}
         before = self.store.one('SELECT * FROM tasks WHERE id=?', (self.task['id'],))
         with patch.object(delivery, 'checked', return_value=json.dumps([pr])):
@@ -177,6 +185,7 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
         self.pending_close()
         pr = {'url': self.url, 'state': 'OPEN', 'headRefOid': self.head,
               'headRefName': 'feat/rsi-' + self.run['id'], 'baseRefName': 'main',
+              'headRepository': {'nameWithOwner': 'example/project'},
               'headRepositoryOwner': {'login': 'example'}}
         now = 10000000000
         with patch.object(delivery, 'CLOSE_ATTEMPT_LIMIT', 3), \
@@ -252,6 +261,7 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
         self.prepare()
         pr = {'url': self.url, 'state': 'OPEN', 'headRefOid': self.head,
               'headRefName': 'feat/rsi-' + self.run['id'], 'baseRefName': 'main',
+              'headRepository': {'nameWithOwner': 'example/project'},
               'headRepositoryOwner': {'login': 'example'}}
         with patch.object(delivery, 'RECOVERY_ATTEMPT_LIMIT', 2), \
                 patch.object(delivery, 'checked', side_effect=['[]', json.dumps([pr])]) as command:
@@ -332,6 +342,7 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
         self.prepare()
         pr = {'url': self.url, 'state': 'OPEN', 'headRefOid': self.head,
               'headRefName': 'feat/rsi-' + self.run['id'], 'baseRefName': 'main',
+              'headRepository': {'nameWithOwner': 'example/project'},
               'headRepositoryOwner': {'login': 'example'}}
         with patch.object(delivery, 'checked', return_value=json.dumps([pr])):
             delivery.tick(self.runtime, now=10000000000, project_id=self.project)
@@ -342,3 +353,20 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
             delivery.tick(self.runtime, now=10000000100, project_id=self.project)
             command.assert_not_called()
         self.assertTrue(json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])['close_pending'])
+
+
+    def test_same_owner_other_repository_and_old_response_fail_closed(self):
+        for source in ({'nameWithOwner': 'example/other-fork'}, None):
+            with self.subTest(source=source):
+                self.prepare()
+                self.store.execute('UPDATE runs SET result=? WHERE id=?', (self.run['result'], self.run['id']))
+                pr = {'url': self.url, 'state': 'OPEN', 'headRefOid': self.head,
+                      'headRefName': 'feat/rsi-' + self.run['id'], 'baseRefName': 'main',
+                      'headRepositoryOwner': {'login': 'example'}}
+                if source is not None:
+                    pr['headRepository'] = source
+                with patch.object(delivery, 'checked', return_value=json.dumps([pr])):
+                    delivery.tick(self.runtime, now=10000000000, project_id=self.project)
+                result = json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])
+                self.assertNotIn('pr', result)
+                self.store.put_setting('delivery-tick:' + self.project, 0)

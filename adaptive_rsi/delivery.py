@@ -5,7 +5,7 @@ import re
 import time
 from pathlib import Path
 
-from .config import merge
+from .config import fingerprint, merge
 from .gitops import git, origin_repository, snapshot
 from .process import Cancelled, ProcessError, checked
 from .store import encode, uid
@@ -547,6 +547,37 @@ def update_behind(runtime, project, run, outcome, policy, repo, now, pr, cancell
     被改写、冲突或退避用尽为 stale，交回关闭重排路径。
     """
     store = runtime.store
+    if store.one('SELECT 1 FROM settings WHERE key=?', ('delivery-generation:' + run['id'],)):
+        # A new tree needs a new run's full evaluation and approval. The caller
+        # admits this path only with auto-merge authority; reuse its bounded
+        # stale/close/requeue flow rather than parking the published replay.
+        if cancelled() or runtime.project(project['id'])['paused']:
+            return 'waiting'
+        live = runtime.config(project['id'])
+        live_run = store.one('SELECT * FROM runs WHERE id=?', (run['id'],))
+        if (not live_run or live_run['state'] != 'pr_open' or
+                not _dict_field(_json_object(live_run['config']), 'delivery').get('auto_merge') or
+                not live['delivery']['auto_merge'] or live['delivery']['mode'] != 'pr' or
+                live['github']['repository'] != repo):
+            return 'waiting'
+        intent = store.setting('delivery-push:' + run['id'])
+        if (not isinstance(intent, dict) or
+                not _update_pr_identity(pr, repo, policy['branch'], intent.get('branch'), policy['head'])):
+            outcome['delivery_update_blocked'] = 'Published generation PR identity differs'
+            return 'waiting'
+        # 密封首次已验证的目标；后续 tick 和关闭前不得重新绑定身份。
+        outcome['generation_replan_target'] = {
+            'policy': policy, 'intent': intent,
+            'baseline': store.setting('run-baseline:' + run['id']),
+            'generation': fingerprint(store.setting('delivery-generation:' + run['id'])),
+            'candidate': fingerprint(store.setting('delivery-candidate:' + run['id'])),
+            'base_branch': live['delivery']['base_branch'], 'pr': outcome.get('pr')}
+        outcome['generation_replan'] = True
+        outcome['delivery_stale'] = stale_reason(pr, policy, live['delivery']['base_branch'])
+        store.event('delivery_generation_stale',
+                    'Published generation baseline advanced; full reevaluation and approval required',
+                    project['id'], run['id'])
+        return 'stale'
     workspace = Path(store.root) / "runs" / run["id"] / "candidate"
     if not workspace.is_dir():
         if store.setting("delivery-update:" + run["id"]):
@@ -837,20 +868,33 @@ def publish(runtime, project, task, run, workspace, config):
         authorization = json.loads(approval["evidence"] or "[]")
     except (TypeError, ValueError):
         authorization = []
+    if (not isinstance(authorization, list) or len(authorization) != 1 or
+            not isinstance(authorization[0], dict)):
+        raise RuntimeError("Publishing authorization is malformed")
+    run_fields = ("task", "project", "base", "result", "config", "path")
+    task_fields = ("id", "project", "source", "fingerprint", "title", "body", "evidence", "acceptance", "overrides")
+    if task["id"] != run["task"] or task["project"] != project["id"] or run["project"] != project["id"]:
+        raise RuntimeError("Publishing source identity does not match the approved run")
+
     def authorize_write():
         live = runtime.config(project["id"])
         job = store.one("SELECT * FROM runs WHERE task=? AND ended IS NULL", (approval["id"],))
-        pending = store.one("SELECT state FROM tasks WHERE id=?", (approval["id"],))
-        source = store.one("SELECT state FROM tasks WHERE id=?", (task["id"],))
-        original = store.one("SELECT state FROM runs WHERE id=? AND project=?", (run["id"], project["id"]))
+        pending = store.one("SELECT * FROM tasks WHERE id=?", (approval["id"],))
+        source = store.one("SELECT * FROM tasks WHERE id=?", (task["id"],))
+        original = store.one("SELECT * FROM runs WHERE id=? AND project=?", (run["id"], project["id"]))
         if not original or original["state"] != "awaiting_approval":
             raise Cancelled("Approved candidate was superseded; publishing stopped")
+        if any(original[key] != run[key] for key in run_fields):
+            raise Cancelled("Approved run evidence changed; publishing stopped")
+        if (not pending or pending["project"] != project["id"] or
+                pending["source"] != "system_publish" or pending["body"] != run["id"] or
+                pending["evidence"] != approval["evidence"]):
+            raise Cancelled("Publishing authorization identity changed; publishing stopped")
+        if not source or source["state"] != "awaiting_approval" or any(source[key] != task[key] for key in task_fields):
+            raise Cancelled("Source task identity changed; publishing stopped")
         if (runtime.stop.is_set() or runtime.project(project["id"])["paused"] or
                 not pending or pending["state"] != "planning" or (job and runtime.is_cancelled(job))):
             raise Cancelled("Publishing cancelled or project paused")
-        if not source or source["state"] in ["cancelled", "expired", "obsolete"]:
-            # 批准之后、发出外部写操作之前源任务被取消/过期时，授权不再成立。
-            raise Cancelled("Source task is cancelled or expired; publishing stopped")
         grant = authorization[0] if authorization else None
         if not isinstance(grant, dict) or grant.get("authorization") not in ["project_policy", "per_candidate"]:
             raise RuntimeError("Publishing authorization is missing")
@@ -889,6 +933,10 @@ def publish(runtime, project, task, run, workspace, config):
     repo = config["github"]["repository"]
     if not repo or repo.lower() != origin_repository(project["path"]).lower():
         raise RuntimeError("PR repository must match project origin")
+    generation_row = store.one("SELECT value FROM settings WHERE key=?", ("delivery-generation:" + run["id"],))
+    if generation_row:
+        from .delivery_generation import publish_generation
+        return publish_generation(runtime, project, task, run, config, approval['id'], authorize_write)
     source, current, base_branch = baseline(runtime, project, config)
     authorize_write()
     identity = store.setting("run-baseline:" + run["id"])
@@ -901,11 +949,31 @@ def publish(runtime, project, task, run, workspace, config):
     # push 是唯一没有回执的远端写：崩溃可发生在 push 成功之后、PR 创建之前，
     # 远端会留下没有 PR 的记录。推之前先落盘交付意图，重试与清理预览才能凭本地
     # 记录判断该分支属于哪次交付，而不是只靠「分支名确定性 + 重新观察远端」。
-    pushed_intent = store.setting("delivery-push:" + run["id"])
-    if not isinstance(pushed_intent, dict):
-        pushed_intent = None
-    if pushed_intent and pushed_intent.get("branch") and pushed_intent["branch"] != branch:
+    # Read the raw row: Store.setting deliberately treats corrupt JSON as absent.
+    push_row = store.one("SELECT value FROM settings WHERE key=?", ("delivery-push:" + run["id"],))
+    pushed_intent = None
+    if push_row:
+        try:
+            pushed_intent = json.loads(push_row["value"])
+        except (TypeError, ValueError):
+            pass
+        if not isinstance(pushed_intent, dict) or not pushed_intent:
+            raise RuntimeError("Delivery push journal is malformed; reconcile it before retrying")
+    if pushed_intent and pushed_intent.get("branch") != branch:
         raise RuntimeError("Delivery push journal records a different branch; reconcile it before retrying")
+
+    def evaluated_tree():
+        # Only the staged, evaluated delta may become a delivery commit. A
+        # passing verdict alone does not bind a mutable worktree to evidence.
+        if (git(workspace, "diff", "--no-ext-diff", "--no-textconv") or
+                git(workspace, "ls-files", "--others", "--exclude-standard", "-z")):
+            raise RuntimeError("Candidate has unstaged or untracked changes; delivery refused")
+        patch = git(workspace, "diff", run["base"], "--binary", "--no-ext-diff", "--no-textconv")
+        if not patch or fingerprint(patch) != outcome.get("patch_hash"):
+            raise RuntimeError("Candidate changed after evaluation; delivery refused")
+        return git(workspace, "write-tree")
+
+    tree = evaluated_tree()
     if git(workspace, "branch", "--show-current") != branch:
         # 重试可复用同一候选提交上的分支，不能覆盖已有分支指向的其他提交。
         existing_head = git(workspace, "branch", "--list", branch, "--format=%(objectname)")
@@ -920,9 +988,54 @@ def publish(runtime, project, task, run, workspace, config):
         git(workspace, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
             "commit", "-m", "完成任务：" + title)
     sha = git(workspace, "rev-parse", "HEAD")
-    if pushed_intent and pushed_intent.get("head") and pushed_intent["head"] != sha:
-        # 该分支上一次已被推过别的提交；不覆盖远端引用，交人工按意图记录对账。
-        raise RuntimeError("Delivery push journal records a different candidate head; reconcile it before retrying")
+    candidate_identity = {"branch": branch, "head": sha, "tree": tree,
+                          "base": run["base"], "repository": repo,
+                          "evidence": fingerprint({key: run[key] for key in run_fields})}
+    # Keep the version-1 journal readable across upgrades. Approval fields are
+    # an audit snapshot of that attempt, not immutable candidate identity:
+    # a failed policy publication may be explicitly reapproved by the user.
+    binding = {"version": 1, **candidate_identity, "approval": approval["id"],
+               "authorization": fingerprint(authorization)}
+
+    def matches_binding(saved, push=False):
+        required = binding.keys()
+        return (isinstance(saved, dict) and required <= saved.keys() and
+                saved.keys() <= required | ({"created"} if push else set()) and
+                type(saved.get("version")) is int and saved["version"] == 1 and
+                isinstance(saved.get("approval"), str) and bool(saved["approval"]) and
+                isinstance(saved.get("authorization"), str) and
+                re.fullmatch(r"[0-9a-f]{64}", saved["authorization"]) is not None and
+                all(saved.get(key) == value for key, value in candidate_identity.items()))
+
+    def verify_candidate():
+        authorize_write()
+        if (git(workspace, "rev-parse", "HEAD") != sha or
+                git(workspace, "rev-parse", sha + "^{tree}") != tree or
+                git(workspace, "diff", "HEAD", "--no-ext-diff", "--no-textconv") or
+                evaluated_tree() != tree):
+            raise RuntimeError("Delivery commit differs from evaluated candidate")
+
+    verify_candidate()
+    if pushed_intent is not None:
+        # Only the original unversioned schema may omit the new binding fields.
+        # Rebuild those fields from freshly verified evidence, never from HEAD alone.
+        legacy_keys = {"branch", "head", "base", "repository"}
+        legacy = (legacy_keys <= pushed_intent.keys() and
+                  pushed_intent.keys() <= legacy_keys | {"created"})
+        if pushed_intent.get("head") != sha:
+            raise RuntimeError("Delivery push journal records a different candidate head; reconcile it before retrying")
+        if ((legacy and any(pushed_intent.get(key) != binding[key] for key in legacy_keys)) or
+                (not legacy and not matches_binding(pushed_intent, push=True))):
+            raise RuntimeError("Delivery push journal identity differs; reconcile it before retrying")
+    # This receipt survives a push/PR failure and a new Runtime instance. Never
+    # replace it with a newly observed HEAD on retry, even for an identical tree.
+    with store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        prior = db.execute("SELECT value FROM settings WHERE key=?", ("delivery-candidate:" + run["id"],)).fetchone()
+        if prior and not matches_binding(_json_object(prior["value"])):
+            raise RuntimeError("Delivery candidate identity changed; reconcile it before retrying")
+        if not prior:
+            db.execute("INSERT INTO settings(key,value) VALUES (?,?)", ("delivery-candidate:" + run["id"], encode(binding)))
     existing = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "all", "--head", branch,
                                    "--limit", "1", "--json", "url"]))
     if existing:
@@ -957,23 +1070,24 @@ def publish(runtime, project, task, run, workspace, config):
         if current != run["base"]:
             change = baseline_change(source, run["base"], current)
             store.event("baseline_changed", "Remote baseline evidence invalidated", project["id"], run["id"], change)
+            if change['relation'] == 'advanced' and pushed_intent is None:
+                from .delivery_generation import prepare_publication, publish_generation
+                authorize_write()
+                prepare_publication(runtime, project, run, approval['id'], workspace, source, current, config)
+                return publish_generation(runtime, project, task, run, config, approval['id'], authorize_write)
+            if pushed_intent is not None:
+                raise RuntimeError('Baseline changed with an unresolved push journal; reconcile before retrying')
             raise StaleCandidate("Remote baseline changed (" + change["relation"] + "); " + change["recovery"])
         git(workspace, "remote", "set-url", "origin", "https://github.com/" + repo + ".git")
-        authorize_write()
-        pushed_intent = pushed_intent or {
-            "branch": branch,
-            "head": sha,
-            "base": run["base"],
-            "repository": repo,
-            "created": time.time(),
-        }
+        verify_candidate()
+        pushed_intent = {**(pushed_intent if pushed_intent is not None else {"created": time.time()}), **binding}
         # 意图先于远端写落地：进程在 push 后消失时，重试仍能看到同一分支、同一
         # 提交的既有意图；重复 push 指向同一引用，不会产生第二个远端分支。
         store.put_setting("delivery-push:" + run["id"], pushed_intent)
-        github_git(workspace, "push", "origin", "HEAD:refs/heads/" + branch)
+        github_git(workspace, "push", "origin", sha + ":refs/heads/" + branch)
         body = Path(workspace).parent / "pr-body.md"
         body.write_text(pr_body(task, run, outcome), encoding="utf-8")
-        authorize_write()
+        verify_candidate()
         url = checked(["gh", "pr", "create", "--repo", repo, "--head", branch, "--base", base_branch,
                        "--title", "完成任务：" + task["title"], "--body-file", str(body)])
     store.put_setting("delivery:" + run["id"], {"head": sha, "base": run["base"], "branch": base_branch,
@@ -1035,6 +1149,10 @@ def _update_pr_task(store, run, state, now):
 def _supersede_pr(store, run, outcome, task_state, now, feedback_keys=None):
     """Detach tracking from the task and persist close intent before remote writes."""
     outcome.update(replanned=True, close_pending=True)
+    if outcome.get('generation_replan'):
+        # 关闭被拒绝、响应丢失或退避期间，禁止调度同一任务再次交付。
+        outcome['generation_replan_task_state'] = task_state
+        task_state = 'blocked'
     with store.connect() as db:
         db.execute("BEGIN IMMEDIATE")
         if feedback_keys is not None:
@@ -1092,7 +1210,16 @@ def _close_retry_due(outcome, now):
     return now - last >= _write_retry_delay(attempts)
 
 
-def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
+def _release_generation_replan(store, run, outcome, now):
+    state = outcome.get('generation_replan_task_state')
+    if outcome.get('generation_replan') and state in ('queued', 'blocked'):
+        store.execute("UPDATE tasks SET state=?,available=0,updated=? WHERE id=? AND state='blocked' "
+                      "AND NOT EXISTS (SELECT 1 FROM runs WHERE task=? AND "
+                      "(started>? OR (started=? AND id>?)))",
+                      (state, now, run['task'], run['task'], run['started'], run['started'], run['id']))
+
+
+def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now, generation_admitted=None):
     """Observe a superseded PR and record a merge instead of discarding it.
 
     Returns True when the run was advanced to merged, so the caller still runs
@@ -1100,6 +1227,9 @@ def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
     """
     # A failed/lost response leaves the intent durable. Always observe remote state
     # before retrying, including manual closes and merges while the worker was down.
+    if outcome.get('generation_replan') and (
+            not generation_admitted or not generation_admitted(pr)):
+        return
     if pr["state"] == "OPEN":
         if cancelled():
             return
@@ -1127,6 +1257,7 @@ def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
                         run["project"], run["id"])
             store.remote_wait(run["id"], None, time.time())
             return
+        _release_generation_replan(store, run, outcome, now)
         outcome["close_status"] = "close_submitted"
         outcome["close_pending"] = False
         store.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run["id"]))
@@ -1172,6 +1303,7 @@ def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
         if state == "merged":
             run["state"] = "merged"
         return state == "merged"
+    _release_generation_replan(store, run, outcome, now)
     outcome["close_pending"] = False
     store.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run["id"]))
     store.remote_wait(run["id"], None, time.time())
@@ -1319,10 +1451,35 @@ def _recover_superseded_receipt(runtime, project, run, config, now):
     branch = prefix + '/rsi-' + re.sub(r'[^a-zA-Z0-9._-]', '-', run['id'])
     head = intent.get('head')
     base_branch = identity.get('branch')
+    published_base = run['base']
+    generation_snapshot = None
+    if intent.get('version') == 2:
+        # Compare raw values so malformed receipts are never treated as absent.
+        snapshot_keys = ['delivery-generation:', 'delivery-candidate:', 'run-baseline:',
+                         'delivery-generation-pr:', 'delivery:']
+        def recovery_snapshot(db):
+            values = [db.execute('SELECT value FROM settings WHERE key=?',
+                                (key + run['id'],)).fetchone() for key in snapshot_keys]
+            approval = db.execute('SELECT * FROM tasks WHERE id=?', (intent.get('approval'),)).fetchone()
+            project_row = db.execute('SELECT * FROM projects WHERE id=?', (project['id'],)).fetchone()
+            task_row = db.execute('SELECT * FROM tasks WHERE id=?', (run['task'],)).fetchone()
+            global_config = db.execute("SELECT value FROM settings WHERE key='config'").fetchone()
+            return ([None if value is None else value['value'] for value in values],
+                    dict(approval) if approval else None, dict(project_row) if project_row else None,
+                    dict(task_row) if task_row else None, global_config['value'] if global_config else None)
+        with store.connect() as db:
+            generation_snapshot = recovery_snapshot(db)
+        from .delivery_generation import journal_policy, GenerationError
+        try:
+            generation_policy = journal_policy(store, run, intent)
+        except GenerationError as exc:
+            _block_recovery(store, run, now, str(exc))
+            return
+        published_base = generation_policy['base']
     if (not isinstance(head, str) or not re.fullmatch(r'[0-9a-fA-F]{40}', head) or
             not isinstance(base_branch, str) or not base_branch or
             intent.get('branch') != branch or intent.get('repository') != repo or
-            intent.get('base') != run['base'] or identity != {
+            intent.get('base') != published_base or identity != {
                 'repository': repo, 'branch': base_branch, 'sha': run['base']}):
         _block_recovery(store, run, now, 'push journal does not match the run baseline')
         return
@@ -1341,7 +1498,7 @@ def _recover_superseded_receipt(runtime, project, run, config, now):
         return
     records = json.loads(checked(['gh', 'pr', 'list', '--repo', repo, '--state', 'all',
         '--head', branch, '--limit', '100', '--json',
-        'url,state,headRefOid,headRefName,headRepositoryOwner,baseRefName,mergeCommit']))
+        'url,state,headRefOid,headRefName,headRepository,headRepositoryOwner,baseRefName,mergeCommit']))
     if not isinstance(records, list) or len(records) >= 100:
         raise ValueError('Incomplete PR recovery response')
     matches = []
@@ -1351,6 +1508,7 @@ def _recover_superseded_receipt(runtime, project, run, config, now):
         url = pr.get('url')
         if (isinstance(url, str) and re.fullmatch(r'https://github\.com/' + re.escape(repo) + r'/pull/[1-9][0-9]*', url, re.I)
                 and pr.get('headRefName') == branch and pr.get('headRefOid') == head
+                and str(_dict_field(pr, 'headRepository').get('nameWithOwner', '')).lower() == repo.lower()
                 and isinstance(pr.get('headRepositoryOwner'), dict)
                 and str(pr['headRepositoryOwner'].get('login', '')).lower() == repo.split('/')[0].lower()
                 and pr.get('baseRefName') == base_branch and pr.get('state') in ('OPEN', 'CLOSED', 'MERGED')):
@@ -1359,7 +1517,7 @@ def _recover_superseded_receipt(runtime, project, run, config, now):
         raise ValueError('Ambiguous PR recovery response')
     with store.connect() as db:
         db.execute('BEGIN IMMEDIATE')
-        row = db.execute('SELECT state,result FROM runs WHERE id=?', (run['id'],)).fetchone()
+        row = db.execute('SELECT * FROM runs WHERE id=?', (run['id'],)).fetchone()
         saved_intent = db.execute('SELECT value FROM settings WHERE key=?', ('delivery-push:' + run['id'],)).fetchone()
         if not row or row['state'] != 'superseded' or not saved_intent or json.loads(saved_intent['value']) != intent:
             return
@@ -1370,6 +1528,41 @@ def _recover_superseded_receipt(runtime, project, run, config, now):
         outcome['delivery_recovery_retry'] = 3600
         state = 'superseded'
         if matches:
+            if generation_snapshot is not None:
+                from .delivery_generation import journal_policy_db, record_verified_merge, _setting
+                try:
+                    if (recovery_snapshot(db) != generation_snapshot or
+                            any(row[key] != run[key] for key in ('base', 'config', 'task', 'project', 'path', 'started')) or
+                            journal_policy_db(db, dict(row), intent) != generation_policy or
+                            row['result'] != encode(stamped[0])):
+                        return
+                    pr = matches[0]
+                    if pr['state'] == 'MERGED' and not re.fullmatch(
+                            r'[0-9a-f]{40,64}', _dict_field(pr, 'mergeCommit').get('oid', '')):
+                        return
+                    receipt_key = 'delivery-generation-pr:' + run['id']
+                    raw_receipt = db.execute('SELECT value FROM settings WHERE key=?', (receipt_key,)).fetchone()
+                    receipt = _setting(db, receipt_key) if raw_receipt else None
+                    generation = intent['generation']
+                    if raw_receipt and (not isinstance(receipt, dict) or
+                            receipt.get('generation') != generation or receipt.get('url') != pr['url'] or
+                            'error' in receipt or 'verified_merge' in receipt or
+                            ('observation' in receipt and (not isinstance(receipt['observation'], dict) or
+                             receipt['observation'].get('state') not in ('OPEN', 'CLOSED', 'MERGED') or
+                             receipt['observation'].get('url') != pr['url'] or
+                             not _update_pr_identity({**receipt['observation'], 'state': 'OPEN'}, repo,
+                                                     base_branch, branch, head)))):
+                        return
+                    db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',
+                               (receipt_key, encode({**(receipt or {}), 'generation': generation,
+                                                     'url': pr['url'], 'observation': pr})))
+                    if pr['state'] == 'MERGED' and not record_verified_merge(db, run, generation_policy, pr):
+                        db.rollback()
+                        return
+                    outcome['delivery_generation'] = generation
+                except (GenerationError, TypeError, ValueError, KeyError, AttributeError):
+                    db.rollback()
+                    return
             outcome['delivery_recovery_checked'] = True
             pr = matches[0]
             outcome.update(pr=pr['url'], replanned=True, close_pending=pr['state'] == 'OPEN')
@@ -1390,11 +1583,18 @@ def _recover_superseded_receipt(runtime, project, run, config, now):
                     # 和发布资格。oid 缺失时仍保留 superseded（无 sha 无法验证）。
                     state = 'merged'
                 if previous_status not in ('stale', 'feedback_replan'):
+                    if generation_snapshot is not None and state == 'merged':
+                        # Lost publication leaves the original task awaiting approval.
+                        # Do not overwrite a newer run's task ownership.
+                        db.execute("UPDATE tasks SET state='merged',updated=? WHERE id=? AND state='awaiting_approval' "
+                                   "AND NOT EXISTS (SELECT 1 FROM runs WHERE task=? AND "
+                                   "(started>? OR (started=? AND id>?)))",
+                                   (now, run['task'], run['task'], run['started'], run['started'], run['id']))
                     db.execute("UPDATE tasks SET state='merged',updated=? WHERE id=? AND state IN ('queued','blocked','obsolete') "
                                "AND NOT EXISTS (SELECT 1 FROM runs WHERE task=? AND state='awaiting_approval')",
                                (now, run['task'], run['task']))
             db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('delivery:' + run['id'], encode(
-                {'head': head, 'base': run['base'], 'branch': base_branch, 'repository': repo})))
+                {'head': head, 'base': published_base, 'branch': base_branch, 'repository': repo})))
         db.execute("UPDATE runs SET state=?,result=? WHERE id=? AND state='superseded'", (state, encode(outcome), run['id']))
 
 
@@ -1471,6 +1671,65 @@ def tick(runtime, now=None, project_id=None, active_run=None):
         current = store.one("SELECT * FROM runs WHERE id=?", (active_run,))
         return not current or runtime.is_cancelled(current)
 
+    def generation_replan_cancelled(run, outcome, pr=None):
+        if not outcome.get('generation_replan'):
+            return False
+        try:
+            from .delivery_generation import journal_policy
+            target = outcome['generation_replan_target']
+            sealed = target['policy']
+            repo = sealed['repository']
+            # Git 在任何 SQLite 写事务之外执行，不复用 tick 的 origin 缓存。
+            live_project = runtime.project(run['project'])
+            live_origin = origin_repository(live_project['path'])
+            live = runtime.config(run['project'])
+            live_run = store.one('SELECT * FROM runs WHERE id=?', (run['id'],))
+            intent = store.setting('delivery-push:' + run['id'])
+            identity = store.setting('run-baseline:' + run['id'])
+            valid = (live_run and live_run['state'] in ('pr_open', 'superseded') and
+                     live['github']['repository'] == repo and live_origin.lower() == repo.lower() and
+                     live['delivery']['base_branch'] == target['base_branch'] and
+                     (not live['delivery']['base_branch'] or live['delivery']['base_branch'] == sealed['branch']) and
+                     store.setting('delivery:' + run['id']) == sealed and
+                     identity == target['baseline'] ==
+                     {'repository': repo, 'branch': sealed['branch'], 'sha': live_run['base']} and
+                     intent == target['intent'] and journal_policy(store, live_run, intent) == sealed and
+                     fingerprint(store.setting('delivery-generation:' + run['id'])) == target['generation'] and
+                     fingerprint(store.setting('delivery-candidate:' + run['id'])) == target['candidate'] and
+                     outcome.get('pr') == target['pr'] == _json_object(live_run['result']).get('pr') and
+                     isinstance(target['pr'], str) and
+                     re.fullmatch(r'https://github\.com/' + re.escape(repo) + r'/pull/[1-9][0-9]*', target['pr'], re.I))
+            if pr is None or pr.get('state') == 'OPEN':
+                valid = (valid and not tracking_cancelled() and not live_project['paused'] and
+                         _dict_field(_json_object(live_run['config']), 'delivery').get('auto_merge') and
+                         live['delivery']['auto_merge'] and live['delivery']['mode'] == 'pr')
+            if pr is not None:
+                valid = (valid and pr.get('state') in ('OPEN', 'CLOSED', 'MERGED') and
+                         pr.get('url') == target['pr'] and
+                         _update_pr_identity({**pr, 'state': 'OPEN'}, repo, sealed['branch'],
+                                             intent['branch'], sealed['head']))
+            if valid:
+                if pr is not None:
+                    outcome.pop('close_blocked_at', None)
+                    outcome.pop('close_blocked_reason', None)
+                return False
+            reason = 'Generation replan target, PR identity or authority changed; close withheld'
+        except Exception as exc:
+            reason = 'Generation replan admission unavailable; close withheld: ' + str(exc)[:300]
+        outcome['close_blocked_at'] = now
+        outcome['close_blocked_reason'] = reason
+        # 同时收住旧版本已入队但关闭未完成的 generation 重排；新 run
+        # 已取得任务时仅保留证据，不能改写它持有的任务状态。
+        store.execute("UPDATE tasks SET state='blocked',updated=? WHERE id=? "
+                      "AND state IN ('queued','pr_open') "
+                      "AND EXISTS (SELECT 1 FROM runs WHERE id=? AND state='superseded') "
+                      "AND NOT EXISTS (SELECT 1 FROM runs WHERE task=? AND "
+                      "(started>? OR (started=? AND id>?)))",
+                      (now, run['task'], run['id'], run['task'], run['started'], run['started'], run['id']))
+        _persist_result(store, run, outcome)
+        store.event('delivery_close_blocked', reason, run['project'], run['id'])
+        return True
+
     # 同一 tick 内多个就绪 PR / 到期监控共享同一份基线读数：首个调用触发一次
     # 真实 fetch，其余直接复用。publish 不在此路径；合并准入/监控的密封目标
     # 仍逐 run 对共享值复核 sha/branch，字典随 tick 结束丢弃，不读跨 tick 陈旧值。
@@ -1526,6 +1785,20 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                 continue
             identity = store.setting("run-baseline:" + run["id"])
             sealed_target = identity == {"repository": repo, "branch": policy["branch"], "sha": policy["base"]}
+            generation_row = store.one('SELECT 1 FROM settings WHERE key=?', ('delivery-generation:' + run['id'],))
+            if generation_row:
+                from .delivery_generation import journal_policy, GenerationError
+                try:
+                    # The historical baseline seals the original SHA; the v2 journal
+                    # seals the replay parent. Both must still name today's repo.
+                    sealed_target = (identity == {'repository': repo, 'branch': policy['branch'], 'sha': run['base']} and
+                                     policy.get('repository') == repo and
+                                     journal_policy(store, run, store.setting('delivery-push:' + run['id'])) == policy)
+                except GenerationError as exc:
+                    store.event('delivery_policy_invalid', str(exc), project['id'], run['id'])
+                    continue
+            if generation_row and not sealed_target:
+                continue
             pr_url = outcome.get("pr")
             if run["state"] in ["pr_open", "superseded"] and not isinstance(pr_url, str):
                 # result 中 pr 字段缺失或类型错误，后续 merge/close 判断无从谈起。
@@ -1571,6 +1844,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         not sealed_target or pr.get('headRefOid') != policy['head'] or
                         pr.get('baseRefName') != policy['branch'] or
                         not isinstance(recovery_intent, dict) or pr.get('headRefName') != recovery_intent.get('branch') or
+                        str(_dict_field(pr, 'headRepository').get('nameWithOwner', '')).lower() != repo.lower() or
                         not isinstance(pr.get('headRepositoryOwner'), dict) or
                         str(pr['headRepositoryOwner'].get('login', '')).lower() != repo.split('/')[0].lower()):
                     outcome['close_blocked_at'] = now
@@ -1580,8 +1854,12 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     store.event('delivery_close_blocked', outcome['close_blocked_reason'],
                                 project['id'], run['id'])
                     continue
+                if pr.get('state') == 'OPEN' and generation_replan_cancelled(run, outcome):
+                    continue
                 if _close_superseded_pr(store, run, outcome, repo, pr,
-                                        lambda: tracking_cancelled() or runtime.project(project['id'])['paused'], now):
+                                        lambda: tracking_cancelled() or runtime.project(project['id'])['paused'] or
+                                        generation_replan_cancelled(run, outcome), now,
+                                        generation_admitted=lambda observed: not generation_replan_cancelled(run, outcome, observed)):
                     _finish_merge(runtime, project, run, outcome, config, now,
                                   active_run, tracking_cancelled, tick_baselines)
                 continue
@@ -1654,6 +1932,9 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                             except Exception:
                                 intent = None
                         outcome["merged_by_local"] = isinstance(intent, dict) and intent.get("head") == policy["head"]  # type: ignore
+                        if target_state == 'merged' and generation_row:
+                            from .delivery_generation import record_verified_merge
+                            record_verified_merge(db, run, policy, pr)
                         db.execute("UPDATE runs SET state=?,result=? WHERE id=?", (target_state, encode(outcome), run["id"]))
                     run["state"] = target_state
                     if target_state == "unverified_merge":
@@ -1795,6 +2076,16 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                                  (run["id"], project["id"]))
                             live_policy = store.setting("delivery:" + run["id"])
                             live_identity = store.setting("run-baseline:" + run["id"])
+                            live_sealed = live_identity == {"repository": repo, "branch": policy["branch"], "sha": policy["base"]}
+                            if generation_row:
+                                from .delivery_generation import journal_policy, GenerationError
+                                try:
+                                    live_sealed = (bool(live_run) and live_identity == {'repository': live_config['github']['repository'],
+                                                                   'branch': policy['branch'], 'sha': live_run['base']} and
+                                                   policy.get('repository') == live_config['github']['repository'] and
+                                                   journal_policy(store, live_run, store.setting('delivery-push:' + run['id'])) == policy)
+                                except GenerationError:
+                                    live_sealed = False
                             if (remote == policy["base"] and branch == policy["branch"] and
                                     live_run and live_run["state"] == "pr_open" and
                                     _dict_field(_json_object(live_run["config"]), "delivery").get("auto_merge") and
@@ -1809,7 +2100,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                     # 别的仓库，复用 tick 开头的读数会放行一次本该拒绝的合并。
                                     repo.lower() == origin_repository(live_project["path"]).lower() and
                                     live_policy == policy and live_identity == identity and
-                                    live_identity == {"repository": repo, "branch": policy["branch"], "sha": policy["base"]} and
+                                    live_sealed and
                                     not live_project["paused"] and not tracking_cancelled()):
                                 merge_admitted = True
                                 # 与关闭写同序：先在意图里落盘 attempts+1 再发请求，响应丢失或
@@ -1837,6 +2128,10 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                             else:
                                 outcome["delivery_status"] = "merge_submitted"
                     elif gate == "stale" and not outcome.get("replanned"):
+                        if generation_replan_cancelled(run, outcome):
+                            outcome['delivery_status'] = 'waiting'
+                            _persist_result(store, run, outcome)
+                            continue
                         if tracking_cancelled():
                             return
                         task = store.one("SELECT attempts FROM tasks WHERE id=?", (run["task"],))
@@ -1844,7 +2139,11 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         if _supersede_pr(store, run, outcome, state, now):
                             try:
                                 if _close_superseded_pr(store, run, outcome, repo,
-                                                        pr_view(repo, outcome["pr"]), tracking_cancelled, now):
+                                                        pr_view(repo, outcome["pr"]),
+                                                        lambda: tracking_cancelled() or runtime.project(project['id'])['paused'] or
+                                                        generation_replan_cancelled(run, outcome), now,
+                                                        generation_admitted=lambda observed:
+                                                        not generation_replan_cancelled(run, outcome, observed)):
                                     _finish_merge(runtime, project, run, outcome, config, now,
                                                   active_run, tracking_cancelled, tick_baselines)
                             finally:

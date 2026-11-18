@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 
 from adaptive_rsi.auth_sessions import _Process
 from adaptive_rsi.cli_worker import run_cli
-from adaptive_rsi.config import DEFAULTS
+from adaptive_rsi.config import DEFAULTS, fingerprint
 from adaptive_rsi.delivery import publish
 from adaptive_rsi.gitops import changes, git, snapshot
 from adaptive_rsi.agent import CodexAgent
@@ -127,8 +127,9 @@ class AuditRuntimeBoundariesTest(unittest.TestCase):
         base = git(self.repo, "rev-parse", "HEAD")
         workspace = snapshot(self.repo, self.root / "candidate")
         (workspace / "calculator.py").write_text("def add(a,b):\n    return a+b\n")
-        changes(workspace)
-        outcome = {"evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}
+        _, patch = changes(workspace)
+        outcome = {"evaluation": {"decision": "pass"}, "review": {"decision": "pass"},
+                   "patch_hash": fingerprint(patch)}
         self.store.execute("UPDATE runs SET base=? WHERE id=?", (base, run["id"]))
         self.store.transition(run["id"], "awaiting_approval", outcome, True)
         self.store.put_setting("run-baseline:" + run["id"],

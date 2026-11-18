@@ -304,6 +304,8 @@ def _evaluation_source(config, base, checks, patch, environment_digest, acceptan
     return {"base": base, "checks": checks, "patch_hash": fingerprint(patch),
             "environment": environment_digest, "validation": config.get("validation"),
             "acceptance_hash": acceptance["hash"] if acceptance else None,
+            "contract_hash": fingerprint(acceptance["contract"]) if acceptance else None,
+            "criteria_hash": fingerprint(acceptance["criteria"]) if acceptance else None,
             "test_first": bool(test_first), "change_kind": change_type}
 
 
@@ -416,7 +418,7 @@ def _setup_changes(workspace):
 
 def _prepare_environment(runtime, run, project, config, directory, workspace, checks):
     """Seal selected dependency seeds once and restore a private copy per workspace."""
-    from .environment import capture, materialize, prepare_cached, restore
+    from .environment import capture, frozen_dependencies, materialize, prepare_cached, restore
     from .evaluator import host_tool_versions
     source = Path(project["path"])
     seeds = directory / "dependencies"
@@ -431,6 +433,9 @@ def _prepare_environment(runtime, run, project, config, directory, workspace, ch
         # The copy is verified while it is read, so a corrupt entry never reaches
         # the workspace.
         materialize(prepared, seeds)
+        # Cache keys describe source inputs before read-only sealing. Evaluation
+        # evidence must identify the actual run-owned copy, including its modes.
+        environment.update(frozen_dependencies(seeds, config))
         seed_source = seeds
         message = "Sealed dependency preparation reused" if prepared["reused"] else \
             "Sealed dependency preparation frozen"

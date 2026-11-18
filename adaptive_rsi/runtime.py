@@ -978,6 +978,20 @@ class Runtime(Maintenance):
             if prior:
                 task = prior["id"]
                 if prior["state"] not in ["queued", "planning", "executing", "evaluating"]:
+                    if not automatic:
+                        # Explicit reapproval may rebuild an unpublished replay.
+                        # Keep its record/files; any uncertain push forbids retirement.
+                        generation_key = 'delivery-generation:' + run_id
+                        generation = db.execute('SELECT value FROM settings WHERE key=?', (generation_key,)).fetchone()
+                        if generation and not db.execute('SELECT 1 FROM settings WHERE key IN (?,?)',
+                                ('delivery-push:' + run_id, 'delivery-generation-pr:' + run_id)).fetchone():
+                            history_id = uid()
+                            db.execute('INSERT INTO settings(key,value) VALUES (?,?)',
+                                       ('delivery-generation-history:' + run_id + ':' + history_id, generation['value']))
+                            db.execute('INSERT INTO settings(key,value) VALUES (?,?)',
+                                       ('delivery-generation-history-proof:' + run_id + ':' + history_id,
+                                        encode({'unpublished': True, 'record': fingerprint(json.loads(generation['value']))})))
+                            db.execute('DELETE FROM settings WHERE key=?', (generation_key,))
                     db.execute("UPDATE tasks SET state='queued',available=0,evidence=?,updated=? WHERE id=?",
                                (encode(evidence), now, task))
                 elif not automatic and prior["state"] == "queued":
@@ -2591,6 +2605,11 @@ class Runtime(Maintenance):
                 try:
                     url = self.publish(project, source_task, original, candidate, config)
                 except StaleCandidate as exc:
+                    # An uncertain remote write must retain the original evidence
+                    # and journal for reconciliation, never silently replan it.
+                    if self.store.one("SELECT 1 FROM settings WHERE key IN (?,?)",
+                                      ('delivery-push:' + original['id'], 'delivery-generation:' + original['id'])):
+                        raise RuntimeError('Publication retained for reconciliation: ' + str(exc)) from exc
                     outcome["reason"] = str(exc)
                     # Issue work must wait for synchronization to replace stale evidence.
                     state = "blocked" if source_task["source"] == "issue" else (
@@ -2603,10 +2622,19 @@ class Runtime(Maintenance):
                             db.execute("UPDATE tasks SET state=?,available=0,updated=? WHERE id=? "
                                        "AND state='awaiting_approval'", (state, time.time(), original["task"]))
                     raise
-                outcome["pr"] = url
                 with self.store.connect() as db:
                     db.execute("BEGIN IMMEDIATE")
-                    current = db.execute("SELECT state FROM runs WHERE id=?", (original["id"],)).fetchone()
+                    current = db.execute("SELECT state,result FROM runs WHERE id=?", (original["id"],)).fetchone()
+                    # publish may have recovered a receipt while another writer
+                    # added evidence. Merge only our receipt into the current
+                    # result under the write lock; the cached outcome is stale.
+                    try:
+                        outcome = json.loads(current["result"] or "{}")
+                    except (TypeError, ValueError):
+                        outcome = {}
+                    if not isinstance(outcome, dict):
+                        outcome = {}
+                    outcome["pr"] = url
                     # 已发 PR 的回执必须落盘，但不能把重试后的新任务改回 pr_open。
                     state = "pr_open" if current["state"] in ["awaiting_approval", "pr_open"] else "superseded"
                     if state == "superseded":
