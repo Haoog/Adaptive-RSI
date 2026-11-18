@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+## 0.5.144
+
+<!-- adaptive-rsi-release:0.5.144;base:ddc3961c42146e194b55ecbe37a0d7bcd1eef921 -->
+
+- Release verified mainline improvements from commit `ddc3961c42146e194b55ecbe37a0d7bcd1eef921`.
+
 ## 0.5.143
 
 <!-- adaptive-rsi-release:0.5.143;base:bb948c13fbdfb009810a88979a95eb33f539ff69 -->
