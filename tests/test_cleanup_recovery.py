@@ -1,4 +1,5 @@
 """Bounded settings/data retention regressions; entirely offline."""
+import json
 import os
 import tempfile
 import time
@@ -94,6 +95,45 @@ class CleanupRecoveryTest(unittest.TestCase):
             self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key=?", (key,)), key)
         for key in ('run-baseline:r1', 'evaluation-baseline:scope'):
             self.assertIsNotNone(self.store.one("SELECT 1 FROM settings WHERE key=?", (key,)), key)
+
+    def test_expired_run_history_is_compacted_after_artifacts_are_removed(self):
+        # 只删产物不会让 state.sqlite3 收缩：过期运行的 result 里带着完整检查
+        # 输出，stages 里带着补丁，events 按 run 累积。产物确认删除后必须同时
+        # 压缩这些行，否则库随运行数无界增长；顺序反了（先压缩后删产物）会在
+        # 删除失败时永久丢掉证据。
+        run_id = 'r-compact'
+        directory = self.store.root / 'runs' / run_id
+        (directory / 'workspace').mkdir(parents=True)
+        (directory / 'workspace' / 'evidence.txt').write_text('x')
+        blob = 'y' * 20000
+        result = {"evaluation": {"decision": "fail",
+                                 "reason": "Candidate failed independent checks",
+                                 "checks": {"baseline": [{"name": "Python", "exit_code": 1,
+                                                          "output": blob}]}},
+                  "failure": {"code": "checks"}}
+        ended = time.time() - 40 * 86400
+        self.store.execute(
+            "INSERT INTO runs(id,project,state,path,ended,result) VALUES (?,'p','failed',?,?,?)",
+            (run_id, str(directory), ended, json.dumps(result)))
+        self.store.execute(
+            "INSERT INTO stages(run,stage,signature,data,created) VALUES (?,?,?,?,?)",
+            (run_id, 'candidate', 'sig', blob, ended))
+        self.store.execute(
+            "INSERT INTO events(project,run,kind,message,data,created) VALUES ('p',?,?,?,?,?)",
+            (run_id, 'failed', 'boom', '{}', ended))
+
+        from adaptive_rsi.runtime import Runtime
+        Runtime(self.store, agent=object()).maintenance()
+
+        stored = self.store.one("SELECT result,path FROM runs WHERE id=?", (run_id,))
+        self.assertIsNotNone(stored, '运行行保留，历史仍可查')
+        payload = json.loads(stored['result'])
+        self.assertTrue(payload.get('compacted'))
+        self.assertEqual(payload['decision'], 'fail')
+        self.assertEqual(payload['reason'], 'Candidate failed independent checks')
+        self.assertNotIn('output', payload['checks']['baseline'][0])
+        self.assertIsNone(self.store.one("SELECT 1 FROM stages WHERE run=?", (run_id,)))
+        self.assertIsNone(self.store.one("SELECT 1 FROM events WHERE run=?", (run_id,)))
 
     def test_deep_nested_dependency_tree_is_removed_without_recursion(self):
         # 深层嵌套（node_modules 式依赖树）超过默认递归上限；此前递归删除

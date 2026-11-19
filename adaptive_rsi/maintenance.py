@@ -395,6 +395,60 @@ def _run_directory_settled(directory):
     return True
 
 
+COMPACT_RESULT_ABOVE = 4096
+
+
+def _compacted_run_result(value):
+    """保留可查询的结论，丢掉完整检查输出这类大块内容。"""
+    try:
+        result = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(result, dict):
+        return None
+    evaluation = result.get("evaluation")
+    evaluation = evaluation if isinstance(evaluation, dict) else {}
+    checks = {}
+    for stage, items in (evaluation.get("checks") or {}).items():
+        if not isinstance(items, list):
+            continue
+        checks[stage] = [{"name": item.get("name"), "exit_code": item.get("exit_code")}
+                         for item in items if isinstance(item, dict)]
+    return {"compacted": True, "decision": evaluation.get("decision"),
+            "reason": evaluation.get("reason"), "failure": result.get("failure"),
+            "checks": checks}
+
+
+def _compact_expired_run(store, run_id):
+    """产物删除后压缩过期运行的历史，避免数据库随运行数无界增长。
+
+    只在该运行的产物确认删除之后调用：此时磁盘上的证据已经不存在，继续保留
+    完整检查输出、补丁和阶段快照只会让 state.sqlite3 一直涨。运行行本身、
+    状态与结论保留，历史仍然可查；阶段快照与事件按运行删除。
+    """
+    from .store import encode
+    # 代际回收把 stages/events 当作生命周期证据（_lifecycle_closed 依赖它们），
+    # 压缩这些运行的任何一行都会让回收永远无法闭合。只处理没有代际记录的运行。
+    if store.one("SELECT 1 FROM settings WHERE key=?",
+                 ("delivery-generation:" + run_id,)):
+        return
+    row = store.one("SELECT result FROM runs WHERE id=?", (run_id,))
+    if row is None:
+        return
+    compacted = _compacted_run_result(row["result"])
+    large = len(row["result"] or "") > COMPACT_RESULT_ABOVE
+    try:
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM stages WHERE run=?", (run_id,))
+            db.execute("DELETE FROM events WHERE run=?", (run_id,))
+            if compacted is not None and large:
+                db.execute("UPDATE runs SET result=? WHERE id=?", (encode(compacted), run_id))
+    except sqlite3.Error:
+        logging.getLogger(__name__).warning(
+            "Run history compaction skipped for %s", run_id, exc_info=True)
+
+
 def _remove_run_artifacts(store, run_id, project, directory, stored=None, snapshot=None):
     """Delete finished artifacts, with bounded steps for generation-managed runs.
 
@@ -708,6 +762,10 @@ class Maintenance:
                                 logging.getLogger(__name__).warning(
                                     "Maintenance kept run %s for retry (%s: %s)",
                                     run["id"], type(exc).__name__, exc)
+                            else:
+                                # 产物确认删除后才压缩历史：顺序反了会先丢掉
+                                # 结论、再因为删除失败而永久保留半份证据。
+                                _compact_expired_run(self.store, run["id"])
                 # Freeze promotion/rollback while choosing and deleting retired candidates.
                 with self.store.connect() as db:
                     db.execute("BEGIN IMMEDIATE")
