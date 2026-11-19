@@ -463,12 +463,27 @@ COMPACTION_BACKFILL_LIMIT = 64
 
 
 def _compact_retired_runs(store, project, cutoff):
-    """按保留期回填压缩「产物已删除、path 已置空」的运行历史。"""
-    for row in store.query(
-            "SELECT id FROM runs WHERE project=? AND path IS NULL AND ended<? "
-            "AND length(CAST(result AS BLOB))>? LIMIT ?",
-            (project, cutoff, COMPACT_RESULT_ABOVE, COMPACTION_BACKFILL_LIMIT)):
+    """按保留期回填压缩「产物已删除、path 已置空」的运行历史。
+
+    用 keyset 游标推进：被法定保留或代际记录挡住的运行不会改变资格，没有游标
+    就每轮都选中同一批，后面的运行永远轮不到。游标只按 id 前进，与"是否真的
+    压缩"无关。候选条件同时看 result 与 stages：result 很小但阶段里存着大补丁
+    的运行同样要处理。
+    """
+    key = "compaction-cursor:" + project
+    cursor = store.setting(key, "")
+    if not isinstance(cursor, str):
+        cursor = ""
+    rows = store.query(
+        "SELECT id FROM runs WHERE project=? AND path IS NULL AND ended<? AND id>? "
+        "AND (length(CAST(result AS BLOB))>? "
+        "OR EXISTS (SELECT 1 FROM stages WHERE stages.run=runs.id)) "
+        "ORDER BY id LIMIT ?",
+        (project, cutoff, cursor, COMPACT_RESULT_ABOVE, COMPACTION_BACKFILL_LIMIT))
+    for row in rows:
         _compact_expired_run(store, row["id"])
+    if rows:
+        store.put_setting(key, rows[-1]["id"] if len(rows) >= COMPACTION_BACKFILL_LIMIT else "")
 
 
 def _remove_run_artifacts(store, run_id, project, directory, stored=None, snapshot=None):

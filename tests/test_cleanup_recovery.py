@@ -164,6 +164,38 @@ class CleanupRecoveryTest(unittest.TestCase):
         self.assertEqual(payload['evaluation']['reason'], 'retired')
         self.assertIsNone(self.store.one("SELECT 1 FROM stages WHERE run=?", (run_id,)))
 
+    def test_backfill_cursor_advances_past_held_runs(self):
+        # 被法定保留挡住的运行不会改变资格；没有游标时每轮都选中同一批，
+        # 后面的运行永远轮不到。
+        from unittest.mock import patch
+        blocked, later = 'a-held', 'b-free'
+        blob = 'w' * 20000
+        result = json.dumps({"evaluation": {"decision": "fail", "reason": "x"}})
+        self.store.execute(
+            "INSERT INTO runs(id,project,state,path,ended,result) VALUES (?,'p','failed',NULL,?,?)",
+            (blocked, time.time() - 40 * 86400, result))
+        self.store.execute(
+            "INSERT INTO runs(id,project,state,path,ended,result) VALUES (?,'p','failed',NULL,?,?)",
+            (later, time.time() - 40 * 86400, result))
+        # 被挡住的运行靠 stages 里的大补丁进入候选。
+        self.store.execute(
+            "INSERT INTO stages(run,stage,signature,data,created) VALUES (?,?,?,?,?)",
+            (blocked, 'candidate', 'sig', blob, time.time()))
+        self.store.execute("INSERT INTO settings VALUES (?,?)",
+                           ('legal-hold:' + blocked, 'true'))
+
+        from adaptive_rsi.runtime import Runtime
+        rt = Runtime(self.store, agent=object())
+        with patch.object(maintenance, 'COMPACTION_BACKFILL_LIMIT', 1):
+            rt.maintenance()
+            self.store.put_setting('maintenance-last', 0)
+            rt.maintenance()
+
+        held = self.store.one("SELECT 1 FROM stages WHERE run=?", (blocked,))
+        self.assertIsNotNone(held, '法定保留必须挡住压缩')
+        self.assertIsNone(self.store.one("SELECT 1 FROM stages WHERE run=?", (later,)),
+                          '游标推进后，后面的运行必须被处理')
+
     def test_history_is_not_compacted_when_artifact_removal_is_refused(self):
         # 删除被拒绝时 _remove_run_artifacts 返回 False（不抛异常）。此时产物还在
         # 磁盘上，压缩会让数据库里的证据先消失，留下半份记录。
