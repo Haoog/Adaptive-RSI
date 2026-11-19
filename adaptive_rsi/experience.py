@@ -13,6 +13,22 @@ def safe_excerpt(value, limit=1200):
     return text[:limit]
 
 
+def failure_excerpt(value, limit=1000):
+    """保留失败详情而不是开头。
+
+    unittest 先打一屏进度点，FAIL / ERROR 行和收尾统计在末尾；按前 N 个字符
+    截断等于什么都没给，下一轮只能瞎猜改哪里。
+    """
+    lines = str(value or "").splitlines()
+    progress = re.compile(r"[.sFEx]*")
+    useful = [line.strip()[:300] for line in lines
+              if line.strip() and not progress.fullmatch(line.strip())]
+    notable = [line for line in useful if line.startswith(("FAIL:", "ERROR:"))]
+    kept = list(dict.fromkeys(notable[:8] + useful[-6:]))
+    joined = "\n".join(kept).strip()
+    return joined[-limit:] if len(joined) > limit else joined
+
+
 def retry_feedback(row, protected=()):
     try:
         result = json.loads(row["result"] or "{}")
@@ -54,7 +70,7 @@ def retry_feedback(row, protected=()):
     checks = result.get("evaluation", {}).get("checks", {})
     feedback["failed_regression_checks"] = [{"stage": stage, "name": excerpt(c.get("name"), 200),
                                              "exit_code": c.get("exit_code"),
-                                             "stderr": excerpt(c.get("stderr"), 1000)}
+                                             "stderr": failure_excerpt(excerpt(c.get("stderr"), 20000))}
                                             for stage in ["candidate", "candidate_full"]
                                             for c in checks.get(stage, []) if not c.get("passed")][:5]
     return feedback
