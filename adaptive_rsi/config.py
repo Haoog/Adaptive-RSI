@@ -49,6 +49,9 @@ DEFAULTS = {
                             "health_consecutive_successes": 1, "health_urls": [],
                             "rollback_data_policy": "manual", "rollback_recovery_notes": ""}},
     "checks": [],
+    # 行为类任务默认可以在没有具名回归测试的情况下开工；打开后要求计划先说出
+    # 「哪些既有测试钉住了不能变的行为」，说不出来就当作规格没想清楚，不进实现。
+    "specification": {"require_preserved_tests": False},
     # 探测到的检查默认仍会加入完整检查面，防止候选缩小检查范围；探测对当前
     # 运行环境明显不适用时（例如容器里没有对应工具链），可以显式关掉。
     "detected_checks": True,
@@ -125,6 +128,8 @@ def _validate(config, *, _ignore_invalid_health_urls=False):
         raise ValueError('Stage deadlines must be 1..86400 seconds')
     if type(config.get("detected_checks")) is not bool:
         raise ValueError("detected_checks must be true or false")
+    if type((config.get("specification") or {}).get("require_preserved_tests")) is not bool:
+        raise ValueError("specification.require_preserved_tests must be true or false")
     if not 0 <= config["recovery"]["provider_retry_minutes"] <= 1440:
         raise ValueError("provider_retry_minutes must be 0..1440")
     if type(config["recovery"].get("reuse_sealed_checkpoints")) is not bool:

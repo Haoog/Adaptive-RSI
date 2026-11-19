@@ -917,6 +917,41 @@ class ExperienceTest(unittest.TestCase):
         self.assertNotIn("12345", json.dumps(feedback))
         self.assertEqual("candidate_full", feedback["failed_regression_checks"][0]["stage"])
 
+    def test_attempt_diagnosis_names_the_stage_that_blocked(self):
+        # 额度用尽时任务只剩一个 failed 状态；诊断要把卡点写出来，
+        # 否则归档之后没人知道为什么停。
+        from adaptive_rsi.runtime import attempt_diagnosis
+        result = {"evaluation": {"decision": "fail", "checks": {"candidate": [
+                    {"name": "Python: 核心契约", "passed": False,
+                     "stderr": "." * 500 + "\nFAIL: test_x (tests.test_runtime.T.test_x)\n"}]}},
+                  "review": {"assessments": [{"area": "tests", "decision": "fail", "reason": "x"}]},
+                  "reason": "Candidate failed independent checks"}
+        text = attempt_diagnosis(result)
+        self.assertIn("evaluation=fail", text)
+        self.assertIn("test_x", text)
+        self.assertIn("tests=fail", text)
+        self.assertEqual(attempt_diagnosis({}), "no evaluation evidence recorded")
+
+    def test_behavior_plan_must_name_preserved_tests_when_required(self):
+        # 说不出「哪些既有测试钉住了不能变的行为」，说明改动边界没想清楚。
+        # 在契约这一步挡住，比让实现跑完再被复审否决便宜一个数量级。
+        from adaptive_rsi.workflow import evidence_contract
+        task = {"source": "goal", "title": "手动请求绕过退避"}
+        with self.assertRaises(ValueError):
+            evidence_contract(task, {"change_kind": "behavior"}, require_preserved=True)
+        named = {"change_kind": "behavior",
+                 "required_test_ids": ["tests.test_runtime.RuntimeTest.test_failing_scan_backs_off"]}
+        contract = evidence_contract(task, named, require_preserved=True)
+        self.assertEqual(contract["required_test_ids"],
+                         ["tests.test_runtime.RuntimeTest.test_failing_scan_backs_off"])
+        # 开关关闭时保持原行为，不改变既有项目的语义。
+        self.assertNotIn("required_test_ids",
+                         evidence_contract(task, {"change_kind": "behavior"}))
+        # 非行为类不受这条约束。
+        self.assertNotIn("required_test_ids",
+                         evidence_contract(task, {"change_kind": "documentation"},
+                                           require_preserved=True))
+
     def test_retry_feedback_keeps_the_failing_test_not_the_progress_dots(self):
         # unittest 先打一屏进度点，FAIL 行在末尾。按前 1000 字符截断时下一轮只
         # 看得到点，看不到是哪个用例挂了——服务器上就是这样连输四轮的。

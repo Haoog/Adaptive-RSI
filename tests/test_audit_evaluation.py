@@ -1452,6 +1452,18 @@ class AuditEvaluationTest(unittest.TestCase):
             pipeline._evaluation_source(on, 'base', [], 'patch', None, None, False, None),
             pipeline._evaluation_source(off, 'base', [], 'patch', None, None, False, None))
 
+    def test_named_tests_are_verified_across_stages(self):
+        # 具名测试分两类：新行为的在宿主验收里，被保护的既有测试在普通回归里。
+        # 只查 acceptance_candidate 会把后者全部误判成「没执行」。
+        from adaptive_rsi.evaluator import named_test_rows, verify_test_identities
+        rows = {'candidate': [{'test_identities': {'executed': ['tests.test_runtime.T.test_old']}}],
+                'candidate_full': [],
+                'acceptance_candidate': [{'test_identities': {'executed': ['accept_new']}}]}
+        self.assertEqual(len(named_test_rows(rows)), 2)
+        result = verify_test_identities(named_test_rows(rows), ['tests.test_runtime.T.test_old'])
+        self.assertTrue(result['valid'], result)
+        self.assertEqual(result['missing'], [])
+
     def test_detected_checks_can_be_disabled_when_detection_does_not_apply(self):
         # 探测默认保留，防止候选通过删测试缩小检查面。但探测对运行环境明显
         # 不适用时（容器里没有 Rust 工具链、整套 discover 在隔离环境跑不起来），

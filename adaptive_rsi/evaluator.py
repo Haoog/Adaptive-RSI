@@ -200,6 +200,12 @@ def test_identities(text):
             "limitation": "Runner output is diagnostic; sealed check exit status remains authoritative"}
 
 
+def named_test_rows(results):
+    """具名测试可能落在任一阶段：新行为在宿主验收里，被保护的既有测试在回归里。"""
+    return [row for stage in ["candidate", "candidate_full", "acceptance_candidate"]
+            for row in results.get(stage, [])]
+
+
 def verify_test_identities(rows, required):
     executed = {identity for row in rows for identity in row.get("test_identities", {}).get("executed", [])}
     missing = sorted(set(required) - executed)
@@ -1942,7 +1948,10 @@ class Evaluator:
             data["contract"] = acceptance.get("contract")
             required = (acceptance.get("contract") or {}).get("required_test_ids")
             if required:
-                data["test_identity_verification"] = verify_test_identities(results.get("acceptance_candidate", []), required)
+                # 具名测试可能是宿主验收里的新行为测试，也可能是普通回归里钉住旧
+                # 行为的既有测试；只查 acceptance_candidate 会把后者误判成没执行。
+                data["test_identity_verification"] = verify_test_identities(
+                    named_test_rows(results), required)
                 if not data["test_identity_verification"]["valid"]:
                     data.update(decision="insufficient_evidence", reason="Required regression test IDs were not executed")
         elif test_first:
