@@ -423,7 +423,7 @@ def _compacted_run_result(value):
             "failure": result.get("failure")}
 
 
-def _compact_expired_run(store, run_id, project):
+def _compact_expired_run(store, run_id):
     """产物删除后压缩过期运行的历史，避免数据库随运行数无界增长。
 
     只在 `_remove_run_artifacts` **返回真** 之后调用：删除被拒绝（新增法定保留、
@@ -437,9 +437,10 @@ def _compact_expired_run(store, run_id, project):
     if store.one("SELECT 1 FROM settings WHERE key=?",
                  ("delivery-generation:" + run_id,)):
         return
-    row = store.one("SELECT result FROM runs WHERE id=?", (run_id,))
+    row = store.one("SELECT result,project FROM runs WHERE id=?", (run_id,))
     if row is None:
         return
+    project = row["project"]
     compacted = _compacted_run_result(row["result"])
     large = len(row["result"] or "") > COMPACT_RESULT_ABOVE
     try:
@@ -454,6 +455,35 @@ def _compact_expired_run(store, run_id, project):
     except sqlite3.Error:
         logging.getLogger(__name__).warning(
             "Run history compaction skipped for %s", run_id, exc_info=True)
+
+
+# 归档删除后 runs.path 会被置空，候选查询 `path IS NOT NULL` 再也看不到它们；
+# 历史压缩必须单独回填，否则升级前删掉产物的一大批运行永远不会被压缩。
+COMPACTION_BACKFILL_LIMIT = 64
+
+
+def _compact_retired_runs(store, project, cutoff):
+    """按保留期回填压缩「产物已删除、path 已置空」的运行历史。
+
+    用 keyset 游标推进：被法定保留或代际记录挡住的运行不会改变资格，没有游标
+    就每轮都选中同一批，后面的运行永远轮不到。游标只按 id 前进，与"是否真的
+    压缩"无关。候选条件同时看 result 与 stages：result 很小但阶段里存着大补丁
+    的运行同样要处理。
+    """
+    key = "compaction-cursor:" + project
+    cursor = store.setting(key, "")
+    if not isinstance(cursor, str):
+        cursor = ""
+    rows = store.query(
+        "SELECT id FROM runs WHERE project=? AND path IS NULL AND ended<? AND id>? "
+        "AND (length(CAST(result AS BLOB))>? "
+        "OR EXISTS (SELECT 1 FROM stages WHERE stages.run=runs.id)) "
+        "ORDER BY id LIMIT ?",
+        (project, cutoff, cursor, COMPACT_RESULT_ABOVE, COMPACTION_BACKFILL_LIMIT))
+    for row in rows:
+        _compact_expired_run(store, row["id"])
+    if rows:
+        store.put_setting(key, rows[-1]["id"] if len(rows) >= COMPACTION_BACKFILL_LIMIT else "")
 
 
 def _remove_run_artifacts(store, run_id, project, directory, stored=None, snapshot=None):
@@ -775,7 +805,10 @@ class Maintenance:
                                 # 磁盘上，这时压缩会留下「磁盘有、库里没有」的
                                 # 半份证据。
                                 if removed:
-                                    _compact_expired_run(self.store, run["id"], project["id"])
+                                    _compact_expired_run(self.store, run["id"])
+                # 产物已在旧版本删掉、path 已置空的运行不会回到上面的候选里，
+                # 这里按同一保留期回填压缩，数据库才会随保留策略一起收敛。
+                _compact_retired_runs(self.store, project["id"], cutoff)
                 # Freeze promotion/rollback while choosing and deleting retired candidates.
                 with self.store.connect() as db:
                     db.execute("BEGIN IMMEDIATE")
