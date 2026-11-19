@@ -49,6 +49,9 @@ DEFAULTS = {
                             "health_consecutive_successes": 1, "health_urls": [],
                             "rollback_data_policy": "manual", "rollback_recovery_notes": ""}},
     "checks": [],
+    # 探测到的检查默认仍会加入完整检查面，防止候选缩小检查范围；探测对当前
+    # 运行环境明显不适用时（例如容器里没有对应工具链），可以显式关掉。
+    "detected_checks": True,
     "validation": {"controls": [], "affected_check_scheduling": False},
     "environment": {"seed_paths": [], "setup": [], "max_seed_mb": 1024},
     "evolution": {"enabled": True, "every_completed": 5, "auto_promote": True,
@@ -120,6 +123,8 @@ def _validate(config, *, _ignore_invalid_health_urls=False):
             raise ValueError("Control fixture too large")
     if any(type(value) is not int or not 1 <= value <= 86400 for value in config['deadlines'].values()):
         raise ValueError('Stage deadlines must be 1..86400 seconds')
+    if type(config.get("detected_checks")) is not bool:
+        raise ValueError("detected_checks must be true or false")
     if not 0 <= config["recovery"]["provider_retry_minutes"] <= 1440:
         raise ValueError("provider_retry_minutes must be 0..1440")
     if type(config["recovery"].get("reuse_sealed_checkpoints")) is not bool:

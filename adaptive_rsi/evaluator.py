@@ -848,6 +848,24 @@ def _test_symbols(root, filename):
     return []
 
 
+def _full_checks(checks, candidate, detected=True):
+    """完整检查面：配置的检查 + 探测到的检查。
+
+    探测默认保留，防止候选通过删测试或改配置缩小检查范围。``detected_checks``
+    为 false 时只跑配置项：探测对当前运行环境明显不适用（容器里没有对应工具链、
+    整套 discover 在隔离环境里本来就跑不起来）时，否则每个候选都会被必然失败的
+    探测项判死。
+    """
+    full = list(checks)
+    if not detected:
+        return full
+    for check in detect(candidate)["checks"]:
+        if not any(row["argv"] == check["argv"] and row.get("cwd", ".") == check.get("cwd", ".")
+                   for row in full):
+            full.append(check)
+    return full
+
+
 def _isolated_test_check(checks, root, filename, regression_symbols=()):
     root = Path(root).resolve()
     target = (root / filename).resolve()
@@ -1726,11 +1744,7 @@ class Evaluator:
                                   for symbol in _test_symbols(baseline, path)} if test_first else set())
         regression_test_symbols = ([symbol for path in added_tests for symbol in _test_symbols(candidate, path)
                                    if symbol not in existing_test_symbols] if test_first else [])
-        full_checks = list(checks)
-        for check in detect(candidate)["checks"]:
-            if not any(row["argv"] == check["argv"] and row.get("cwd", ".") == check.get("cwd", ".")
-                       for row in full_checks):
-                full_checks.append(check)
+        full_checks = _full_checks(checks, candidate, config.get("detected_checks", True))
         changed_harness = _changed_harness(changed_files or [], full_checks, baseline, added_tests)
         # Without a repository the harness comparison cannot prove that the
         # candidate did not rewrite tests, so compare the files that the
