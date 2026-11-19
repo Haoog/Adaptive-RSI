@@ -138,6 +138,32 @@ class CleanupRecoveryTest(unittest.TestCase):
         self.assertIsNone(self.store.one("SELECT 1 FROM stages WHERE run=?", (run_id,)))
         self.assertIsNone(self.store.one("SELECT 1 FROM events WHERE run=?", (run_id,)))
 
+    def test_runs_whose_artifacts_were_already_removed_are_backfilled(self):
+        # 旧版本删产物时会把 runs.path 置空；候选查询是 `path IS NOT NULL`，
+        # 这些运行再也不会回到清理循环里，历史压缩必须单独回填，否则升级前
+        # 删掉产物的一大批运行永远不会被压缩。
+        run_id = 'r-retired'
+        blob = 'q' * 20000
+        result = {"evaluation": {"decision": "fail", "reason": "retired",
+                                 "checks": {"baseline": [{"name": "Python", "exit_code": 1,
+                                                          "output": blob}]}}}
+        ended = time.time() - 40 * 86400
+        self.store.execute(
+            "INSERT INTO runs(id,project,state,path,ended,result) VALUES (?,'p','failed',NULL,?,?)",
+            (run_id, ended, json.dumps(result)))
+        self.store.execute(
+            "INSERT INTO stages(run,stage,signature,data,created) VALUES (?,?,?,?,?)",
+            (run_id, 'candidate', 'sig', blob, ended))
+
+        from adaptive_rsi.runtime import Runtime
+        Runtime(self.store, agent=object()).maintenance()
+
+        payload = json.loads(self.store.one("SELECT result FROM runs WHERE id=?",
+                                            (run_id,))['result'])
+        self.assertTrue(payload.get('compacted'), '产物已删除的运行也要回填压缩')
+        self.assertEqual(payload['evaluation']['reason'], 'retired')
+        self.assertIsNone(self.store.one("SELECT 1 FROM stages WHERE run=?", (run_id,)))
+
     def test_history_is_not_compacted_when_artifact_removal_is_refused(self):
         # 删除被拒绝时 _remove_run_artifacts 返回 False（不抛异常）。此时产物还在
         # 磁盘上，压缩会让数据库里的证据先消失，留下半份记录。
