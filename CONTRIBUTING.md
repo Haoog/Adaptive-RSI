@@ -21,6 +21,8 @@ npm run test:browser -- browser_task_detail.cjs
 npm run test:browser -- browser_hardening.cjs:routes
 ```
 
+改动行为前，先跑覆盖该路径的既有测试。既有测试失败时，要么改代码让它继续通过，要么在同一个改动里更新那个测试、并写清行为为什么应当改变；把红着的用例留给后续提交不算完成。
+
 新增或改名测试模块时，必须同步把它登记到 `.github/workflows/checks.yml` 的矩阵里；未登记的模块不会被 CI 选择，也不会出现在交付证据里，复审会以「没有证据」驳回。
 
 修改前端共享请求、状态或渲染逻辑时，运行 `node --test tests/web_*.cjs` 以及相关真实浏览器场景；修改后端共享运行时、数据或隔离边界时，扩大到对应模块并在交付前运行全量。文档改动使用 `python3 -B scripts/check_docs.py`。首次准备环境或锁文件变化后才需要 `npm ci --ignore-scripts` 和浏览器安装。
