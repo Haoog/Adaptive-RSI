@@ -21,6 +21,8 @@ npm run test:browser -- browser_task_detail.cjs
 npm run test:browser -- browser_hardening.cjs:routes
 ```
 
+Before changing behavior, run the existing tests that cover that path. If one fails, either change the code so it still passes, or update that test in the same change and state why the behavior should change. Leaving a red test for a later commit is not done.
+
 When you add or rename a test module, register it in the `.github/workflows/checks.yml` matrix in the same change. Modules that are not listed are never selected by CI and never appear in delivery evidence, so review rejects the change for lacking evidence.
 
 For shared frontend request, state or rendering changes, run `node --test tests/web_*.cjs` and the relevant real-browser scenarios. For shared backend runtime, storage or isolation changes, expand to the related modules and run the full suite before delivery. Documentation changes use `python3 -B scripts/check_docs.py`. Dependency installation (`npm ci --ignore-scripts`) and browser installation are needed for initial setup or lockfile changes.
