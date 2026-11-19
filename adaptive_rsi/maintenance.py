@@ -414,17 +414,22 @@ def _compacted_run_result(value):
             continue
         checks[stage] = [{"name": item.get("name"), "exit_code": item.get("exit_code")}
                          for item in items if isinstance(item, dict)]
-    return {"compacted": True, "decision": evaluation.get("decision"),
-            "reason": evaluation.get("reason"), "failure": result.get("failure"),
-            "checks": checks}
+    # 保持 evaluation 这一层：dashboard.py 和 web/app.js 都从
+    # result['evaluation'] 读 decision 与 checks，搬平会让历史里的评估
+    # 显示成「没有评估过」。
+    return {"compacted": True,
+            "evaluation": {"decision": evaluation.get("decision"),
+                           "reason": evaluation.get("reason"), "checks": checks},
+            "failure": result.get("failure")}
 
 
-def _compact_expired_run(store, run_id):
+def _compact_expired_run(store, run_id, project):
     """产物删除后压缩过期运行的历史，避免数据库随运行数无界增长。
 
-    只在该运行的产物确认删除之后调用：此时磁盘上的证据已经不存在，继续保留
-    完整检查输出、补丁和阶段快照只会让 state.sqlite3 一直涨。运行行本身、
-    状态与结论保留，历史仍然可查；阶段快照与事件按运行删除。
+    只在 `_remove_run_artifacts` **返回真** 之后调用：删除被拒绝（新增法定保留、
+    留下未知工件）时函数是返回 False 而不是抛异常，此时磁盘证据还在，压缩会
+    造成「磁盘上留着、库里却没了」的半份证据。写事务里再查一次 hold，让清理
+    期间新提交的保留同样能挡住数据库侧删除。
     """
     from .store import encode
     # 代际回收把 stages/events 当作生命周期证据（_lifecycle_closed 依赖它们），
@@ -440,6 +445,8 @@ def _compact_expired_run(store, run_id):
     try:
         with store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if _held_in_transaction(db, run_id, project):
+                return
             db.execute("DELETE FROM stages WHERE run=?", (run_id,))
             db.execute("DELETE FROM events WHERE run=?", (run_id,))
             if compacted is not None and large:
@@ -753,8 +760,9 @@ class Maintenance:
                             # 单个运行删除失败（EACCES、只读挂载、网络文件系统错误）
                             # 不阻塞同批其他运行；path 保留，下一轮自然重试。
                             try:
-                                _remove_run_artifacts(self.store, run["id"], project["id"], directory,
-                                                      stored=run["path"], snapshot=snapshot)
+                                removed = _remove_run_artifacts(
+                                    self.store, run["id"], project["id"], directory,
+                                    stored=run["path"], snapshot=snapshot)
                             except (OSError, sqlite3.Error) as exc:
                                 degraded.append({"run": run["id"], "project": project["id"],
                                                  "error_type": type(exc).__name__,
@@ -763,9 +771,11 @@ class Maintenance:
                                     "Maintenance kept run %s for retry (%s: %s)",
                                     run["id"], type(exc).__name__, exc)
                             else:
-                                # 产物确认删除后才压缩历史：顺序反了会先丢掉
-                                # 结论、再因为删除失败而永久保留半份证据。
-                                _compact_expired_run(self.store, run["id"])
+                                # 删除被拒绝时返回 False 而不是抛异常：产物还在
+                                # 磁盘上，这时压缩会留下「磁盘有、库里没有」的
+                                # 半份证据。
+                                if removed:
+                                    _compact_expired_run(self.store, run["id"], project["id"])
                 # Freeze promotion/rollback while choosing and deleting retired candidates.
                 with self.store.connect() as db:
                     db.execute("BEGIN IMMEDIATE")
