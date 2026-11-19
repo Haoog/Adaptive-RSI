@@ -395,8 +395,14 @@ def improvement(results, acceptance):
             "improved_checks": changed, "basis": "independent_behavior_before_after"}
 
 
-def evidence_contract(task, plan):
+def evidence_contract(task, plan, require_preserved=False):
     kind = "refactor" if task["source"] == "rollback" else change_kind(task, plan)
+    if require_preserved and kind == "behavior":
+        # 说不出「哪些既有测试钉住了不能变的行为」，说明这个改动还没想清楚边界。
+        # 在这里挡住比让实现跑完再被复审否决便宜一个数量级。
+        named = plan.get("required_test_ids")
+        if not isinstance(named, list) or not named:
+            raise ValueError("Behavior plan must name the existing tests that pin the behavior it must not change")
     requirements = {
         "behavior": "Reproduce the reported behavior before the change and demonstrate it works afterward.",
         "performance": "Emit one JSON measurement line per version, repetition, load condition and guardrail metric: metric, unit, value and the load label when declared. Use the frozen targets and tolerances.",

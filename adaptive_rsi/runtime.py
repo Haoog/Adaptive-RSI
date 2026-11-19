@@ -174,6 +174,34 @@ class IssueSyncCorruptPending(ValueError):
         self.project = project
 
 
+def attempt_diagnosis(result):
+    """重试额度用尽时写清楚卡在哪，而不是只留一个 failed 状态。"""
+    parts = []
+    evaluation = result.get("evaluation") or {}
+    if evaluation.get("decision"):
+        parts.append("evaluation=" + str(evaluation["decision"]))
+    failing = []
+    for stage in ["candidate", "candidate_full"]:
+        for check in (evaluation.get("checks") or {}).get(stage, []):
+            if isinstance(check, dict) and not check.get("passed"):
+                detail = ""
+                for line in str(check.get("stderr") or "").splitlines():
+                    if line.startswith(("FAIL:", "ERROR:")):
+                        detail = line[:160]
+                        break
+                failing.append((check.get("name") or "check") + ((" -> " + detail) if detail else ""))
+    if failing:
+        parts.append("failing: " + "; ".join(failing[:3]))
+    review = result.get("review") or {}
+    blocked = [a for a in review.get("assessments") or []
+               if isinstance(a, dict) and a.get("decision") not in (None, "pass")]
+    if blocked:
+        parts.append("review: " + "; ".join(str(a.get("area")) + "=" + str(a.get("decision")) for a in blocked[:3]))
+    if result.get("reason"):
+        parts.append("reason: " + str(result["reason"])[:200])
+    return " | ".join(parts) or "no evaluation evidence recorded"
+
+
 class Runtime(Maintenance):
     @classmethod
     def open(cls, root, agent=None):
@@ -2835,6 +2863,10 @@ class Runtime(Maintenance):
             self.monitor_strategy(run["project"], False, run, attributable=regression)
         if retry and transitioned and self.store.one("SELECT state FROM tasks WHERE id=?", (task["id"],))["state"] == "queued":
             self.store.event("retry", "Fresh run scheduled with bounded backoff", run["project"], run["id"])
+        elif state == "failed" and transitioned:
+            # 额度用尽：把卡点写进事件，归档后人和下一轮都能看到为什么停。
+            self.store.event("diagnosis", "Attempts exhausted: " + attempt_diagnosis(result),
+                             run["project"], run["id"])
 
     def inspect(self, project, workspace, kind, run, strategies):
         head = git(workspace, "rev-parse", "HEAD")
