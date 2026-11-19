@@ -21,6 +21,8 @@ npm run test:browser -- browser_task_detail.cjs
 npm run test:browser -- browser_hardening.cjs:routes
 ```
 
+新增或改名测试模块时，必须同步把它登记到 `.github/workflows/checks.yml` 的矩阵里；未登记的模块不会被 CI 选择，也不会出现在交付证据里，复审会以「没有证据」驳回。
+
 修改前端共享请求、状态或渲染逻辑时，运行 `node --test tests/web_*.cjs` 以及相关真实浏览器场景；修改后端共享运行时、数据或隔离边界时，扩大到对应模块并在交付前运行全量。文档改动使用 `python3 -B scripts/check_docs.py`。首次准备环境或锁文件变化后才需要 `npm ci --ignore-scripts` 和浏览器安装。
 
 选择器会在启动任何进程前展开成具体用例：整类与其中某个方法同时选择、选择器互相包含、或选择不到任何用例，都会直接报错而不启动 worker；完全重复的选择器视为幂等，去重后只执行一次。运行器通过 `RSI_TEST_RUNNING` 拒绝重入 worker 正在执行的模块；使用 `scripts.test_worker` 的路径在父进程消失后退出。隔离夹具可受控执行其他模块，因此不能把防护理解成禁止所有嵌套进程。维护者报告的两次资源耗尽故障、根因和后续执行规则见[测试递归事故记录](docs/validation/test-runner-recursion-20261028.md)。运行器回归必须拦截进程创建并断言零 spawn，禁止放开真实递归复现，也不能为提速绕过这些护栏。
