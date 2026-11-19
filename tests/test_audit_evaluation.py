@@ -1439,5 +1439,33 @@ class AuditEvaluationTest(unittest.TestCase):
             self.assertEqual(isolated['argv'], ['go', 'test', '-tags', 'ci', '-run', '^(TestX)$', './pkg'])
 
 
+    def test_detection_policy_participates_in_reuse_identities(self):
+        # 关掉探测时通过的候选，如果中断后打开探测重试，不能复用那次结论：
+        # 开关必须进阶段缓存键和评估来源指纹。
+        from adaptive_rsi import pipeline
+        from adaptive_rsi.config import DEFAULTS, merge
+        on = merge(DEFAULTS, {'detected_checks': True})
+        off = merge(DEFAULTS, {'detected_checks': False})
+        self.assertNotEqual(pipeline._stage_config(on, 'implementation')[0],
+                            pipeline._stage_config(off, 'implementation')[0])
+        self.assertNotEqual(
+            pipeline._evaluation_source(on, 'base', [], 'patch', None, None, False, None),
+            pipeline._evaluation_source(off, 'base', [], 'patch', None, None, False, None))
+
+    def test_detected_checks_can_be_disabled_when_detection_does_not_apply(self):
+        # 探测默认保留，防止候选通过删测试缩小检查面。但探测对运行环境明显
+        # 不适用时（容器里没有 Rust 工具链、整套 discover 在隔离环境跑不起来），
+        # 每个候选都会被必然失败的探测项判死，需要能显式关掉。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'tests').mkdir()
+            (root / 'pyproject.toml').write_text('[project]\nname="fixture"\n')
+            (root / 'tests' / 'test_fixture.py').write_text('import unittest\n')
+            configured = [{'name': 'core', 'cwd': '.',
+                           'argv': ['python3', '-m', 'unittest', 'tests.test_fixture']}]
+            self.assertGreater(len(evaluator._full_checks(configured, root)), 1)
+            self.assertEqual(evaluator._full_checks(configured, root, detected=False), configured)
+
+
 if __name__ == '__main__':
     unittest.main()

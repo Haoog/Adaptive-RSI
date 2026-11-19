@@ -181,6 +181,8 @@ def _stage_config(config, stage):
         value["triage"] = config["triage"]
     if stage in ["planning", "acceptance", "implementation"]:
         value["checks"] = config["checks"]
+        # 探测策略决定实际执行哪些检查：关掉时通过的缓存不能在打开后被复用。
+        value["detected_checks"] = config.get("detected_checks", True)
         value["environment"] = config["environment"]
     if stage == "review":
         value["review"] = config["review"]
@@ -303,6 +305,7 @@ def _evaluation_source(config, base, checks, patch, environment_digest, acceptan
     """
     return {"base": base, "checks": checks, "patch_hash": fingerprint(patch),
             "environment": environment_digest, "validation": config.get("validation"),
+            "detected_checks": config.get("detected_checks", True),
             "acceptance_hash": acceptance["hash"] if acceptance else None,
             "contract_hash": fingerprint(acceptance["contract"]) if acceptance else None,
             "criteria_hash": fingerprint(acceptance["criteria"]) if acceptance else None,
