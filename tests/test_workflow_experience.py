@@ -917,6 +917,25 @@ class ExperienceTest(unittest.TestCase):
         self.assertNotIn("12345", json.dumps(feedback))
         self.assertEqual("candidate_full", feedback["failed_regression_checks"][0]["stage"])
 
+    def test_retry_feedback_keeps_the_failing_test_not_the_progress_dots(self):
+        # unittest 先打一屏进度点，FAIL 行在末尾。按前 1000 字符截断时下一轮只
+        # 看得到点，看不到是哪个用例挂了——服务器上就是这样连输四轮的。
+        from adaptive_rsi.experience import retry_feedback
+        noise = "." * 4000
+        stderr = (noise + "\n" + "=" * 70 + "\n"
+                  "FAIL: test_failing_system_scan_gets_circuit_breaker_backoff "
+                  "(tests.test_runtime.RuntimeTest.test_failing_system_scan_gets_circuit_breaker_backoff)\n"
+                  + "-" * 70 + "\nAssertionError: 3 != 5\n\n"
+                  "----------------------------------------------------------------------\n"
+                  "Ran 555 tests in 86.4s\n\nFAILED (failures=1)\n")
+        result = {"evaluation": {"checks": {"candidate": [
+            {"name": "Python: 核心契约（555 项）", "passed": False, "exit_code": 1, "stderr": stderr}]}}}
+        feedback = retry_feedback({"result": json.dumps(result)})
+        stderr_out = feedback["failed_regression_checks"][0]["stderr"]
+        self.assertIn("test_failing_system_scan_gets_circuit_breaker_backoff", stderr_out)
+        self.assertIn("AssertionError: 3 != 5", stderr_out)
+        self.assertLess(len(stderr_out), 1200, "失败摘要必须仍然有界")
+
     def test_global_resume_resets_only_matching_project_circuit(self):
         from adaptive_rsi.provider_health import ProviderHealth, connection_key
         from adaptive_rsi.store import encode
