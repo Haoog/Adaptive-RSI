@@ -486,12 +486,24 @@ def connection_config():
     return result
 
 
+# 内置连接里带变体后缀的 provider：与基础 provider 共用连接配置和凭据。
+PROVIDER_ALIASES = {"opencode-go": "opencode"}
+
+
 def prepare_home(home, model=None, read_only=True, container=False, capabilities=None, binary=None,
                  exported_auth=None):
     providers = connection_config()
     prefix = model.split("/", 1)[0] if model else None
+    # 只有已知的变体前缀才回退到基础 provider。自定义的连字符 id（例如
+    # openai-private）用自己的配置和密钥，不能借用别的 provider 的凭据。
+    alias = PROVIDER_ALIASES.get(prefix) if prefix else None
+    explicit = bool(alias) and any(key == prefix for key in providers)
+    base_prefix = alias if alias and not explicit else prefix
     if prefix:
-        providers = {key: value for key, value in providers.items() if key == prefix}
+        selected = {key: value for key, value in providers.items() if key == prefix}
+        if not selected and base_prefix != prefix:
+            selected = {key: value for key, value in providers.items() if key == base_prefix}
+        providers = selected
     # 只导入连接配置，不继承插件、MCP、Agent 或项目权限。
     providers = {key: {field: value for field, value in provider.items()
                        if field in ["name", "npm", "api", "env", "options", "models", "whitelist", "blacklist"]}
@@ -525,7 +537,7 @@ def prepare_home(home, model=None, read_only=True, container=False, capabilities
                 "deepseek": ["DEEPSEEK_API_KEY"], "openrouter": ["OPENROUTER_API_KEY"],
                 "opencode": ["OPENCODE_API_KEY"]}
     for key, values in standard.items():
-        if prefix is None or prefix == key:
+        if prefix is None or prefix == key or base_prefix == key:
             names.update(values)
     for name in names:
         if name in os.environ:

@@ -546,3 +546,36 @@ class OpenCodeIntegrationTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join()
+
+
+class OpenCodeCredentialPrefixTest(unittest.TestCase):
+    def test_variant_prefix_still_receives_the_provider_key(self):
+        # 模型前缀可能是 opencode-go 这样的变体；按精确匹配挑连接和凭据会让
+        # OPENCODE_API_KEY 根本进不了工具环境，调用直接失败且信息被脱敏。
+        from adaptive_rsi import opencode
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {"OPENCODE_API_KEY": "oc_sk_variant_prefix_probe"}):
+            environment, secrets = opencode.prepare_home(
+                Path(directory), "opencode-go/deepseek-v4.1-flash")
+        self.assertEqual(environment.get("OPENCODE_API_KEY"), "oc_sk_variant_prefix_probe")
+        self.assertIn("oc_sk_variant_prefix_probe", secrets)
+
+    def test_custom_hyphenated_provider_does_not_borrow_another_key(self):
+        # openai-private 是自定义连接，用自己的密钥；不能因为前缀像 openai
+        # 就把宿主的 OPENAI_API_KEY 塞进去。
+        from adaptive_rsi import opencode
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {"OPENAI_API_KEY": "sk-other-provider-probe"}):
+            environment, secrets = opencode.prepare_home(
+                Path(directory), "openai-private/some-model")
+        self.assertNotIn("OPENAI_API_KEY", environment)
+        self.assertNotIn("sk-other-provider-probe", secrets)
+
+    def test_unrelated_provider_does_not_receive_the_key(self):
+        from adaptive_rsi import opencode
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {"OPENCODE_API_KEY": "oc_sk_variant_prefix_probe"}):
+            environment, secrets = opencode.prepare_home(
+                Path(directory), "anthropic/claude-sonnet-4")
+        self.assertNotIn("OPENCODE_API_KEY", environment)
+        self.assertNotIn("oc_sk_variant_prefix_probe", secrets)
