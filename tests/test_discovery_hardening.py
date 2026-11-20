@@ -1236,5 +1236,25 @@ class IssueRequirementsTest(unittest.TestCase):
         self.assertEqual(self.task()["body"], "shortened\n\nlocal")
 
 
+class CIRegistrationTest(unittest.TestCase):
+    """新增测试模块必须出现在 CI 的选择矩阵里，否则它永远不会被执行。
+
+    这条以前只写在 CONTRIBUTING.md 里，循环踩了很多次：候选加了新回归模块但不
+    登记，本地跑绿、CI 不选、复审以「没有证据」驳回。写成检查之后，没登记就是
+    一个具体的红，不用靠复审从仓库外面发现。
+    """
+
+    def test_every_test_module_is_selected_by_a_workflow(self):
+        import re
+        root = Path(__file__).resolve().parents[1]
+        workflows = "\n".join(path.read_text(encoding="utf-8")
+                              for path in sorted((root / ".github" / "workflows").glob("*.yml")))
+        modules = sorted(path.stem for path in (root / "tests").glob("test_*.py"))
+        self.assertGreater(len(modules), 10)
+        missing = [module for module in modules
+                   if not re.search(r"\btests\." + re.escape(module) + r"\b", workflows)]
+        self.assertEqual(missing, [], "测试模块没有登记到 CI 矩阵: " + ", ".join(missing))
+
+
 if __name__ == "__main__":
     unittest.main()
