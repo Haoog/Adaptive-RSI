@@ -560,6 +560,17 @@ class OpenCodeCredentialPrefixTest(unittest.TestCase):
         self.assertEqual(environment.get("OPENCODE_API_KEY"), "oc_sk_variant_prefix_probe")
         self.assertIn("oc_sk_variant_prefix_probe", secrets)
 
+    def test_custom_hyphenated_provider_does_not_borrow_another_key(self):
+        # openai-private 是自定义连接，用自己的密钥；不能因为前缀像 openai
+        # 就把宿主的 OPENAI_API_KEY 塞进去。
+        from adaptive_rsi import opencode
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {"OPENAI_API_KEY": "sk-other-provider-probe"}):
+            environment, secrets = opencode.prepare_home(
+                Path(directory), "openai-private/some-model")
+        self.assertNotIn("OPENAI_API_KEY", environment)
+        self.assertNotIn("sk-other-provider-probe", secrets)
+
     def test_unrelated_provider_does_not_receive_the_key(self):
         from adaptive_rsi import opencode
         with tempfile.TemporaryDirectory() as directory, \

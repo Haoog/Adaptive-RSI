@@ -486,13 +486,19 @@ def connection_config():
     return result
 
 
+# 内置连接里带变体后缀的 provider：与基础 provider 共用连接配置和凭据。
+PROVIDER_ALIASES = {"opencode-go": "opencode"}
+
+
 def prepare_home(home, model=None, read_only=True, container=False, capabilities=None, binary=None,
                  exported_auth=None):
     providers = connection_config()
     prefix = model.split("/", 1)[0] if model else None
-    # opencode-go / opencode-xyz 这类变体指向同一个连接：模型前缀带后缀时，
-    # 精确匹配不到就回退到基础 provider，否则连接配置和凭据都不会进入工具环境。
-    base_prefix = prefix.split("-", 1)[0] if prefix and "-" in prefix else prefix
+    # 只有已知的变体前缀才回退到基础 provider。自定义的连字符 id（例如
+    # openai-private）用自己的配置和密钥，不能借用别的 provider 的凭据。
+    alias = PROVIDER_ALIASES.get(prefix) if prefix else None
+    explicit = bool(alias) and any(key == prefix for key in providers)
+    base_prefix = alias if alias and not explicit else prefix
     if prefix:
         selected = {key: value for key, value in providers.items() if key == prefix}
         if not selected and base_prefix != prefix:
