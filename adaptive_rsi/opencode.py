@@ -490,8 +490,14 @@ def prepare_home(home, model=None, read_only=True, container=False, capabilities
                  exported_auth=None):
     providers = connection_config()
     prefix = model.split("/", 1)[0] if model else None
+    # opencode-go / opencode-xyz 这类变体指向同一个连接：模型前缀带后缀时，
+    # 精确匹配不到就回退到基础 provider，否则连接配置和凭据都不会进入工具环境。
+    base_prefix = prefix.split("-", 1)[0] if prefix and "-" in prefix else prefix
     if prefix:
-        providers = {key: value for key, value in providers.items() if key == prefix}
+        selected = {key: value for key, value in providers.items() if key == prefix}
+        if not selected and base_prefix != prefix:
+            selected = {key: value for key, value in providers.items() if key == base_prefix}
+        providers = selected
     # 只导入连接配置，不继承插件、MCP、Agent 或项目权限。
     providers = {key: {field: value for field, value in provider.items()
                        if field in ["name", "npm", "api", "env", "options", "models", "whitelist", "blacklist"]}
@@ -525,7 +531,7 @@ def prepare_home(home, model=None, read_only=True, container=False, capabilities
                 "deepseek": ["DEEPSEEK_API_KEY"], "openrouter": ["OPENROUTER_API_KEY"],
                 "opencode": ["OPENCODE_API_KEY"]}
     for key, values in standard.items():
-        if prefix is None or prefix == key:
+        if prefix is None or prefix == key or base_prefix == key:
             names.update(values)
     for name in names:
         if name in os.environ:
