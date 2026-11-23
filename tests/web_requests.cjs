@@ -3969,6 +3969,55 @@ test('model capability form validates limits and links and submits only changed 
 });
 
 for(const action of ['save','clear']){
+  test(`model capability form waits for the rendered catalog before closing after ${action}`,async()=>{
+    const page=await modelCapabilityPage();
+    if(action==='save'){
+      page.catalog({source:'conservative_default',context_tokens:32000,max_output_tokens:2048});
+      await page.context.window.RSIModelCenter.load();
+    }
+    const rowStatus=()=>descendants(page.node('mc-model-list').children[0]).find(node=>node.tagName==='SMALL').textContent;
+    const before=action==='save'?'保守默认值':'人工覆盖',after=action==='save'?'人工覆盖':'保守默认值';
+    page.open();page.change('note','saved');
+    const dialog=page.field('dialog'),pending=page.run(action);
+    let releaseRead,statusAtClose;
+    page.beforeRead(()=>new Promise(resolve=>{releaseRead=resolve;}));
+    const close=dialog.close.bind(dialog);
+    dialog.close=()=>{statusAtClose=rowStatus();close();};
+    page.catalog({source:action==='save'?'manual':'conservative_default',context_tokens:32000,max_output_tokens:2048});
+    page.requests[0].resolve({saved:true});await waitFor(()=>releaseRead);
+    assert.match(rowStatus(),new RegExp(before));
+    assert.equal(dialog.open,true,'the dialog must stay open while the catalog GET is pending');
+    assert.equal(page.field('save').disabled,true);
+    assert.equal(page.node('mc-feedback').textContent,'');
+    releaseRead();await pending;
+    assert.equal(dialog.open,false);
+    assert.match(statusAtClose,new RegExp(after));
+    assert.equal(page.node('mc-feedback').textContent,action==='save'?'模型能力元数据已保存。':'已清除人工能力覆盖。');
+  });
+
+  test(`model capability form preserves edits during the catalog read after ${action}`,async()=>{
+    const page=await modelCapabilityPage();page.open();
+    if(action==='save')page.change('context','65000');
+    const pending=page.run(action);
+    let releaseRead;
+    page.beforeRead(()=>new Promise(resolve=>{releaseRead=resolve;}));
+    page.requests[0].resolve({saved:true});await waitFor(()=>releaseRead);
+    page.change('note','draft');
+    if(action==='save')page.change('context','64000');
+    page.catalog(action==='save'
+      ?{source:'manual',context_tokens:65000,max_output_tokens:4096,note:'original'}
+      :{source:'conservative_default',context_tokens:32000,max_output_tokens:2048});
+    releaseRead();await pending;
+    assert.equal(page.field('dialog').open,true);
+    assert.equal(page.field('note').value,'draft');
+    assert.equal(page.field('context').value,action==='save'?'64000':'32000');
+    assert.equal(page.field('clear').hidden,action==='clear');
+    assert.equal(page.node('mc-feedback').textContent,'');
+    const current=page.run('save');
+    assert.deepEqual(page.requests[1].body.model.capability_override,action==='save'?{context_tokens:64000,note:'draft'}:{note:'draft'});
+    page.requests[1].resolve({saved:true});await current;
+  });
+
   test(`model capability form ignores an old ${action} rejection after reopening`,async()=>{
     const page=await modelCapabilityPage();page.open();page.change('note','old');const old=page.run(action);
     page.close();page.open();page.change('note','new');const current=page.run(action);
@@ -4052,6 +4101,21 @@ test('model capability form preserves edits after clearing and uses the refreshe
   const current=page.run('save');
   assert.deepEqual(page.requests[1].body.model.capability_override,{note:'draft'});
   page.requests[1].resolve({saved:true});await current;
+});
+
+test('model capability form keeps a new form open after a late catalog read succeeds',async()=>{
+  const page=await modelCapabilityPage();page.open();page.change('note','saved');const old=page.run('save');
+  let releaseRead;
+  page.beforeRead(()=>new Promise(resolve=>{releaseRead=resolve;}));
+  page.requests[0].resolve({saved:true});await waitFor(()=>releaseRead);
+  page.close();page.open();page.change('note','new');const current=page.run('clear');
+  releaseRead();await old;
+  assert.equal(page.field('dialog').open,true);
+  assert.equal(page.field('clear').disabled,true);
+  assert.equal(page.field('note').value,'new');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  page.requests[1].resolve({saved:true});await current;
+  assert.equal(page.field('dialog').open,false);
 });
 
 test('model capability form ignores a late catalog read failure after reopening',async()=>{

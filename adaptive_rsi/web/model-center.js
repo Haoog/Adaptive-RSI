@@ -407,8 +407,6 @@ window.RSIModelCenter = (() => {
         if(override&&!Object.keys(override).length){box.close();return;}
         await api('model-center/model',{project,provider,model:{id:model,capability_override:override}});
       }catch(error){if(ownsForm())errorNode.textContent=message(error);return;}
-      const closed=ownsForm();
-      if(closed)box.close();
       if(scope!==project)return;
       // 同一弹窗有后续编辑时，目录读取失败也保留已确认的保存差量。
       if(isOpen()&&ownsFeedback()){
@@ -419,15 +417,19 @@ window.RSIModelCenter = (() => {
         }
       }
       const read=load({reportError:false}),ticket=sequence;
-      const ownsResult=()=>capabilityTarget===target&&ownsFeedback()&&ticket===sequence;
       try{await read;}
       catch{
-        if(closed&&ownsResult())setStatus(t(clearing?'已清除人工能力覆盖，但模型列表刷新失败。':'模型能力元数据已保存，但模型列表刷新失败。'),true);
+        if(ticket===sequence&&ownsForm()){
+          box.close();
+          setStatus(t(clearing?'已清除人工能力覆盖，但模型列表刷新失败。':'模型能力元数据已保存，但模型列表刷新失败。'),true);
+        }
         return;
       }
-      if(!ownsResult())return;
-      if(closed)setStatus(t(clearing?'已清除人工能力覆盖。':'模型能力元数据已保存。'));
-      else if(isOpen()){
+      if(ticket!==sequence||!isOpen()||!ownsFeedback())return;
+      if(unchanged()){
+        box.close();
+        setStatus(t(clearing?'已清除人工能力覆盖。':'模型能力元数据已保存。'));
+      }else{
         const capability=data.providers.find(item=>item.id===provider)?.catalog.models.find(item=>item.id===model)?.capabilities;
         if(capability)renderCapabilityFields(target,capability,submitted);
       }
