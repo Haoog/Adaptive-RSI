@@ -3505,7 +3505,7 @@ function modelScopePage(savedDrafts = new Map()) {
       overrides.set(body.project,Object.fromEntries(Object.entries(body.models).filter(([role,route])=>!body.inherit?.includes(role)&&JSON.stringify(route)!==JSON.stringify(globals[role]))));
       return {saved:true,models:effective(body.project)};
     }
-    if(path==='model-center/probe'){if(probeFailure)throw Object.assign(new Error('Probe failed'),{code:'probe_failed'});return {calls:[{tokens:1}]};}
+    if(path==='model-center/probe'){if(probeFailure)throw Object.assign(new Error('Probe failed'),{code:probeFailure});return {calls:[{tokens:1}]};}
     if(path.startsWith('model-center'))return modelSnapshot(path.includes('?')?decodeURIComponent(path.split('=')[1]):null);
     throw new Error('Unexpected model request '+path);
   };
@@ -3523,7 +3523,7 @@ function modelScopePage(savedDrafts = new Map()) {
     draft(){return page.context.window.modelScopeTest.draft();},
     openProbe(){page.context.window.modelScopeTest.openProbe();},
     otherProbe(){page.context.window.modelScopeTest.otherProbe();},
-    hold(){holdNext=true;},failProbe(){probeFailure=true;},release(){assert(held);release();}
+    hold(){holdNext=true;},failProbe(code='probe_failed'){probeFailure=code;},release(){assert(held);release();}
   };
 }
 
@@ -3747,6 +3747,59 @@ test('the probe button cancels a running test without closing the dialog',async(
   assert.equal(page.node('mc-probe-start').disabled,false);
   page.release();await probing;
   assert.equal(page.node('mc-probe-dialog').open,true,'cancelling keeps the dialog open for another attempt');
+});
+
+test('the probe wait deadline warns about possible charges and remembers the original target',async()=>{
+  const page=modelScopePage();await page.show('a');page.openProbe();page.hold();
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  vm.runInContext(i18n.slice(0,i18n.indexOf('const staticText =')),page.context);
+  const api=page.context.api;
+  page.context.api=async(path,body,options)=>{
+    const result=await api(path,body,options);
+    options?.signal?.throwIfAborted();
+    return result;
+  };
+  const probing=page.click('mc-probe-start');
+  assert.equal(page.node('mc-probe-result').textContent,'正在执行基础能力测试…');
+  page.fireTimer(16*60*1000);
+  assert.equal(page.probeSignals[0].aborted,true);
+  const deadlineResult=page.node('mc-probe-result').textContent;
+  page.release();await probing;
+  const notice='等待测试结果已超时。测试可能仍在服务端继续并产生费用。';
+  assert.equal(page.node('mc-probe-result').textContent,notice);
+  assert.equal(deadlineResult,notice,'the timer reports the end of the wait before request settlement');
+  assert.equal(page.node('mc-probe-start').textContent,'运行基础能力测试');
+  assert.equal(page.node('mc-probe-start').disabled,false);
+  for(const project of ['b',null]){
+    await page.show(project);page.openProbe();
+    assert.equal(page.node('mc-probe-result').textContent,'');
+  }
+  await page.show('a');page.otherProbe();
+  assert.equal(page.node('mc-probe-result').textContent,'');
+  assert.equal(page.posts.length,1,'switching targets must not resubmit the probe');
+  await page.click('mc-probe-start');
+  page.node('mc-probe-dialog').close();page.openProbe();
+  assert.equal(page.node('mc-probe-result').textContent,notice);
+  assert.equal(page.posts.length,2);
+  vm.runInContext(`language='en';window.RSIModelCenter.translate()`,page.context);
+  assert.equal(page.node('mc-probe-result').textContent,'Timed out waiting for the test result. The test may still be running on the server and may incur charges.');
+  vm.runInContext(`language='zh-CN';window.RSIModelCenter.translate()`,page.context);
+  await page.click('mc-probe-start');
+  assert.match(page.node('mc-probe-result').textContent,/基础能力测试通过/);
+  page.node('mc-probe-dialog').close();page.openProbe();
+  assert.equal(page.node('mc-probe-result').textContent,'');
+  assert.deepEqual(page.posts.map(({body})=>[body.project,body.model]),[['a','scope-coder'],['a','other-coder'],['a','scope-coder']]);
+});
+
+test('a probe service timeout reports the known failure without a retained wait notice',async()=>{
+  const page=modelScopePage();await page.show('a');page.openProbe();page.failProbe('timeout');
+  await page.click('mc-probe-start');
+  assert.equal(page.node('mc-probe-result').textContent,'请求超时，请重试。');
+  assert.equal(page.probeSignals[0].aborted,false);
+  assert.equal(page.timers.some(timer=>timer.active&&timer.delay===16*60*1000),false);
+  page.node('mc-probe-dialog').close();page.openProbe();
+  assert.equal(page.node('mc-probe-result').textContent,'');
+  assert.equal(page.posts.length,1);
 });
 
 for(const fails of [false,true])test(`catalog callback ${fails?'failure':'success'} preserves feedback after provider switch`,async()=>{

@@ -1316,6 +1316,7 @@ const english = {
   "我的中转站": "My gateway",
   "运行基础能力测试": "Run tool format test",
   "已停止等待；测试可能仍在服务端继续、产生费用并记录结果。": "Stopped waiting; the test may continue on the server, incur charges, and record results.",
+  "等待测试结果已超时。测试可能仍在服务端继续并产生费用。": "Timed out waiting for the test result. The test may still be running on the server and may incur charges.",
   "正在执行基础能力测试…": "Running tool format test…",
   "认证失败，请检查密钥及账号权限。": "Authentication failed. Check the key and account permissions.",
   "服务未提供标准模型目录，可添加自定义模型。": "The service does not provide a standard model directory. Add a custom model.",

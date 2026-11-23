@@ -189,7 +189,7 @@ State defaults to `~/.local/share/adaptive-rsi`. Override it with `ADAPTIVE_RSI_
 
 - With a project connected, Settings defaults to that project. Shared defaults supply values only where no project override exists. Delivery authorization is project-specific; shared settings offers a project shortcut.
 - Delivery modes mean keep changes locally, automatically submit a change request (PR) awaiting merge, or automatically merge after checks. Automatic merging still requires value assessment, tests, independent review and repository protection checks.
-- The Chinese UI uses everyday terms while retaining actual parameters such as `high` and `max`. A basic capability test makes a real, potentially billable model call and checks tool use/output format; it does not certify real-task performance.
+- The Chinese UI uses everyday terms while retaining actual parameters such as `high` and `max`. A basic capability test makes a real, potentially billable model call and checks tool use/output format; it does not certify real-task performance. The console waits up to 16 minutes. After the wait times out, the test may continue on the server and incur charges. On the current page, reopening the test for the same scope, service and model shows the timeout notice until you manually start a new test for that target.
 - Form errors preserve input, repeated clicks do not add duplicate goals, and partial batch imports retain only unsuccessful URLs for retry. Unchanged background polls preserve activity expansion and task-list focus.
 - If a browser session expires, follow the recovery page or run `python3 scripts/rsi open`. Projects and settings remain intact; no restart is required. Do not share authenticated links.
 
