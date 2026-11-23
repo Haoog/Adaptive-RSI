@@ -3506,6 +3506,7 @@ function modelScopePage(savedDrafts = new Map(), {connections=false} = {}) {
   if(connections)providers.push({id:'openai',name:'OpenAI',health:{},catalog:{models:[{id:'other-coder',name:'Other coder'}]}});
   const modelSnapshot=project=>({project,models:effective(project),global_models:structuredClone(globals),overrides:structuredClone(overrides.get(project)||{}),providers:structuredClone(providers)});
   page.context.english={};page.context.window.addEventListener=()=>{};
+  if(!connections)Object.assign(page.context.location,{href:'http://localhost/#modelTab=roles',hash:'#modelTab=roles'});
   const tabs=(connections?['providers','roles']:['roles']).map(name=>{
     const tab=page.node('model-tab-'+name);tab.dataset.mcTab=name;tab.parentElement=page.node('model-tabs');return tab;
   });
@@ -4145,6 +4146,110 @@ test('provider form sends full custom IDs without inventing truncated display na
   page.context.api=async(path,body)=>path==='model-center/provider'?{id:'ollama'}:api(path,body);
   await page.submit('mc-provider-form');
   assert.deepEqual(page.posts.find(post=>post.path==='model-center/model').body.model,{id,manual:true});
+});
+
+for(const failedRead of ['routes','state'])test(`route save acknowledges the write when the ${failedRead} read fails`,async()=>{
+  const page=modelScopePage(),api=page.context.api;
+  vm.runInContext('state.config_revision=7',page.context);
+  await page.show('a');page.edit('high');
+  let refreshes=0,fail=true;
+  page.context.refresh=async()=>{
+    refreshes++;
+    if(fail&&failedRead==='state')throw new Error('State read failed');
+    vm.runInContext('state.config_revision=8',page.context);
+  };
+  page.context.api=async(path,body)=>{
+    if(fail&&failedRead==='routes'&&path==='model-center?project=a')throw new Error('Route read failed');
+    return api(path,body);
+  };
+  page.hold();const saving=page.click('mc-save-routes');
+  page.edit('low');page.release();await saving;
+  assert.equal(page.posts[0].body.revision,7);
+  assert.equal(page.overrides.get('a').planning.effort,'high');
+  assert.equal(page.savedDrafts.get('a').baseline.planning.effort,'high');
+  assert.equal(page.savedDrafts.get('a').routes.planning.effort,'low');
+  assert.equal(page.node('mc-dirty').textContent,'模型分工有未保存的修改');
+  assert.match(page.node('mc-feedback').textContent,/模型分工已保存，但刷新失败/);
+  assert.equal(refreshes,1);
+  fail=false;
+  if(failedRead==='state')await page.context.refresh();
+  await page.click('mc-save-routes');
+  assert.equal(page.posts[1].body.revision,8);
+  assert.equal(page.savedDrafts.has('a'),false);
+});
+
+for(const transition of ['project round trip','returning to the page','connection tab round trip'])test(`route save leaves newer feedback intact after ${transition}`,async()=>{
+  const page=await diagnosisPage();page.click('model-tab-roles');page.edit('high');
+  page.hold();const saving=page.click('mc-save-routes');
+  await diagnosisTransitions[transition](page);
+  page.click('model-tab-roles');
+  assert.equal(page.node('mc-dirty').textContent,'正在保存模型分工…');
+  page.click('mc-reset-inheritance');page.edit('low');
+  const feedback=page.node('mc-feedback').textContent;
+  assert.match(feedback,/已选择跟随通用设置/);
+  page.release();await saving;
+  assert.equal(page.node('mc-feedback').textContent,feedback);
+  assert.equal(page.node('mc-dirty').textContent,'模型分工有未保存的修改');
+  assert.equal(page.overrides.get('a').planning.effort,'high');
+  assert.equal(page.savedDrafts.get('a').routes.planning.effort,'low');
+});
+
+for(const roundTrip of [false,true])test(`route save ${roundTrip?'ignores a stale':'shows the current'} revision rejection`,async()=>{
+  const page=modelScopePage(),api=page.context.api;let reject;
+  await page.show('a');page.edit('high');
+  page.context.api=(path,body)=>path==='model-center/routes'?new Promise((_resolve,fail)=>{reject=fail;}):api(path,body);
+  const saving=page.click('mc-save-routes');
+  if(roundTrip){
+    await page.show('b');await page.show('a');
+    page.click('mc-reset-inheritance');page.edit('low');
+  }
+  reject(Object.assign(new Error('Revision conflict'),{status:409,code:'config_revision_conflict'}));
+  await saving;
+  assert.match(page.node('mc-feedback').textContent,roundTrip?/已选择跟随通用设置/:/Revision conflict/);
+  assert.equal(page.savedDrafts.get('a').routes.planning.effort,roundTrip?'low':'high');
+  assert.equal(page.node('mc-save-routes').disabled,false);
+});
+
+test('route save keeps the conflict detected by the acknowledgement read',async()=>{
+  const page=modelScopePage(),api=page.context.api;
+  await page.show('a');page.edit('high');page.hold();
+  page.context.api=async(path,body)=>{
+    if(path==='model-center?project=a')page.overrides.get('a').planning.effort='xhigh';
+    return api(path,body);
+  };
+  const saving=page.click('mc-save-routes');page.edit('low');page.release();await saving;
+  assert.match(page.node('mc-feedback').textContent,/服务器模型设置已变化/);
+  assert.equal(page.draft().planning.effort,'xhigh');
+  assert.equal(page.node('mc-save-routes').disabled,true);
+});
+
+for(const outcome of ['confirmed write','unconfirmed write','rejected write'])test(`route save reports a ${outcome} accurately after a project switch`,async()=>{
+  const page=await diagnosisPage();page.click('model-tab-roles');page.edit('high');
+  const api=page.context.api;let finish,renderProject;
+  page.context.api=async(path,body)=>{
+    if(path==='model-center?project=b')await new Promise(resolve=>{renderProject=resolve;});
+    if(path==='model-center/routes'&&outcome!=='confirmed write'){
+      await new Promise(resolve=>{finish=resolve;});
+      if(outcome==='rejected write')throw Object.assign(new Error('Revision conflict'),{status:409,code:'config_revision_conflict'});
+      await api(path,body);
+      throw new TypeError('Connection lost');
+    }
+    if(path==='model-center?project=a'&&finish===undefined){
+      await new Promise(resolve=>{finish=resolve;});throw new Error('Route read failed');
+    }
+    return api(path,body);
+  };
+  const saving=page.click('mc-save-routes');await new Promise(setImmediate);
+  page.project('b');await new Promise(setImmediate);
+  assert.equal(page.node('mc-dirty').textContent,'');
+  finish();await saving;
+  assert.equal(page.node('mc-dirty').textContent,'');
+  renderProject();await new Promise(setImmediate);
+  if(outcome==='confirmed write')assert.equal(page.node('toast').hidden,true);
+  else assert.match(page.node('toast').textContent,outcome==='rejected write'?/先前的提交未成功/:/无法确认先前提交的模型分工是否已保存/);
+  assert.equal(page.savedDrafts.has('a'),outcome!=='confirmed write');
+  assert.equal(page.overrides.get('a').planning.effort,outcome==='rejected write'?'medium':'high');
+  assert.equal(page.node('mc-dirty').textContent,'模型分工已保存');
 });
 
 test('equal-valued project overrides can be reset, persisted across reload, and follow later defaults',async()=>{

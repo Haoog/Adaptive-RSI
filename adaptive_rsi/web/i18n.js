@@ -1172,6 +1172,8 @@ const english = {
 
   "后台已更新，当前输入已保留。刷新页面可加载新版界面。": "The service has updated and your input is retained. Refresh to load the new interface.",
   "已保存提交的配置，后续修改仍未保存。": "Submitted settings are saved; your later edits are still unsaved.",
+  "模型分工已保存，但刷新失败。请刷新页面核对当前设置。": "Model assignments were saved, but the refresh failed. Reload the page to check the current settings.",
+  "无法确认先前提交的模型分工是否已保存。草稿已保留，请先核对原来的设置范围。": "We couldn't confirm whether the submitted model assignments were saved. Your draft is retained. Check the original settings scope first.",
   "服务正在完成更新，表单已保留，恢复后自动提交。": "The service is finishing an update. Your form is retained and will submit automatically when ready.",
   "更新尚未完成，已保留输入；请稍后再提交。": "The update is still in progress. Your input is retained; please submit again later.",
   "已保存，无需重启；新任务使用新配置": "Saved without restart; new tasks use the updated settings",
