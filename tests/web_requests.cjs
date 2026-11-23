@@ -607,6 +607,233 @@ test('an ambiguous connection failure after a write is never replayed', async ()
   assert.equal(calls, 1);
 });
 
+function projectAddPage(source = 'github') {
+  const page = browser(new Map(), context => {
+    const document = context.document, dialog = document.getElementById('project-dialog');
+    const close = document.getElementById('close-project-dialog');
+    close.closest = () => dialog;
+    const scopes = ['project', 'global'].map(scope => {
+      const button = document.getElementById('scope-' + scope);
+      button.dataset.settingsScope = scope;
+      return button;
+    });
+    document.querySelectorAll = selector => {
+      if (selector === '.close-dialog') return [close];
+      if (selector === '[data-settings-scope]') return scopes;
+      return [];
+    };
+    context.Event = Event;
+  });
+  const {node, context} = page;
+  const form = node('project-form'), select = node('project-source');
+  form.reset = () => {
+    select.value = 'github';
+    for (const id of ['project-urls', 'project-directory', 'project-path', 'project-name']) node(id).value = '';
+    node('project-enabled').checked = false;
+  };
+  select.dispatchEvent = event => {
+    page.listeners.get(event.type)({target: select});
+    select.handlers[event.type]({target: select});
+  };
+  select.form = form;
+  select.value = source;
+  select.dispatchEvent(new Event('change'));
+  node('add-project').handlers.click();
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', context);
+  return page;
+}
+
+const githubProject = name => `https://github.com/example/${name}`;
+const projectList = (...ids) => ({...snapshot(), projects: [...snapshot().projects, ...ids.map(id => ({id, name: id, paused: true}))]});
+
+test('GitHub project form distinguishes refused and unconfirmed links and retries only retained links manually', async () => {
+  const page = projectAddPage(), {node, context} = page, posts = [];
+  const urls = ['first', 'refused', 'lost', 'missing-id', 'last'].map(githubProject);
+  let retrying = false;
+  node('project-urls').value = urls.join('\n');
+  node('project-directory').value = '/tmp/chosen';
+  node('project-name').value = 'untouched local name';
+  context.fetch = async (url, options) => {
+    if (url.startsWith('/api/state?')) return response(projectList('first', 'lost', 'last', ...(retrying ? ['refused', 'missing-id'] : [])));
+    assert.equal(url, '/api/projects/import');
+    const body = JSON.parse(options.body);
+    posts.push(body);
+    if (retrying) return response({id: body.url.split('/').pop()});
+    if (body.url === urls[1]) return response({error: 'Import directory already exists; register it as a local project instead', error_code: 'validation_error'}, 400);
+    if (body.url === urls[2]) throw new TypeError('receipt lost after registration');
+    if (body.url === urls[3]) return response({});
+    return response({id: body.url.split('/').pop()});
+  };
+  await page.submit('project-form');
+  assert.deepEqual(posts, urls.map(url => ({url, directory: '/tmp/chosen'})));
+  assert.equal(node('project-urls').value, urls.slice(1, 4).join('\n'));
+  const status = node('import-status').textContent;
+  assert.match(status, /已确认接入 2/);
+  assert.ok(status.includes(`服务已拒绝：${urls[1]}`));
+  assert.ok(status.includes(`导入结果未确认：${urls[2]}`));
+  assert.ok(status.includes(`导入结果未确认：${urls[3]}`));
+  assert.equal(node('project-directory').value, '/tmp/chosen');
+  assert.equal(node('project-name').value, 'untouched local name');
+  assert.equal(node('project-dialog').open, true);
+  assert.equal(node('project-submit').disabled, false);
+  assert.equal(vm.runInContext('projectId', context), 'a');
+  retrying = true;
+  await page.submit('project-form');
+  assert.deepEqual(posts.slice(urls.length), urls.slice(1, 4).map(url => ({url, directory: '/tmp/chosen'})));
+  assert.equal(vm.runInContext('projectId', context), 'missing-id');
+  assert.equal(node('project-dialog').open, false);
+});
+
+test('GitHub project form reports an update rejection and an ambiguous server error in English', async () => {
+  const page = projectAddPage(), {node, context} = page, posts = [];
+  const links = ['blocked-by-update', 'server-error'].map(githubProject);
+  const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')) + ';language="en";', context);
+  node('project-urls').value = links.join('\n');
+  context.fetch = async (url, options) => {
+    if (url.startsWith('/api/state')) return response(projectList());
+    const {url: link} = JSON.parse(options.body);
+    posts.push(link);
+    if (posts.length === 1) return response({error: 'Software update in progress', error_code: 'update_in_progress'}, 503);
+    if (link === links[0]) return response({id: 'unexpected-retry'});
+    return response({error: 'Request could not be completed', error_code: 'internal_error'}, 500);
+  };
+  const pending = page.submit('project-form');
+  await new Promise(setImmediate);
+  if (page.timers.some(timer => timer.active && timer.delay === 1000)) await page.resume();
+  await pending;
+  assert.deepEqual(posts, links);
+  assert.equal(node('project-urls').value, links.join('\n'));
+  assert.match(node('import-status').textContent, /Confirmed imports for 0 links/);
+  assert.ok(node('import-status').textContent.includes(`Rejected by the service: ${links[0]}`));
+  assert.ok(node('import-status').textContent.includes(`Import result unconfirmed: ${links[1]}`));
+});
+
+for (const partial of [false, true]) test(`GitHub project form keeps ${partial ? 'partial results' : 'confirmed selection'} when the list read fails`, async () => {
+  const page = projectAddPage(), {node, context} = page, calls = [];
+  const urls = ['first', 'last'].map(githubProject);
+  node('project-urls').value = urls.join('\n');
+  context.fetch = async (url, options) => {
+    if (url.startsWith('/api/state?')) {
+      calls.push('list');
+      throw new TypeError('list unavailable');
+    }
+    const {url: link} = JSON.parse(options.body);
+    calls.push(link);
+    if (partial && link === urls[1]) return response({error: 'Invalid request', error_code: 'invalid_request'}, 400);
+    return response({id: link.split('/').pop()});
+  };
+  await page.submit('project-form');
+  assert.deepEqual(calls, [...urls, 'list']);
+  assert.equal(node('connection').textContent, '连接中断');
+  assert.ok(!node('project-form').querySelector('[data-form-error]'));
+  assert.equal(node('project-dialog').open, partial);
+  assert.equal(vm.runInContext('projectId', context), partial ? 'a' : 'last');
+  assert.equal(node('project-urls').value, partial ? urls[1] : '');
+  if (partial) assert.match(node('import-status').textContent, /已确认接入 1/);
+  else assert.equal(node('toast').textContent, '项目已接入');
+});
+
+for (const change of ['edit', 'reopen', 'source', 'project', 'settings scope']) test(`GitHub project form leaves ${change} alone after the prior batch settles`, async () => {
+  const page = projectAddPage(), {node, context} = page, posts = [];
+  const urls = ['first', 'last'].map(githubProject);
+  const draft = githubProject('new-draft');
+  let finishFirst, finishLast;
+  const first = new Promise(resolve => {finishFirst = resolve;});
+  const last = new Promise(resolve => {finishLast = resolve;});
+  node('project-urls').value = urls.join('\n');
+  context.fetch = (url, options) => {
+    if (url.startsWith('/api/state?')) return Promise.resolve(response(projectList('first', 'last')));
+    const {url: link} = JSON.parse(options.body);
+    posts.push(link);
+    return link === urls[0] ? first : last;
+  };
+  const pending = page.submit('project-form');
+  assert.deepEqual(posts, urls.slice(0, 1));
+  assert.match(node('import-status').textContent, /1 \/ 2/);
+  if (change === 'reopen') {
+    node('close-project-dialog').handlers.click();
+    node('onboard-add').handlers.click();
+  }
+  if (change === 'source') {
+    node('project-source').value = 'local';
+    node('project-source').dispatchEvent(new Event('change'));
+    node('project-path').value = '/draft/local';
+  }
+  if (change === 'project') {
+    node('project-select').value = 'b';
+    node('project-select').handlers.change();
+  }
+  if (change === 'settings scope') {
+    vm.runInContext('renderSettings=()=>{};renderNavigation=()=>{};', context);
+    node('scope-global').handlers.click();
+    node('scope-project').handlers.click();
+  }
+  if (change === 'edit' || change === 'reopen') {
+    node('project-urls').value = draft;
+    if (change === 'edit') page.input('project-urls', 'project-form');
+  }
+  const progress = node('import-status').textContent;
+  node('toast').textContent = 'newer feedback';
+  finishFirst(response({id: 'first'}));
+  await new Promise(setImmediate);
+  assert.deepEqual(posts, urls);
+  assert.equal(node('import-status').textContent, progress);
+  finishLast(change === 'project' ? response({error: 'Invalid request'}, 400) : response({id: 'last'}));
+  await pending;
+  assert.equal(node('import-status').textContent, '');
+  assert.equal(node('toast').textContent, 'newer feedback');
+  assert.equal(node('project-dialog').open, true);
+  assert.equal(node('project-urls').value, change === 'edit' || change === 'reopen' ? draft : urls.join('\n'));
+  assert.equal(node('project-path').value, change === 'source' ? '/draft/local' : '');
+  assert.equal(vm.runInContext('projectId', context), change === 'project' ? 'b' : 'a');
+});
+
+test('GitHub project form preserves a reopened draft while the successful batch list refresh finishes', async () => {
+  const page = projectAddPage(), {node, context} = page;
+  let finishList;
+  const list = new Promise(resolve => {finishList = resolve;});
+  node('project-urls').value = githubProject('added');
+  context.fetch = async url => url.startsWith('/api/state?') ? list : response({id: 'added'});
+  const pending = page.submit('project-form');
+  await new Promise(setImmediate);
+  const feedbackBeforeRefresh = node('toast').textContent;
+  node('onboard-add').handlers.click();
+  node('project-urls').value = githubProject('new-draft');
+  page.input('project-urls', 'project-form');
+  node('toast').textContent = 'newer feedback';
+  finishList(response(projectList('added')));
+  await pending;
+  assert.equal(node('toast').textContent, 'newer feedback');
+  assert.equal(feedbackBeforeRefresh, '项目已接入');
+  assert.equal(node('project-dialog').open, true);
+  assert.equal(node('project-urls').value, githubProject('new-draft'));
+  assert.equal(node('project-submit').disabled, false);
+  assert.equal(vm.runInContext('projectId', context), 'added');
+});
+
+test('local project form keeps the confirmed existing-project feedback when the list read fails', async () => {
+  const page = projectAddPage('local'), {node, context} = page, calls = [];
+  node('project-path').value = '/existing/project';
+  node('project-name').value = 'unsaved rename';
+  node('project-enabled').checked = true;
+  context.fetch = async (url, options) => {
+    if (url.startsWith('/api/state?')) {
+      calls.push('list');
+      throw new TypeError('list unavailable');
+    }
+    assert.equal(url, '/api/projects');
+    calls.push(JSON.parse(options.body));
+    return response({id: 'b', existing: true, name: 'B', paused: true});
+  };
+  await page.submit('project-form');
+  assert.deepEqual(calls, [{path: '/existing/project', name: 'unsaved rename', enabled: true}, 'list']);
+  assert.equal(node('project-dialog').open, false);
+  assert.equal(vm.runInContext('projectId', context), 'b');
+  assert.match(node('toast').textContent, /该路径已接入.*B.*已暂停.*未修改名称或启用状态/);
+  assert.equal(node('connection').textContent, '连接中断');
+});
+
 test('a failed capability probe reports the connection error rather than an upgrade hint', async () => {
   const page = browser();
   let calls = 0;

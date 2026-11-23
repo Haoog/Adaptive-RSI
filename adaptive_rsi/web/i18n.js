@@ -1068,7 +1068,9 @@ const english = {
   "登录已失效 · 当前显示 {time} 的数据": "Session expired · Showing data from {time}",
   "登录已失效": "Session expired",
   "登录已失效，重新打开控制台": "Session expired. Reopen the console",
-  "未成功的链接已保留，已接入的项目不会重复导入。": "Only unsuccessful links remain. Successfully connected projects will not be imported again.",
+  "已确认接入 {count} 个链接。其余链接已保留，可检查项目列表后手动重试。": "Confirmed imports for {count} links. The remaining links are kept. You can check the project list before retrying manually.",
+  "服务已拒绝：": "Rejected by the service: ",
+  "导入结果未确认：": "Import result unconfirmed: ",
 
   "工作台": "Workspace",
   "任务": "Tasks",

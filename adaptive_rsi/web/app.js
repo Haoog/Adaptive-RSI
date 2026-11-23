@@ -16,7 +16,7 @@ const sourceNames = {goal:'用户目标',inspection:'自主发现',issue:'GitHub
 const reviewNames = {correctness:'正确性',security:'安全性',maintainability:'可维护性',architecture:'架构',tests:'测试',scope:'改动范围',critical:'致命',high:'高',medium:'中',low:'低'};
 const roleNames = {analysis:'项目理解 / 检查',planning:'规划',implementation:'代码实现 / 修复',review:'独立审查',evolution:'策略改进'};
 const formRevisions=new WeakMap(), settingsDrafts=new Map(), settingsClean=new Map(), settingsModes=new WeakMap(), settingsFieldRevisions=new Map(), goalDrafts=new Map(), goalDraftRevisions=new Map(), valueFeedbackDrafts=new Map();
-let navigationSequence=0;
+let navigationSequence=0,projectImportRevision=0;
 let settingsContext='',settingsGeneration=0,goalDraftRestoredProject=null;
 let configurationRepairBusy=false;
 let refreshSequence=0,refreshPromise=null,refreshController=null,refreshProject=null,refreshKey=null,refreshQueued=false,refreshForce=false,refreshWaiters=[],refreshPollTimer=null,lastUpdateToast='',sessionExpired=false,lastRefreshAt=0;
@@ -209,8 +209,10 @@ const apiErrors={
  "Only queued inactive tasks can be scheduled": "只有排队中且未开始运行的任务才能预约时间。"
 };
 function reviseForm(form){if(form)formRevisions.set(form,(formRevisions.get(form)||0)+1);}
+function resetProjectImportFeedback(){projectImportRevision++;$('import-status').textContent='';}
 for(const type of ['input','change','reset'])document.addEventListener(type,event=>{
  const form=event.target.closest('form');reviseForm(form);
+ if(form?.id==='project-form')resetProjectImportFeedback();
  if(form?.id==='settings-form'&&event.target.dataset.path){const key=settingsKey(),revisions=settingsFieldRevisions.get(key)||new Map();revisions.set(event.target.dataset.path,(revisions.get(event.target.dataset.path)||0)+1);settingsFieldRevisions.set(key,revisions);}
 },true);
 document.addEventListener('close',event=>{
@@ -702,7 +704,7 @@ function showView(name,recordHistory=true){
  if(!state){toast(t('正在连接本地服务，请稍候再提交。'));return;}
  if(!['overview','tasks','evolution','settings','models','usage'].includes(name))return;
  const models=name==='models';name=name==='tasks'?'overview':name;
- navigationSequence++;view=name;if(models)window.RSIModelCenter?.connections(false);document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+name);
+ navigationSequence++;resetProjectImportFeedback();view=name;if(models)window.RSIModelCenter?.connections(false);document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+name);
  if(recordHistory)writeNavigation(models?'models':name);
  render();if(['overview','evolution'].includes(name))safe(refresh);if(models)window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null,true);window.scrollTo(0,0);
  setUtilityMenu(false);
@@ -1142,6 +1144,7 @@ function syncDelivery(){
 }
 function changeSettingsScope(scope,recordHistory=true){
  if(!state)return;
+ if(scope!==$('config-scope').value)resetProjectImportFeedback();
  scopeChosen=true;
  stashSettings();$('config-scope').value=scope;settingsBaseline=null;
  if(view!=='models')renderSettings();renderNavigation();if(view==='models')window.RSIModelCenter?.show(scope==='project'?projectId:null);
@@ -1281,7 +1284,7 @@ $('attention-open').addEventListener('click',()=>{$('show-system-tasks').checked
 document.querySelectorAll('[data-unit-for]').forEach(unit=>unit.addEventListener('change',()=>{const node=document.querySelector('[data-path="'+unit.dataset.unitFor+'"]');const previous=Number(unit.dataset.previous||durationUnit(node));node.value=Number(node.value)*previous/Number(unit.value);unit.dataset.previous=unit.value;node.min=5/Number(unit.value);node.max=525600/Number(unit.value);}));
 $('delivery-choice').addEventListener('change',()=>{if($('delivery-choice').value==='custom')return;document.querySelector('[data-path="delivery.mode"]').value=$('delivery-choice').value==='local'?'local':'pr';document.querySelector('[data-path="delivery.auto_merge"]').checked=$('delivery-choice').value==='auto';syncDelivery();});
 $('goal-text').addEventListener('input',()=>{goalDraftRevisions.set(projectId,(goalDraftRevisions.get(projectId)||0)+1);stashGoalDraft();});
-$('project-select').addEventListener('change',()=>{if(projectId!==$('project-select').value)navigationSequence++;stashSettings();stashGoalDraft();closeTaskDetail();projectId=$('project-select').value;restoreGoalDraft();goalDraftRestoredProject=projectId;localWrite('rsi-project',projectId);settingsBaseline=null;if(view==='models')window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null);taskOffset=0;writeNavigation(view);render();safe(refresh);});
+$('project-select').addEventListener('change',()=>{if(projectId!==$('project-select').value){navigationSequence++;resetProjectImportFeedback();}stashSettings();stashGoalDraft();closeTaskDetail();projectId=$('project-select').value;restoreGoalDraft();goalDraftRestoredProject=projectId;localWrite('rsi-project',projectId);settingsBaseline=null;if(view==='models')window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null);taskOffset=0;writeNavigation(view);render();safe(refresh);});
 var offerGlobalConfigRepair=function(raw){
  const dialog=el('dialog','','confirm-dialog');dialog.setAttribute('aria-labelledby','global-config-repair-title');
  const title=el('h2',t('通用配置损坏'));title.id='global-config-repair-title';
@@ -1295,6 +1298,7 @@ for(const id of ['add-project','onboard-add'])$(id).addEventListener('click',()=
  if(dialog.open)return;
  dialog.showModal();
  reviseForm($('project-form'));
+ resetProjectImportFeedback();
 });
 document.querySelectorAll('.close-dialog').forEach(button=>button.addEventListener('click',()=>{const box=button.closest('dialog');if(box.id==='detail-dialog')closeTaskDetail();else box.close();}));
 document.querySelectorAll('dialog').forEach(d=>d.addEventListener('click',e=>{if(e.target===d){if(d.id==='detail-dialog')closeTaskDetail();else d.close();}}));
@@ -1302,17 +1306,33 @@ $('project-source').addEventListener('change',()=>{const remote=$('project-sourc
 $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
  const unchanged=unchangedForm(event.target,{projectSensitive:false}),dialog=$('project-dialog');
  const current=()=>dialog.open&&unchanged(),github=$('project-source').value==='github';
+ const importRevision=projectImportRevision,project=projectId;
+ const importCurrent=()=>current()&&importRevision===projectImportRevision&&project===projectId;
  $('project-submit').disabled=true;
  try{
-  let addedProject,existingProject=null;
+  let addedProject,existingProject=null,retryUrls=[];
   if(github){
-   const urls=$('project-urls').value.split(/\s+/).filter(Boolean),directory=$('project-directory').value||null;if(!urls.length||urls.length>10)throw Error(t('一次请输入 1 至 10 个仓库链接'));
-   const failed=[],failedUrls=[];
-   for(let i=0;i<urls.length;i++){
-    $('import-status').textContent=t('正在导入')+' '+(i+1)+' / '+urls.length;
-    try{const added=await api('projects/import',{url:urls[i],directory});addedProject=added.id;}catch(error){failed.push(urls[i]+': '+error.message);failedUrls.push(urls[i]);}
+   const urls=$('project-urls').value.split(/\s+/).filter(Boolean),directory=$('project-directory').value||null;
+   if(!urls.length||urls.length>10)throw Error(t('一次请输入 1 至 10 个仓库链接'));
+   const status=$('import-status'),details=[];
+   for(const [index,url] of urls.entries()){
+    if(importCurrent())status.textContent=t('正在导入')+' '+(index+1)+' / '+urls.length;
+    try{
+     // Keep one attempt per link. A lost receipt can follow a committed registration.
+     const added=await sendApi('projects/import',{url,directory});
+     if(typeof added?.id==='string'&&added.id.trim()){addedProject=added.id;continue;}
+     details.push(t('导入结果未确认：')+url);
+    }catch(error){
+     const refused=error.status===401||([400,403].includes(error.status)&&typeof error.evidence?.error==='string')||
+      (error.status===503&&error.code==='update_in_progress');
+     details.push(refused?t('服务已拒绝：')+url+' · '+error.message:t('导入结果未确认：')+url);
+    }
+    retryUrls.push(url);
    }
-   if(failed.length){if(unchanged()){$('project-urls').value=failedUrls.join('\n');$('import-status').textContent=t('未成功的链接已保留，已接入的项目不会重复导入。')+'\n'+failed.join('\n');}await refresh();return;}
+   if(importCurrent()&&retryUrls.length){
+    $('project-urls').value=retryUrls.join('\n');
+    status.textContent=[t('已确认接入 {count} 个链接。其余链接已保留，可检查项目列表后手动重试。').replace('{count}',urls.length-retryUrls.length),...details].join('\n');
+   }
   }else{
    try{
     const added=await api('projects',{path:$('project-path').value,name:$('project-name').value||null,enabled:$('project-enabled').checked});addedProject=added.id;
@@ -1324,13 +1344,15 @@ $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(
     }
    }catch(error){if(current())throw error;return;}
   }
-  if(github?unchanged():current()){
+  if(github?importCurrent()&&!retryUrls.length:current()){
    stashSettings();closeTaskDetail();projectId=addedProject;localWrite('rsi-project',projectId);writeNavigation(view);settingsBaseline=null;dialog.close();$('project-form').reset();$('project-source').dispatchEvent(new Event('change'));$('import-status').textContent='';
-   if(!github)toast(existingProject?t('该路径已接入')+t('：')+(existingProject.name||t('未命名项目'))+' · '+t(existingProject.paused?'已暂停':'运行中')+' · '+t('未修改名称或启用状态'):t('项目已接入'));
+   toast(existingProject?t('该路径已接入')+t('：')+(existingProject.name||t('未命名项目'))+' · '+t(existingProject.paused?'已暂停':'运行中')+' · '+t('未修改名称或启用状态'):t('项目已接入'));
   }
-  if(github){await refresh();toast(t('项目已接入'));return;}
-  // 接入结果已确认，列表刷新只更新连接状态。
-  try{await refresh();}catch{if(!sessionExpired)$('connection').textContent=t('连接中断');}
+  // 接入结果与后续只读刷新分别反馈。
+  const refreshNavigation=navigationSequence,refreshingProject=projectId;
+  try{await refresh();}catch{
+   if(!sessionExpired&&(!github||refreshNavigation===navigationSequence&&refreshingProject===projectId))$('connection').textContent=t('连接中断');
+  }
  }finally{$('project-submit').disabled=false;}
 },event.target);});
 $('pause-button').addEventListener('click',()=>safe(async()=>{const project=currentProject();await api('pause',{project:project.id,paused:!project.paused});await refresh();toast(project.paused?t('项目已启用'):t('已暂停，正在中断当前工作'));}));
