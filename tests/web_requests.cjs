@@ -2792,6 +2792,160 @@ test('an active task accepts a supplement and reports its pending application', 
   }
 });
 
+function pendingSupplementPage(task = fixtureTask('supplement', 'executing')) {
+  const page = experiencePage(), posts = [], metadata = {...task};
+  const reads = {refresh: 0, detail: 0, fail: false};
+  page.context.language = 'zh-CN';
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.refresh = async () => { reads.refresh++; };
+  page.context.fetch = async (url, options) => {
+    if (url.endsWith('/task/revise')) {
+      return new Promise(resolve => posts.push({body: JSON.parse(options.body), finish: resolve}));
+    }
+    if (url.includes('/task-runs?')) return response([]);
+    assert.ok(url.includes('/task?'), url);
+    reads.detail++;
+    if (reads.fail) return response({error_code: 'internal_error'}, 500);
+    const query = new URL(url, 'http://fixture.test').searchParams;
+    return response({...metadata, id: query.get('id'), project: query.get('project')});
+  };
+  function editor() {
+    const form = supplementForm(page.node('detail-body'));
+    const [label, reasonLabel, button] = form.children;
+    const fields = [label.children[0], reasonLabel.children[0]];
+    return {
+      form, button, fields,
+      edit(index, value) { fields[index].value = value; page.input(fields[index].id, form.id); },
+      submit() { form.onsubmit({target: form, preventDefault() {}}); return page.context.lastAction; },
+    };
+  }
+  return {
+    page, task, posts, reads, metadata, editor,
+    async open(next = task) { await openExperienceTask(page, next); return editor(); },
+  };
+}
+
+for (const reopen of [false, true]) {
+  test(`supplement POST blocks repeat submits after ${reopen ? 'reopening' : 'rebuilding'} and keeps newer edits`, async t => {
+    const f = pendingSupplementPage(), original = await f.open();
+    original.edit(0, '原始需求'); original.edit(1, '原始原因');
+    const saving = original.submit();
+    if (reopen) {
+      f.page.context.closeTaskDetail();
+      await f.open();
+    } else {
+      f.metadata.title = '同步后的标题';
+      f.page.fireTimer(5000); await new Promise(setImmediate);
+      await f.page.context.lastAction;
+    }
+    const rebuilt = f.editor(), pendingDisabled = rebuilt.button.disabled;
+    assert.notEqual(rebuilt.form, original.form);
+    assert.deepEqual(rebuilt.fields.map(field => field.value), ['原始需求', '原始原因']);
+    if (reopen) {
+      rebuilt.edit(1, '中间修改'); rebuilt.edit(1, '原始原因');
+    } else {
+      rebuilt.edit(0, '较新需求');
+    }
+    const remaining = reopen ? ['', '原始原因'] : ['较新需求', ''];
+    const overlap = rebuilt.submit();
+    const overlapCount = f.posts.length;
+    f.page.context.toast('较新详情反馈');
+    f.posts[0].finish(response({saved: true, pending: true}));
+    if (overlapCount > 1) f.posts[1].finish(response({error_code: 'validation_error'}, 400));
+    await saving; await overlap;
+    t.diagnostic(JSON.stringify({overlapCount, pendingDisabled, toast: f.page.node('toast').textContent}));
+    assert.equal(overlapCount, 1);
+    assert.equal(pendingDisabled, true);
+    assert.equal(rebuilt.button.disabled, false);
+    assert.deepEqual(rebuilt.fields.map(field => field.value), remaining);
+    const store = f.page.context.window.RSIDraftStore;
+    assert.equal(store.get('task-supplement', f.task.id), remaining[0] || null);
+    assert.equal(store.get('task-reason', f.task.id), remaining[1] || null);
+    assert.equal(f.page.node('toast').textContent, '较新详情反馈');
+    assert.equal(f.reads.refresh, 0);
+    if (reopen) rebuilt.edit(0, '较新需求');
+    const later = rebuilt.submit();
+    assert.deepEqual(f.posts.map(post => post.body), [
+      {task: f.task.id, supplement: '原始需求', reason: '原始原因'},
+      {task: f.task.id, supplement: '较新需求', reason: remaining[1]},
+    ]);
+    f.posts[1].finish(response({saved: true, pending: true})); await later;
+    assert.match(f.page.node('toast').textContent, /已收到.*下一轮/);
+  });
+}
+
+for (const navigation of ['other task', 'other project', 'other runtime']) {
+  for (const accepted of [true, false]) {
+    test(`supplement POST ${accepted ? 'acknowledgement' : 'rejection'} leaves ${navigation} feedback and drafts alone`, async t => {
+      const f = pendingSupplementPage(), original = await f.open();
+      original.edit(0, '原始需求'); original.edit(1, '原始原因');
+      const saving = original.submit();
+      f.page.context.closeTaskDetail();
+      const next = {...f.task};
+      if (navigation === 'other task') next.id = 'other';
+      if (navigation === 'other project') {
+        next.id = 'other'; next.project = 'b';
+        const select = f.page.node('project-select');
+        select.value = 'b'; select.handlers.change();
+        await f.page.context.lastAction;
+      }
+      if (navigation === 'other runtime') f.page.context.window.__RSI_MACHINE_KEY__ = 'other-machine';
+      const current = await f.open(next);
+      current.edit(0, '原始需求'); current.edit(1, '原始原因');
+      f.page.context.toast('较新详情反馈');
+      const refreshes = f.reads.refresh;
+      f.posts[0].finish(accepted ? response({saved: true}) : response({error_code: 'validation_error'}, 400));
+      await saving;
+      const store = f.page.context.window.RSIDraftStore;
+      t.diagnostic(JSON.stringify({toast: f.page.node('toast').textContent, lateRefreshes: f.reads.refresh - refreshes,
+        supplement: store.get('task-supplement', next.id), reason: store.get('task-reason', next.id)}));
+      assert.equal(f.page.node('toast').textContent, '较新详情反馈');
+      assert.equal(f.reads.refresh, refreshes);
+      assert.equal(store.get('task-supplement', next.id), '原始需求');
+      assert.equal(store.get('task-reason', next.id), '原始原因');
+      assert.equal(supplementForm(f.page.node('detail-body')), current.form);
+      assert.equal(current.button.disabled, false);
+    });
+  }
+}
+
+test('supplement POST failure keeps newer input and allows a manual retry', async () => {
+  const f = pendingSupplementPage(), editor = await f.open();
+  editor.edit(0, '原始需求'); editor.edit(1, '原始原因');
+  const saving = editor.submit();
+  editor.edit(0, '较新需求'); editor.edit(1, '较新原因');
+  f.posts[0].finish(response({error_code: 'validation_error'}, 400)); await saving;
+  assert.equal(editor.button.disabled, false);
+  assert.notEqual(f.page.node('toast').className, '');
+  const rebuilt = await f.open();
+  assert.deepEqual(rebuilt.fields.map(field => field.value), ['较新需求', '较新原因']);
+  const retry = rebuilt.submit();
+  assert.deepEqual(f.posts[1].body, {task: f.task.id, supplement: '较新需求', reason: '较新原因'});
+  f.posts[1].finish(response({saved: true})); await retry;
+  assert.match(f.page.node('toast').textContent, /已保存.*重新评估/);
+});
+
+test('supplement POST success with a failed detail read preserves the receipt and retries only the read', async t => {
+  const f = pendingSupplementPage(), editor = await f.open();
+  editor.edit(0, '保留原文'); editor.edit(1, '原始原因');
+  const saving = editor.submit();
+  editor.edit(1, '较新原因');
+  f.reads.fail = true;
+  f.posts[0].finish(response({saved: true, pending: true})); await saving;
+  const status = f.page.node('detail-live-status');
+  t.diagnostic(JSON.stringify({toast: f.page.node('toast').textContent, readRetryVisible: !status.hidden,
+    fields: editor.fields.map(field => field.value)}));
+  assert.match(f.page.node('toast').textContent, /已收到.*下一轮/);
+  assert.equal(status.hidden, false);
+  assert.deepEqual(editor.fields.map(field => field.value), ['', '较新原因']);
+  const detailReads = f.reads.detail;
+  f.reads.fail = false;
+  buttonWith(status, '重试').handlers.click(); await f.page.context.lastAction;
+  assert.equal(status.hidden, true);
+  assert.equal(f.reads.detail, detailReads + 1);
+  assert.equal(f.posts.length, 1, 'the refresh retry does not resubmit the confirmed supplement');
+});
+
 test('detail retry is offered only for a queued task waiting on backoff', async () => {
   for (const [offset, expected] of [[3600, true], [0, false]]) {
     const task = fixtureTask('child', 'queued');
