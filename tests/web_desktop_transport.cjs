@@ -51,12 +51,13 @@ test('desktop replies drop malformed request IDs',async()=>{
 
 test('desktop keeps the old page fenced after accepting a new connection',async()=>{
  const handlers={},calls=[];
- let form,input,finishRequest,finishReload;
+ let form,input,finishReload;
+ const replies=[];
  const makeElement=()=>({append(){},prepend(){},setAttribute(){},addEventListener(){}});
  const window={fetch:async()=>{},__TAURI_INTERNALS__:{invoke:async(command,args)=>{
   calls.push({command,args});
-  if(command==='runtime_info')return {kind:'local',connected:true,scope:'local',connection_generation:7};
-  if(command==='request')return new Promise(resolve=>{finishRequest=resolve;});
+  if(command==='runtime_info')return {kind:'remote',connected:true,scope:'https://old.example.test',connection_generation:7};
+  if(command==='request')return new Promise(resolve=>{replies.push(resolve);});
   if(command==='validate_connection_target')return true;
   if(command==='connect')return {scope:'remote',connection_generation:8};
  }}};
@@ -67,16 +68,18 @@ test('desktop keeps the old page fenced after accepting a new connection',async(
  vm.runInNewContext(desktopSource,{window,document,t:value=>value,crypto:webcrypto,Response,DOMException,console,
   history:{replaceState(){}},location:{reload:finishReload}});
  await handlers.DOMContentLoaded();
- const pending=window.fetch('/api/state');
+ const oldSuccess=assert.rejects(window.fetch('/api/state'),{name:'AbortError'});
+ const oldFailure=assert.rejects(window.fetch('/api/state'),{name:'AbortError'});
  await new Promise(setImmediate);
- assert.equal(calls.find(call=>call.command==='request').args.connectionGeneration,7);
- input.value='https://rsi.example.test/?token=fixture';
+ assert.deepEqual(calls.filter(call=>call.command==='request').map(call=>call.args.connectionGeneration),[7,7]);
+ input.value='https://rsi.example.test';
  form.onsubmit({preventDefault(){}});
  await reloaded;
- finishRequest({status:200,body:'{}'});
- await assert.rejects(pending,{name:'AbortError'});
+ replies[0]({status:200,body:'{"projects":[]}'});
+ replies[1]({status:401,body:'{}'});
+ await oldSuccess;await oldFailure;
  await assert.rejects(window.fetch('/api/config',{method:'POST',body:'{}'}),{name:'AbortError'});
- assert.deepEqual(calls.map(call=>call.command),['runtime_info','request','validate_connection_target','connect']);
+ assert.deepEqual(calls.map(call=>call.command),['runtime_info','request','request','validate_connection_target','connect']);
 });
 
 const sshAuthError='SSH 隧道可达，但认证失败。请生成新的认证地址后重试。';
@@ -161,6 +164,162 @@ test('a stale page waits for native recovery then reloads without replaying its 
  assert.equal(reloads,1);
  await assert.rejects(window.fetch('/api/state'),{name:'AbortError'});
  assert.deepEqual(calls.map(call=>[call.path,call.connectionGeneration]),[['state',1],['config',1]]);
+});
+
+const sessionError='远端登录已失效。请生成新的认证地址并重新连接。';
+const sessionButton='登录已失效，重新打开控制台';
+const refreshButton='界面有更新，保存输入后刷新';
+const stateReply=(build='running')=>({status:200,body:JSON.stringify({projects:[],build,version:'test'})});
+async function sessionPage(kind,scope){
+ const handlers={},nodes=new Map(),dialogs=[],pending=[],cancelled=[];
+ const element=()=>({textContent:'',value:'',open:false,hidden:false,options:[],dataset:{},children:[],listeners:{},
+  classList:{add(){},remove(){},toggle(){}},style:{},setAttribute(){},focus(){},querySelector(){return null},querySelectorAll(){return[]},remove(){},
+  append(...children){this.children.push(...children);},prepend(child){this.children.unshift(child);},replaceChildren(...children){this.children=children;},
+  addEventListener(name,handler,capture=false){(this.listeners[name]??=[]).push({handler,capture});},
+  showModal(){this.open=true;},close(){this.open=false;for(const {handler} of this.listeners.close??[])handler();}});
+ const node=id=>{if(!nodes.has(id))nodes.set(id,element());return nodes.get(id);};
+ const body=element(),tools=element(),document={body,documentElement:{dataset:{build:'loaded'}},visibilityState:'visible',getElementById:node,
+  querySelector:selector=>selector==='.project-tools'?tools:null,querySelectorAll:()=>[],createTextNode:text=>({textContent:text}),
+  createElement(tag){const child=element();if(tag==='dialog')dialogs.push(child);return child;},
+  addEventListener(name,handler){(handlers[name]??=[]).push(handler);}};
+ let reloads=0,confirmations=0,timer=0;
+ const window={fetch:async()=>{assert.fail('unexpected network request');},addEventListener(){},__TAURI_INTERNALS__:{invoke:async(command,args)=>{
+  if(command==='runtime_info')return {kind,scope,connected:true,connection_generation:7};
+  if(command==='request')return new Promise(resolve=>pending.push({args,resolve}));
+  if(command==='cancel_request'){cancelled.push(args.id);return;}
+  if(command==='validate_connection_target')return false;
+  if(command==='set_native_language')return;
+  throw new Error(`Unexpected command: ${command}`);
+ }}};
+ const storage={getItem(){return null;},setItem(){},removeItem(){}};
+ const context=vm.createContext({window,document,localStorage:storage,sessionStorage:storage,structuredClone,URLSearchParams,AbortController,DOMException,queueMicrotask,
+  TextEncoder,TextDecoder,crypto:webcrypto,Response,console,setTimeout:()=>++timer,clearTimeout(){},setInterval(){},clearInterval(){},
+  location:{hash:'',reload(){reloads++;}},navigator:{clipboard:{}},matchMedia:()=>({matches:false,addEventListener(){}}),language:'zh-CN',t:value=>value});
+ vm.runInContext(desktopSource,context);
+ context.fetch=window.fetch;
+ const reload=node('reload-ui');reload.textContent=refreshButton;reload.hidden=true;
+ vm.runInContext(appSource,context);
+ context.render=()=>{};
+ context.uiConfirm=async()=>{confirmations++;return true;};
+ await handlers.DOMContentLoaded[0]();
+ const tick=()=>new Promise(setImmediate);
+ const take=async()=>{await tick();const request=pending.shift();assert.ok(request,node('toast').textContent);assert.equal(request.args.connectionGeneration,7);return request;};
+ const finish=async(promise,reply)=>{const request=await take();request.resolve(reply);return promise;};
+ const initial=await take();assert.match(initial.args.path,/^state\?/);initial.resolve(stateReply());await tick();
+ assert.equal(node('connection').textContent,'已连接');
+ const dialog=dialogs[0],form=dialog.children[0],input=form.children[5],alert=form.children[6];
+ return {context,dialog,alert,form,input,reload,cancelled,node,tick,take,finish,read:(path='/api/state?sections=core',options)=>window.fetch(path,options),
+  openMachine:()=>tools.children[0].onclick(),reloads:()=>reloads,confirmations:()=>confirmations,
+  async clickReload(){let stopped=false;for(const {handler} of [...reload.listeners.click].sort((a,b)=>Number(b.capture)-Number(a.capture))){handler({stopImmediatePropagation(){stopped=true;}});if(stopped)break;}await tick();}};
+}
+const unauthorized={status:401,body:'{}'};
+for(const [name,kind,scope] of [
+ ['local','local','local'],['SSH tunnel','remote','http://127.0.0.1:43217'],['direct HTTPS','remote','https://rsi.example.test'],
+]){
+ test(`desktop session refresh recovery through ${name}`,async()=>{
+  const page=await sessionPage(kind,scope);
+  assert.equal(page.reload.textContent,refreshButton);
+  const failure=assert.rejects(page.context.refresh(),{code:'session_required'});
+  await page.finish(failure,unauthorized);
+  assert.equal(page.reload.textContent,sessionButton);
+  assert.equal(vm.runInContext('refreshPollTimer',page.context),null);
+  await page.clickReload();
+  assert.equal(page.dialog.open,kind==='remote');
+  assert.equal(page.confirmations(),kind==='remote'?0:1);
+  if(kind==='remote')assert.equal(page.alert.textContent,sessionError);
+  const response=await page.finish(page.read(),stateReply());
+  assert.equal(response.status,200);
+  assert.deepEqual(await response.json(),{projects:[],build:'running',version:'test'});
+  if(kind==='local'){
+   assert.equal(page.reload.textContent,sessionButton);
+   assert.equal(vm.runInContext('refreshPollTimer',page.context),null);
+   return;
+  }
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.alert.hidden,true);
+  page.dialog.close();
+  await page.clickReload();
+  assert.equal(page.dialog.open,false);
+  assert.equal(page.confirmations(),1);
+  assert.equal(page.reloads(),1);
+  assert.equal(page.reload.textContent,refreshButton);
+  assert.equal(page.reload.hidden,false);
+  assert.equal(page.node('connection').textContent,'已连接');
+  assert.ok(vm.runInContext('refreshPollTimer',page.context));
+  await page.finish(page.context.refresh(),stateReply());
+ });
+}
+
+test('desktop session recovery hides the expired refresh button when the interface is current',async()=>{
+ const page=await sessionPage('remote','https://rsi.example.test');
+ const refresh=()=>page.context.safe(()=>page.context.refresh());
+ await page.finish(refresh(),unauthorized);
+ assert.equal(page.node('toast').hidden,false);
+ assert.equal(page.reload.textContent,sessionButton);
+ await page.finish(page.read(),stateReply('loaded'));
+ assert.equal(page.node('toast').hidden,true);
+ assert.equal(page.reload.textContent,refreshButton);
+ assert.equal(page.reload.hidden,true);
+});
+
+test('desktop session recovery ignores a late refresh 401 after a newer valid state read',async()=>{
+ const page=await sessionPage('remote','https://rsi.example.test');
+ const refresh=page.context.safe(()=>page.context.refresh()),older=await page.take();
+ await page.finish(page.read(),stateReply());
+ older.resolve(unauthorized);
+ await refresh;
+ assert.equal(page.reload.textContent,refreshButton);
+ assert.equal(page.node('connection').textContent,'已连接');
+ assert.equal(page.node('toast').textContent,'');
+ page.openMachine();assert.equal(page.alert.hidden,true);
+});
+
+test('desktop session recovery preserves the current connection validation error',async()=>{
+ const page=await sessionPage('remote','https://rsi.example.test');
+ await page.finish(page.read(),unauthorized);
+ await page.clickReload();
+ assert.equal(page.alert.textContent,sessionError);
+ page.input.value='invalid.example.test';
+ page.form.onsubmit({preventDefault(){}});
+ await page.tick();
+ const validationError='请输入 HTTPS 认证地址。';
+ assert.equal(page.alert.textContent,validationError);
+ page.dialog.close();
+ await page.clickReload();
+ assert.equal(page.alert.textContent,validationError);
+ await page.finish(page.read(),stateReply());
+ assert.equal(page.alert.textContent,validationError);
+ page.dialog.close();page.openMachine();
+ assert.equal(page.alert.textContent,validationError);
+});
+
+test('desktop session recovery orders valid state reads and ignores cancelled or unrelated replies',async()=>{
+ const page=await sessionPage('remote','https://rsi.example.test');
+ const first=page.read(),oldSuccess=await page.take();
+ await page.finish(page.read(),unauthorized);
+ oldSuccess.resolve(stateReply());await first;
+ const controller=new AbortController(),aborted=assert.rejects(page.read(undefined,{signal:controller.signal}),{name:'AbortError'}),cancelled=await page.take();
+ controller.abort();await aborted;
+ assert.deepEqual(page.cancelled,[cancelled.args.requestId]);
+ cancelled.resolve(stateReply());
+ for(const [path,options,reply] of [
+  ['/api/health',{},stateReply()],['/api/state',{method:'POST',body:'{}'},stateReply()],['/api/state',{method:'POST'},stateReply()],
+  ['/api/state',{method:'GET',body:'{}'},stateReply()],['/api/state',{}, {status:200,body:'{}'}],
+  ['/api/state',{}, {status:200,body:'unavailable'}],['/api/state',{}, {status:503,body:'{}'}],
+ ])await page.finish(page.read(path,options),reply);
+ await page.clickReload();assert.equal(page.alert.textContent,sessionError);
+ page.dialog.close();
+ const later=page.read(),oldFailure=await page.take();
+ const newerController=new AbortController(),newer=assert.rejects(page.read(undefined,{signal:newerController.signal}),{name:'AbortError'}),newerRequest=await page.take();
+ newerController.abort();await newer;newerRequest.resolve(unauthorized);
+ await page.finish(page.read(),stateReply('loaded'));
+ oldFailure.resolve(unauthorized);await later;
+ const lateController=new AbortController(),late=assert.rejects(page.read(undefined,{signal:lateController.signal}),{name:'AbortError'}),lateRequest=await page.take();
+ lateController.abort();await late;lateRequest.resolve(unauthorized);
+ await page.clickReload();
+ assert.equal(page.dialog.open,false);
+ assert.equal(page.reloads(),1);
+ page.openMachine();assert.equal(page.alert.hidden,true);
 });
 
 test('desktop download links are handled as downloads while ordinary external links use the native bridge', async () => {

@@ -2,15 +2,33 @@
 if(window.__TAURI_INTERNALS__){
  const invoke=(command,args={})=>window.__TAURI_INTERNALS__.invoke(command,args);
  const originalFetch=window.fetch.bind(window);
- let sshTunnelConnected=false;
+ let remoteRuntime=false,sshTunnelConnected=false;
  const ready=invoke('runtime_info').then(info=>{
   window.__RSI_MACHINE_KEY__=info.scope||'disconnected';
-  sshTunnelConnected=info.kind==='remote'&&/^(?:ssh:|http:\/\/127\.0\.0\.1(?::|$))/.test(info.scope||'');
+  remoteRuntime=info.kind==='remote';
+  sshTunnelConnected=remoteRuntime&&/^(?:ssh:|http:\/\/127\.0\.0\.1(?::|$))/.test(info.scope||'');
   return info;
  }).catch(error=>{console.warn(error);return null;});
- window.RSIDesktop={invoke,ready,isSshTunnel:()=>sshTunnelConnected};
  let switching=false,switched=false,remoteSessionExpired=false;
+ let stateRequest=0,lastSessionReply=0,clearConnectionExpiry;
+ const sessionExpiredMessage='远端登录已失效。请生成新的认证地址并重新连接。';
+ window.RSIDesktop={invoke,ready,isSshTunnel:()=>sshTunnelConnected,
+  remoteSessionExpiry:()=>remoteRuntime?remoteSessionExpired:undefined};
  const aborted=()=>new DOMException('Aborted','AbortError');
+ function observeRemoteSession(ticket,reply){
+  if(ticket<=lastSessionReply)return;
+  if(reply.status===401){lastSessionReply=ticket;remoteSessionExpired=true;return;}
+  if(reply.status!==200)return;
+  let snapshot;
+  try{snapshot=JSON.parse(reply.body);}catch{return;}
+  if(!Array.isArray(snapshot?.projects))return;
+  // Only conclusive state replies count. A later failed or cancelled read cannot hide an earlier 401.
+  lastSessionReply=ticket;
+  if(!remoteSessionExpired)return;
+  remoteSessionExpired=false;
+  clearConnectionExpiry?.();
+  window.RSIDesktop.onRemoteSessionRecovered?.(snapshot.build);
+ }
  function reloadRuntime(info,next){
   switching=switched=true;
   if(next?.scope&&next.scope!==info.scope)history.replaceState(null,'',location.pathname+location.search);
@@ -21,12 +39,15 @@ if(window.__TAURI_INTERNALS__){
   const info=await ready;
   if(!info||switching||options.signal?.aborted)throw aborted();
   const id=crypto.randomUUID(),path=input.slice(5);
+  const ticket=info.kind==='remote'&&path.split('?')[0]==='state'&&
+   String(options.method??'GET').toUpperCase()==='GET'&&options.body==null?++stateRequest:0;
   const operation=invoke('request',{path,body:options.body?JSON.parse(options.body):null,requestId:id,connectionGeneration:info.connection_generation}).then(reply=>{
-   if(switched)throw aborted();
-   if(info.kind==='remote'&&!options.signal?.aborted&&reply.status===401&&path.split('?')[0]==='state')remoteSessionExpired=true;
+   if(switched||options.signal?.aborted)throw aborted();
    const headers={'Content-Type':'application/json'};
    if(typeof reply.requestId==='string'&&/^[a-f0-9]{16}$/.test(reply.requestId))headers['X-RSI-Request-ID']=reply.requestId;
-   return new Response(reply.body,{status:reply.status,headers});
+   const response=new Response(reply.body,{status:reply.status,headers});
+   if(ticket)observeRemoteSession(ticket,reply);
+   return response;
   },async error=>{
    if(error==='Runtime connection changed'){
     // Native recovery can change the connection outside the dialog. Reload
@@ -119,9 +140,10 @@ if(window.__TAURI_INTERNALS__){
    change(mode.value==='ssh'?{url,sshTunnel:true}:{url});
   };
   local.onclick=()=>change({url:null});
+  clearConnectionExpiry=()=>{if(connectionError===sessionExpiredMessage)showConnectionError('');};
   function openMachine(){
    if(dialog.open)return;
-   if(remoteSessionExpired)showConnectionError('远端登录已失效。请生成新的认证地址并重新连接。');
+   if(remoteSessionExpired&&!connectionError)showConnectionError(sessionExpiredMessage);
    dialog.showModal();
   }
   machine.onclick=openMachine;

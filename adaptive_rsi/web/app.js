@@ -454,7 +454,7 @@ async function safe(fn,form){
 }
 function refreshDelay(){if(document.visibilityState==='hidden')return 60000;return state?.runs?.some(run=>!run.ended)?5000:15000;}
 function clockTime(value){const date=new Date(value);return String(date.getHours()).padStart(2,'0')+':'+String(date.getMinutes()).padStart(2,'0');}
-// 会话失效后没有自动恢复入口：停止轮询，标出最后一次成功刷新的时间，并把现有的刷新按钮变成重新登录入口。
+// 会话失效后停止轮询，标出最后一次成功刷新的时间，并把现有的刷新按钮变成重新登录入口。
 function expireSessionCopy(){
  $('connection').textContent=lastRefreshAt?t('登录已失效 · 当前显示 {time} 的数据').replace('{time}',clockTime(lastRefreshAt)):t('登录已失效');
  const reload=$('reload-ui');reload.hidden=false;reload.textContent=t('登录已失效，重新打开控制台');
@@ -465,6 +465,16 @@ function expireSession(){
  expireSessionCopy();
 }
 function scheduleRefreshPoll(delay=refreshDelay()){if(sessionExpired)return;clearTimeout(refreshPollTimer);refreshPollTimer=setTimeout(()=>{refreshPollTimer=null;refresh().catch(()=>{if(!sessionExpired)$('connection').textContent=t('连接中断');});},delay);}
+if(window.RSIDesktop)window.RSIDesktop.onRemoteSessionRecovered=build=>{
+ if(!sessionExpired)return;
+ sessionExpired=false;
+ $('connection').textContent=t('已连接');
+ if($('toast').textContent===t('登录已失效，输入已保留。请从启动入口重新打开控制台，无需重启。'))$('toast').hidden=true;
+ const reload=$('reload-ui'),currentBuild=build||state?.build;
+ reload.textContent=t('界面有更新，保存输入后刷新');
+ reload.hidden=!(bootBuild&&currentBuild&&bootBuild!==currentBuild);
+ scheduleRefreshPoll();
+};
 function requestedStateSections(force=false){
  const sections=['core'],project=projectId||null,stale=Date.now()-30000;
  // 用户刚完成回滚、导入或晋升时，旧数组仍在 TTL 内也不能沿用；其他轮询继续使用 TTL。
@@ -509,7 +519,13 @@ async function refresh(options={}){
   }catch(error){if(controller.signal.aborted){if(timedOut&&requestedProject===projectId)$('connection').textContent=t('连接超时');return;}throw error;}
   finally{clearTimeout(timeout);}
  })();refreshPromise=operation;
- try{return await operation;}catch(error){if(error.code==='session_required')expireSession();throw error;}finally{if(refreshPromise===operation){refreshPromise=null;refreshController=null;refreshProject=null;refreshKey=null;}if(refreshQueued){refreshQueued=false;const waiters=refreshWaiters.splice(0),forceNext=refreshForce;refreshForce=false;let next;try{next=refresh({force:forceNext});}catch(error){for(const waiter of waiters)waiter.reject(error);scheduleRefreshPoll();}if(next)Promise.resolve(next).then(value=>waiters.forEach(waiter=>waiter.resolve(value)),error=>waiters.forEach(waiter=>waiter.reject(error)));}else scheduleRefreshPoll();}
+ try{return await operation;}catch(error){
+  if(error.code==='session_required'){
+   if(window.RSIDesktop?.remoteSessionExpiry?.()===false)return;
+   expireSession();
+  }
+  throw error;
+ }finally{if(refreshPromise===operation){refreshPromise=null;refreshController=null;refreshProject=null;refreshKey=null;}if(refreshQueued){refreshQueued=false;const waiters=refreshWaiters.splice(0),forceNext=refreshForce;refreshForce=false;let next;try{next=refresh({force:forceNext});}catch(error){for(const waiter of waiters)waiter.reject(error);scheduleRefreshPoll();}if(next)Promise.resolve(next).then(value=>waiters.forEach(waiter=>waiter.resolve(value)),error=>waiters.forEach(waiter=>waiter.reject(error)));}else scheduleRefreshPoll();}
 }
 function parentView(name){return name==='tasks'?'overview':name;}
 let attentionCount=0;
