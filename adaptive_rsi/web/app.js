@@ -1300,11 +1300,12 @@ document.querySelectorAll('.close-dialog').forEach(button=>button.addEventListen
 document.querySelectorAll('dialog').forEach(d=>d.addEventListener('click',e=>{if(e.target===d){if(d.id==='detail-dialog')closeTaskDetail();else d.close();}}));
 $('project-source').addEventListener('change',()=>{const remote=$('project-source').value==='github';$('local-project-fields').hidden=remote;$('github-project-fields').hidden=!remote;$('project-path').required=!remote;$('project-urls').required=remote;});
 $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
- const unchanged=unchangedForm(event.target,{projectSensitive:false});
+ const unchanged=unchangedForm(event.target,{projectSensitive:false}),dialog=$('project-dialog');
+ const current=()=>dialog.open&&unchanged(),github=$('project-source').value==='github';
  $('project-submit').disabled=true;
  try{
   let addedProject,existingProject=null;
-  if($('project-source').value==='github'){
+  if(github){
    const urls=$('project-urls').value.split(/\s+/).filter(Boolean),directory=$('project-directory').value||null;if(!urls.length||urls.length>10)throw Error(t('一次请输入 1 至 10 个仓库链接'));
    const failed=[],failedUrls=[];
    for(let i=0;i<urls.length;i++){
@@ -1313,18 +1314,23 @@ $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(
    }
    if(failed.length){if(unchanged()){$('project-urls').value=failedUrls.join('\n');$('import-status').textContent=t('未成功的链接已保留，已接入的项目不会重复导入。')+'\n'+failed.join('\n');}await refresh();return;}
   }else{
-   const added=await api('projects',{path:$('project-path').value,name:$('project-name').value||null,enabled:$('project-enabled').checked});addedProject=added.id;
-   if(added.existing)existingProject=added;
+   try{
+    const added=await api('projects',{path:$('project-path').value,name:$('project-name').value||null,enabled:$('project-enabled').checked});addedProject=added.id;
+    if(added.existing)existingProject=added;
+    if(existingProject?.archived){
+     if(!current()||!(await uiConfirm(t('该项目已归档。恢复后保持暂停，不会重新执行已取消的任务。确认恢复？')))||!current())return;
+     await api('project/restore',{project:existingProject.id,confirmation:'restore-project'});
+     existingProject.paused=true;
+    }
+   }catch(error){if(current())throw error;return;}
   }
-  if(existingProject?.archived){
-   if(!(await uiConfirm(t('该项目已归档。恢复后保持暂停，不会重新执行已取消的任务。确认恢复？'))))return;
-   await api('project/restore',{project:existingProject.id,confirmation:'restore-project'});
-   existingProject.archived=false;existingProject.paused=true;
+  if(github?unchanged():current()){
+   stashSettings();closeTaskDetail();projectId=addedProject;localWrite('rsi-project',projectId);writeNavigation(view);settingsBaseline=null;dialog.close();$('project-form').reset();$('project-source').dispatchEvent(new Event('change'));$('import-status').textContent='';
+   if(!github)toast(existingProject?t('该路径已接入')+t('：')+(existingProject.name||t('未命名项目'))+' · '+t(existingProject.paused?'已暂停':'运行中')+' · '+t('未修改名称或启用状态'):t('项目已接入'));
   }
-  if(unchanged()){stashSettings();closeTaskDetail();projectId=addedProject;localWrite('rsi-project',projectId);writeNavigation(view);settingsBaseline=null;$('project-dialog').close();$('project-form').reset();$('project-source').dispatchEvent(new Event('change'));$('import-status').textContent='';}
-  await refresh();
-  if(existingProject)toast(t('该路径已接入')+t('：')+(existingProject.name||t('未命名项目'))+' · '+t(existingProject.paused?'已暂停':'运行中')+' · '+t('未修改名称或启用状态'));
-  else toast(t('项目已接入'));
+  if(github){await refresh();toast(t('项目已接入'));return;}
+  // 接入结果已确认，列表刷新只更新连接状态。
+  try{await refresh();}catch{if(!sessionExpired)$('connection').textContent=t('连接中断');}
  }finally{$('project-submit').disabled=false;}
 },event.target);});
 $('pause-button').addEventListener('click',()=>safe(async()=>{const project=currentProject();await api('pause',{project:project.id,paused:!project.paused});await refresh();toast(project.paused?t('项目已启用'):t('已暂停，正在中断当前工作'));}));
