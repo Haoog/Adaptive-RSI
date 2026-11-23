@@ -3852,6 +3852,102 @@ test('the probe button cancels a running test without closing the dialog',async(
   assert.equal(page.node('mc-probe-dialog').open,true,'cancelling keeps the dialog open for another attempt');
 });
 
+async function modelPreferencePage(field){
+  const page=await diagnosisPage(),api=page.context.api,posts=[],reads=[];
+  let finish,stored=false,readFailure=false;
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/model'){
+      posts.push(structuredClone(body));
+      await new Promise((resolve,reject)=>{finish=error=>error?reject(error):resolve();});
+      stored=body.model[field];
+      return {saved:true};
+    }
+    if(path==='model-center'||path.startsWith('model-center?')){
+      reads.push(path);
+      if(readFailure)throw new Error('Confirmation read failed');
+      const snapshot=await api(path,body,options);
+      if(snapshot.project==='a'){
+        const catalog=snapshot.providers.find(provider=>provider.id==='ollama').catalog;
+        catalog.models[0][field]=stored;
+        if(stored)catalog.models.push({id:'new-coder',name:'New coder'});
+      }
+      return snapshot;
+    }
+    return api(path,body,options);
+  };
+  await page.show('a');
+  reads.length=0;
+  const filter=page.node('mc-model-filter');filter.value='all';filter.handlers.change();
+  const control=()=>{
+    const [,actions]=page.node('mc-model-list').children[0].children;
+    const [label,more]=actions.children;
+    return field==='enabled'?label.children[0]:more.children[1].children[0];
+  };
+  return {...page,posts,reads,control,
+    save(){
+      const node=control();
+      if(field==='enabled'){node.checked=true;node.handlers.change();}
+      else node.handlers.click();
+      assert.deepEqual(posts,[{project:'a',provider:'ollama',model:{id:'scope-coder',[field]:true}}]);
+      return page.context.lastAction;
+    },
+    finish(error){finish(error);},
+    failRead(){readFailure=true;},
+    value(){return field==='enabled'?control().checked:control().textContent==='取消收藏';}
+  };
+}
+
+const preferenceTransitions={
+  'project switch':async page=>{page.project('b');await new Promise(setImmediate);},
+  'project round trip':diagnosisTransitions['project round trip'],
+  'provider switch':diagnosisTransitions['provider switch'],
+  'provider round trip':diagnosisTransitions['provider round trip'],
+  'leaving the page':diagnosisTransitions['leaving the page'],
+  'returning to the page':diagnosisTransitions['returning to the page']
+};
+for(const field of ['enabled','favorite']){
+  for(const [name,transition] of Object.entries(preferenceTransitions))for(const failure of [false,true]){
+    test(`model preference ${field} keeps ${failure?'failure':'success'} scoped after ${name}`,async()=>{
+      const page=await modelPreferencePage(field),pending=page.save();
+      await transition(page);
+      page.reads.length=0;
+      page.finish(failure?new Error('Old model preference error'):undefined);
+      await pending;
+      assert.deepEqual(page.reads,failure||name==='project switch'?[]:['model-center?project=a']);
+      assert.equal(page.node('mc-feedback').textContent,'');
+      assert.equal(page.node('toast').hidden,true);
+      if(!failure&&name!=='project switch'){
+        if(name==='leaving the page'){
+          page.click('model-test-view-models');await page.context.lastAction;
+        }
+        if(name==='provider switch')await page.provider('Ollama');
+        assert.equal(page.value(),true);
+        assert.equal(page.node('mc-model-count').textContent,2,'same-scope refresh keeps directory changes');
+      }
+    });
+  }
+  test(`model preference ${field} keeps current POST failure feedback`,async()=>{
+    const page=await modelPreferencePage(field),pending=page.save();
+    page.finish(new Error('Current model preference error'));await pending;
+    assert.deepEqual(page.reads,[]);
+    assert.equal(page.value(),false);
+    assert.equal(page.control().disabled,false);
+    assert.equal(page.node('mc-feedback').textContent,'Current model preference error');
+    assert.equal(page.node('toast').hidden,field==='enabled');
+  });
+  test(`model preference ${field} keeps confirmed save after a failed read`,async()=>{
+    const page=await modelPreferencePage(field),pending=page.save();
+    page.failRead();page.finish();await pending;
+    assert.deepEqual(page.reads,['model-center?project=a']);
+    assert.equal(page.value(),true);
+    assert.equal(page.control().disabled,false);
+    assert.equal(page.node('mc-feedback').textContent,field==='enabled'?'模型选择范围已保存。':'');
+    assert.equal(page.node('toast').hidden,true);
+    page.node('mc-model-filter').handlers.change();
+    assert.equal(page.value(),true,'confirmed preference survives a local redraw');
+  });
+}
+
 for(const failure of [false,true])test(`model catalog ignores stale ${failure?'failure':'success'} after a provider round trip`,async()=>{
   const page=await diagnosisPage(),api=page.context.api;
   let finish,reads=0;

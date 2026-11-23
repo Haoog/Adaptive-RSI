@@ -117,6 +117,34 @@ window.RSIModelCenter = (() => {
   function invalidateConnectionView(){diagnosisSequence++;connectionViewVersion++;}
   function selectProvider(next){if(active!==next)invalidateConnectionView();active=next;}
   function selectTab(next){if(tab!==next)invalidateConnectionView();tab=next;}
+  async function saveModelPreference(provider,model,checkbox){
+    const project=scope,viewVersion=connectionViewVersion;
+    const ownsFeedback=()=>viewVersion===connectionViewVersion&&scope===project&&active===provider&&tab==='providers'&&!$('view-models').hidden;
+    if(checkbox)checkbox.disabled=true;
+    try{
+      try{await api('model-center/model',{project,provider,model});}
+      catch(error){
+        if(checkbox)checkbox.checked=!model.enabled;
+        if(ownsFeedback()){
+          error.message=message(error);setStatus(error.message,true);
+          if(!checkbox)throw error;
+        }
+        return;
+      }
+      if(ownsFeedback()&&checkbox)setStatus(t('模型选择范围已保存。'));
+      if(scope!==project)return;
+      // The POST has committed. Keep the confirmed fields even if the catalog read fails.
+      const snapshot=data;
+      if(snapshot?.project===project){
+        const saved=snapshot.providers.find(item=>item.id===provider)?.catalog.models.find(item=>item.id===model.id);
+        if(saved)Object.assign(saved,model);
+      }
+      try{await load({reportError:false});}
+      catch{
+        if(scope===project&&data===snapshot&&data?.project===project&&active===provider&&!loading)renderModels();
+      }
+    }finally{if(checkbox)checkbox.disabled=false;}
+  }
   function render(){
     if(!data||loading||data.project!==scope)return;
     $('view-models').dataset.scope=scopeKey();
@@ -237,10 +265,10 @@ window.RSIModelCenter = (() => {
       const controls=el('div',undefined,'mc-model-actions'),label=el('label',undefined,'mc-enable'),checkbox=el('input');
       checkbox.type='checkbox';checkbox.checked=!!model.enabled;checkbox.disabled=!!model.kind;checkbox.setAttribute('aria-label',t('启用模型')+' '+model.name);
       label.title=t('此开关只控制模型选择列表；已有角色配置和正在运行的任务继续使用原来的模型。');
-      checkbox.addEventListener('change',()=>safe(async()=>{const original=model.enabled;model.enabled=checkbox.checked;checkbox.disabled=true;try{await request('model',{provider:provider.id,model:{id:model.id,enabled:checkbox.checked}});setStatus(t('模型选择范围已保存。'));await load();}catch(error){model.enabled=original;checkbox.checked=original;}finally{checkbox.disabled=false;}}));
+      checkbox.addEventListener('change',()=>safe(()=>saveModelPreference(provider.id,{id:model.id,enabled:checkbox.checked},checkbox)));
       label.append(checkbox,document.createTextNode(t('启用')));
       const test=action(t('测试模型'),()=>openProbe(provider,model),'mc-text-button');test.disabled=!!model.kind;test.setAttribute('aria-label',t('测试模型')+' '+model.name);
-      const favorite=action(t(model.favorite?'取消收藏':'收藏'),async()=>{await request('model',{provider:provider.id,model:{id:model.id,favorite:!model.favorite}});await load();},'mc-text-button');
+      const favorite=action(t(model.favorite?'取消收藏':'收藏'),()=>saveModelPreference(provider.id,{id:model.id,favorite:!model.favorite}),'mc-text-button');
       const price=action(t('估算价格'),()=>{const snapshot={unit_price:model.unit_price==null?'':String(model.unit_price)};for(const [key] of priceFields)snapshot[key]=model.prices?.[key]==null?'':String(model.prices[key]);priceTarget={project:scope,provider:provider.id,model:model.id,snapshot};$('mc-price-target').textContent=provider.name+' / '+model.id;$('mc-price-input').value=snapshot.unit_price;for(const [key,id] of priceFields)$(id).value=snapshot[key];$('mc-price-error').textContent='';$('mc-price-dialog').showModal();},'mc-text-button');
       const more=el('details',undefined,'model-more'),menu=el('div',undefined,'model-more-actions');more.append(el('summary',t('更多')));menu.append(favorite,test,price,action(t('能力元数据'),()=>openCapabilities(provider,model),'mc-text-button'));more.append(menu);controls.append(label,more);row.append(copy,controls);list.append(row);
     }
