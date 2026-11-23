@@ -299,7 +299,6 @@ class ServerHardeningTest(unittest.TestCase):
         client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         client.settimeout(5)
         client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
-        client.connect(("127.0.0.1", self.server.server_port))
         body = b'{"project":"p"}'
         request = (b"POST /api/project/archive HTTP/1.1\r\n"
                    + f"Host: 127.0.0.1:{self.server.server_port}\r\n".encode()
@@ -311,6 +310,8 @@ class ServerHardeningTest(unittest.TestCase):
         try:
             with patch.object(Handler, "setup", small_socket_buffer), \
                     patch.object(Handler, "respond", observe_response):
+                # The server can construct its handler as soon as the client connects.
+                client.connect(("127.0.0.1", self.server.server_port))
                 client.sendall(request)
                 self.assertTrue(response_entered.wait(5), "POST 响应未开始")
                 self.assertFalse(response_finished.wait(.1), "大响应没有形成慢客户端背压")
