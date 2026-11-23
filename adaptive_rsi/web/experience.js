@@ -1097,12 +1097,18 @@ window.RSIExperience = (() => {
       try {
         const operation = await api("operations", {kind:"backup", parameters:{}}),
           status = el("p", t("正在创建备份"), "muted");
+        status.setAttribute("role", "status");
         cancelButton = action(t("取消备份"), () => api("operations/cancel", {id:operation.id}), "text-button");
         box.append(status, cancelButton);
         let current;
         do {
           await new Promise(resolve => { timer = setTimeout(resolve, 500); });
-          current = await api("operation?id=" + encodeURIComponent(operation.id));
+          try {
+            current = await api("operation?id=" + encodeURIComponent(operation.id));
+          } catch {
+            status.textContent = t("无法继续获取备份状态。服务可能仍在创建备份，请稍后查看备份列表。");
+            return;
+          }
           if (current.result?.pages_total) status.textContent = t("正在创建备份") + " · " +
             Math.round(current.result.pages_done * 100 / current.result.pages_total) + "%";
         } while (!current.ended);

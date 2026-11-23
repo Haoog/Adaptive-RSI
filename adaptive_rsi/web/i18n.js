@@ -374,6 +374,7 @@ const english = {
  "确认对所选任务执行此操作？": "Apply this action to the selected tasks?",
  "批量操作已完成": "Batch operation completed",
  "正在创建备份": "Creating backup",
+ "无法继续获取备份状态。服务可能仍在创建备份，请稍后查看备份列表。": "Unable to keep checking the backup status. The service may still be creating the backup. Check the backup list later.",
  "取消备份": "Cancel backup",
  "备份已取消": "Backup cancelled",
  "备份未完成，请重试。": "Backup did not complete. Please retry.",
