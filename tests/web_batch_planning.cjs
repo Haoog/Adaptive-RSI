@@ -481,6 +481,75 @@ const historyScopes=[
  ['runtime switch',fixture=>fixture.machine('other')],
 ];
 
+for(const [scope,leave] of [['same view',null],...historyScopes]){
+ for(const stage of ['preview','receipt lookup','confirmed execution']){
+  test(`toolbar ${stage} capability wait respects ${scope}`,async()=>{
+   const negotiation=deferred(),started=deferred(),supported=new Set(['task-batch']);
+   const lookup=stage==='receipt lookup',execution=stage==='confirmed execution';
+   let checks=0;
+   const fixture=harness((_path,body)=>{
+    if(!body)return {receipt:{...preview,complete:false}};
+    return body.preview?preview:completedBatch;
+   },{clickConfirm:true,capabilities:()=>{
+    if(++checks!==(execution?2:1))return supported;
+    started.resolve();return negotiation.promise;
+   }});
+   if(lookup)fixture.store.set('batch','project',draft());
+   fixture.check('t1');
+   const pending=fixture.click();
+   if(execution){await nextTurn();assert.equal(fixture.dialog()?.open,true);fixture.confirm();}
+   await started.promise;
+   assert.equal(fixture.button().disabled,true);
+   await fixture.click();
+   leave?.(fixture);
+   negotiation.resolve(supported);
+   await nextTurn();
+   if(fixture.dialog()?.open)fixture.confirm();
+   await pending;
+   assert.deepEqual({previews:fixture.calls.filter(call=>call.body?.preview).length,
+    lookups:fixture.calls.filter(call=>!call.body).map(call=>call.path),posts:executionCount(fixture),
+    confirmations:fixture.confirms.length,refreshes:fixture.refreshes.length,toasts:fixture.toasts.length},
+   {previews:execution||(!leave&&!lookup)?1:0,lookups:!leave&&lookup?['tasks/batch?project=project&id=request-1']:[],
+    posts:leave?0:1,confirmations:execution||!leave?1:0,refreshes:leave?0:1,toasts:leave?0:1});
+   if(!leave&&lookup)assert.equal(fixture.calls.at(-1).body.request_id,'request-1');
+  });
+ }
+
+ test(`toolbar execution update wait respects ${scope}`,async()=>{
+  const status=deferred(),pollStarted=deferred();
+  const fixture=harness((path,body)=>{
+   if(path==='state'){pollStarted.resolve();return status.promise;}
+   if(!body)return {receipt:{...preview,complete:false}};
+   if(body.preview)return preview;
+   return executionCount(fixture)===1?{error_code:'update_in_progress'}:completedBatch;
+  },{clickConfirm:true,capabilities:()=>new Set(['task-batch'])});
+  fixture.machine('original');
+  fixture.check('t1');
+  const pending=fixture.click();
+  await nextTurn();assert.equal(fixture.dialog()?.open,true);fixture.confirm();
+  await pollStarted.promise;
+  assert.equal(fixture.button().disabled,true);
+  await fixture.click();
+  const original=fixture.calls.find(call=>call.body?.preview===false);
+  leave?.(fixture);
+  status.resolve({update:{busy:false}});
+  await pending;
+  const posts=()=>fixture.calls.filter(call=>call.body?.preview===false);
+  assert.deepEqual(posts().map(call=>call.body.request_id),leave?[original.body.request_id]:[original.body.request_id,original.body.request_id]);
+  assert.deepEqual([fixture.confirms.length,fixture.refreshes.length,fixture.toasts.length],leave?[1,0,1]:[1,1,2]);
+  if(!leave)return;
+  // Returning to the original view can reconcile the preserved ID in a new action.
+  fixture.project('project');fixture.machine('original');fixture.render(['t1']);
+  assert.equal(fixture.store.get('batch','project')?.[0]?.id,original.body.request_id);
+  const recovery=fixture.click();
+  await nextTurn();assert.equal(fixture.dialog()?.open,true);fixture.confirm();
+  await recovery;
+  assert.equal(fixture.calls.at(-2).path,'tasks/batch?project=project&id='+original.body.request_id);
+  assert.deepEqual(posts().map(call=>call.body),[original.body,original.body]);
+  assert.equal(fixture.store.get('batch','project'),null);
+ });
+}
+
 for(const [scope,leave] of historyScopes){
  test(`batch history blocks an old dialog click after ${scope}`,async()=>{
   const fixture=harness((_path,body)=>body?completedBatch:historyReport());

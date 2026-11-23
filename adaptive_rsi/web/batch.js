@@ -221,21 +221,21 @@ function paint(){for(const [id,box] of boxes)box.checked=ids().has(id);}
  }
  async function perform(kind){
   const project=projectId,tasks=Array.from(ids()).sort();if(!project||!tasks.length||pending.has(project))return;
-  const {machine,current}=batchView(project);
+  const {machine,current}=batchView(project),requestOptions={current};
   pending.add(project);toolbar();
   try{
    const saved=findReceipt(project,kind,tasks,machine);
    let prior=null,unverified=false;
    // 回执核对只用于恢复上一次已确认的请求；瞬时失败时保留原请求编号继续，由服务端按回执幂等复核。
    if(saved){
-    try{prior=(await api('tasks/batch?project='+encodeURIComponent(project)+'&id='+encodeURIComponent(saved.id))).receipt;}
+    try{prior=(await api('tasks/batch?project='+encodeURIComponent(project)+'&id='+encodeURIComponent(saved.id),undefined,requestOptions)).receipt;}
     catch{unverified=true;}
    }
    // 已完成的操作仍需清理原回执；界面反馈只属于发起时的导航。
    if(prior?.complete)forgetReceipt(project,saved.id,machine);
    if(!current())return;
    if(prior?.complete){selected.get(project)?.clear();toolbar();toast(t('批量操作已完成'));await refresh({force:true});return;}
-   const preview=prior||await api('tasks/batch',{project,tasks,action:kind,preview:true});
+   const preview=prior||await api('tasks/batch',{project,tasks,action:kind,preview:true},requestOptions);
    if(!current())return;
    const description=preview.tasks.map(item=>{
     const candidate=preview.candidates?.find(value=>value.task===item.id);
@@ -251,7 +251,7 @@ function paint(){for(const [id,box] of boxes)box.checked=ids().has(id);}
    const request_id=saved?.id||crypto.randomUUID();
    rememberReceipt(project,{id:request_id,tasks,action:kind},machine);
    let result;
-   try{result=await api('tasks/batch',{project,tasks,action:kind,request_id,revision:preview.revision,preview:false});}
+   try{result=await api('tasks/batch',{project,tasks,action:kind,request_id,revision:preview.revision,preview:false},requestOptions);}
    catch(error){if(current())toast(t('批量操作结果待核对，原请求编号已保留；网络恢复后重新执行会先核对回执，不会重复操作。')+' · '+(error.message||''),true);return;}
    if(result.complete)forgetReceipt(project,request_id,machine);
    if(!current())return;
