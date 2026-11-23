@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.145
+
+<!-- adaptive-rsi-release:0.5.145;base:5609bb016c32c13c131b876a7035a909e8b50a40 -->
+
 - **Desktop connections.** Connect to a server runtime through an existing SSH tunnel. The desktop app accepts HTTP authentication URLs on `127.0.0.1` in this mode. Direct server connections still use HTTPS.
 - **Multiple models.** Fix credential fallback from `opencode-go` to `opencode` when no dedicated configuration exists. OpenCode steps that omit usage data are recorded as unknown.
 - **Backups and updates.** Desktop backup downloads validate the response, preserve existing files with the same name, and discard incomplete backups on cancellation. Desktop updates validate resumed downloads more strictly and recheck the cached package signature before installation.
