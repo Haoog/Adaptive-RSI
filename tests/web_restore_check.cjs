@@ -23,6 +23,12 @@ function fixture(api) {
   return {button, toasts, get status() { return status; }, expire: () => deadline()};
 }
 
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+  return {promise, resolve, reject};
+}
+
 function backupFixture(api) {
   const source = fs.readFileSync('adaptive_rsi/web/experience.js', 'utf8');
   const start = source.indexOf('    const backupButton = action(');
@@ -87,32 +93,147 @@ test('backup submission errors still reach the shared action handler', async () 
   assert.deepEqual(f.elements, []);
 });
 
-test('backup cancellation waits for the server to confirm the terminal state', async () => {
-  let notifyPoll, finishPoll, cancellationId;
-  const pollStarted = new Promise(resolve => { notifyPoll = resolve; });
-  const poll = new Promise(resolve => { finishPoll = resolve; });
+test('backup cancellation shows sending and waiting despite progress and sends only one request', async () => {
+  const polls = Array.from({length:3}, () => ({started:deferred(), response:deferred()}));
+  const post = deferred();
+  const cancellationIds = [];
+  let pollCount = 0;
   const f = backupFixture(async (path, body) => {
     if (path === 'operations') return {id:'op'};
     if (path === 'operations/cancel') {
-      cancellationId = body.id;
-      return {ended:null, state:'running'};
+      cancellationIds.push(body.id);
+      return post.promise;
     }
-    notifyPoll();
-    return poll;
+    const poll = polls[pollCount++];
+    poll.started.resolve();
+    return poll.response.promise;
   });
   const [start] = f.buttons;
   const pending = start.handler();
-  await pollStarted;
+  await polls[0].started.promise;
   const [status, cancel] = f.elements;
+  const cancelling = cancel.handler();
+  assert.equal(status.textContent, '正在发送备份取消请求…');
+  assert.equal(cancel.disabled, true);
   await cancel.handler();
-  assert.equal(cancellationId, 'op');
-  assert.equal(status.textContent, '正在创建备份');
-  finishPoll({ended:'now', state:'cancelled'});
+  polls[0].response.resolve({ended:null, result:{pages_total:8, pages_done:2}});
+  await polls[1].started.promise;
+  assert.equal(status.textContent, '正在发送备份取消请求…');
+  post.resolve({ended:null, state:'running'});
+  await cancelling;
+  assert.equal(status.textContent, '已请求取消备份，等待服务确认…');
+  assert.equal(cancel.disabled, true);
+  await cancel.handler();
+  assert.deepEqual(cancellationIds, ['op']);
+  polls[1].response.resolve({ended:null, result:{pages_total:8, pages_done:4}});
+  await polls[2].started.promise;
+  assert.equal(status.textContent, '已请求取消备份，等待服务确认…');
+  polls[2].response.resolve({ended:'now', state:'cancelled'});
   await pending;
   assert.equal(status.textContent, '备份已取消');
   assert.equal(cancel.removed, true);
   assert.equal(start.disabled, false);
   assert.equal(f.elements.some(node => node.tag === 'a'), false);
+});
+
+test('backup cancellation failure allows retry while polling continues', async () => {
+  const firstPoll = deferred();
+  const nextPoll = deferred();
+  const firstPollStarted = deferred();
+  const nextPollStarted = deferred();
+  let postCount = 0, pollCount = 0;
+  const f = backupFixture(async path => {
+    if (path === 'operations') return {id:'op'};
+    if (path === 'operations/cancel') {
+      if (++postCount === 1) throw Error('raw cancellation request error');
+      return {ended:null, state:'running'};
+    }
+    if (++pollCount === 1) {
+      firstPollStarted.resolve();
+      return firstPoll.promise;
+    }
+    nextPollStarted.resolve();
+    return nextPoll.promise;
+  });
+  const pending = f.buttons[0].handler();
+  await firstPollStarted.promise;
+  const [status, cancel] = f.elements;
+  await cancel.handler();
+  assert.equal(status.textContent, '发送备份取消请求失败，可重试取消。');
+  assert.equal(cancel.disabled, false);
+  firstPoll.resolve({ended:null, result:{pages_total:8, pages_done:2}});
+  await nextPollStarted.promise;
+  assert.equal(status.textContent, '发送备份取消请求失败，可重试取消。');
+  await cancel.handler();
+  assert.equal(postCount, 2);
+  assert.equal(status.textContent, '已请求取消备份，等待服务确认…');
+  nextPoll.resolve({ended:'now', state:'cancelled'});
+  await pending;
+  assert.equal(status.textContent, '备份已取消');
+});
+
+test('backup cancellation uses terminal POST results despite a still-pending GET', async () => {
+  for (const [state, expected, result] of [
+    ['completed', '备份已完成', {id:'saved'}],
+    ['cancelled', '备份已取消', {}],
+    ['failed', '备份未完成，请重试。', {error_code:'raw operation failure'}],
+    ['interrupted', '备份未完成，请重试。', {}],
+  ]) {
+    const pollStarted = deferred();
+    const poll = deferred();
+    const f = backupFixture(async path => {
+      if (path === 'operations') return {id:'op'};
+      if (path === 'operations/cancel') return {ended:'now', state, result};
+      pollStarted.resolve();
+      return poll.promise;
+    });
+    const [start] = f.buttons;
+    const pending = start.handler();
+    await pollStarted.promise;
+    const [status, cancel] = f.elements;
+    await cancel.handler();
+    assert.equal(status.textContent, expected);
+    await pending;
+    assert.equal(cancel.removed, true);
+    assert.equal(start.disabled, false);
+    if (state === 'failed') poll.reject(Error('late status API error'));
+    else poll.resolve({ended:'earlier', state:'completed', result:{id:'stale'}});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(status.textContent, expected);
+    assert.deepEqual(f.elements.filter(node => node.tag === 'a').map(link => link.href),
+      state === 'completed' ? ['/api/backup?id=saved'] : []);
+  }
+});
+
+test('backup ignores a late cancellation response after terminal GET or lost tracking', async () => {
+  for (const terminal of [true, false]) {
+    const pollStarted = deferred();
+    const poll = deferred();
+    const post = deferred();
+    const f = backupFixture(async path => {
+      if (path === 'operations') return {id:'op'};
+      if (path === 'operations/cancel') return post.promise;
+      pollStarted.resolve();
+      return poll.promise;
+    });
+    const [start] = f.buttons;
+    const pending = start.handler();
+    await pollStarted.promise;
+    const [status, cancel] = f.elements;
+    const cancelling = cancel.handler();
+    if (terminal) poll.resolve({ended:'now', state:'cancelled'});
+    else poll.reject(Error('raw status API error'));
+    await pending;
+    const expected = terminal ? '备份已取消' :
+      '无法继续获取备份状态。服务可能仍在创建备份，请稍后查看备份列表。';
+    assert.equal(status.textContent, expected);
+    post.resolve({ended:'now', state:'completed', result:{id:'stale'}});
+    await cancelling;
+    assert.equal(status.textContent, expected);
+    assert.equal(cancel.removed, true);
+    assert.equal(start.disabled, false);
+    assert.equal(f.elements.some(node => node.tag === 'a'), false);
+  }
 });
 
 test('backup preserves confirmed failure feedback and successful downloads', async () => {

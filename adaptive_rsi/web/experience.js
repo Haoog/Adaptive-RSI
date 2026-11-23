@@ -1098,21 +1098,53 @@ window.RSIExperience = (() => {
         const operation = await api("operations", {kind:"backup", parameters:{}}),
           status = el("p", t("正在创建备份"), "muted");
         status.setAttribute("role", "status");
-        cancelButton = action(t("取消备份"), () => api("operations/cancel", {id:operation.id}), "text-button");
-        box.append(status, cancelButton);
-        let current;
-        do {
-          await new Promise(resolve => { timer = setTimeout(resolve, 500); });
-          try {
-            current = await api("operation?id=" + encodeURIComponent(operation.id));
-          } catch {
-            status.textContent = t("无法继续获取备份状态。服务可能仍在创建备份，请稍后查看备份列表。");
-            return;
-          }
-          if (current.result?.pages_total) status.textContent = t("正在创建备份") + " · " +
-            Math.round(current.result.pages_done * 100 / current.result.pages_total) + "%";
-        } while (!current.ended);
-        cancelButton.remove();
+        const current = await new Promise(resolve => {
+          let finished = false, showProgress = true;
+          const finish = row => {
+            finished = true;
+            resolve(row);
+          };
+          cancelButton = action(t("取消备份"), async () => {
+            if (finished || cancelButton.disabled) return;
+            cancelButton.disabled = true;
+            showProgress = false;
+            status.textContent = t("正在发送备份取消请求…");
+            let row;
+            try {
+              row = await api("operations/cancel", {id:operation.id});
+            } catch {
+              if (finished) return;
+              status.textContent = t("发送备份取消请求失败，可重试取消。");
+              cancelButton.disabled = false;
+              return;
+            }
+            if (finished) return;
+            if (row.ended) finish(row);
+            else status.textContent = t("已请求取消备份，等待服务确认…");
+          }, "text-button");
+          box.append(status, cancelButton);
+          const poll = async () => {
+            if (finished) return;
+            try {
+              const row = await api("operation?id=" + encodeURIComponent(operation.id));
+              if (finished) return;
+              if (row.ended) {
+                finish(row);
+                return;
+              }
+              if (showProgress && row.result?.pages_total) status.textContent = t("正在创建备份") + " · " +
+                Math.round(row.result.pages_done * 100 / row.result.pages_total) + "%";
+              timer = setTimeout(poll, 500);
+            } catch {
+              if (!finished) finish();
+            }
+          };
+          timer = setTimeout(poll, 500);
+        });
+        if (!current) {
+          status.textContent = t("无法继续获取备份状态。服务可能仍在创建备份，请稍后查看备份列表。");
+          return;
+        }
         if (current.state !== "completed") {
           status.textContent = t(current.state === "cancelled" ? "备份已取消" : "备份未完成，请重试。");
           return;
