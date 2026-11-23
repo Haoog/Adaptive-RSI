@@ -3948,6 +3948,119 @@ for(const field of ['enabled','favorite']){
   });
 }
 
+async function modelResumePage(){
+  const page=await diagnosisPage(),api=page.context.api,posts=[],reads=[],resumed=new Set();
+  let readError;
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/resume'){
+      await new Promise((resolve,reject)=>posts.push({body:structuredClone(body),resolve,reject}));
+      resumed.add(body.project+':'+body.provider);
+      return {saved:true,resumed_tasks:0};
+    }
+    if(path==='model-center'||path.startsWith('model-center?')){
+      reads.push(path);
+      if(readError)throw readError;
+      const snapshot=await api(path,body,options);
+      for(const provider of snapshot.providers){
+        provider.health=resumed.has(snapshot.project+':'+provider.id)
+          ?{paused:false,failures:0}:{paused:true,failures:3,code:'timeout'};
+      }
+      return snapshot;
+    }
+    return api(path,body,options);
+  };
+  await page.show('a');
+  reads.length=0;
+  return {...page,posts,reads,failRead(error){readError=error;},resume:()=>page.node('mc-resume'),feedback:()=>page.node('mc-feedback').textContent};
+}
+
+const resumeTransitions={
+  'project switch':preferenceTransitions['project switch'],
+  'project round trip':diagnosisTransitions['project round trip'],
+  'provider switch':diagnosisTransitions['provider switch'],
+  'provider round trip':diagnosisTransitions['provider round trip'],
+  'connection tab round trip':diagnosisTransitions['connection tab round trip'],
+  'returning to the page':diagnosisTransitions['returning to the page']
+};
+for(const [name,transition] of Object.entries(resumeTransitions))for(const failure of [false,true]){
+  test(`model resume keeps late ${failure?'failure':'success'} scoped after ${name}`,async()=>{
+    const page=await modelResumePage(),pending=page.click('mc-resume');
+    assert.deepEqual(page.posts.map(post=>post.body),[{provider:'ollama',project:'a'}]);
+    await transition(page);
+    const provider=page.node('mc-provider-name').textContent;
+    page.reads.length=0;
+    if(failure)page.posts[0].reject(new Error('Old resume error'));
+    else page.posts[0].resolve();
+    await pending;
+    assert.deepEqual(page.reads,failure||name==='project switch'?[]:['model-center?project=a']);
+    assert.equal(page.feedback(),'');
+    assert.equal(page.node('toast').hidden,true);
+    assert.equal(page.node('mc-provider-name').textContent,provider);
+    assert.equal(page.resume().hidden,!failure&&name!=='project switch'&&name!=='provider switch');
+  });
+}
+
+for(const outcome of ['success','POST failure','read failure'])test(`model resume keeps current ${outcome} consistent`,async()=>{
+  const page=await modelResumePage(),pending=page.click('mc-resume');
+  if(outcome==='read failure')page.failRead(new Error('Confirmation read failed'));
+  if(outcome==='POST failure')page.posts[0].reject(new Error('Current resume error'));
+  else page.posts[0].resolve();
+  await pending;
+  const failed=outcome==='POST failure';
+  assert.deepEqual(page.reads,failed?[]:['model-center?project=a']);
+  assert.equal(page.feedback(),failed?'Current resume error':'已恢复请求，下次调用将重新检查。');
+  assert.equal(page.node('toast').hidden,!failed);
+  assert.equal(page.resume().disabled,false);
+  assert.equal(page.resume().hidden,!failed);
+  assert.equal(page.node('mc-health').hidden,!failed);
+  await page.provider('OpenAI');await page.provider('Ollama');
+  assert.equal(page.resume().hidden,!failed,'local redraw preserves the confirmed health mark');
+});
+
+test('model resume prevents a duplicate POST while pending across redraws',async()=>{
+  const page=await modelResumePage(),pending=page.click('mc-resume');
+  await page.provider('OpenAI');await page.provider('Ollama');
+  assert.equal(page.resume().disabled,true);
+  page.click('mc-resume');
+  assert.equal(page.posts.length,1);
+  page.posts[0].reject(new Error('Resume failed'));await pending;
+  assert.equal(page.resume().disabled,false);
+  const retry=page.click('mc-resume');
+  assert.equal(page.posts.length,2);
+  page.posts[1].resolve();await retry;
+  assert.equal(page.resume().hidden,true);
+});
+
+test('model resume preserves a newer provider error after an earlier provider succeeds',async()=>{
+  const page=await modelResumePage(),earlier=page.click('mc-resume');
+  await page.provider('OpenAI');
+  const current=page.click('mc-resume');
+  assert.deepEqual(page.posts.map(post=>post.body),[{provider:'ollama',project:'a'},{provider:'openai',project:'a'}]);
+  page.posts[1].reject(new Error('Current provider error'));await current;
+  page.posts[0].resolve();await earlier;
+  assert.equal(page.feedback(),'Current provider error');
+  assert.equal(page.node('toast').textContent,'Current provider error');
+  assert.equal(page.resume().hidden,false);
+  await page.provider('Ollama');
+  assert.equal(page.resume().hidden,true);
+});
+
+test('model resume ignores a late confirmation-read error after switching projects',async()=>{
+  const page=await modelResumePage(),api=page.context.api;
+  let rejectRead;
+  page.context.api=(path,...args)=>path==='model-center?project=a'
+    ?new Promise((_,reject)=>{rejectRead=reject;})
+    :api(path,...args);
+  const pending=page.click('mc-resume');
+  page.posts[0].resolve();await new Promise(setImmediate);
+  assert.equal(typeof rejectRead,'function');
+  await preferenceTransitions['project switch'](page);
+  rejectRead(new Error('Old confirmation read error'));await pending;
+  assert.equal(page.feedback(),'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.resume().hidden,false);
+});
+
 for(const failure of [false,true])test(`model catalog ignores stale ${failure?'failure':'success'} after a provider round trip`,async()=>{
   const page=await diagnosisPage(),api=page.context.api;
   let finish,reads=0;

@@ -30,7 +30,7 @@ window.RSIModelCenter = (() => {
     unsupported_model_kind:'此模型类型不能用于当前代码任务。',invalid_model:'请填写有效的模型 ID 和名称。',invalid_capability:'能力覆盖必须使用正整数，并保证输出上限不超过上下文上限。',invalid_routes:'角色配置不完整，请重新选择。'
   };
   const purpose = {analysis:'查找有依据的改进',planning:'判断是否值得执行',implementation:'实现并补充验证',review:'检查正确性与可维护性',evolution:'分析证据与提出待验证改动'};
-  const drafts = new Map(), baselines = new Map(), jobs = new Set(), savingRoutes = new Set(), inheritanceResets = new Map();
+  const drafts = new Map(), baselines = new Map(), jobs = new Set(), resuming = new Set(), savingRoutes = new Set(), inheritanceResets = new Map();
   const initialTab=location.href?new URLSearchParams(String(location.hash||'').replace(/^#/, '')).get('modelTab'):null;
   let data, active='openai', scope=null, tab=initialTab==='roles'?'roles':'providers', sequence=0, editing=null, editorSession=null, probeSession=null, probeRun=null, probeCancelled=null, picking=null, loading=false;
   let feedbackKey='',feedbackError=false,modelPage=0,pickerPage=0,priceTarget=null,capabilityTarget=null;
@@ -117,9 +117,12 @@ window.RSIModelCenter = (() => {
   function invalidateConnectionView(){diagnosisSequence++;connectionViewVersion++;}
   function selectProvider(next){if(active!==next)invalidateConnectionView();active=next;}
   function selectTab(next){if(tab!==next)invalidateConnectionView();tab=next;}
+  function connectionFeedbackOwner(provider,project){
+    const viewVersion=connectionViewVersion;
+    return ()=>viewVersion===connectionViewVersion&&scope===project&&active===provider&&tab==='providers'&&!$('view-models').hidden;
+  }
   async function saveModelPreference(provider,model,checkbox){
-    const project=scope,viewVersion=connectionViewVersion;
-    const ownsFeedback=()=>viewVersion===connectionViewVersion&&scope===project&&active===provider&&tab==='providers'&&!$('view-models').hidden;
+    const project=scope,ownsFeedback=connectionFeedbackOwner(provider,project);
     if(checkbox)checkbox.disabled=true;
     try{
       try{await api('model-center/model',{project,provider,model});}
@@ -144,6 +147,30 @@ window.RSIModelCenter = (() => {
         if(scope===project&&data===snapshot&&data?.project===project&&active===provider&&!loading)renderModels();
       }
     }finally{if(checkbox)checkbox.disabled=false;}
+  }
+  async function resumeProvider(){
+    const project=scope,provider=active,key=jobKey(provider,project);
+    if(data?.project!==project||!selected()?.health.paused||tab!=='providers'||$('view-models').hidden||resuming.has(key))return;
+    const ownsFeedback=connectionFeedbackOwner(provider,project);
+    resuming.add(key);$('mc-resume').disabled=true;
+    try{
+      try{await api('model-center/resume',{provider,project});}
+      catch(error){
+        if(ownsFeedback()){
+          error.message=message(error);setStatus(error.message,true);throw error;
+        }
+        return;
+      }
+      if(scope!==project)return;
+      // The POST reset the health mark. Keep it cleared if the snapshot read fails.
+      const saved=data?.project===project&&data.providers.find(item=>item.id===provider);
+      if(saved)saved.health={paused:false,failures:0};
+      try{await load({reportError:false});}catch{}
+      if(ownsFeedback())setStatus(t('已恢复请求，下次调用将重新检查。'));
+    }finally{
+      resuming.delete(key);
+      if(scope===project&&data?.project===project&&active===provider&&!loading)renderProviderHealth(selected());
+    }
   }
   function render(){
     if(!data||loading||data.project!==scope)return;
@@ -176,6 +203,12 @@ window.RSIModelCenter = (() => {
     heading.append(el('h2',t(title)),close);
     box.append(heading);document.body.append(box);box.showModal();return box;
   }
+  function renderProviderHealth(provider){
+    $('mc-health').hidden=!provider.health.paused&&!provider.health.failures;
+    $('mc-health-status').textContent=provider.health.paused?t('连续失败已暂停')+' · '+t(errors[provider.health.code]||''):t('连续故障次数')+' '+provider.health.failures+' / 3';
+    $('mc-resume').hidden=!provider.health.paused;
+    $('mc-resume').disabled=resuming.has(jobKey(provider.id));
+  }
   function renderProvider(){
     const provider=selected(),catalog=provider.catalog;
     $('mc-provider-name').textContent=provider.id==='openai'?t('Codex 登录'):provider.name;
@@ -197,9 +230,7 @@ window.RSIModelCenter = (() => {
     $('mc-step-account').dataset.state=accountReady?'done':'current';
     $('mc-step-models').dataset.state=catalog.fetched?'done':accountReady?'current':'pending';
     $('mc-truncated').hidden=!catalog.truncated;
-    $('mc-health').hidden=!provider.health.paused&&!provider.health.failures;
-    $('mc-health-status').textContent=provider.health.paused?t('连续失败已暂停')+' · '+t(errors[provider.health.code]||''):t('连续故障次数')+' '+provider.health.failures+' / 3';
-    $('mc-resume').hidden=!provider.health.paused;$('mc-resume').disabled=false;
+    renderProviderHealth(provider);
     let diagnostics=$('mc-diagnostics');
     if(!diagnostics){diagnostics=el('button',t('只读诊断'),'mc-text-button');diagnostics.id='mc-diagnostics';diagnostics.type='button';$('mc-health').after(diagnostics);}
     diagnostics.onclick=async()=>{
@@ -477,8 +508,7 @@ window.RSIModelCenter = (() => {
   }
   async function fetchProvider(providerId=active,requested=scope,propagateError=false){
     const key=jobKey(providerId,requested);if(jobs.has(key)){if(propagateError)throw new Error('catalog_refresh_pending');return;}
-    const viewVersion=connectionViewVersion;
-    const ownsFeedback=()=>viewVersion===connectionViewVersion&&scope===requested&&active===providerId&&tab==='providers'&&!$('view-models').hidden;
+    const ownsFeedback=connectionFeedbackOwner(providerId,requested);
     jobs.add(key);if(scope===requested)renderProvider();
     let failure;
     try{
@@ -542,7 +572,7 @@ window.RSIModelCenter = (() => {
     $('mc-model-filter').addEventListener('change',()=>{modelPage=0;renderModels();});
     $('mc-prev').addEventListener('click',()=>{modelPage--;renderModels();});$('mc-next').addEventListener('click',()=>{modelPage++;renderModels();});
     $('mc-undo').addEventListener('click',()=>{if(resetConflict(scopeKey()))setStatus('');inheritanceResets.delete(scopeKey());drafts.set(scopeKey(),structuredClone(data.models));renderRoles();});
-    $('mc-resume').addEventListener('click',()=>safe(async()=>{await request('resume',{provider:active});await load();setStatus(t('已恢复请求，下次调用将重新检查。'));}));
+    $('mc-resume').addEventListener('click',()=>safe(resumeProvider));
     $('mc-fallback-provider').addEventListener('change',()=>renderFallbackModels());$('mc-fallback-model').addEventListener('change',()=>renderFallbackEffort());
     $('mc-price-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
       const unchanged=unchangedForm(event.target),project=scope,target={...priceTarget},button=event.target.querySelector('button[type="submit"]');
