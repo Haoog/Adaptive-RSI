@@ -30,7 +30,7 @@ window.RSIModelCenter = (() => {
     unsupported_model_kind:'此模型类型不能用于当前代码任务。',invalid_model:'请填写有效的模型 ID 和名称。',invalid_capability:'能力覆盖必须使用正整数，并保证输出上限不超过上下文上限。',invalid_routes:'角色配置不完整，请重新选择。'
   };
   const purpose = {analysis:'查找有依据的改进',planning:'判断是否值得执行',implementation:'实现并补充验证',review:'检查正确性与可维护性',evolution:'分析证据与提出待验证改动'};
-  const drafts = new Map(), baselines = new Map(), jobs = new Set(), resuming = new Set(), savingRoutes = new Map(), inheritanceResets = new Map();
+  const drafts = new Map(), baselines = new Map(), jobs = new Set(), resuming = new Set(), removing = new Set(), savingRoutes = new Map(), inheritanceResets = new Map();
   const initialTab=location.href?new URLSearchParams(String(location.hash||'').replace(/^#/, '')).get('modelTab'):null;
   let data, active='openai', scope=null, tab=initialTab==='roles'?'roles':'providers', sequence=0, editing=null, editorSession=null, probeSession=null, probeRun=null, probeCancelled=null, loading=false;
   let feedbackKey='',feedbackError=false,modelPage=0,pickerPage=0,pickerSession=null,priceSession=null,capabilityTarget=null;
@@ -79,8 +79,7 @@ window.RSIModelCenter = (() => {
   }
   function info(text,cls='mc-secondary'){return el('span',text,cls);}
   function findModel(route){return data?.providers.find(p=>p.id===route.provider)?.catalog.models.find(m=>m.id===route.model);}
-  async function request(path,body){try{return await api('model-center/'+path,{...body,project:scope});}catch(error){error.message=message(error);setStatus(error.message,true);throw error;}}
-  async function load({reset=false,reportError=true}={}){
+  async function load({reset=false,reportError=true,beforeRender}={}){
     if(!state)return;
     const ticket=++sequence,requested=scope;
     loading=true;
@@ -117,6 +116,7 @@ window.RSIModelCenter = (() => {
       else if(JSON.stringify(safeRoute(previous[role]))!==JSON.stringify(safeRoute(data.models[role]))){draft[role]=structuredClone(data.models[role]);conflicts=true;}
     }
     baselines.set(key,structuredClone(data.models));
+    beforeRender?.();
     if(!selected())selectProvider(data.providers[0].id);
     render();if(conflicts)setStatus(t('服务器模型设置已变化，冲突分工未从旧草稿恢复。'),true,true);
   }
@@ -194,7 +194,7 @@ window.RSIModelCenter = (() => {
   function render(){
     if(!data||loading||data.project!==scope)return;
     $('view-models').dataset.scope=scopeKey();
-    for(const id of ['mc-add-provider','mc-edit-provider','mc-remove-provider','mc-add-model','mc-reset-inheritance'])$(id).disabled=false;
+    for(const id of ['mc-add-provider','mc-edit-provider','mc-add-model','mc-reset-inheritance'])$(id).disabled=false;
     $('mc-scope').value=scope?'project':'global';
     $('mc-scope').querySelector('[value="project"]').disabled=!projectId;
     $('mc-scope-note').textContent=scope?t('当前项目的模型服务与角色覆盖独立保存。'):t('模型服务与角色默认供各项目继承使用。');
@@ -238,6 +238,7 @@ window.RSIModelCenter = (() => {
     $('mc-catalog-status').className='badge '+(catalog.fetched?'good':'neutral');
     $('mc-refreshed').textContent=catalog.fetched?t('更新于 ')+stamp(catalog.fetched):'';
     $('mc-edit-provider').hidden=provider.builtin;$('mc-remove-provider').hidden=provider.builtin;
+    $('mc-remove-provider').disabled=removing.has(jobKey(provider.id));
     $('mc-fetch').disabled=jobs.has(jobKey(provider.id));$('mc-fetch').textContent=t(jobs.has(jobKey(provider.id))?'获取中…':'获取模型');
     $('mc-directory-error').hidden=!catalog.error;
     $('mc-directory-error').textContent=catalog.error?errorCopy(catalog.error):'';
@@ -746,9 +747,37 @@ window.RSIModelCenter = (() => {
       }finally{if(ownsEditor())button.disabled=false;}
     });});
     $('mc-remove-provider').addEventListener('click',()=>safe(async()=>{
-      // 移除立即退役连接并删除本机凭据，重新添加生成新 id；必须先确认，取消路径不发出任何请求。
-      if(!(await uiConfirm(t('此连接与本机保存的凭据（钥匙串或私有文件）会一并删除且不可恢复；重新添加将生成新连接，启用、收藏、验证与价格记录不会恢复。若仍被角色分工或备用模型引用，服务端会拒绝移除。'))))return;
-      await request('remove',{provider:active});await load();await refresh();setStatus(t('连接已移除。'));
+      const button=$('mc-remove-provider'),project=scope,provider=active,key=jobKey(provider,project);
+      const ownsView=connectionFeedbackOwner(provider,project);
+      if(button.disabled||button.hidden||removing.has(key)||data?.project!==project||!ownsView())return;
+      const submittedFeedback=feedbackVersion;
+      const ownsFeedback=()=>ownsView()&&feedbackVersion===submittedFeedback;
+      removing.add(key);button.disabled=true;
+      try{
+        const confirmed=await uiConfirm(t('此连接与本机保存的凭据（钥匙串或私有文件）会一并删除且不可恢复；重新添加将生成新连接，启用、收藏、验证与价格记录不会恢复。若仍被角色分工或备用模型引用，服务端会拒绝移除。'));
+        if(!confirmed||!ownsView())return;
+        try{
+          const result=await api('model-center/remove',{provider,project});
+          if(result?.removed!==true)throw new Error(t('无法确认连接是否已移除。请先刷新页面核对连接。'));
+        }catch(error){
+          if(ownsFeedback()){error.message=message(error);setStatus(error.message,true);throw error;}
+          return;
+        }
+        if(scope!==project||$('view-models').hidden)return;
+        let refreshFailed=false;
+        try{await refresh();}catch{refreshFailed=true;}
+        if(scope!==project||$('view-models').hidden)return;
+        const refreshWarning='连接已移除，但设置刷新失败。请刷新页面核对连接。';
+        try{
+          await load({reportError:false,beforeRender:()=>{
+            // 在应用新目录时、自动切换到另一个连接前，核对移除提示的归属。
+            if(ownsFeedback())setStatus(t(refreshFailed?refreshWarning:'连接已移除。'),refreshFailed);
+          }});
+        }catch{if(ownsFeedback())setStatus(t(refreshWarning),true);}
+      }finally{
+        removing.delete(key);
+        if(!loading&&data?.project===scope)button.disabled=removing.has(jobKey(active));
+      }
     }));
     const customForm=$('mc-custom-form'),customDialog=$('mc-custom-dialog'),customError=$('mc-custom-error');
     let customSession=null;

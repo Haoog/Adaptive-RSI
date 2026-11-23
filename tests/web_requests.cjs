@@ -3561,6 +3561,145 @@ function modelScopePage(savedDrafts = new Map(), {connections=false,renderRoutes
   };
 }
 
+async function providerRemovalPage(){
+  const page=modelScopePage(new Map(),{connections:true}),requests=[],removed=new Set();
+  const api=page.context.api;
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/remove'){
+      const result=await new Promise((resolve,reject)=>requests.push({body:structuredClone(body),resolve,reject}));
+      if(result?.removed)removed.add(`${body.project}:${body.provider}`);
+      return result;
+    }
+    const result=await api(path,body,options);
+    if(!body)result.providers=result.providers
+      .map((provider,index)=>({...provider,id:`fixture-${index}`,name:`Fixture ${index}`}))
+      .filter(provider=>!removed.has(`${result.project}:${provider.id}`));
+    return result;
+  };
+  page.context.history={state:null};
+  const navigate=async(project)=>{
+    page.context.location.hash=`#view=models&project=${project}&scope=project&modelTab=providers`;
+    page.context.location.href='http://localhost/'+page.context.location.hash;
+    page.windowListeners.get('hashchange')();
+    await page.context.lastAction;
+    await new Promise(setImmediate);
+  };
+  await navigate('a');
+  return {...page,requests,navigate,
+    confirm(value){
+      const box=page.document.body.children.find(node=>node.className==='confirm-dialog'&&node.open);
+      box.children.at(-1).children[value?1:0].handlers.click();
+    },
+    provider(name){page.node('mc-provider-list').children.find(button=>button.attributes['aria-label']===name).handlers.click();},
+    project(id){page.node('project-select').value=id;page.node('project-select').handlers.change();return page.context.lastAction;},
+    remove(){return page.click('mc-remove-provider');},
+    feedback(){return page.node('mc-feedback').textContent;}
+  };
+}
+
+const providerRemovalTransitions={
+  'provider switch':page=>page.provider('Fixture 1'),
+  'project switch':page=>page.project('b'),
+  'history back':page=>page.navigate('b')
+};
+
+for(const [name,transition] of Object.entries(providerRemovalTransitions))test(`model provider removal discards a pending confirmation after ${name}`,async()=>{
+  const page=await providerRemovalPage(),pending=page.remove();
+  await transition(page);
+  page.confirm(true);
+  await new Promise(setImmediate);
+  assert.deepEqual(page.requests.map(request=>request.body),[]);
+  await pending;
+});
+
+test('model provider removal sends one scoped POST and keeps the fallback selection',async()=>{
+  const page=await providerRemovalPage(),pending=page.remove();
+  const repeatedConfirmation=page.remove();
+  assert.equal(page.document.body.children.filter(node=>node.className==='confirm-dialog'&&node.open).length,1);
+  page.confirm(true);
+  await new Promise(setImmediate);
+  const repeatedPost=page.remove();
+  await new Promise(setImmediate);
+  assert.deepEqual(page.requests.map(request=>request.body),[{project:'a',provider:'fixture-0'}]);
+  page.requests[0].resolve({removed:true});
+  await Promise.all([pending,repeatedConfirmation,repeatedPost]);
+  assert.equal(page.feedback(),'连接已移除。');
+  assert.deepEqual(page.node('mc-provider-list').children.map(button=>button.attributes['aria-label']),['Fixture 1']);
+  assert.equal(page.node('mc-provider-list').children[0].attributes['aria-pressed'],'true');
+});
+
+for(const stage of ['catalog read','state refresh'])test(`model provider removal reports acknowledgement when ${stage} fails`,async()=>{
+  const page=await providerRemovalPage(),api=page.context.api,pending=page.remove();
+  page.confirm(true);
+  await new Promise(setImmediate);
+  const failure=new Error('Fixture read failure');
+  if(stage==='catalog read')page.context.api=(path,body)=>body?api(path,body):Promise.reject(failure);
+  else page.context.refresh=async()=>{throw failure;};
+  page.requests[0].resolve({removed:true});
+  await pending;
+  assert.equal(page.feedback(),'连接已移除，但设置刷新失败。请刷新页面核对连接。');
+  assert.equal(page.node('toast').hidden,true);
+  if(stage==='state refresh')assert.equal(page.node('mc-provider-list').children.length,1);
+});
+
+for(const outcome of ['success','rejection'])test(`model provider removal keeps newer feedback after a delayed ${outcome}`,async()=>{
+  const page=await providerRemovalPage(),pending=page.remove();
+  page.confirm(true);
+  await new Promise(setImmediate);
+  assert.deepEqual(page.requests.map(request=>request.body),[{project:'a',provider:'fixture-0'}]);
+  page.provider('Fixture 1');
+  page.node('mc-scope').value='global';
+  await page.node('mc-scope').handlers.change();
+  const api=page.context.api;
+  page.context.api=async(path,body)=>{
+    if(path==='model-center/fetch')throw new Error('Current fixture feedback');
+    return api(path,body);
+  };
+  await page.click('mc-fetch');
+  assert.equal(page.feedback(),'Current fixture feedback');
+  if(outcome==='success')page.requests[0].resolve({removed:true});
+  else page.requests[0].reject(Object.assign(new Error('Fixture rejection'),{code:'provider_in_use'}));
+  await pending;
+  assert.equal(page.feedback(),'Current fixture feedback');
+  assert.equal(page.node('toast').hidden,true);
+});
+
+test('model provider removal requires a positive acknowledgement before refreshing',async()=>{
+  const page=await providerRemovalPage(),pending=page.remove();
+  page.confirm(true);
+  await new Promise(setImmediate);
+  let refreshed=false;
+  page.context.refresh=async()=>{refreshed=true;};
+  page.requests[0].resolve({});
+  await pending;
+  assert.equal(refreshed,false);
+  assert.equal(page.feedback(),'无法确认连接是否已移除。请先刷新页面核对连接。');
+  assert.equal(page.node('mc-provider-list').children.length,2);
+});
+
+test('model provider removal preserves cancel, confirmation failure and backend rejection',async()=>{
+  const page=await providerRemovalPage(),cancelled=page.remove();
+  page.confirm(false);
+  await cancelled;
+  assert.equal(page.requests.length,0);
+  const confirm=page.context.uiConfirm;
+  page.context.uiConfirm=()=>Promise.reject(new Error('Fixture confirmation failed'));
+  await page.remove();
+  assert.equal(page.requests.length,0);
+  assert.equal(page.node('toast').textContent,'Fixture confirmation failed');
+  page.context.uiConfirm=confirm;
+  const pending=page.remove();
+  page.confirm(true);
+  await new Promise(setImmediate);
+  assert.equal(page.requests.length,1);
+  page.requests[0].reject(Object.assign(new Error('Fixture rejection'),{code:'provider_in_use'}));
+  await pending;
+  assert.equal(page.feedback(),'此连接仍被角色或备用模型使用，请先更换相关配置。');
+  assert.equal(page.node('toast').textContent,page.feedback());
+  assert.equal(page.node('mc-provider-list').children.length,2);
+  assert.equal(page.node('mc-remove-provider').disabled,false);
+});
+
 async function diagnosisPage(){
   const page=modelScopePage(new Map(),{connections:true}),requests=[];
   const api=page.context.api;

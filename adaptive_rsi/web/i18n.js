@@ -1319,6 +1319,8 @@ const english = {
   "保存并获取模型": "Save & fetch models",
   "连接配置已保存。": "Connection saved.",
   "连接已移除。": "Connection removed.",
+  "连接已移除，但设置刷新失败。请刷新页面核对连接。": "Connection removed, but settings could not be refreshed. Reload the page to verify the connection list.",
+  "无法确认连接是否已移除。请先刷新页面核对连接。": "Could not confirm that the connection was removed. Reload the page to verify the connection list first.",
   "此连接与本机保存的凭据（钥匙串或私有文件）会一并删除且不可恢复；重新添加将生成新连接，启用、收藏、验证与价格记录不会恢复。若仍被角色分工或备用模型引用，服务端会拒绝移除。": "Removing this connection also deletes credentials stored on this machine (keychain or private file) and cannot be undone. Re-adding creates a new connection; enabled, favorite, verified and price records are not restored. The server rejects removal while the connection is still used by a role or fallback model.",
   "模型列表已更新，原来选择的模型没有改变。": "Model directory updated; existing selections preserved.",
   "我的中转站": "My gateway",
