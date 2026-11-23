@@ -33,7 +33,7 @@ window.RSIModelCenter = (() => {
   const drafts = new Map(), baselines = new Map(), jobs = new Set(), resuming = new Set(), savingRoutes = new Set(), inheritanceResets = new Map();
   const initialTab=location.href?new URLSearchParams(String(location.hash||'').replace(/^#/, '')).get('modelTab'):null;
   let data, active='openai', scope=null, tab=initialTab==='roles'?'roles':'providers', sequence=0, editing=null, editorSession=null, probeSession=null, probeRun=null, probeCancelled=null, picking=null, loading=false;
-  let feedbackKey='',feedbackError=false,modelPage=0,pickerPage=0,priceTarget=null,capabilityTarget=null;
+  let feedbackKey='',feedbackError=false,modelPage=0,pickerPage=0,priceSession=null,capabilityTarget=null;
   const pageSize=20;
   const priceFields=[['input','mc-price-input-tokens'],['output','mc-price-output'],['cache_read','mc-price-cache-read'],['cache_write','mc-price-cache-write']];
   const scopeKey = () => scope || 'global';
@@ -300,10 +300,23 @@ window.RSIModelCenter = (() => {
       label.append(checkbox,document.createTextNode(t('启用')));
       const test=action(t('测试模型'),()=>openProbe(provider,model),'mc-text-button');test.disabled=!!model.kind;test.setAttribute('aria-label',t('测试模型')+' '+model.name);
       const favorite=action(t(model.favorite?'取消收藏':'收藏'),()=>saveModelPreference(provider.id,{id:model.id,favorite:!model.favorite}),'mc-text-button');
-      const price=action(t('估算价格'),()=>{const snapshot={unit_price:model.unit_price==null?'':String(model.unit_price)};for(const [key] of priceFields)snapshot[key]=model.prices?.[key]==null?'':String(model.prices[key]);priceTarget={project:scope,provider:provider.id,model:model.id,snapshot};$('mc-price-target').textContent=provider.name+' / '+model.id;$('mc-price-input').value=snapshot.unit_price;for(const [key,id] of priceFields)$(id).value=snapshot[key];$('mc-price-error').textContent='';$('mc-price-dialog').showModal();},'mc-text-button');
+      const price=action(t('估算价格'),()=>openPrice(provider,model),'mc-text-button');
       const more=el('details',undefined,'model-more'),menu=el('div',undefined,'model-more-actions');more.append(el('summary',t('更多')));menu.append(favorite,test,price,action(t('能力元数据'),()=>openCapabilities(provider,model),'mc-text-button'));more.append(menu);controls.append(label,more);row.append(copy,controls);list.append(row);
     }
     if(!matches.length)list.append(el('p',t(models.length?'没有匹配的模型。':'连接后点击「获取模型」，也可以添加自定义模型。'),'mc-empty'));
+  }
+  function openPrice(provider,model){
+    const dialog=$('mc-price-dialog'),project=scope,ownsFeedback=connectionFeedbackOwner(provider.id,project);
+    if(dialog.open||data?.project!==project||!ownsFeedback())return;
+    const snapshot={unit_price:model.unit_price==null?'':String(model.unit_price)};
+    for(const [key] of priceFields)snapshot[key]=model.prices?.[key]==null?'':String(model.prices[key]);
+    priceSession={project,provider:provider.id,model:model.id,snapshot,ownsFeedback};
+    $('mc-price-target').textContent=provider.name+' / '+model.id;
+    $('mc-price-input').value=snapshot.unit_price;
+    for(const [key,id] of priceFields)$(id).value=snapshot[key];
+    $('mc-price-error').textContent='';
+    $('mc-price-form').querySelector('button[type="submit"]').disabled=false;
+    dialog.showModal();
   }
   function capabilityDialog(){
     let box=$('mc-capability-dialog');
@@ -574,20 +587,40 @@ window.RSIModelCenter = (() => {
     $('mc-undo').addEventListener('click',()=>{if(resetConflict(scopeKey()))setStatus('');inheritanceResets.delete(scopeKey());drafts.set(scopeKey(),structuredClone(data.models));renderRoles();});
     $('mc-resume').addEventListener('click',()=>safe(resumeProvider));
     $('mc-fallback-provider').addEventListener('change',()=>renderFallbackModels());$('mc-fallback-model').addEventListener('change',()=>renderFallbackEffort());
-    $('mc-price-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
-      const unchanged=unchangedForm(event.target),project=scope,target={...priceTarget},button=event.target.querySelector('button[type="submit"]');
-      if(!target?.model)return;
-      button.disabled=true;$('mc-price-error').textContent='';
-      try{const snapshot=target.snapshot||{},submission={id:target.model},prices={};let changed=false;
-        // 只提交相对打开时快照变动的字段；清空用显式 null，未变字段不覆盖其他窗口的保存。
-        const unit=$('mc-price-input').value;if(unit!==(snapshot.unit_price??'')){submission.unit_price=unit===''?null:Number(unit);changed=true;}
-        for(const [key,id] of priceFields){const value=$(id).value;if(value!==(snapshot[key]??'')){prices[key]=value===''?null:Number(value);changed=true;}}
-        if(Object.keys(prices).length)submission.prices=prices;
-        if(!changed){if(unchanged()&&scope===project)$('mc-price-dialog').close();return;}
-        await api('model-center/model',{project:target.project,provider:target.provider,model:submission});if(unchanged()&&scope===project)$('mc-price-dialog').close();if(scope===project)await load();}
-      catch(error){if(unchanged()&&scope===project)$('mc-price-error').textContent=message(error);else toast(t('先前的提交未成功。当前输入已保留，请回到原来的项目或设置范围检查。'),true);}
-      finally{button.disabled=false;}
-    },event.target);});$('mc-picker-search').addEventListener('input',()=>{pickerPage=0;renderPicker();});
+    const priceForm=$('mc-price-form'),priceDialog=$('mc-price-dialog'),priceError=$('mc-price-error');
+    priceForm.addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
+      const session=priceSession,button=priceForm.querySelector('button[type="submit"]');
+      if(!priceDialog.open||!session?.ownsFeedback()||button.disabled)return;
+      const {project,provider,model,snapshot,ownsFeedback}=session;
+      const unchanged=unchangedForm(priceForm,{projectSensitive:false});
+      const ownsForm=()=>priceSession===session&&priceDialog.open&&ownsFeedback()&&unchanged();
+      const submission={id:model},prices={},changed={};
+      // 只提交相对已知价格变动的字段，清空用显式 null。
+      const unit=$('mc-price-input').value;
+      if(unit!==snapshot.unit_price){submission.unit_price=unit===''?null:Number(unit);changed.unit_price=unit;}
+      for(const [key,id] of priceFields){
+        const value=$(id).value;
+        if(value!==snapshot[key]){prices[key]=value===''?null:Number(value);changed[key]=value;}
+      }
+      if(!Object.keys(changed).length){priceDialog.close();return;}
+      if(Object.keys(prices).length)submission.prices=prices;
+      button.disabled=true;priceError.textContent='';
+      try{await api('model-center/model',{project,provider,model:submission});}
+      catch(error){if(ownsForm())priceError.textContent=message(error);return;}
+      finally{if(priceSession===session&&priceDialog.open)button.disabled=false;}
+      // 同一表单继续编辑时，以服务已确认的字段计算下一次差量，保留当前输入。
+      if(priceSession===session&&priceDialog.open&&ownsFeedback())Object.assign(snapshot,changed);
+      const closeAfterSave=ownsForm();
+      if(closeAfterSave)priceDialog.close();
+      if(scope!==project)return;
+      const read=load({reportError:false}),ticket=sequence;
+      try{await read;}
+      catch{
+        if(closeAfterSave&&priceSession===session&&ownsFeedback()&&ticket===sequence)
+          setStatus(t('估算价格已保存，但模型列表刷新失败。'),true);
+      }
+    });});
+    $('mc-picker-search').addEventListener('input',()=>{pickerPage=0;renderPicker();});
     $('mc-picker-provider').addEventListener('change',()=>{pickerPage=0;renderPicker();});
     $('mc-picker-prev').addEventListener('click',()=>{pickerPage--;renderPicker();});$('mc-picker-next').addEventListener('click',()=>{pickerPage++;renderPicker();});
     $('mc-fetch').addEventListener('click',()=>safe(()=>fetchProvider()));

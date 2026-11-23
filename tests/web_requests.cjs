@@ -3766,6 +3766,145 @@ test('custom model form ignores a late catalog read failure after reopening',asy
   assert.equal(page.node('toast').hidden,true);
 });
 
+async function modelPricePage(){
+  const page=modelScopePage(new Map(),{connections:true});
+  const form=page.node('mc-price-form'),dialog=page.node('mc-price-dialog'),button=page.node('price-submit');
+  const error=page.node('mc-price-error'),requests=[],reads=[],api=page.context.api;
+  const catalogPrice={unit_price:5,prices:{input:1,output:2,cache_read:0.5,cache_write:3}};
+  let nextRead;
+  form.querySelector=selector=>selector==='button[type="submit"]'?button:null;
+  dialog.tagName='DIALOG';dialog.querySelector=()=>form;
+  page.context.safe=(fn,form)=>{page.context.lastAction=page.context.originalSafe(fn,form);return page.context.lastAction;};
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/model')return new Promise((resolve,reject)=>requests.push({body:structuredClone(body),resolve,reject}));
+    if(path==='model-center'||path.startsWith('model-center?')){
+      reads.push(path);
+      const beforeRead=nextRead;nextRead=null;
+      if(beforeRead)await beforeRead();
+      const snapshot=await api(path,body,options);
+      for(const provider of snapshot.providers)Object.assign(provider.catalog.models[0],structuredClone(catalogPrice));
+      return snapshot;
+    }
+    return api(path,body,options);
+  };
+  page.node('mc-model-filter').value='all';
+  page.click('model-test-view-models');await page.context.lastAction;
+  const provider=label=>page.node('mc-provider-list').children.find(item=>item.attributes['aria-label']===label).handlers.click();
+  provider('Ollama');reads.length=0;
+  return {...page,dialog,button,error,requests,reads,provider,
+    open(){
+      const actions=page.node('mc-model-list').children[0].children[1].children[1].children[1];
+      actions.children.find(action=>action.textContent==='估算价格').handlers.click();
+    },
+    close(){dialog.close();page.listeners.get('close')({target:dialog});},
+    change(field,value){const id='mc-price-'+field;page.node(id).value=value;page.input(id,form.id);},
+    submit(){return page.submit(form.id);},
+    beforeRead(fn){nextRead=fn;}
+  };
+}
+
+for(const target of ['same','provider','scope'])test(`model price form keeps a reopened ${target} submission independent`,async()=>{
+  const page=await modelPricePage();page.open();page.change('output','4');const old=page.submit();page.close();
+  if(target==='provider')page.provider('OpenAI');
+  if(target==='scope'){page.click('model-test-settingsScope-global');await page.context.lastAction;}
+  page.open();
+  assert.equal(page.button.disabled,false,'a reopened price form can submit independently');
+  page.change('cache-write','0');const current=page.submit();await page.submit();
+  assert.deepEqual(page.requests.map(request=>request.body),[
+    {project:'a',provider:'ollama',model:{id:'scope-coder',prices:{output:4}}},
+    {project:target==='scope'?null:'a',provider:target==='provider'?'openai':'ollama',
+      model:{id:target==='provider'?'other-coder':'scope-coder',prices:{cache_write:0}}}
+  ]);
+  page.reads.length=0;
+  page.requests[0].resolve({});await old;
+  assert.deepEqual(page.reads,target==='scope'?[]:['model-center?project=a']);
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.button.disabled,true);
+  assert.equal(page.error.textContent,'');
+  page.requests[1].reject(new Error('Current price POST failed'));await current;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.node('mc-price-cache-write').value,'0');
+  assert.equal(page.error.textContent,'Current price POST failed');
+  assert.equal(page.button.disabled,false);
+});
+
+for(const transition of ['reopening','editing','provider round trip','scope round trip'])test(`model price form ignores a rejected POST after ${transition}`,async()=>{
+  const page=await modelPricePage();page.open();page.change('output','4');const pending=page.submit();
+  if(transition==='reopening'){page.close();page.open();page.change('output','4');}
+  if(transition==='editing')page.change('output','6');
+  if(transition==='provider round trip'){page.provider('OpenAI');page.provider('Ollama');}
+  if(transition==='scope round trip'){
+    page.click('model-test-settingsScope-global');await page.context.lastAction;
+    page.click('model-test-settingsScope-project');await page.context.lastAction;
+  }
+  page.reads.length=0;
+  page.requests[0].reject(new Error('Old price POST failed'));await pending;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.node('mc-price-output').value,transition==='editing'?'6':'4');
+  assert.equal(page.button.disabled,false);
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.deepEqual(page.reads,[]);
+});
+
+test('model price form skips unchanged prices and sends only changed fields and explicit clears',async()=>{
+  const page=await modelPricePage();page.open();await page.submit();
+  assert.equal(page.dialog.open,false);
+  assert.deepEqual(page.requests,[]);
+  assert.deepEqual(page.reads,[]);
+  page.open();page.change('input','');page.change('input-tokens','0');page.change('cache-read','');
+  const pending=page.submit();await page.submit();
+  assert.deepEqual(page.requests.map(request=>request.body),[
+    {project:'a',provider:'ollama',model:{id:'scope-coder',unit_price:null,prices:{input:0,cache_read:null}}}
+  ]);
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,false);
+  assert.deepEqual(page.reads,['model-center?project=a']);
+});
+
+test('model price form preserves edits after saving and can restore a previously submitted field',async()=>{
+  const page=await modelPricePage();page.open();page.change('output','4');const pending=page.submit();
+  page.change('output','2');page.change('input','7');
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.node('mc-price-output').value,'2');
+  assert.equal(page.node('mc-price-input').value,'7');
+  assert.equal(page.button.disabled,false);
+  assert.deepEqual(page.reads,['model-center?project=a']);
+  const current=page.submit();
+  assert.deepEqual(page.requests[1].body,{project:'a',provider:'ollama',model:{id:'scope-coder',unit_price:7,prices:{output:2}}});
+  page.requests[1].resolve({});await current;
+  assert.equal(page.dialog.open,false);
+});
+
+test('model price form reports saved pricing separately from a failed catalog read',async()=>{
+  const page=await modelPricePage();page.open();page.change('output','4');const pending=page.submit();
+  page.beforeRead(()=>{throw new Error('Fixture price catalog read failed');});
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,false);
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.node('mc-feedback').textContent,'估算价格已保存，但模型列表刷新失败。');
+  assert.deepEqual(page.reads,['model-center?project=a']);
+});
+
+test('model price form ignores a late catalog read failure after reopening',async()=>{
+  const page=await modelPricePage();page.open();page.change('output','4');const saved=page.submit();
+  let rejectRead;
+  page.beforeRead(()=>new Promise((_,reject)=>{rejectRead=reject;}));
+  page.requests[0].resolve({});await waitFor(()=>rejectRead);
+  assert.equal(page.dialog.open,false);
+  page.open();assert.equal(page.button.disabled,false);
+  page.change('cache-read','1');const current=page.submit();
+  page.requests[1].reject(new Error('New price POST failed'));await current;
+  rejectRead(new Error('Old price catalog read failed'));await saved;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.node('mc-price-cache-read').value,'1');
+  assert.equal(page.error.textContent,'New price POST failed');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+});
+
 test('provider form sends full custom IDs without inventing truncated display names',async()=>{
   const page=modelScopePage();await page.show('a');
   page.node('mc-provider-form').reset=()=>{page.node('mc-provider-preset').value='custom';};

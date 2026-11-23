@@ -1626,6 +1626,7 @@ const english = {
   "已恢复请求，下次调用将重新检查。": "Requests resumed; the next call will check the connection again.",
   "费用估算设置": "Cost estimation settings",
   "保存估算价格": "Save estimated price",
+  "估算价格已保存，但模型列表刷新失败。": "Estimated pricing was saved, but the model list could not be refreshed.",
   "估算价格": "Estimated pricing",
   "估算费用": "Estimated cost",
   "未知": "Unknown",
