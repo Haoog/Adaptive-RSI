@@ -32,8 +32,8 @@ window.RSIModelCenter = (() => {
   const purpose = {analysis:'查找有依据的改进',planning:'判断是否值得执行',implementation:'实现并补充验证',review:'检查正确性与可维护性',evolution:'分析证据与提出待验证改动'};
   const drafts = new Map(), baselines = new Map(), jobs = new Set(), resuming = new Set(), savingRoutes = new Map(), inheritanceResets = new Map();
   const initialTab=location.href?new URLSearchParams(String(location.hash||'').replace(/^#/, '')).get('modelTab'):null;
-  let data, active='openai', scope=null, tab=initialTab==='roles'?'roles':'providers', sequence=0, editing=null, editorSession=null, probeSession=null, probeRun=null, probeCancelled=null, picking=null, loading=false;
-  let feedbackKey='',feedbackError=false,modelPage=0,pickerPage=0,priceSession=null,capabilityTarget=null;
+  let data, active='openai', scope=null, tab=initialTab==='roles'?'roles':'providers', sequence=0, editing=null, editorSession=null, probeSession=null, probeRun=null, probeCancelled=null, loading=false;
+  let feedbackKey='',feedbackError=false,modelPage=0,pickerPage=0,pickerSession=null,priceSession=null,capabilityTarget=null;
   const pageSize=20;
   const priceFields=[['input','mc-price-input-tokens'],['output','mc-price-output'],['cache_read','mc-price-cache-read'],['cache_write','mc-price-cache-write']];
   const scopeKey = () => scope || 'global';
@@ -125,8 +125,10 @@ window.RSIModelCenter = (() => {
   function selectProvider(next){if(active!==next)invalidateConnectionView();active=next;}
   let routeViewVersion=0, ownsAdvancedView=null;
   function invalidateRouteView(){
-    routeViewVersion++;ownsAdvancedView=null;
-    const dialog=$('mc-advanced-dialog');if(dialog.open)dialog.close();
+    routeViewVersion++;ownsAdvancedView=null;pickerSession=null;
+    for(const id of ['mc-advanced-dialog','mc-picker-dialog']){
+      const dialog=$(id);if(dialog.open)dialog.close();
+    }
     if(routeFeedback)setStatus('');
   }
   function routeViewOwner(project){
@@ -467,13 +469,13 @@ window.RSIModelCenter = (() => {
     select.value=route.effort;select.addEventListener('change',()=>onChange(select.value));return select;
   }
   function renderRoles(){
-    const container=$('mc-role-list'),extra=$('mc-extra-role-list');container.replaceChildren();extra.replaceChildren();
+    const container=$('mc-role-list'),extra=$('mc-extra-role-list'),ownsView=routeViewOwner(scope);container.replaceChildren();extra.replaceChildren();
     for(const [role,title]of Object.entries(roleNames)){
       const route=routes()[role],row=el('div',undefined,'mc-role-row'),label=el('div',undefined,'mc-role-title');
       const simpleTitle={planning:'思考与规划',implementation:'代码实现',review:'代码评审'}[role]||title;
       label.append(el('strong',t(simpleTitle)),el('small',t(purpose[role])));
       if(scope)label.append(el('small',t(JSON.stringify(route)===JSON.stringify(data.global_models[role])?'跟随通用设置':'此项目单独设置')));
-      const modelField=el('div',undefined,'mc-model-field'),select=action('',()=>openPicker(role),'mc-role-select mc-route-picker');
+      const modelField=el('div',undefined,'mc-model-field'),select=action('',()=>openPicker(role,ownsView),'mc-role-select mc-route-picker');
       select.id='mc-role-model-'+role;select.value=JSON.stringify([route.provider,route.model]);
       select.setAttribute('aria-label',t(simpleTitle)+' · '+t('选择模型'));select.setAttribute('aria-haspopup','dialog');
       select.append(el('strong',findModel(route)?.name||route.model),el('small',data.providers.find(p=>p.id===route.provider)?.name||route.provider),el('span','⌄','mc-picker-arrow'));
@@ -501,14 +503,21 @@ window.RSIModelCenter = (() => {
     $('mc-save-routes').disabled=saving||conflict||!dirty;$('mc-undo').disabled=!dirty;
     if(reportConflict&&conflict)setStatus(t(resetConflictCopy),true,true);
   }
-  function openPicker(role){
-    picking=role;pickerPage=0;renderPickerProviders();$('mc-picker-title').textContent=t(roleNames[role])+' · '+t('选择模型');$('mc-picker-search').value='';renderPicker();$('mc-picker-dialog').showModal();$('mc-picker-search').focus();
+  function openPicker(role,ownsView){
+    const dialog=$('mc-picker-dialog');
+    if(dialog.open||data?.project!==scope||!ownsView())return;
+    pickerSession={role,ownsView};pickerPage=0;
+    renderPickerProviders();$('mc-picker-title').textContent=t(roleNames[role])+' · '+t('选择模型');$('mc-picker-search').value='';
+    renderPicker();dialog.showModal();$('mc-picker-search').focus();
   }
   function renderPickerProviders(){
     const select=$('mc-picker-provider'),before=select.value;select.replaceChildren();const all=el('option',t('所有模型服务'));all.value='';select.append(all);
     for(const provider of data.providers){const option=el('option',provider.name);option.value=provider.id;select.append(option);}select.value=before;
   }
   function renderPicker(){
+    const session=pickerSession;
+    if(!session)return;
+    const {role,ownsView}=session,dialog=$('mc-picker-dialog');
     const list=$('mc-picker-list'),query=$('mc-picker-search').value.toLowerCase();list.replaceChildren();
     const providerFilter=$('mc-picker-provider').value;
     const matches=data.providers.flatMap(p=>p.catalog.models.filter(m=>m.enabled&&!m.missing&&!m.kind&&(!providerFilter||p.id===providerFilter)&&(m.id+' '+m.name+' '+p.name).toLowerCase().includes(query)).map(m=>({provider:p,model:m})));
@@ -518,7 +527,12 @@ window.RSIModelCenter = (() => {
       const models=visible.filter(item=>item.provider.id===provider.id).map(item=>item.model);
       if(!models.length)continue;
       list.append(el('h3',provider.name));
-      for(const model of models){const button=action('',()=>{const old=routes()[picking];routes()[picking]={...old,provider:provider.id,model:model.id,effort:old.provider===provider.id&&old.model===model.id?old.effort:'default'};$('mc-picker-dialog').close();renderRoles();$('mc-role-model-'+picking)?.focus();},'mc-picker-option');
+      for(const model of models){const button=action('',()=>{
+        if(pickerSession!==session||!dialog.open||!ownsView())return;
+        const draft=routes(),old=draft[role];
+        draft[role]={...old,provider:provider.id,model:model.id,effort:old.provider===provider.id&&old.model===model.id?old.effort:'default'};
+        dialog.close();renderRoles();$('mc-role-model-'+role)?.focus();
+      },'mc-picker-option');
         const copy=el('span');copy.append(el('strong',model.name));if(model.name!==model.id)copy.append(el('small',model.id));button.append(copy,info(model.verified||Object.values(model.probes||{}).some(p=>p.state==='pass')?t('已测试'):t('待验证')));list.append(button);}
     }
     if(!list.children.length)list.append(el('p',t('没有已启用的匹配模型，请先到模型服务页面获取或添加。'),'mc-empty'));
@@ -667,6 +681,7 @@ window.RSIModelCenter = (() => {
           setStatus(t('估算价格已保存，但模型列表刷新失败。'),true);
       }
     });});
+    $('mc-picker-dialog').addEventListener('close',()=>{if(!$('mc-picker-dialog').open)pickerSession=null;});
     $('mc-picker-search').addEventListener('input',()=>{pickerPage=0;renderPicker();});
     $('mc-picker-provider').addEventListener('change',()=>{pickerPage=0;renderPicker();});
     $('mc-picker-prev').addEventListener('click',()=>{pickerPage--;renderPicker();});$('mc-picker-next').addEventListener('click',()=>{pickerPage++;renderPicker();});
@@ -805,7 +820,7 @@ window.RSIModelCenter = (() => {
   init();
   function translate(){
     if(!data)return;render();window.RSIAuth?.translate();renderStatus();
-    if($('mc-picker-dialog').open){renderPickerProviders();$('mc-picker-title').textContent=t(roleNames[picking])+' · '+t('选择模型');renderPicker();}
+    if($('mc-picker-dialog').open&&pickerSession){renderPickerProviders();$('mc-picker-title').textContent=t(roleNames[pickerSession.role])+' · '+t('选择模型');renderPicker();}
     if($('mc-provider-dialog').open){$('mc-provider-dialog-title').textContent=t(editing?'连接设置':'添加模型服务');$('mc-input-key').placeholder=t(editing&&['stored','configured'].includes(editing.credential_status)?'留空保留当前密钥':'填写 API Key');}
     if($('mc-advanced-dialog').open){const provider=$('mc-fallback-provider').value,model=$('mc-fallback-model').value,effort=$('mc-fallback-effort').querySelector('select').value;renderFallback(provider?{provider,model,effort}:null);const role=$('mc-advanced-dialog').dataset.role;$('mc-advanced-title').textContent=t(roleNames[role])+' · '+t('高级参数');}
     if($('mc-probe-dialog').open){const dialog=$('mc-probe-dialog'),model=data.providers.find(p=>p.id===dialog.dataset.provider)?.catalog.models.find(m=>m.id===dialog.dataset.model);$('mc-probe-title').textContent=t('测试模型')+' · '+(model?.name||dialog.dataset.model);$('mc-probe-start').textContent=t(probeRun?'停止等待':'运行基础能力测试');}

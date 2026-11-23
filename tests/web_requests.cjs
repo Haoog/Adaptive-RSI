@@ -4205,6 +4205,113 @@ for(const [transition,navigate] of Object.entries(advancedRouteTransitions))test
   assert.equal(closedOnNavigation,true);
 });
 
+function routePickerButton(page,role){
+  return descendants(page.node('mc-role-list')).find(node=>node.id==='mc-role-model-'+role);
+}
+
+function routePickerOptions(page){
+  return descendants(page.node('mc-picker-list')).filter(node=>node.className==='mc-picker-option');
+}
+
+for(const [transition,navigate] of Object.entries(advancedRouteTransitions))test(`model picker discards stale options after ${transition}`,async()=>{
+  const page=await advancedRoutePage(),dialog=page.node('mc-picker-dialog');
+  const opener=routePickerButton(page,'planning');opener.handlers.click();
+  assert.equal(dialog.open,true);
+  const option=routePickerOptions(page).find(node=>descendants(node).some(child=>child.textContent==='Other coder'));
+  assert.ok(option);
+  await navigate(page);
+  const closedOnNavigation=!dialog.open;
+  const draft=page.draft(),dirty=page.node('mc-dirty').textContent;
+  option.handlers.click();
+  assert.deepEqual(page.draft(),draft);
+  assert.equal(page.savedDrafts.size,0);
+  assert.equal(page.node('mc-dirty').textContent,dirty);
+  assert.deepEqual(page.posts,[]);
+  assert.equal(closedOnNavigation,true);
+  await page.navigate();
+  routePickerButton(page,'planning').handlers.click();
+  assert.equal(dialog.open,true);
+  assert.equal(page.draft().planning.model,'scope-coder');
+});
+
+test('model picker cannot open from a stale role button after a project switch',async()=>{
+  const page=await advancedRoutePage(),dialog=page.node('mc-picker-dialog');
+  const opener=routePickerButton(page,'planning');
+  await page.show('b');
+  opener.handlers.click();
+  const openedFromStaleButton=Boolean(dialog.open);
+  if(openedFromStaleButton)routePickerOptions(page)[1].handlers.click();
+  assert.equal(page.draft().planning.model,'scope-coder');
+  assert.equal(page.savedDrafts.size,0);
+  assert.equal(openedFromStaleButton,false);
+  routePickerButton(page,'planning').handlers.click();
+  assert.equal(dialog.open,true);
+});
+
+test('model picker options cannot select a model in a reopened session',async()=>{
+  const page=await advancedRoutePage(),dialog=page.node('mc-picker-dialog');
+  routePickerButton(page,'planning').handlers.click();
+  const [sameModel,oldOption]=routePickerOptions(page);
+  assert.equal(routePickerOptions(page).length,2);
+  sameModel.handlers.click();
+  assert.equal(dialog.open,false);
+  assert.equal(page.draft().planning.effort,'medium');
+  routePickerButton(page,'implementation').handlers.click();
+  const currentOption=routePickerOptions(page)[1];
+  oldOption.handlers.click();
+  assert.equal(page.draft().implementation.model,'scope-coder');
+  assert.equal(dialog.open,true);
+  assert.equal(page.savedDrafts.size,0);
+  currentOption.handlers.click();
+  assert.equal(dialog.open,false);
+  assert.deepEqual(page.savedDrafts.get('a').routes.implementation,{provider:'openai',model:'other-coder',effort:'default',fallback:null});
+  assert.equal(page.draft().planning.model,'scope-coder');
+  assert.deepEqual(page.posts,[]);
+});
+
+test('model picker retains filters and pagination across translation and isolates project drafts',async()=>{
+  const page=await advancedRoutePage(),api=page.context.api;
+  page.context.api=async(...args)=>{
+    const result=await api(...args);
+    if(result.providers){
+      const models=result.providers.find(provider=>provider.id==='ollama').catalog.models;
+      for(let index=1;index<=21;index++)models.push({id:'fixture-'+index,name:'Fixture '+index,enabled:true});
+    }
+    return result;
+  };
+  await page.show('a');routePickerButton(page,'planning').handlers.click();
+  const provider=page.node('mc-picker-provider'),search=page.node('mc-picker-search'),pagination=page.node('mc-picker-page');
+  provider.value='openai';provider.handlers.change();
+  assert.equal(routePickerOptions(page).length,1);
+  assert.ok(descendants(routePickerOptions(page)[0]).some(child=>child.textContent==='Other coder'));
+  provider.value='ollama';provider.handlers.change();
+  search.value='fixture';search.handlers.input();
+  assert.equal(pagination.textContent,'1 / 2');
+  assert.equal(routePickerOptions(page).length,20);
+  page.click('mc-picker-next');
+  assert.equal(pagination.textContent,'2 / 2');
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  const english=vm.runInNewContext(i18n.slice(0,i18n.indexOf('let language'))+';english');
+  page.context.t=text=>english[text]??text;
+  page.context.window.RSIModelCenter.translate();
+  assert.match(page.node('mc-picker-title').textContent,/ · Select model$/);
+  assert.equal(provider.value,'ollama');
+  assert.equal(search.value,'fixture');
+  assert.equal(pagination.textContent,'2 / 2');
+  assert.equal(routePickerOptions(page).length,1);
+  routePickerOptions(page)[0].handlers.click();
+  assert.equal(page.node('mc-picker-dialog').open,false);
+  assert.equal(page.savedDrafts.get('a').routes.planning.model,'fixture-21');
+  await page.show('b');
+  assert.equal(page.draft().planning.model,'scope-coder');
+  await page.navigate({scope:'global'});
+  assert.equal(page.draft().planning.model,'scope-coder');
+  await page.navigate();
+  assert.equal(page.draft().planning.model,'fixture-21');
+  assert.deepEqual([...page.savedDrafts.keys()],['a']);
+  assert.deepEqual(page.posts,[]);
+});
+
 test('advanced route form validates and persists a fallback within its current scope',async()=>{
   const page=await advancedRoutePage();page.click('mc-reset-inheritance');
   const feedback=page.node('mc-feedback').textContent;
