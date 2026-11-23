@@ -92,7 +92,10 @@ async function checkMachineSwitch(browser,url){
   assert.deepEqual({openAfterEscape,...blocked},{openAfterEscape:true,outcomes:['rejected','rejected'],forwarded:[0,0]});
   assert.equal(await dialog.getByRole('button',{name:'关闭'}).isDisabled(),true);
   await page.evaluate(()=>window.failConnect('Missing runtime authentication'));
-  await dialog.getByRole('alert').filter({hasText:'Missing runtime authentication'}).waitFor();
+  const connectionError=dialog.getByRole('alert');
+  const retryHint='未能完成 HTTPS 连接。请核对完整的认证地址，并确认远端服务正在运行后重试。';
+  await connectionError.filter({hasText:retryHint}).waitFor();
+  assert.equal(await connectionError.textContent(),retryHint,'the dialog shows retry guidance without raw native details');
   assert.equal(await address.inputValue(),remote.scope+'/?token=fixture');
   assert.equal(await page.evaluate(async()=>(await fetch('/api/state?sections=core')).status),200);
   await connect.click();
