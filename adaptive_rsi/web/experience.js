@@ -658,10 +658,17 @@ window.RSIExperience = (() => {
         safe(async () => {
           if (!current() || queueSaves.has(editor.key)) return;
           const parents = selection(), submitted = {task: task.id, ...(parents.length > 1 ? {dependencies: parents} : {dependency: parents[0] || null}), urgency: urgency.checked ? 1 : 0};
+          const ownsFeedback = () => sameRuntime() && queueEditorCurrent(editor);
           queueSaves.set(editor.key, submitted);
           submit.disabled = true;
           try {
-            await api("task/schedule", submitted);
+            try {
+              await api("task/schedule", submitted);
+            } catch (error) {
+              if (ownsFeedback()) throw error;
+              return;
+            }
+            if (!sameRuntime()) return;
             // Rebase even if this form was rebuilt. Its editor still owns newer edits.
             editor.baseline = {dependencies: parents, urgency: !!submitted.urgency};
             editor.version++;
@@ -670,9 +677,15 @@ window.RSIExperience = (() => {
               queueEditor.baseline = {dependencies: parents, urgency: !!submitted.urgency};
               queueEditor.version++;
             }
-            if (!queueEditorCurrent(editor)) return;
-            await refresh();
-            if (queueEditorCurrent(editor)) toast(t("排队设置已保存"));
+            if (!ownsFeedback()) return;
+            toast(t("排队设置已保存"));
+            try {
+              await refresh();
+            } catch {
+              if (!ownsFeedback()) return;
+              liveFailures += 1;
+              liveNotice();
+            }
           } finally {
             queueSaves.delete(editor.key);
             if (queueEditor?.key === editor.key && queueEditor.submit)

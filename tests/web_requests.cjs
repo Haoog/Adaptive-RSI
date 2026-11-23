@@ -2469,7 +2469,7 @@ test('non-queued task details offer no schedule form', async () => {
   assert.equal(detailDescendants(page.node('detail-body')).filter(node => node.className === 'task-schedule-editor').length, 0);
 });
 
-function experiencePage({navigation = false} = {}) {
+function experiencePage({navigation = false, realRefresh = false} = {}) {
   const page = browser(), ready = [], windowEvents = new Map();
   Object.assign(page.context, {
     URL, navigator: {}, history: {replaceState() {}, pushState() {}},
@@ -2486,7 +2486,7 @@ function experiencePage({navigation = false} = {}) {
   vm.runInContext(experienceSource, page.context);
   if (navigation) ready[0]();
   page.notify = task => windowEvents.get('rsi-notification-open')({detail: task});
-  page.context.refresh = async () => {};
+  if (!realRefresh) page.context.refresh = async () => {};
   return page;
 }
 
@@ -3729,6 +3729,137 @@ for (const navigation of ['close', 'project', 'other-task']) {
       const other = queueForm(page);
       assert.equal(other.children[0].children[0].value, '');
       assert.equal(other.children[1].children[0].checked, false);
+    }
+  });
+}
+
+for (const scenario of ['success', 'write failure', 'refresh failure', 'refresh failure with undo',
+  'refresh timeout', 'discarded refresh', 'refresh failure after reopen', 'refresh failure after switching task',
+  'write failure after reopen', 'write failure after switching task']) {
+  test(`queue submit separates confirmed saves from ${scenario}`, async t => {
+    const page = experiencePage({realRefresh: true}), posts = [];
+    page.context.location.hash = '';
+    page.context.language = 'zh-CN';
+    const task = {...fixtureTask('child', 'queued'), updated: 1}, other = fixtureTask('other', 'queued');
+    const candidates = [fixtureTask('parent'), fixtureTask('second-parent')];
+    let metadata = task, finishWrite, finishRefresh, refreshes = 0, detailReads = 0;
+    const writeFails = scenario.startsWith('write failure');
+    vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+    page.context.fetch = async (url, options) => {
+      const {pathname, searchParams} = new URL(url, 'http://fixture.test');
+      if (pathname === '/api/task/schedule') {
+        const submitted = JSON.parse(options.body);
+        posts.push(submitted);
+        return new Promise(resolve => {finishWrite = () => {
+          if (writeFails) return resolve(response({error: 'schedule write rejected'}, 400));
+          metadata = {...metadata, updated: metadata.updated + 1, urgency: submitted.urgency,
+            dependency: submitted.dependency ? {dependency: submitted.dependency} : null};
+          resolve(response({saved: true}));
+        };});
+      }
+      if (pathname === '/api/state') {
+        if (searchParams.get('limit') === '200') return response({tasks: candidates});
+        refreshes++;
+        return new Promise((resolve, reject) => {
+          options.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {once: true});
+          finishRefresh = (fails = false) => resolve(fails
+            ? response({error: 'state read failed'}, 503)
+            : response({...snapshot(), selected_project: 'a', tasks: [metadata]}));
+        });
+      }
+      if (pathname === '/api/task-runs') return response([]);
+      if (pathname === '/api/task') {
+        const id = searchParams.get('id');
+        if (id === task.id) {detailReads++; return response(metadata);}
+        return response(candidates.find(candidate => candidate.id === id) || other);
+      }
+      return response([]);
+    };
+    const submitQueue = () => {
+      const form = queueForm(page), button = buttonWith(form, '保存排队设置');
+      assert.equal(button.type, 'submit');
+      assert.equal(button.disabled, false);
+      // The VM has no default click actions. A submit button dispatches its form's submit event.
+      form.onsubmit({submitter: button, preventDefault() {}});
+      return page.context.lastAction;
+    };
+    const fields = () => {
+      const form = queueForm(page);
+      return [form.children[0].children[0], form.children[1].children[0]];
+    };
+    const values = () => fields().map(field => field.type === 'checkbox' ? field.checked : field.value);
+    const navigate = async () => {
+      if (scenario.endsWith('reopen')) page.context.closeTaskDetail();
+      await openExperienceTask(page, scenario.endsWith('reopen') ? task : other);
+      page.context.toast('当前详情提示');
+    };
+    await openExperienceTask(page, task);
+    fields()[0].value = 'parent'; fields()[1].checked = true;
+    const submitted = submitQueue();
+    if (writeFails && scenario.includes('after')) await navigate();
+    finishWrite();
+    if (!writeFails) {
+      await waitFor(() => finishRefresh);
+      if (scenario.includes('after')) await navigate();
+      if (scenario.endsWith('with undo')) fields()[1].checked = false;
+      if (scenario === 'discarded refresh') vm.runInContext('view="settings"', page.context);
+      if (scenario === 'refresh timeout') page.fireTimer(15000);
+      else finishRefresh(scenario.startsWith('refresh failure'));
+    }
+    await submitted;
+    const notice = page.node('detail-live-status'), toast = page.node('toast');
+    const error = queueForm(page).querySelector('[data-form-error]');
+    t.diagnostic(JSON.stringify({posts: posts.length, refreshes, saved: metadata.urgency === 1,
+      toast: toast.textContent, formError: error?.textContent, retry: !notice.hidden}));
+    assert.deepEqual(posts, [{task: task.id, dependency: 'parent', urgency: 1}]);
+    assert.equal(refreshes, writeFails ? 0 : 1);
+    assert.equal(buttonWith(queueForm(page), '保存排队设置').disabled, false);
+    if (scenario.includes('after')) {
+      assert.equal(toast.textContent, '当前详情提示');
+      assert.equal(notice.hidden, true);
+      assert.equal(error, undefined);
+      return;
+    }
+    if (writeFails) {
+      assert.equal(metadata, task);
+      assert.equal(error?.textContent, '操作未完成，请稍后重试。');
+      assert.equal(toast.className, 'error');
+      assert.equal(notice.hidden, true);
+      assert.deepEqual(values(), ['parent', true]);
+      return;
+    }
+    assert.equal(toast.textContent, '排队设置已保存');
+    assert.equal(toast.className, '');
+    assert.equal(error, undefined);
+    if (scenario === 'success') assert.equal(page.node('connection').textContent, '已连接');
+    if (scenario === 'refresh timeout') assert.equal(page.node('connection').textContent, '连接超时');
+    if (scenario === 'discarded refresh') assert.equal(vm.runInContext('state.tasks', page.context), undefined);
+    if (!scenario.startsWith('refresh failure')) {
+      assert.equal(notice.hidden, true);
+      assert.deepEqual(values(), ['parent', true]);
+      return;
+    }
+    assert.equal(notice.hidden, false);
+    assert.match(notice.children[0].textContent, /实时刷新中断/);
+    const readsBeforeRetry = detailReads, undo = scenario.endsWith('with undo');
+    if (undo) metadata = {...metadata, dependency: {dependency: 'second-parent'}, updated: 3};
+    buttonWith(notice, '重试').handlers.click();
+    await page.context.lastAction;
+    await new Promise(setImmediate);
+    assert.ok(detailReads > readsBeforeRetry);
+    assert.equal(posts.length, 1, 'detail recovery only reads');
+    assert.equal(notice.hidden, true);
+    assert.deepEqual(values(), [undo ? 'second-parent' : 'parent', !undo]);
+    if (undo) {
+      finishRefresh = null;
+      const later = submitQueue();
+      assert.deepEqual(posts[1], {task: task.id, dependency: 'second-parent', urgency: 0});
+      finishWrite();
+      await waitFor(() => finishRefresh);
+      finishRefresh();
+      await later;
+      assert.equal(metadata.urgency, 0);
+      assert.equal(toast.textContent, '排队设置已保存');
     }
   });
 }
