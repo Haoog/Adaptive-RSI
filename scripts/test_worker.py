@@ -249,6 +249,10 @@ def install_crash_dumps(seconds, stream=None):
     """
     if not 0 < seconds <= 3600:
         raise ValueError("diagnose interval must be between 0 and 3600 seconds")
+    # On macOS the native watchdog has crashed while walking stacks in
+    # active Python workers. The GIL-held stall watcher still reports stacks.
+    if sys.platform == "darwin":
+        return False
     stream = sys.__stderr__ if stream is None else stream
     if stream is None:
         return False
@@ -317,8 +321,9 @@ if __name__ == "__main__":
         ".".join(selector.split(".")[:2]) for selector in arguments.selectors}))
     progress = Progress(emit=emit_fd(2))
     start_stall_watch(progress, arguments.diagnose_after)
-    if not install_crash_dumps(arguments.diagnose_after):
-        progress._write("[worker] crash dumps unavailable")
+    native_dumps = install_crash_dumps(arguments.diagnose_after)
+    if not native_dumps:
+        progress._write("[worker] using Python stall diagnostics")
     if os.environ.get("RSI_TEST_ACTIVE") == "1":
         threading.Thread(target=watch_parent, args=(os.getppid(),), daemon=True).start()
     progress.set("starting", detail="selectors={}".format(len(arguments.selectors)))
@@ -328,5 +333,6 @@ if __name__ == "__main__":
         progress.set("failed")
         raise
     progress.set("exiting", detail="code={}".format(code))
-    faulthandler.cancel_dump_traceback_later()
+    if native_dumps:
+        faulthandler.cancel_dump_traceback_later()
     sys.exit(code)

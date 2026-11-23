@@ -675,6 +675,7 @@ class WorkerDiagnosticsTest(unittest.TestCase):
         stream = io.StringIO()
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(unittest.defaultTestLoader, 'loadTestsFromName', side_effect=load), \
+                patch.object(test_worker.sys, 'platform', 'linux'), \
                 patch.object(test_worker.faulthandler, 'dump_traceback_later') as schedule, \
                 patch.object(test_worker.faulthandler, 'cancel_dump_traceback_later') as cancel, \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -682,6 +683,13 @@ class WorkerDiagnosticsTest(unittest.TestCase):
             self.assertEqual(test_worker.run(['fast', 'slow'], Path(directory) / 'timing.json'), 0)
         schedule.assert_called_once_with(30, repeat=True, file=stream)
         cancel.assert_not_called()
+
+    def test_macos_leaves_stall_diagnostics_to_the_python_watcher(self):
+        from scripts import test_worker
+        with patch.object(test_worker.sys, 'platform', 'darwin'), \
+                patch.object(test_worker.faulthandler, 'dump_traceback_later') as schedule:
+            self.assertFalse(test_worker.install_crash_dumps(30, io.StringIO()))
+        schedule.assert_not_called()
 
     def test_child_listing_without_ps_reports_unavailable_instead_of_failing(self):
         from scripts import test_worker
