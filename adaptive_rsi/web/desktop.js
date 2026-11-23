@@ -99,7 +99,9 @@ if(window.__TAURI_INTERNALS__){
     switching=switched;
     const message=String(e);
     if(args.sshTunnel){
-     showConnectionError(message.includes('authentication')||message.includes('session')
+     const authenticationFailed=/^(?:Error: )?(?:SSH tunnel authentication was rejected|Missing runtime authentication)$/.test(message)
+      ||/^(?:Error: )?Runtime (?:health|state) check failed \(HTTP 40[13]\)$/.test(message);
+     showConnectionError(authenticationFailed
       ?'SSH 隧道可达，但认证失败。请生成新的认证地址后重试。'
       :'未能通过 SSH 隧道连接。请检查终端中的转发仍在运行，并核对本机端口后重试。',
       /^(?:Error: )?Server connection failed$/.test(message)?'Server connection failed':'');

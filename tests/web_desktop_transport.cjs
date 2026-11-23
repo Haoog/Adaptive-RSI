@@ -79,6 +79,69 @@ test('desktop keeps the old page fenced after accepting a new connection',async(
  assert.deepEqual(calls.map(call=>call.command),['runtime_info','request','validate_connection_target','connect']);
 });
 
+const sshAuthError='SSH 隧道可达，但认证失败。请生成新的认证地址后重试。';
+const sshNetworkError='未能通过 SSH 隧道连接。请检查终端中的转发仍在运行，并核对本机端口后重试。';
+for(const [rejection,expected] of [
+ ['Runtime health check failed (HTTP 401)',sshAuthError],
+ ['Runtime health check failed (HTTP 403)',sshAuthError],
+ ['Runtime state check failed (HTTP 401)',sshAuthError],
+ ['Runtime state check failed (HTTP 403)',sshAuthError],
+ ['SSH tunnel authentication was rejected',sshAuthError],
+ ['Missing runtime authentication',sshAuthError],
+ ['Server connection failed',`${sshNetworkError} (Server connection failed)`],
+ [new Error('Server connection failed'),`${sshNetworkError} (Server connection failed)`],
+ ['Cannot connect to the selected runtime',sshNetworkError],
+ ['SSH tunnel handshake timed out',sshNetworkError],
+ ['Runtime health check failed (HTTP 503)',sshNetworkError],
+ ['Runtime state check failed (HTTP 401): session at http://127.0.0.1:6090/?token=fixture',sshNetworkError],
+]){
+ test(`SSH connection rejection is safe and keeps the old page usable: ${rejection}`,async()=>{
+  const handlers={},elements={},calls=[];
+  let finishRequest,failConnect;
+  const makeElement=()=>({textContent:'',append(){},prepend(){},addEventListener(){},
+   setAttribute(name,value){if(name==='role'&&value==='alert')elements.alert=this;}});
+  const oldReply={status:200,body:'{"runtime":"old"}'};
+  const window={fetch:async()=>{},__TAURI_INTERNALS__:{invoke:async(command,args)=>{
+   calls.push({command,args});
+   if(command==='runtime_info')return {kind:'local',connected:true,scope:'local',connection_generation:7};
+   if(command==='request')return args.path==='state'?new Promise(resolve=>{finishRequest=resolve;}):oldReply;
+   if(command==='validate_connection_target')return true;
+   if(command==='connect')return new Promise((_,reject)=>{failConnect=reject;});
+  }}};
+  const document={body:makeElement(),querySelector:makeElement,getElementById:makeElement,
+   createElement(tag){const element=makeElement();elements[tag]=element;return element;},
+   addEventListener(name,handler){handlers[name]=handler;}};
+  let reloads=0;
+  vm.runInNewContext(desktopSource,{window,document,t:value=>value,crypto:webcrypto,Response,DOMException,console,
+   location:{reload(){reloads++;}}});
+  await handlers.DOMContentLoaded();
+  const pending=window.fetch('/api/state');
+  await new Promise(setImmediate);
+  elements.select.value='ssh';
+  elements.select.onchange();
+  const url='http://127.0.0.1:6090/?token=fixture';
+  elements.input.value=url;
+  elements.form.onsubmit({preventDefault(){}});
+  await new Promise(setImmediate);
+  assert.deepEqual(calls.slice(2).map(({command,args})=>[command,args.url,args.sshTunnel]),[
+   ['validate_connection_target',url,true],['connect',url,true],
+  ]);
+  failConnect(rejection);
+  await new Promise(setImmediate);
+  assert.equal(elements.alert.hidden,false);
+  assert.equal(elements.alert.textContent,expected);
+  assert.equal(elements.select.disabled,false);
+  assert.equal(window.__RSI_MACHINE_KEY__,'local');
+  assert.equal(reloads,0);
+  finishRequest(oldReply);
+  assert.deepEqual(await (await pending).json(),{runtime:'old'});
+  assert.deepEqual(await (await window.fetch('/api/config')).json(),{runtime:'old'});
+  assert.deepEqual(calls.filter(({command})=>command==='request').map(({args})=>[args.path,args.connectionGeneration]),[
+   ['state',7],['config',7],
+  ]);
+ });
+}
+
 test('a stale page waits for native recovery then reloads without replaying its request',async()=>{
  const calls=[];
  let current={scope:'local',connected:true,connection_generation:1},reloads=0;
