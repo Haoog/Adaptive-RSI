@@ -32,21 +32,23 @@ window.RSIBatch=(()=>{
   box.append(download,close);box.onclose=()=>{if(historyBox===box)historyBox=null;box.remove();previousFocus?.focus?.();};document.body.append(box);box.showModal();filter.focus();
  }
  function signature(action,tasks){return JSON.stringify([action,[...tasks].sort()]);}
- function receipts(project){
-  const saved=window.RSIDraftStore?.get('batch',project);
+ function receipts(project,machine){
+  const saved=window.RSIDraftStore?.get('batch',project,machine);
   return Array.isArray(saved)?saved:saved?.signature?[saved]:[];
  }
- function findReceipt(project,action,tasks){
+ function findReceipt(project,action,tasks,machine){
   const key=signature(action,tasks);
-  return receipts(project).find(entry=>signature(entry.action,entry.tasks)===key);
+  return receipts(project,machine).find(entry=>signature(entry.action,entry.tasks)===key);
  }
- function rememberReceipt(project,receipt){
-  if(!receipts(project).some(entry=>entry.id===receipt.id))window.RSIDraftStore?.set('batch',project,[...receipts(project),receipt]);
+ function rememberReceipt(project,receipt,machine){
+  const entries=receipts(project,machine);
+  if(!entries.some(entry=>entry.id===receipt.id))window.RSIDraftStore?.set('batch',project,[...entries,receipt],machine);
  }
- function forgetReceipt(project,id){
-  const entries=receipts(project).filter(entry=>entry.id!==id);
-  if(entries.length)window.RSIDraftStore?.set('batch',project,entries);
-  else window.RSIDraftStore?.remove('batch',project);
+ function forgetReceipt(project,id,machine){
+  const saved=receipts(project,machine),entries=saved.filter(entry=>entry.id!==id);
+  if(entries.length===saved.length)return;
+  if(entries.length)window.RSIDraftStore?.set('batch',project,entries,machine);
+  else window.RSIDraftStore?.remove('batch',project,machine);
  }
  function ids(){if(!selected.has(projectId))selected.set(projectId,new Set());return selected.get(projectId);}
 // 选择只保留当前页仍可见的任务：筛选或翻页后不会再用用户看不见的 id 发起批量操作。
@@ -159,38 +161,46 @@ function paint(){for(const [id,box] of boxes)box.checked=ids().has(id);}
  }
  async function perform(kind){
   const project=projectId,tasks=Array.from(ids()).sort();if(!project||!tasks.length||pending.has(project))return;
+  const machine=window.__RSI_MACHINE_KEY__||'',navigation=navigationSequence;
+  const current=()=>project===projectId&&machine===(window.__RSI_MACHINE_KEY__||'')&&navigation===navigationSequence;
   pending.add(project);toolbar();
   try{
-  const saved=findReceipt(project,kind,tasks);
-  let prior=null,unverified=false;
-  // 回执核对只用于恢复上一次已确认的请求；瞬时失败时保留原请求编号继续，由服务端按回执幂等复核。
-  if(saved){
-   try{prior=(await api('tasks/batch?project='+encodeURIComponent(project)+'&id='+encodeURIComponent(saved.id))).receipt;}
-   catch{unverified=true;}
-  }
-  if(prior?.complete){forgetReceipt(project,saved.id);selected.get(project)?.clear();toolbar();toast(t('批量操作已完成'));await refresh({force:true});return;}
-  const preview=prior||await api('tasks/batch',{project,tasks,action:kind,preview:true});
-  const description=preview.tasks.map(item=>{
-   const candidate=preview.candidates?.find(value=>value.task===item.id);
-   const detail=candidate?'\n  '+t('风险')+': '+t(reviewNames[candidate.risk]||candidate.risk||'未知')+
-    '\n  '+t('涉及文件')+': '+(candidate.files.join(', ')||t('未知'))+(candidate.files_truncated?' …':''):'';
-   return item.title+' · '+t(statusNames[item.state]||item.state)+detail;
-  }).join('\n');
-  const conflict=preview.conflicts.length?t('存在重叠文件，请复核。')+'\n':'';
-  const unknown=preview.unknown_scope.length?t('部分任务的文件范围未知，请先核对需求。')+'\n':'';
-  const grouping=kind==='group'?t('原任务将合并为一个新任务并保留原始要求。')+'\n':kind==='split_retry'?t('原任务将恢复到队列，各自重新验证；任务组的失败证据继续保留。')+'\n'+preview.originals.map(item=>item.title).join('\n')+'\n'+(preview.supplement_required?t('分组后修订的完整要求将另建任务重新验证，避免丢失或猜测归属。')+'\n':''):'';
-  const receiptNote=unverified?t('上次的批次回执暂时无法核对；继续会沿用原请求编号，服务端按回执返回结果，不会重复执行。')+'\n':'';
-  if(!(await uiConfirm(t('确认对所选任务执行此操作？')+'\n'+receiptNote+grouping+(preview.verification_cost?costText(preview.verification_cost)+'\n':'')+conflict+unknown+description)))return;
-  const request_id=saved?.id||crypto.randomUUID();
-  rememberReceipt(project,{id:request_id,tasks,action:kind});
-  let result;
-  try{result=await api('tasks/batch',{project,tasks,action:kind,request_id,revision:preview.revision,preview:false});}
-  catch(error){toast(t('批量操作结果待核对，原请求编号已保留；网络恢复后重新执行会先核对回执，不会重复操作。')+' · '+(error.message||''),true);return;}
-  if(result.complete)forgetReceipt(project,request_id);
-  selected.get(project)?.clear();toolbar();
-  toast(t(result.complete?'批量操作已完成':'部分结果待核对，请打开批次记录。')+' · '+result.receipts.filter(item=>['accepted','grouped','restored'].includes(item.state)).length+'/'+result.receipts.length);
-  await refresh({force:true});
-  }finally{pending.delete(project);toolbar();}
+   const saved=findReceipt(project,kind,tasks,machine);
+   let prior=null,unverified=false;
+   // 回执核对只用于恢复上一次已确认的请求；瞬时失败时保留原请求编号继续，由服务端按回执幂等复核。
+   if(saved){
+    try{prior=(await api('tasks/batch?project='+encodeURIComponent(project)+'&id='+encodeURIComponent(saved.id))).receipt;}
+    catch{unverified=true;}
+   }
+   // 已完成的操作仍需清理原回执；界面反馈只属于发起时的导航。
+   if(prior?.complete)forgetReceipt(project,saved.id,machine);
+   if(!current())return;
+   if(prior?.complete){selected.get(project)?.clear();toolbar();toast(t('批量操作已完成'));await refresh({force:true});return;}
+   const preview=prior||await api('tasks/batch',{project,tasks,action:kind,preview:true});
+   if(!current())return;
+   const description=preview.tasks.map(item=>{
+    const candidate=preview.candidates?.find(value=>value.task===item.id);
+    const detail=candidate?'\n  '+t('风险')+': '+t(reviewNames[candidate.risk]||candidate.risk||'未知')+
+     '\n  '+t('涉及文件')+': '+(candidate.files.join(', ')||t('未知'))+(candidate.files_truncated?' …':''):'';
+    return item.title+' · '+t(statusNames[item.state]||item.state)+detail;
+   }).join('\n');
+   const conflict=preview.conflicts.length?t('存在重叠文件，请复核。')+'\n':'';
+   const unknown=preview.unknown_scope.length?t('部分任务的文件范围未知，请先核对需求。')+'\n':'';
+   const grouping=kind==='group'?t('原任务将合并为一个新任务并保留原始要求。')+'\n':kind==='split_retry'?t('原任务将恢复到队列，各自重新验证；任务组的失败证据继续保留。')+'\n'+preview.originals.map(item=>item.title).join('\n')+'\n'+(preview.supplement_required?t('分组后修订的完整要求将另建任务重新验证，避免丢失或猜测归属。')+'\n':''):'';
+   const receiptNote=unverified?t('上次的批次回执暂时无法核对；继续会沿用原请求编号，服务端按回执返回结果，不会重复执行。')+'\n':'';
+   if(!(await uiConfirm(t('确认对所选任务执行此操作？')+'\n'+receiptNote+grouping+(preview.verification_cost?costText(preview.verification_cost)+'\n':'')+conflict+unknown+description))||!current())return;
+   const request_id=saved?.id||crypto.randomUUID();
+   rememberReceipt(project,{id:request_id,tasks,action:kind},machine);
+   let result;
+   try{result=await api('tasks/batch',{project,tasks,action:kind,request_id,revision:preview.revision,preview:false});}
+   catch(error){if(current())toast(t('批量操作结果待核对，原请求编号已保留；网络恢复后重新执行会先核对回执，不会重复操作。')+' · '+(error.message||''),true);return;}
+   if(result.complete)forgetReceipt(project,request_id,machine);
+   if(!current())return;
+   selected.get(project)?.clear();toolbar();
+   toast(t(result.complete?'批量操作已完成':'部分结果待核对，请打开批次记录。')+' · '+result.receipts.filter(item=>['accepted','grouped','restored'].includes(item.state)).length+'/'+result.receipts.length);
+   await refresh({force:true});
+  }catch(error){if(current())throw error;}
+  finally{pending.delete(project);if(project===projectId)toolbar();}
  }
  toolbar();
  return {row,toolbar,costText,evidence};

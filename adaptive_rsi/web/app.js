@@ -29,11 +29,11 @@ function changedList(node,rows){const signature=JSON.stringify([projectId,langua
 const draftStore=(()=>{
  const memory=new Map();let warned=false;
  function failed(){if(!warned){warned=true;Promise.resolve().then(()=>toast(t('浏览器未能保存草稿；当前页面仍保留输入，关闭页面前请另行保存。'),true));}}
- const storageKey=()=> 'rsi-ui-drafts'+(window.__RSI_MACHINE_KEY__?':'+window.__RSI_MACHINE_KEY__:''),version=1,ttl=7*24*60*60*1000;
- function read(){if(memory.has(storageKey()))return structuredClone(memory.get(storageKey()));try{const saved=JSON.parse(sessionStorage.getItem(storageKey())||'null');if(saved?.version===version&&saved.entries)return saved;}catch{}return{version,entries:{}};}
- function get(kind,scope){const data=read(),entry=data.entries[kind]?.[scope];if(!entry)return null;if(entry.version!==version||entry.expiresAt<Date.now()){delete data.entries[kind][scope];try{sessionStorage.setItem(storageKey(),JSON.stringify(data));}catch{}return null;}return structuredClone(entry.value);}
- function set(kind,scope,value){const data=read();data.entries[kind]??={};data.entries[kind][scope]={version,savedAt:Date.now(),expiresAt:Date.now()+ttl,value:structuredClone(value)};memory.set(storageKey(),structuredClone(data));try{sessionStorage.setItem(storageKey(),JSON.stringify(data));memory.delete(storageKey());}catch{failed();}}
- function remove(kind,scope){const data=read();if(!data.entries[kind])return;delete data.entries[kind][scope];if(!Object.keys(data.entries[kind]).length)delete data.entries[kind];memory.set(storageKey(),structuredClone(data));try{sessionStorage.setItem(storageKey(),JSON.stringify(data));memory.delete(storageKey());}catch{failed();}}
+ const storageKey=(machine=window.__RSI_MACHINE_KEY__)=> 'rsi-ui-drafts'+(machine?':'+machine:''),version=1,ttl=7*24*60*60*1000;
+ function read(key){if(memory.has(key))return structuredClone(memory.get(key));try{const saved=JSON.parse(sessionStorage.getItem(key)||'null');if(saved?.version===version&&saved.entries)return saved;}catch{}return{version,entries:{}};}
+ function get(kind,scope,machine){const key=storageKey(machine),data=read(key),entry=data.entries[kind]?.[scope];if(!entry)return null;if(entry.version!==version||entry.expiresAt<Date.now()){delete data.entries[kind][scope];try{sessionStorage.setItem(key,JSON.stringify(data));}catch{}return null;}return structuredClone(entry.value);}
+ function set(kind,scope,value,machine){const key=storageKey(machine),data=read(key);data.entries[kind]??={};data.entries[kind][scope]={version,savedAt:Date.now(),expiresAt:Date.now()+ttl,value:structuredClone(value)};memory.set(key,structuredClone(data));try{sessionStorage.setItem(key,JSON.stringify(data));memory.delete(key);}catch{failed();}}
+ function remove(kind,scope,machine){const key=storageKey(machine),data=read(key);if(!data.entries[kind])return;delete data.entries[kind][scope];if(!Object.keys(data.entries[kind]).length)delete data.entries[kind];memory.set(key,structuredClone(data));try{sessionStorage.setItem(key,JSON.stringify(data));memory.delete(key);}catch{failed();}}
  return{get,set,remove};
 })();
 window.RSIDraftStore=draftStore;
