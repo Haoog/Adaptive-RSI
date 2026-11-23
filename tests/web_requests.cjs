@@ -1878,6 +1878,125 @@ test('an import form remains unchanged when polling auto-selects a newly importe
   assert.equal(vm.runInContext('importInputUnchanged()',page.context),false);
 });
 
+async function desktopProjectFolder(kind='local') {
+  const page=browser(new Map(),({document})=>{
+    const close=document.getElementById('project-close');
+    close.closest=()=>document.getElementById('project-dialog');
+    document.querySelectorAll=selector=>selector==='.close-dialog'?[close]:[];
+  });
+  const {node,document,context,listeners}=page;
+  const choices=[],posts=[],closeEvents=[];
+  let reloads=0;
+  const dialog=node('project-dialog'),form=node('project-form'),field=node('project-path'),source=node('project-source');
+  source.form=field.form=form;
+  source.dispatchEvent=event=>{listeners.get(event.type)({target:source});source.handlers[event.type]({target:source});};
+  context.Event=Event;
+  dialog.tagName='DIALOG';
+  dialog.querySelector=selector=>selector==='form'?form:null;
+  dialog.close=()=>{dialog.open=false;closeEvents.push(()=>listeners.get('close')({target:dialog}));};
+  form.reset=()=>{listeners.get('reset')({target:form});source.value='github';field.value='';};
+  const close=node('project-close');
+  node('project-enabled').checked=false;
+  document.querySelector=()=>node('project-tools');
+  document.body=node('body');
+  node('toast').hidden=true;
+  context.safe=(fn,owner)=>{context.lastAction=context.originalSafe(fn,owner);return context.lastAction;};
+  context.refresh=async()=>{};
+  context.fetch=async(url,options)=>{posts.push([url,JSON.parse(options.body)]);return response({id:'added'});};
+  context.history={replaceState(){}};
+  context.location={reload(){reloads++;}};
+  context.window.fetch=async()=>{};
+  context.window.__TAURI_INTERNALS__={invoke:async(command)=>{
+    if(command==='runtime_info')return {kind,connected:true,scope:kind,connection_generation:1};
+    if(command==='choose_folder')return new Promise((resolve,reject)=>choices.push({resolve,reject}));
+    if(command==='validate_connection_target')return true;
+    if(command==='connect')return {scope:'remote',connection_generation:2};
+    assert.fail('Unexpected native command: '+command);
+  }};
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/desktop.js'),'utf8'),context);
+  await listeners.get('DOMContentLoaded')();
+  const folder=node('local-project-fields').children.find(button=>button.textContent==='选择文件夹');
+  const select=value=>{source.value=value;source.dispatchEvent(new Event('change'));};
+  node('add-project').handlers.click();select('local');
+  return {
+    ...page,dialog,field,choices,posts,select,pick:()=>folder.onclick(),
+    close:()=>close.handlers.click(),reopen:()=>node('onboard-add').handlers.click(),
+    flushClose:()=>closeEvents.shift()(),
+    edit(value){field.value=value;page.input('project-path','project-form');},
+    async switchRuntime(){
+      node('project-tools').children[0].onclick();
+      const connection=document.body.children[0].children[0];
+      connection.children.find(child=>child.type==='password').value='https://rsi.example.test/?token=fixture';
+      connection.onsubmit({preventDefault(){}});
+      await new Promise(setImmediate);
+      assert.equal(reloads,1);
+    }
+  };
+}
+
+for(const [name,move] of [
+  ['reopened dialog before its queued close event',page=>{page.close();page.reopen();}],
+  ['source toggled away and back',page=>{page.select('github');page.select('local');}],
+  ['manually edited path',page=>page.edit('/manual')],
+  ['manual edit back to the original text',page=>{page.edit('/manual');page.edit('/original');}],
+  ['switched runtime',page=>page.switchRuntime()],
+]){
+  for(const outcome of ['path','error']){
+    test(`desktop project folder ignores stale ${outcome}: ${name}`,async()=>{
+      const page=await desktopProjectFolder();
+      page.edit('/original');
+      const picking=page.pick();
+      assert.equal(page.choices.length,1);
+      await move(page);
+      const expected=page.field.value;
+      if(outcome==='path')page.choices[0].resolve('/late');
+      else page.choices[0].reject('Folder selection interrupted');
+      await picking;
+      assert.equal(page.field.value,expected);
+      assert.equal(page.node('toast').hidden,true);
+    });
+  }
+}
+
+test('desktop project folder coalesces repeated clicks and permits reselection after cancellation',async()=>{
+  const page=await desktopProjectFolder();
+  page.edit('/manual');
+  const first=page.pick(),duplicate=page.pick();
+  const calls=page.choices.length;
+  for(const choice of page.choices)choice.resolve(null);
+  await Promise.all([first,duplicate]);
+  assert.equal(calls,1);
+  assert.equal(page.field.value,'/manual');
+  assert.equal(page.node('toast').hidden,true);
+  const second=page.pick();page.choices.at(-1).resolve('/chosen');await second;
+  assert.equal(page.field.value,'/chosen');
+});
+
+test('desktop project folder preserves selection and ordinary project submission',async()=>{
+  const page=await desktopProjectFolder();
+  const first=page.pick();page.choices.at(-1).resolve('/chosen');await first;
+  assert.equal(page.field.value,'/chosen');
+  page.close();page.reopen();
+  const second=page.pick();page.flushClose();page.choices.at(-1).resolve('/new-choice');await second;
+  assert.equal(page.field.value,'/new-choice');
+  await page.submit('project-form');
+  assert.deepEqual(page.posts,[['/api/projects',{path:'/new-choice',name:null,enabled:false}]]);
+  assert.equal(page.dialog.open,false);
+  assert.equal(page.field.value,'');
+  assert.equal(page.node('project-source').value,'github');
+  assert.equal(page.node('toast').textContent,'项目已接入');
+});
+
+test('desktop project folder on remote runtime keeps manual paths and skips the native chooser',async()=>{
+  const page=await desktopProjectFolder('remote');
+  page.edit('/srv/projects/example');await page.pick();
+  assert.equal(page.choices.length,0);
+  assert.equal(page.node('toast').textContent,'远端项目请填写服务器上的路径。');
+  await page.submit('project-form');
+  assert.deepEqual(page.posts,[['/api/projects',{path:'/srv/projects/example',name:null,enabled:false}]]);
+  assert.equal(page.dialog.open,false);
+});
+
 test('goal drafts stay with their project and submit only to that project', async () => {
   const page=browser(),posts=[];
   page.context.refresh=()=>Promise.resolve();

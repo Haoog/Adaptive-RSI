@@ -213,7 +213,11 @@ for(const type of ['input','change','reset'])document.addEventListener(type,even
  const form=event.target.closest('form');reviseForm(form);
  if(form?.id==='settings-form'&&event.target.dataset.path){const key=settingsKey(),revisions=settingsFieldRevisions.get(key)||new Map();revisions.set(event.target.dataset.path,(revisions.get(event.target.dataset.path)||0)+1);settingsFieldRevisions.set(key,revisions);}
 },true);
-document.addEventListener('close',event=>{if(event.target.tagName==='DIALOG')reviseForm(event.target.querySelector('form'));},true);
+document.addEventListener('close',event=>{
+ const dialog=event.target;
+ // A queued close from the previous opening must not invalidate the reopened project form.
+ if(dialog.tagName==='DIALOG'&&(dialog.id!=='project-dialog'||!dialog.open))reviseForm(dialog.querySelector('form'));
+},true);
 function unchangedForm(form,{projectSensitive=true}={}){const revision=formRevisions.get(form)||0,project=projectId;return ()=>(formRevisions.get(form)||0)===revision&&(!projectSensitive||projectId===project);}
 function el(tag, text, cls){ const node=document.createElement(tag); if(text!==undefined)node.textContent=text; if(cls)node.className=cls; return node; }
 function lazyEvidence(label,produce){
@@ -1286,7 +1290,12 @@ var offerGlobalConfigRepair=function(raw){
  cancel.type=repair.type='button';actions.append(cancel,repair);dialog.append(title,text,actions);document.body.append(dialog);dialog.showModal();
  cancel.onclick=()=>dialog.close();repair.onclick=()=>safe(async()=>{repair.disabled=true;try{await api('config/repair-global',{confirmation:'reset-invalid-global-config'});dialog.close();await refresh({force:true});toast(t('通用配置已重置，所有项目保持暂停。'));}finally{repair.disabled=false;}});
 };
-for(const id of ['add-project','onboard-add'])$(id).addEventListener('click',()=>$('project-dialog').showModal());
+for(const id of ['add-project','onboard-add'])$(id).addEventListener('click',()=>{
+ const dialog=$('project-dialog');
+ if(dialog.open)return;
+ dialog.showModal();
+ reviseForm($('project-form'));
+});
 document.querySelectorAll('.close-dialog').forEach(button=>button.addEventListener('click',()=>{const box=button.closest('dialog');if(box.id==='detail-dialog')closeTaskDetail();else box.close();}));
 document.querySelectorAll('dialog').forEach(d=>d.addEventListener('click',e=>{if(e.target===d){if(d.id==='detail-dialog')closeTaskDetail();else d.close();}}));
 $('project-source').addEventListener('change',()=>{const remote=$('project-source').value==='github';$('local-project-fields').hidden=remote;$('github-project-fields').hidden=!remote;$('project-path').required=!remote;$('project-urls').required=remote;});

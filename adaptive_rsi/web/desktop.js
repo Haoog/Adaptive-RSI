@@ -167,7 +167,22 @@ if(window.__TAURI_INTERNALS__){
   dialog.addEventListener('close',()=>{if(!dialog.open)input.value='';});
   if(!info.connected){showConnectionError(info.error||'连接运行机器');dialog.showModal();}
   const folder=document.createElement('button');folder.type='button';folder.className='button';folder.textContent=t('选择文件夹');
-  folder.onclick=()=>safe(async()=>{if(info.kind!=='local')throw Error(t('远端项目请填写服务器上的路径。'));const path=await invoke('choose_folder');if(path)document.getElementById('project-path').value=path;});
+  const projectDialog=document.getElementById('project-dialog'),projectForm=document.getElementById('project-form');
+  const projectSource=document.getElementById('project-source'),projectPath=document.getElementById('project-path');
+  const canChooseFolder=()=>!switched&&projectDialog.open&&projectSource.value==='local';
+  folder.onclick=()=>safe(async()=>{
+   if(folder.disabled||!canChooseFolder())return;
+   if(info.kind!=='local')throw Error(t('远端项目请填写服务器上的路径。'));
+   const unchanged=unchangedForm(projectForm,{projectSensitive:false});
+   const current=()=>canChooseFolder()&&unchanged();
+   folder.disabled=true;
+   try{
+    const path=await invoke('choose_folder');
+    if(current()&&path)projectPath.value=path;
+   }catch(error){
+    if(current())throw error;
+   }finally{folder.disabled=false;}
+  });
   document.getElementById('local-project-fields').append(folder);
   window.RSIDesktop.translate=()=>{
    machine.textContent=t(info.name||'连接运行机器');machine.title=t('运行机器');title.textContent=t('运行机器');
