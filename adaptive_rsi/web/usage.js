@@ -26,10 +26,11 @@ window.RSIUsage=(()=>{
   clearTimers();const ticket=++sequence,requested=offset;let unsupported=false;$('usage-refresh').disabled=$('usage-prev').disabled=$('usage-next').disabled=true;
   const choice=selection();let params;
   try{params=parameters();}catch(error){offset=renderedOffset;lastError={message:error.message,invalidRange:true};renderNotice();$('usage-refresh').disabled=false;pageBar();return;}
-  try{const result=await api('usage?'+params);if(ticket!==sequence||view!=='usage')return;report=result;reportMeta={choice,params:params.toString(),at:Date.now()};lastError=null;renderNotice();
-   const last=Math.max(0,Math.ceil((report.total||0)/25)-1)*25;
-   if(offset>last){offset=last;safe(load);return;}
-   renderedOffset=requested;render();}
+  try{const result=await api('usage?'+params);if(ticket!==sequence||view!=='usage')return;
+   const last=Math.max(0,Math.ceil((result.total||0)/25)-1)*25;
+   if(requested>last){offset=last;safe(load);return;}
+   report=result;reportMeta={choice,params:params.toString(),at:Date.now()};lastError=null;
+   renderedOffset=requested;render();renderNotice();}
   catch(error){
    if(ticket!==sequence||view!=='usage')return;
    if(error.status!==404){offset=renderedOffset;lastError={message:error.message||''};renderNotice();return;}

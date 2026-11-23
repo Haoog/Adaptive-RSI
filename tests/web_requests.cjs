@@ -4327,9 +4327,12 @@ function usagePage() {
   page.node('usage-sort').value = 'recent';
   vm.runInContext('view="usage"', page.context);
   page.context.fetch = url => new Promise(resolve => {
-    requests.push({params: new URLSearchParams(url.split('?')[1]), finish(title, status = 200, callTotal = 0) {
+    const params = new URLSearchParams(url.split('?')[1]);
+    requests.push({params, finish(title, status = 200, callTotal = 0, total = 60) {
+      const tasks = Number(params.get('offset')) < total
+        ? [{task: title, title, project: 'a', state: 'failed', tokens: 100, attempts: 1}] : [];
       resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [], calls: [], call_total: callTotal,
-        tasks: [{task: title, title, project: 'a', state: 'failed', tokens: 100, attempts: 1}], total: 60}, status));
+        tasks, total}, status));
     }});
   });
   return Object.assign(page, {
@@ -4456,27 +4459,65 @@ test('usage clamps an offset beyond the total and reloads the clamped page', asy
   page.requests[1].finish('Page two'); await second;
   page.node('usage-next').onclick(); const third = page.context.lastAction;
   page.requests[2].finish('Page three'); await third;
-  const shrunk = [];
-  const textOf = node => [node.textContent, ...(node.children || []).map(textOf)].filter(Boolean).join(' ');
-  page.context.fetch = url => new Promise(resolve => {
-    const params = new URLSearchParams(url.split('?')[1]);
-    shrunk.push({params, finish(total) {
-      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [],
-        tasks: [{task: 'Clamped', title: 'Clamped', project: 'a', state: 'failed', tokens: 100, attempts: 1}],
-        total}));
-    }});
-  });
-  page.node('usage-refresh').onclick();
-  await waitFor(() => shrunk.length >= 1);
-  assert.equal(shrunk[0].params.get('offset'), '50');
-  shrunk[0].finish(36);
-  await waitFor(() => shrunk.length >= 2 && shrunk[1].params.get('offset') === '25');
-  shrunk[1].finish(36);
-  await new Promise(setImmediate);
+  page.node('usage-refresh').onclick(); const refresh = page.context.lastAction;
+  assert.equal(page.requests[3].params.get('offset'), '50');
+  page.requests[3].finish('Out of range', 200, 0, 36); await refresh;
+  const clamped = page.context.lastAction;
+  assert.equal(page.requests[4].params.get('offset'), '25');
+  page.requests[4].finish('Clamped', 200, 0, 36); await clamped;
   assert.equal(page.node('usage-page').textContent, '36 条记录 · 26–36');
-  assert.equal(textOf(page.node('usage-tasks')).includes('Clamped'), true, 'the clamped page must render its own rows');
+  assert.equal(page.title(), 'Clamped', 'the clamped page must render its own rows');
   assert.equal(page.node('usage-next').disabled, true, 'next must be disabled after clamping to the last page');
   assert.equal(page.node('usage-prev').disabled, false);
+});
+
+test('usage retains the visible report when offset recovery fails after a filter change', async () => {
+  const page = usagePage();
+  const lastSuccess = 1700000000000;
+  let now = lastSuccess;
+  page.context.Date = class extends Date { static now() { return now; } };
+  const stamp = time => vm.runInContext(`stamp(${time / 1000})`, page.context);
+  const initial = page.show();
+  page.requests[0].finish('Page one'); await initial;
+  page.node('usage-next').onclick(); const second = page.context.lastAction;
+  page.requests[1].finish('Page two'); await second;
+  page.node('usage-next').onclick(); const third = page.context.lastAction;
+  page.requests[2].finish('Visible task'); await third;
+  const visibleEnd = page.requests[2].params.get('end');
+
+  now += 60000;
+  page.node('usage-period').value = '7';
+  page.node('usage-period').handlers.change(); const filtered = page.context.lastAction;
+  assert.equal(page.requests[3].params.get('offset'), '0');
+  page.requests[3].finish('Unavailable', 503); await filtered;
+  const notice = page.node('usage-totals').staleNotice;
+  const visibleWarning = notice.children[0].textContent;
+  assert.match(visibleWarning, /全部时间/);
+  assert.ok(visibleWarning.includes(stamp(lastSuccess)));
+
+  now += 60000;
+  page.node('usage-refresh').onclick(); const refresh = page.context.lastAction;
+  assert.equal(page.requests[4].params.get('offset'), '50');
+  page.requests[4].finish('Out of range', 200, 0, 36); await refresh;
+  const clamped = page.context.lastAction;
+  assert.equal(page.requests[5].params.get('offset'), '25');
+  assert.equal(page.title(), 'Visible task');
+  assert.equal(notice.hidden, false, 'an out-of-range response must keep the existing stale warning visible');
+
+  page.node('usage-tasks').children[0].children.at(-1).handlers.click();
+  const detail = page.context.lastAction;
+  assert.equal(page.requests[6].params.get('task'), 'Visible task');
+  assert.equal(page.requests[6].params.get('start'), '0');
+  assert.equal(page.requests[6].params.get('end'), visibleEnd);
+  page.requests[6].finish('Details'); await detail;
+  assert.ok(textOf(page.node('usage-detail-content')).includes('全部时间'));
+  assert.ok(textOf(page.node('usage-detail-content')).includes(stamp(lastSuccess)));
+
+  page.requests[5].finish('Unavailable', 503); await clamped;
+  assert.equal(page.title(), 'Visible task');
+  assert.equal(page.node('usage-page').textContent, '60 条记录 · 51–60');
+  assert.equal(notice.hidden, false);
+  assert.equal(notice.children[0].textContent, visibleWarning);
 });
 
 test('usage detail roles fall back to the usage role names for triage and acceptance', async () => {
