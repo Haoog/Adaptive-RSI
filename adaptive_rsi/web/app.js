@@ -863,6 +863,7 @@ function valueFeedback(data){
  },form);});return form;
 }
 function runPageRows(page){return Array.isArray(page)?page:(Array.isArray(page?.runs)?page.runs:[]);}
+const pendingTaskSchedules=new Map();
 async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&$('detail-dialog').open&&detailTask?.id===task.id&&detailTask?.project===task.project&&projectId===task.project)queueDraft=window.RSIExperience?.queueDraft();const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));
  // A request can finish after the user closed the previous detail view.
  // Only show the dialog after checking that this exact request is still current.
@@ -992,24 +993,53 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
   if(task.state==='queued'){
    // 预约授权一个绝对时刻：时区与重复小时一起提交，由后端拒绝缺失/歧义时刻。
    const scheduleBox=el('div',undefined,'task-schedule-editor'),time=el('input'),zone=el('input'),repeat=el('select'),draft=draftStore.get('task-schedule',task.id);
+   const key=JSON.stringify([machine,project,task.id]);
+   const scheduleCurrent=()=>sameScope()&&$('detail-dialog').open&&detailTask?.id===task.id&&detailTask.project===task.project;
    time.type='datetime-local';
    zone.type='text';zone.value=draft?.zone??displayTz??Intl.DateTimeFormat().resolvedOptions().timeZone;
    for(const [value,text] of [['','时间唯一'],['0','第一次'],['1','第二次']]){const option=el('option',t(text));option.value=value;repeat.append(option);}
    // 详情轮询与语言切换会整块重建；按任务恢复未提交的预约输入。
    time.value=draft?.time??'';repeat.value=draft?.repeat??'';
-   const rememberSchedule=()=>draftStore.set('task-schedule',task.id,{time:time.value,zone:zone.value,repeat:repeat.value});
+   const scheduleValues=()=>({time:time.value,zone:zone.value,repeat:repeat.value});
+   const rememberSchedule=()=>{
+    if(!stillCurrent()||!sameScope())return;
+    const pending=pendingTaskSchedules.get(key);
+    if(pending)pending.edited=true;
+    draftStore.set('task-schedule',task.id,scheduleValues());
+   };
    time.addEventListener('input',rememberSchedule);zone.addEventListener('input',rememberSchedule);repeat.addEventListener('change',rememberSchedule);
    const localLabel=el('label',t('本地时间'));localLabel.append(time);
    const zoneLabel=el('label',t('时区'));zoneLabel.append(zone);
    const repeatLabel=el('label',t('重复小时'));repeatLabel.append(repeat);
-   scheduleBox.append(el('p',t('安排检查：此任务将在指定时刻开始运行。')),localLabel,zoneLabel,repeatLabel,
-    action(t('预约'),async()=>{if(!time.value||!zone.value.trim()){toast(t('请填写本地时间和时区。'),true);return;}
-     const submitted={time:time.value,zone:zone.value,repeat:repeat.value};
+   const scheduleButton=action(t('预约'),async()=>{
+    if(!stillCurrent()||!sameScope()||pendingTaskSchedules.has(key))return;
+    const submitted=scheduleValues();
+    if(!submitted.time||!submitted.zone.trim()){toast(t('请填写本地时间和时区。'),true);return;}
+    const pending={button:scheduleButton,edited:false};
+    pendingTaskSchedules.set(key,pending);scheduleButton.disabled=true;
+    try{
      await api('task/schedule-time',{task:task.id,local_time:submitted.time,timezone:submitted.zone.trim(),
       fold:submitted.repeat===''?undefined:Number(submitted.repeat)});
-     const saved=draftStore.get('task-schedule',task.id);
-     if(saved&&saved.time===submitted.time&&saved.zone===submitted.zone&&saved.repeat===submitted.repeat)draftStore.remove('task-schedule',task.id);
-     toast(t('预约已保存'));if(stillCurrent())closeTaskDetail();await refresh();},'button primary'));
+    }catch(error){
+     if(scheduleCurrent())throw error;
+     return;
+    }finally{pendingTaskSchedules.delete(key);pending.button.disabled=false;}
+    // 草稿按运行环境和任务隔离；回执提示还须属于当前项目。
+    if(window.__RSI_MACHINE_KEY__!==machine)return;
+    const saved=draftStore.get('task-schedule',task.id);
+    if(!pending.edited&&saved?.time===submitted.time&&saved.zone===submitted.zone&&saved.repeat===submitted.repeat)draftStore.remove('task-schedule',task.id);
+    if(!sameScope())return;
+    if(!pending.edited&&scheduleCurrent())closeTaskDetail();
+    toast(t('预约已保存'));
+    const feedbackTicket=detailSequence,receiptTimer=toastTimer;
+    try{await refresh();}catch{
+     if(sameScope()&&detailSequence===feedbackTicket&&toastTimer===receiptTimer)toast(t('预约已保存，但列表刷新失败。'),true);
+    }
+   },'button primary');
+   // 重绘或重开时，当前按钮沿用这笔请求的等待状态。
+   const pending=pendingTaskSchedules.get(key);
+   if(pending){pending.button=scheduleButton;scheduleButton.disabled=true;}
+   scheduleBox.append(el('p',t('安排检查：此任务将在指定时刻开始运行。')),localLabel,zoneLabel,repeatLabel,scheduleButton);
    secondary.append(el('summary',t('安排检查')),scheduleBox);}
   body.append(secondary);}
  restore?.(body);

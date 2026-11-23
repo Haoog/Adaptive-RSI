@@ -2433,6 +2433,7 @@ test('schedule-time rejections are mapped and localized for both console languag
   assert.match(english[apiErrors['Scheduled local time is nonexistent']], /does not exist/);
   assert.match(english[apiErrors['Scheduled local time is ambiguous; specify fold']], /first or second/);
   assert.equal(english['已预约'], 'Reserved');
+  assert.equal(english['预约已保存，但列表刷新失败。'], 'Reservation saved, but the list failed to refresh.');
   assert.equal(english['安排检查：此任务将在指定时刻开始运行。'], 'Schedule check: this task starts at the chosen instant.');
 });
 
@@ -2495,10 +2496,11 @@ test('schedule form omits fold for a single-occurrence time and rejects empty in
   controls.find(node => node.tagName === 'BUTTON' && node.textContent === '预约').handlers.click();
   await page.context.lastAction;
   assert.equal(posts[0].body.fold, undefined, 'single occurrence must not send a fold');
-  // 空输入在本地拦截，不发请求。
-  time.value = '';
+  // 成功后原详情已关闭；从重新打开的正常入口检查空输入。
+  await page.context.showTask(task);
+  const reopened = detailDescendants(page.node('detail-body')).find(node => node.className === 'task-schedule-editor');
   page.node('toast').textContent = '';
-  controls.find(node => node.tagName === 'BUTTON' && node.textContent === '预约').handlers.click();
+  detailDescendants(reopened).find(node => node.tagName === 'BUTTON' && node.textContent === '预约').handlers.click();
   await page.context.lastAction;
   assert.equal(posts.length, 1, 'empty input must not reach the API');
   assert.match(page.node('toast').textContent, /请填写本地时间和时区/);
@@ -2644,6 +2646,198 @@ for (const kind of ['schedule', 'reason']) {
     });
   }
 }
+
+function scheduleRequestPage() {
+  const page = experiencePage({realRefresh: true}), posts = [], refreshes = [];
+  const task = fixtureTask('reservation', 'queued');
+  let refreshFails = false;
+  page.context.location.hash = '';
+  page.context.window.__RSI_MACHINE_KEY__ = 'first';
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.fetch = async (url, options) => {
+    const machine = page.context.window.__RSI_MACHINE_KEY__;
+    if (url === '/api/task/schedule-time') {
+      const body = JSON.parse(options.body);
+      const receipt = {local_time: body.local_time, timezone: body.timezone, fold: body.fold ?? null,
+        at: Date.parse(body.local_time + 'Z') / 1000};
+      return new Promise(resolve => posts.push({machine, body, finish: (reply = response(receipt)) => resolve(reply)}));
+    }
+    if (url.includes('/state?')) {
+      const params = new URL(url, 'http://fixture.test').searchParams;
+      const project = params.get('project');
+      // The dependency editor independently reads candidates with a 200-row page.
+      if (params.get('limit') === '50') {
+        refreshes.push({machine, project});
+        if (refreshFails) throw new Error('offline during list refresh');
+      }
+      return response({...snapshot(), selected_project: project, tasks: [], runs: []});
+    }
+    if (url.includes('/task-runs?')) return response([]);
+    return response(task);
+  };
+  const editor = () => {
+    const box = descendants(page.node('detail-body')).find(node => node.className === 'task-schedule-editor');
+    const controls = descendants(box);
+    return {time: controls.find(node => node.type === 'datetime-local'), zone: controls.find(node => node.type === 'text'),
+      button: controls.find(node => node.tagName === 'BUTTON' && node.textContent === '预约')};
+  };
+  const fill = (time = '2035-01-01T12:00') => {
+    const fields = editor();
+    fields.time.value = time; fields.time.handlers.input();
+    fields.zone.value = 'UTC'; fields.zone.handlers.input();
+  };
+  const click = () => { editor().button.handlers.click(); return page.context.lastAction; };
+  const draft = () => page.context.window.RSIDraftStore.get('task-schedule', task.id);
+  return {page, task, posts, refreshes, editor, fill, click, draft, failRefresh: () => { refreshFails = true; }};
+}
+
+for (const trigger of ['redraw', 'reopen']) {
+  test(`schedule submission stays single across ${trigger} and permits a later reservation`, async () => {
+    const {page, task, posts, editor, fill, click, draft} = scheduleRequestPage();
+    await openExperienceTask(page, task);
+    fill();
+    const pending = click();
+    if (trigger === 'redraw') await changeDetailLanguage(page);
+    else {
+      page.node('detail-dialog').handlers.cancel({preventDefault() {}});
+      await page.context.showTask(task);
+    }
+    await new Promise(setImmediate);
+    const disabled = editor().button.disabled;
+    const duplicate = click();
+    const pendingCount = posts.length;
+    for (const post of posts) post.finish();
+    await Promise.all([pending, duplicate]);
+    assert.equal(pendingCount, 1, 'POST count while awaiting the first receipt');
+    assert.equal(disabled, true);
+    assert.equal(draft(), null);
+    await openExperienceTask(page, task);
+    fill('2035-01-02T13:00');
+    const next = click();
+    assert.equal(posts.length, 2);
+    assert.equal(posts[1].body.local_time, '2035-01-02T13:00');
+    posts[1].finish(); await next;
+  });
+}
+
+test('schedule receipt preserves continued editing in the current editor', async () => {
+  const {page, task, posts, editor, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const pending = click();
+  fill('2035-01-02T13:00');
+  posts[0].finish(); await pending;
+  assert.equal(posts.length, 1);
+  assert.equal(draft().time, '2035-01-02T13:00');
+  assert.equal(page.node('detail-dialog').open, true);
+  assert.equal(editor().button.disabled, false);
+  assert.equal(editor().time.value, '2035-01-02T13:00');
+  const next = click();
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].body.local_time, '2035-01-02T13:00');
+  posts[1].finish(); await next;
+});
+
+test('schedule receipt preserves a draft edited back to the submitted values', async () => {
+  const {page, task, posts, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const pending = click();
+  fill('2035-01-02T13:00');
+  fill();
+  posts[0].finish(); await pending;
+  assert.equal(draft()?.time, '2035-01-01T12:00');
+  assert.equal(page.node('detail-dialog').open, true);
+});
+
+test('schedule rejection after redraw unlocks the current button and keeps its draft', async () => {
+  const {page, task, posts, refreshes, editor, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const pending = click();
+  await changeDetailLanguage(page);
+  await new Promise(setImmediate);
+  posts[0].finish(response({error: 'Scheduled time must be in the future', error_code: 'validation_error'}, 400));
+  await pending;
+  assert.equal(posts.length, 1);
+  assert.equal(refreshes.length, 0);
+  assert.equal(page.node('toast').textContent, '预约时间必须晚于当前时间。');
+  assert.equal(draft()?.time, '2035-01-01T12:00');
+  assert.equal(editor().button.disabled, false);
+  fill('2035-01-02T13:00');
+  const next = click();
+  assert.equal(posts.length, 2);
+  posts[1].finish(); await next;
+});
+
+test('late schedule success in the same project still shows its receipt without closing another task', async () => {
+  const {page, task, posts, refreshes, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const pending = click();
+  const other = fixtureTask('other', 'queued');
+  await page.context.showTask(other);
+  posts[0].finish(); await pending;
+  assert.equal(posts.length, 1);
+  assert.equal(refreshes.length, 1);
+  assert.equal(draft(), null);
+  assert.equal(page.node('toast').textContent, '预约已保存');
+  assert.equal(page.node('detail-dialog').open, true);
+  assert.equal(page.node('detail-title').textContent, other.title);
+});
+
+test('late schedule success leaves the newly selected project alone', async () => {
+  const {page, task, posts, refreshes, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const pending = click();
+  const picker = page.node('project-select');
+  picker.value = 'b'; picker.handlers.change();
+  await page.context.lastAction;
+  const other = {...fixtureTask('other', 'queued'), project: 'b'};
+  await page.context.showTask(other);
+  page.context.toast('新项目反馈');
+  posts[0].finish(); await pending;
+  assert.deepEqual({toast: page.node('toast').textContent, refreshes},
+    {toast: '新项目反馈', refreshes: [{machine: 'first', project: 'b'}]});
+  assert.equal(draft(), null);
+  assert.equal(page.node('detail-dialog').open, true);
+  assert.equal(page.node('detail-title').textContent, other.title);
+});
+
+test('late schedule success cannot clear an identical draft or unlock a request on another runtime', async () => {
+  const {page, task, posts, refreshes, editor, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const old = click();
+  page.context.window.__RSI_MACHINE_KEY__ = 'second';
+  await page.context.showTask(task);
+  fill();
+  const next = click();
+  page.context.toast('新运行环境反馈');
+  assert.deepEqual(posts.map(post => post.machine), ['first', 'second']);
+  posts[0].finish(); await old;
+  const observed = {draft: draft()?.time, toast: page.node('toast').textContent,
+    refreshes: refreshes.slice(), disabled: editor().button.disabled};
+  posts[1].finish(); await next;
+  assert.deepEqual(observed, {draft: '2035-01-01T12:00', toast: '新运行环境反馈', refreshes: [], disabled: true});
+  assert.equal(draft(), null);
+  assert.equal(page.node('toast').textContent, '预约已保存');
+  assert.deepEqual(refreshes, [{machine: 'second', project: 'a'}]);
+});
+
+test('schedule success remains explicit when the subsequent list refresh fails', async () => {
+  const {page, task, posts, refreshes, fill, click, draft, failRefresh} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  failRefresh();
+  const pending = click();
+  posts[0].finish(); await pending;
+  assert.equal(posts.length, 1);
+  assert.equal(refreshes.length, 1);
+  assert.equal(draft(), null);
+  assert.equal(page.node('toast').textContent, '预约已保存，但列表刷新失败。');
+});
 
 test('server schedule rejections reach the console with localized guidance', async () => {
   const page = browser();

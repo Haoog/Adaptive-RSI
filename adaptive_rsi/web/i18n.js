@@ -1465,6 +1465,7 @@ const english = {
   "第二次": "Second occurrence",
   "预约": "Reserve",
   "预约已保存": "Reservation saved",
+  "预约已保存，但列表刷新失败。": "Reservation saved, but the list failed to refresh.",
   "请填写本地时间和时区。": "Enter a local time and a time zone.",
   "安排检查：此任务将在指定时刻开始运行。": "Schedule check: this task starts at the chosen instant.",
   "预约的本地时间不存在（夏令时跳过了这个时刻），请换一个时刻。": "The scheduled local time does not exist (daylight saving skips it); choose another time.",
