@@ -9,9 +9,9 @@ function load() {
  return context.window.RSIBatch;
 }
 function element(tag,text,cls){
- const node={tag,className:cls,textContent:text===undefined?'':text,children:[],dataset:{},listeners:{},disabled:false,open:false,id:'',
+ const node={tag,className:cls,textContent:text===undefined?'':text,children:[],dataset:{},listeners:{},disabled:false,open:false,isConnected:true,id:'',
   append(...items){node.children.push(...items);},
-  replaceChildren(...items){node.children=items;},
+  replaceChildren(...items){for(const child of node.children)child.isConnected=false;node.children=items;},
   setAttribute(){},remove(){},focus(){},showModal(){node.open=true;},close(){node.open=false;node.onclose?.();},
   addEventListener(type,fn){(node.listeners[type]??=[]).push(fn);},
   dispatch(type,extra){let result;for(const fn of node.listeners[type]||[])result=fn({type,target:node,...extra});return result;},
@@ -21,16 +21,29 @@ function element(tag,text,cls){
 // Drives the real toolbar entry point so the regression covers the user path, not a private helper.
 function harness(api,{confirm=true,clickConfirm=false,capabilities}={}){
  const drafts=new Map(),calls=[],toasts=[],confirms=[],refreshes=[],rows={};
- let panel=null,dialog=null,requestNumber=0;
+ let panel=null,dialog=null,requestNumber=0,exportBlob;
+ const downloads=[];
  const host=element('div');host.after=node=>{panel=node;};
  const context={window:{},Map,Set,JSON,AbortController,DOMException,crypto:{randomUUID:()=>++requestNumber===1?'request-new':'request-new-'+requestNumber},console,projectId:'project',navigationSequence:0,t:value=>value,
-  statusNames:{queued:'排队'},reviewNames:{},el:element,
+  statusNames:{queued:'排队'},reviewNames:{},Blob,setTimeout:()=>0,
+  URL:{createObjectURL(blob){exportBlob=blob;return 'blob:batch';},revokeObjectURL(){}},
+  el(tag,...args){
+   const node=element(tag,...args);
+   node.focus=()=>{context.document.activeElement=node;};
+   if(tag==='input')node.value='';
+   if(tag==='a')node.onclick=()=>downloads.push({name:node.download,blob:exportBlob});
+   return node;
+  },
   toast:(message,error=false)=>toasts.push({message,error}),
   uiConfirm:async (message,...options)=>{confirms.push(message);return clickConfirm?confirmDialog(message,...options):confirm;},
   refresh:async options=>{refreshes.push(options);},
   safe:async fn=>{try{await fn();}catch(error){context.toast(error.message,true);}},
-  api:async(path,body)=>{calls.push({path,body});return api(path,body);},
-  document:{querySelector:selector=>selector==='.task-toolbar'?host:null,getElementById:id=>id==='batch-actions'?panel:null,body:{append(node){dialog=node;}}}};
+  api:async(path,body)=>recordRequest(path,body),
+  document:{querySelector:selector=>selector==='.task-toolbar'?host:null,getElementById:id=>id==='batch-actions'?panel:panel?.children.find(node=>node.id===id),body:{append(node){dialog=node;}}}};
+ function recordRequest(path,body){
+  const view={machine:context.window.__RSI_MACHINE_KEY__??'',project:context.projectId,navigation:context.navigationSequence};
+  calls.push({path,body,view});return api(path,body,view);
+ }
  const app=fs.readFileSync('adaptive_rsi/web/app.js','utf8');
  vm.createContext(context);
  const confirmDialog=vm.runInContext('('+app.slice(app.indexOf('function uiConfirm('),app.indexOf('function elapsedCopy('))+')',context);
@@ -39,8 +52,7 @@ function harness(api,{confirm=true,clickConfirm=false,capabilities}={}){
    configReasonLabels:{},apiErrors:{},negotiateCapabilities:capabilities,
    fetch:async(url,options)=>{
     const path=url.slice('/api/'.length),body=options.body===undefined?undefined:JSON.parse(options.body);
-    calls.push({path,body});
-    const data=await api(path,body),status=data.error_code?409:200;
+    const data=await recordRequest(path,body),status=data.error_code?409:200;
     return {ok:status===200,status,json:async()=>data};
    }});
   vm.runInContext(app.slice(app.indexOf('async function sendApi('),app.indexOf('const goalSubmissionLimit=')),context);
@@ -58,7 +70,8 @@ function harness(api,{confirm=true,clickConfirm=false,capabilities}={}){
  const render=tasks=>{const list=tasks.map(task=>typeof task==='string'?{id:task}:task);context.window.RSIBatch.toolbar(list);for(const task of list)rows[task.id]=context.window.RSIBatch.row({id:task.id,title:'任务 '+task.id,fingerprint:''});};
  // Mirror a real checkbox click: the browser toggles checked before dispatching click.
  const check=(id,shiftKey=false)=>{const box=rows[id];box.checked=!box.checked;box.dispatch('click',{shiftKey});};
- return {calls,toasts,confirms,refreshes,drafts,store:context.window.RSIDraftStore,rows,panel,dialog:()=>dialog,
+ return {calls,toasts,confirms,refreshes,drafts,downloads,store:context.window.RSIDraftStore,rows,panel,dialog:()=>dialog,
+  focused:()=>context.document.activeElement,
   project(value){context.projectId=value;context.navigationSequence++;context.window.RSIBatch.viewChanged?.();},
   machine(value){context.window.__RSI_MACHINE_KEY__=value;context.window.RSIBatch.viewChanged?.();},
   navigate(){context.navigationSequence++;context.window.RSIBatch.viewChanged?.();},
@@ -449,6 +462,157 @@ test('batch history ignores a response after a round trip through another projec
  fixture.project('other');fixture.project('project');
  finish({batches:[]});await pending;
  assert.equal(fixture.dialog(),null);
+});
+
+function historyReport(title='原运行环境任务'){
+ return {batches:[{action:'retry',request_id:'request-1',revision:'rev-1',complete:false,
+  tasks:[{id:'t1',title}],receipts:[{id:'t1',state:'unknown'}]}]};
+}
+async function openHistory(fixture){
+ const button=fixture.buttonByText('批次记录');button.focus();await button.click();return fixture.dialog();
+}
+const historyRows=box=>box.children[2];
+const historyRetry=box=>historyRows(box).children[0]?.children[2];
+const historyTitle=box=>historyRows(box).children[0]?.children[0]?.textContent;
+function searchHistory(box,value){const filter=box.children[1];filter.value=value;filter.oninput();}
+const historyScopes=[
+ ['project switch',fixture=>fixture.project('other')],
+ ['navigation round trip',fixture=>{fixture.navigate();fixture.navigate();}],
+ ['runtime switch',fixture=>fixture.machine('other')],
+];
+
+for(const [scope,leave] of historyScopes){
+ test(`batch history blocks an old dialog click after ${scope}`,async()=>{
+  const fixture=harness((_path,body)=>body?completedBatch:historyReport());
+  fixture.machine('original');
+  const old=await openHistory(fixture),button=historyRetry(old);
+  leave(fixture);
+  await button.click();
+  assert.deepEqual({open:old.open,sent:fixture.calls.filter(call=>call.body).map(call=>call.view)},
+   {open:false,sent:[]});
+ });
+
+ test(`batch history blocks a POST waiting for capabilities after ${scope}`,async()=>{
+  const negotiation=deferred(),started=deferred(),supported=new Set(['task-batch']);
+  let checks=0;
+  const fixture=harness((_path,body)=>body?completedBatch:historyReport(),{capabilities:()=>{
+   if(++checks!==2)return supported;
+   started.resolve();return negotiation.promise;
+  }});
+  fixture.machine('original');
+  const box=await openHistory(fixture),pending=historyRetry(box).click();
+  await started.promise;
+  leave(fixture);
+  negotiation.resolve(supported);await pending;
+  assert.deepEqual({sent:fixture.calls.filter(call=>call.body).map(call=>call.view),toasts:fixture.toasts.length},
+   {sent:[],toasts:0});
+ });
+}
+
+test('batch history ignores a list response from a previous runtime',async()=>{
+ const reply=deferred(),fixture=harness(()=>reply.promise);
+ fixture.machine('original');
+ const pending=fixture.buttonByText('批次记录').click();
+ fixture.machine('other');reply.resolve(historyReport());await pending;
+ assert.equal(fixture.dialog()===null,true);
+});
+
+test('batch history keeps feedback in the current dialog when reopened in the same view',async()=>{
+ const reply=deferred();
+ const fixture=harness((_path,body)=>body?reply.promise:historyReport());
+ const old=await openHistory(fixture),pending=historyRetry(old).click();
+ old.children.at(-1).click();
+ const fresh=await openHistory(fixture);
+ fixture.notify('新弹窗提示');
+ reply.reject(new TypeError('旧弹窗请求失败'));await pending;
+ assert.deepEqual({posts:executionCount(fixture),open:fresh.open,focus:fixture.focused()===fresh.children[1],
+  notices:fixture.toasts.map(toast=>toast.message)},
+  {posts:1,open:true,focus:true,notices:['新弹窗提示']});
+});
+
+test('batch history suppresses automatic update retry when the rejected POST is no longer current',async()=>{
+ const reply=deferred(),sent=deferred();
+ const fixture=harness((path,body)=>{
+  if(path==='state')return {update:{busy:false}};
+  if(!body)return historyReport();
+  if(executionCount(fixture)>1)return completedBatch;
+  sent.resolve();return reply.promise;
+ },{capabilities:()=>new Set(['task-batch'])});
+ const box=await openHistory(fixture),pending=historyRetry(box).click();
+ await sent.promise;
+ fixture.navigate();fixture.navigate();
+ reply.resolve({error_code:'update_in_progress'});await pending;
+ assert.deepEqual({paths:fixture.calls.map(call=>call.path),toasts:fixture.toasts.length},
+  {paths:['tasks/batches?project=project','tasks/batch'],toasts:0});
+});
+
+for(const outcome of ['complete','partial','failure']){
+ test(`batch history isolates a late ${outcome} response from a replaced dialog and runtime`,async()=>{
+  const reply=deferred(),started=deferred();
+  const fixture=harness((_path,body,view)=>{
+   if(!body)return historyReport(view.machine==='other'?'新运行环境任务':undefined);
+   started.resolve();return reply.promise;
+  },{clickConfirm:true,capabilities:()=>new Set(['task-batch'])});
+  fixture.machine('original');fixture.store.set('batch','project',draft());
+  const old=await openHistory(fixture),pending=historyRetry(old).click();
+  await started.promise;
+  fixture.machine('other');fixture.store.set('batch','project',draft());
+  // Reopen through the toolbar even when running against the original behavior.
+  if(old.open)old.children.at(-1).click();
+  const fresh=await openHistory(fixture);
+  fixture.notify('新弹窗提示');
+  if(outcome==='failure')reply.reject(new TypeError('旧连接失败'));
+  else reply.resolve(outcome==='complete'?completedBatch:{complete:false,receipts:[{id:'t1',state:'failed'}]});
+  await pending;
+  const currentId=fixture.store.get('batch','project')?.id??null;
+  const actual={sent:fixture.calls.filter(call=>call.body).map(call=>call.view.machine),currentId,
+   title:historyTitle(fresh),oldTitle:historyTitle(old),freshOpen:fresh.open,focus:fixture.focused()===fresh.children[1],
+   notices:fixture.toasts.map(toast=>toast.error?'旧错误':toast.message)};
+  fixture.machine('original');
+  assert.deepEqual({...actual,originalId:fixture.store.get('batch','project')?.id??null},
+   {sent:['original'],currentId:'request-1',title:'重试 · request-1 · 结果待核对',oldTitle:'重试 · request-1 · 结果待核对',
+    freshOpen:true,focus:true,notices:['新弹窗提示'],originalId:outcome==='complete'?null:'request-1'});
+ });
+}
+
+test('batch history search keeps one pending request and exports partial results before retrying the same ID',async()=>{
+ const reply=deferred();
+ const fixture=harness((_path,body)=>!body?historyReport('Task Alpha'):executionCount(fixture)===1?reply.promise:completedBatch);
+ const box=await openHistory(fixture),pending=historyRetry(box).click();
+ searchHistory(box,'no match');const hidden=historyRows(box).children.length;
+ searchHistory(box,'ALPHA');
+ const redrawn=historyRetry(box),disabled=redrawn.disabled;
+ await redrawn.click();
+ reply.resolve({complete:false,receipts:[{id:'t1',state:'failed'}]});await pending;
+ const afterPartial={title:historyTitle(box),enabled:historyRetry(box)?.disabled===false,posts:executionCount(fixture)};
+ box.children.at(-2).click();
+ const [{name,blob}]=fixture.downloads;
+ const exported=JSON.parse(await blob.text());
+ await historyRetry(box).click();
+ const posts=fixture.calls.filter(call=>call.body).map(call=>structuredClone(call.body));
+ assert.deepEqual({hidden,disabled,afterPartial,name,exported,posts,
+  finalTitle:historyTitle(box),finalRetry:!!historyRetry(box)},
+  {hidden:0,disabled:true,afterPartial:{title:'重试 · request-1 · 操作失败',enabled:true,posts:1},
+   name:'adaptive-rsi-batches-project.json',exported:{batches:[{...historyReport('Task Alpha').batches[0],receipts:[{id:'t1',state:'failed'}]}]},
+   posts:Array(2).fill({project:'project',tasks:['t1'],action:'retry',request_id:'request-1',revision:'rev-1',preview:false}),
+   finalTitle:'重试 · request-1 · 已受理',finalRetry:false});
+});
+
+test('batch history keeps a current error retryable and returns focus after toolbar redraw',async()=>{
+ const fixture=harness((_path,body)=>{
+  if(body)throw new TypeError('当前连接失败');
+  return historyReport();
+ });
+ const button=fixture.buttonByText('批次记录'),box=await openHistory(fixture);
+ assert.equal(fixture.focused(),box.children[1]);
+ await historyRetry(box).click();
+ assert.equal(historyRetry(box).disabled,false);
+ assert.deepEqual(fixture.toasts,[{message:'当前连接失败',error:true}]);
+ box.children.at(-1).click();assert.equal(fixture.focused(),button);
+ const reopened=await openHistory(fixture);
+ fixture.render(['t1']);
+ reopened.children.at(-1).click();
+ assert.equal(fixture.focused()===fixture.buttonByText('批次记录'),true);
 });
 
 test('same-name checks at different positions are not attributed to grouped requirements', async () => {

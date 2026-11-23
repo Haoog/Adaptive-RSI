@@ -1,12 +1,13 @@
 'use strict';
 window.RSIBatch=(()=>{
  const selected=new Map(),pending=new Set(),boxes=new Map(),recommendationSelections=new Map();
- let historyBox=null,recommendationDialog=null,visible=[],anchor=-1,pageKey='';
+ let historyDialog=null,recommendationDialog=null,visible=[],anchor=-1,pageKey='';
  function batchView(project){
   const machine=window.__RSI_MACHINE_KEY__||'',navigation=navigationSequence;
   return {machine,current:()=>project===projectId&&machine===(window.__RSI_MACHINE_KEY__||'')&&navigation===navigationSequence};
  }
  function viewChanged(){
+  if(historyDialog?.box.open&&!historyDialog.current())historyDialog.box.close();
   if(recommendationDialog&&!recommendationDialog.current())recommendationDialog.controller.abort();
  }
  async function confirmRecommendation(message,current){
@@ -18,10 +19,15 @@ window.RSIBatch=(()=>{
  const actionLabels={group:'合并任务',ungroup:'拆分任务',split_retry:'拆分失败任务组并重做',retry:'重试',cancel:'取消任务',approve:'批准交付'};
  const stateLabels={accepted:'已受理',unknown:'结果待核对',executing:'正在处理',grouped:'已合并',restored:'已恢复',failed:'操作失败',skipped:'已跳过'};
  async function history(){
-  if(historyBox?.open)return;
-  const project=projectId,navigation=navigationSequence,data=await api('tasks/batches?project='+encodeURIComponent(project));
-  if(project!==projectId||navigation!==navigationSequence||historyBox?.open)return;
-  const box=el('dialog',undefined,'experience-dialog'),previousFocus=document.activeElement;historyBox=box;
+  if(historyDialog?.box.open)return;
+  const project=projectId,{machine,current}=batchView(project);
+  let data;
+  try{data=await api('tasks/batches?project='+encodeURIComponent(project),undefined,{current});}
+  catch(error){if(current())throw error;return;}
+  if(!current()||historyDialog?.box.open)return;
+  const box=el('dialog',undefined,'experience-dialog'),previousFocus=document.activeElement;
+  const dialog={box,current},inFlight=new Set();historyDialog=dialog;
+  const active=()=>box.open&&historyDialog===dialog&&current();
   box.append(el('h2',t('批次记录')));
   const filter=el('input');filter.type='search';filter.setAttribute('aria-label',t('搜索批次记录'));
   const rows=el('div');box.append(filter,rows);
@@ -30,9 +36,20 @@ window.RSIBatch=(()=>{
    for(const report of data.batches.filter(report=>JSON.stringify(report).toLowerCase().includes(filter.value.toLowerCase()))){
     const card=el('section'),title=el('p',t(actionLabels[report.action]||'未知操作')+' · '+(report.request_id||'')+' · '+(report.receipts||[]).map(item=>t(stateLabels[item.state]||'结果待核对')).join(', '));
     card.append(title,el('p',report.tasks.map(task=>task.title).join(' / ')));
-    if(!report.complete&&report.request_id){
+    const request_id=report.request_id;
+    if(!report.complete&&request_id){
      const retry=el('button',t('继续并核对批次'),'button');retry.type='button';
-     retry.onclick=()=>safe(async()=>{retry.disabled=true;try{const result=await api('tasks/batch',{project,tasks:report.tasks.map(task=>task.id),action:report.action,request_id:report.request_id,revision:report.revision,preview:false});Object.assign(report,result);if(result.complete)forgetReceipt(project,report.request_id);renderRows();}finally{retry.disabled=false;}});
+     retry.disabled=inFlight.has(request_id);
+     retry.onclick=()=>safe(async()=>{
+      if(!active()||report.complete||inFlight.has(request_id))return;
+      inFlight.add(request_id);retry.disabled=true;
+      try{
+       const result=await api('tasks/batch',{project,tasks:report.tasks.map(task=>task.id),action:report.action,request_id,revision:report.revision,preview:false},{current:active});
+       if(result.complete)forgetReceipt(project,request_id,machine);
+       if(active())Object.assign(report,result);
+      }catch(error){if(active())throw error;}
+      finally{inFlight.delete(request_id);if(active())renderRows();}
+     });
      card.append(retry);
     }
     rows.append(card);
@@ -42,7 +59,17 @@ window.RSIBatch=(()=>{
   const download=el('button',t('导出批次记录'),'button');download.type='button';
   download.onclick=()=>{const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'})),link=el('a');link.href=url;link.download='adaptive-rsi-batches-'+project+'.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
   const close=el('button',t('关闭'),'text-button');close.type='button';close.onclick=()=>box.close();
-  box.append(download,close);box.onclose=()=>{if(historyBox===box)historyBox=null;box.remove();previousFocus?.focus?.();};document.body.append(box);box.showModal();filter.focus();
+  box.append(download,close);
+  box.onclose=()=>{
+   box.remove();
+   if(historyDialog!==dialog)return;
+   historyDialog=null;
+   if(current()){
+    const target=previousFocus?.isConnected&&previousFocus!==document.body?previousFocus:document.getElementById('batch-records');
+    target?.focus();
+   }
+  };
+  document.body.append(box);box.showModal();filter.focus();
  }
  function signature(action,tasks){return JSON.stringify([action,[...tasks].sort()]);}
  function receipts(project,machine){
