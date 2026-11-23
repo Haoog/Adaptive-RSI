@@ -19,7 +19,7 @@ window.RSIExperience = (() => {
     liveState = "",
     inboxBusy = false,
     inboxAt = 0;
-  const queueSaves = new Map();
+  const queueSaves = new Map(), taskRetries = new Map();
   let queueEditor, backoffRetry, liveRetryButton;
   let usageButton;
   const queueKey = task => JSON.stringify([task.project, task.id]);
@@ -392,6 +392,7 @@ window.RSIExperience = (() => {
       const updated = await api("task?id=" + encodeURIComponent(task.id) + "&project=" + encodeURIComponent(task.project));
       if (current()) await showTask(updated);
     }
+    const retryAtRead = taskRetries.get(editor.key);
     const metadata = await api(
       "task?id=" +
         encodeURIComponent(task.id) +
@@ -433,42 +434,46 @@ window.RSIExperience = (() => {
       causes.addEventListener('toggle',()=>{if(causes.open)safe(loadCauses);});reload.onclick=()=>safe(loadCauses);
     }
     controls.append(el("h3", t("下一步")));
-    if (
-      [
-        "failed",
-        "blocked",
-        "waiting_budget",
-        "interrupted",
-        "expired",
-        "insufficient_evidence",
-        "deferred",
-        "rejected",
-        "cancelled",
-        "obsolete",
-      ].includes(metadata.state)
-    )
-      controls.append(
-        action(
-          t("基于当前输入重新检查"),
-          async () => {
-            if (!current()) return;
-            await api("retry", { task: task.id });
-            await refreshTaskDetail();
-          },
-          "button",
-        ),
-      );
-    else if (metadata.state === "queued" && Number(metadata.available) > Date.now() / 1000) {
-      backoffRetry = action(
-        t("立即重试"),
-        async () => {
-          if (!current()) return;
+    const inBackoff = metadata.state === "queued" && Number(metadata.available) > Date.now() / 1000;
+    const canRecheck = [
+      "failed", "blocked", "waiting_budget", "interrupted", "expired",
+      "insufficient_evidence", "deferred", "rejected", "cancelled", "obsolete",
+    ].includes(metadata.state);
+    // A metadata read started during a write may still describe the old retryable state.
+    if ((canRecheck || inBackoff) && !retryAtRead?.accepted) {
+      const retry = action(canRecheck ? t("基于当前输入重新检查") : t("立即重试"), async () => {
+        if (!current() || retry.disabled || taskRetries.has(editor.key)) return;
+        const pending = {button: retry, accepted: false};
+        taskRetries.set(editor.key, pending);
+        retry.disabled = true;
+        try {
           await api("retry", { task: task.id });
+          pending.accepted = true;
+        } catch (error) {
+          if (current()) throw error;
+          return;
+        } finally {
+          taskRetries.delete(editor.key);
+          if (!pending.accepted) pending.button.disabled = false;
+        }
+        pending.button.remove();
+        if (backoffRetry === pending.button) backoffRetry = null;
+        try {
           await refreshTaskDetail();
-        },
-        "button",
-      );
-      controls.append(backoffRetry);
+        } catch {
+          if (!current()) return;
+          toast(t("已安排重试"));
+          liveFailures += 1;
+          liveNotice();
+        }
+      });
+      const pending = taskRetries.get(editor.key);
+      if (pending) {
+        pending.button = retry;
+        retry.disabled = true;
+      }
+      if (inBackoff) backoffRetry = retry;
+      controls.append(retry);
     }
     if (
       [

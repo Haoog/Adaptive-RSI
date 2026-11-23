@@ -2512,6 +2512,165 @@ function revisionMetadataPage(task, metadata) {
   return page;
 }
 
+function taskRetryPage(...tasks) {
+  const page = experiencePage(), posts = [], metadata = new Map(tasks.map(task => [task.id, task]));
+  const offline = response({error: 'Invalid request', error_code: 'validation_error'}, 400);
+  let failDetailRead = false;
+  page.context.language = 'zh-CN';
+  vm.runInContext('Date.now=()=>1700000000000;safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.fetch = async (url, options) => {
+    if (url.endsWith('/api/retry')) {
+      const body = JSON.parse(options.body), task = metadata.get(body.task);
+      // Model runtime.retry's atomic change to plain queued and delay each reply independently.
+      const eligible = task.state === 'failed' || (task.state === 'queued' && task.available > 1700000000);
+      if (eligible) metadata.set(task.id, {...task, state: 'queued', available: 0});
+      const reply = eligible ? response({saved: true}) : response({error: 'This task cannot be retried', error_code: 'validation_error'}, 400);
+      return new Promise(resolve => posts.push({body, status: reply.status, finish: (result = reply) => resolve(result)}));
+    }
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({tasks: []});
+    const id = new URL(url, 'http://fixture.test').searchParams.get('id');
+    return failDetailRead ? offline : response(metadata.get(id));
+  };
+  const click = button => {
+    button.handlers.click();
+    return page.context.lastAction;
+  };
+  return {page, posts, metadata, click, offline, failDetailRead: value => { failDetailRead = value; }};
+}
+
+for (const [state, label, navigation] of [
+  ['failed', '基于当前输入重新检查', 'task'],
+  ['queued', '立即重试', 'project'],
+]) {
+  test(`task retry POST is single-flight across repeated activation and ${navigation} navigation (${state})`, async t => {
+    const task = {...fixtureTask('child', state), available: 1700000100};
+    const other = {...fixtureTask('other'), project: navigation === 'project' ? 'b' : 'a'};
+    const f = taskRetryPage(task, other);
+    const switchProject = async project => {
+      f.page.node('project-select').value = project;
+      f.page.node('project-select').handlers.change();
+      await f.page.context.lastAction;
+    };
+    const firstButton = buttonWith(await openExperienceTask(f.page, task), label);
+    const first = f.click(firstButton), duplicate = f.click(firstButton);
+    const afterRepeat = f.posts.length;
+    const pendingDisabled = firstButton.disabled;
+    // Simulate a detail response read before the retry was committed, delivered on return.
+    const committed = f.metadata.get(task.id);
+    if (navigation === 'project') await switchProject('b');
+    await openExperienceTask(f.page, other);
+    if (navigation === 'project') await switchProject('a');
+    f.metadata.set(task.id, task);
+    const reopened = buttonWith(await openExperienceTask(f.page, task), label);
+    f.metadata.set(task.id, committed);
+    const afterReturn = f.click(reopened);
+    const reopenedDisabled = reopened.disabled;
+    if (navigation === 'project') await switchProject('b');
+    const otherControls = await openExperienceTask(f.page, other);
+    const draft = supplementForm(otherControls).children[0].children[0];
+    draft.value = '较新详情草稿';
+    draft.handlers.input();
+    const independent = f.click(buttonWith(otherControls, '基于当前输入重新检查'));
+    f.page.context.toast('较新详情反馈');
+    f.posts.filter(post => post.body.task === task.id).forEach(post => post.finish());
+    await Promise.all([first, duplicate, afterReturn]);
+    const afterLate = f.page.node('toast').textContent;
+    const firstTaskStatuses = f.posts.filter(post => post.body.task === task.id).map(post => post.status);
+    t.diagnostic(JSON.stringify({afterRepeat, firstTaskStatuses, afterLate}));
+    assert.equal(f.page.node('detail-title').textContent, other.title);
+    assert.equal(draft.value, '较新详情草稿');
+    const otherPost = f.posts.find(post => post.body.task === other.id);
+    assert.equal(otherPost.status, 200);
+    otherPost.finish();
+    await independent;
+    await f.page.context.lastAction;
+    const currentControls = f.page.node('detail-body').children.find(node => node.className === 'task-controls');
+    assert.equal(supplementForm(currentControls).children[0].children[0].value, draft.value);
+    assert.deepEqual(f.posts.map(post => post.body), [{task: task.id}, {task: other.id}]);
+    assert.equal(afterRepeat, 1);
+    assert.equal(firstTaskStatuses[0], 200);
+    assert.equal(afterLate, '较新详情反馈');
+    assert.equal(pendingDisabled, true);
+    assert.equal(reopenedDisabled, true);
+  });
+}
+
+test('task retry POST releases a rejected request and ignores its old feedback after reopening', async () => {
+  const task = fixtureTask(), f = taskRetryPage(task), label = '基于当前输入重新检查';
+  const first = f.click(buttonWith(await openExperienceTask(f.page, task), label));
+  f.metadata.set(task.id, task);
+  const reopened = buttonWith(await openExperienceTask(f.page, task), label);
+  const disabled = reopened.disabled;
+  f.page.context.toast('较新详情反馈');
+  f.posts[0].finish(f.offline);
+  await first;
+  assert.equal(f.page.node('toast').textContent, '较新详情反馈');
+  assert.equal(reopened.disabled, false);
+  const failed = f.click(reopened);
+  f.metadata.set(task.id, task);
+  f.posts[1].finish(f.offline);
+  await failed;
+  assert.equal(reopened.disabled, false);
+  assert.notEqual(f.page.node('toast').textContent, '较新详情反馈');
+  const later = f.click(reopened);
+  f.posts[2].finish();
+  await later;
+  assert.equal(disabled, true);
+  assert.deepEqual(f.posts.map(post => post.body), [{task: task.id}, {task: task.id}, {task: task.id}]);
+});
+
+test('task retry POST acknowledgement prevents a late metadata read from restoring the old button', async () => {
+  const task = fixtureTask(), f = taskRetryPage(task), label = '基于当前输入重新检查';
+  const pending = f.click(buttonWith(await openExperienceTask(f.page, task), label));
+  const fetch = f.page.context.fetch;
+  let finishRead;
+  f.page.context.fetch = (url, options) => {
+    if (!url.includes('/task?')) return fetch(url, options);
+    return new Promise(resolve => { finishRead = () => resolve(response(task)); });
+  };
+  const reopening = openExperienceTask(f.page, task);
+  await waitFor(() => finishRead);
+  f.posts[0].finish();
+  await pending;
+  finishRead();
+  const reopened = await reopening;
+  assert.equal(buttonWith(reopened, label), undefined);
+  f.page.context.fetch = fetch;
+  f.page.fireTimer(5000);
+  await new Promise(setImmediate);
+  assert.equal(vm.runInContext('detailTask.state', f.page.context), 'queued');
+  assert.deepEqual(f.posts.map(post => post.body), [{task: task.id}]);
+});
+
+test('task retry POST success with a failed detail read only offers to retry the read', async t => {
+  const task = {...fixtureTask('child', 'queued'), available: 1700000100};
+  const f = taskRetryPage(task);
+  const controls = await openExperienceTask(f.page, task);
+  const draft = supplementForm(controls).children[0].children[0];
+  draft.value = '重试后仍保留的草稿';
+  draft.handlers.input();
+  const retryButton = buttonWith(controls, '立即重试');
+  const pending = f.click(retryButton);
+  f.failDetailRead(true);
+  f.posts[0].finish();
+  await pending;
+  const status = f.page.node('detail-live-status');
+  t.diagnostic(JSON.stringify({retryStillAvailable: retryButton.isConnected && !retryButton.disabled, toast: f.page.node('toast').textContent}));
+  assert.equal(status.hidden, false);
+  assert.equal(retryButton.isConnected, false);
+  await f.click(retryButton);
+  assert.equal(f.posts.length, 1);
+  f.failDetailRead(false);
+  await f.click(buttonWith(status, '重试'));
+  await f.page.context.lastAction;
+  assert.equal(status.hidden, true);
+  const updated = f.page.node('detail-body').children.find(node => node.className === 'task-controls');
+  assert.equal(buttonWith(updated, '立即重试'), undefined);
+  assert.equal(supplementForm(updated).children[0].children[0].value, draft.value);
+  assert.deepEqual(f.posts.map(post => post.body), [{task: task.id}]);
+});
+
 test('an active task accepts a supplement and reports its pending application', async () => {
   for (const state of ['planning', 'executing', 'evaluating', 'awaiting_approval']) {
     const task = fixtureTask('active-' + state, state), posts = [];
