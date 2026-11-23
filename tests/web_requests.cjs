@@ -834,6 +834,185 @@ test('local project form keeps the confirmed existing-project feedback when the 
   assert.equal(node('connection').textContent, '连接中断');
 });
 
+function pausePage() {
+  const page = browser(), {context, node} = page;
+  const paused = {a: 0, b: 1}, posts = [], reads = [];
+  const stateFor = project => ({...snapshot(), selected_project: project, sections: ['core'],
+    projects: snapshot().projects.map(item => ({...item, paused: paused[item.id]})),
+    config: {sources: {}, github: {}, schedule: {light_minutes: 60, issues_minutes: 60}, delivery: {}},
+    tasks: [], runs: [], schedules: [], events: [], task_counts: [],
+  });
+  const reply = body => { paused[body.project] = Number(body.paused); return response({saved: true}); };
+  let post = reply, read = project => response(stateFor(project));
+  context.startState = stateFor('a');
+  context.fetch = async (url, options) => {
+    if (url === '/api/pause') {
+      assert.equal(options.method, 'POST');
+      const body = JSON.parse(options.body);
+      posts.push(body);
+      return post(body);
+    }
+    assert.match(url, /^\/api\/state(?:\?|$)/);
+    assert.equal(options.method, undefined);
+    const project = new URLSearchParams(url.split('?')[1]).get('project');
+    reads.push(project);
+    return read(project, options.signal);
+  };
+  vm.runInContext(`state=startState;language='zh-CN';view='settings';settingsBaseline={};
+    readinessCache.set('a',{items:[]});readinessCache.set('b',{items:[]});
+    renderUpdateExtras=()=>{};renderSettings=()=>{};render=originalRender;
+    safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;};render()`, context);
+  const click = (includeDisabled = false, detail = 1) => {
+    if (node('pause-button').disabled && !includeDisabled) return;
+    node('pause-button').handlers.click({detail});
+    return context.lastAction;
+  };
+  const select = project => {
+    node('project-select').value = project;
+    node('project-select').handlers.change();
+    return context.lastAction;
+  };
+  return {...page, posts, reads, stateFor, reply, click, select,
+    onPost(handler) { post = handler; }, onRead(handler) { read = handler; }};
+}
+
+function pauseCounts(t, page) {
+  t.diagnostic(`POST ${page.posts.length}, GET ${page.reads.length}`);
+}
+
+test('pause button holds one write through redraw and project switch-back, then permits an explicit reversal', async t => {
+  const page = pausePage(), button = page.node('pause-button');
+  let finish;
+  const hold = new Promise(resolve => { finish = resolve; });
+  page.onPost(async body => { await hold; return page.reply(body); });
+  const first = page.click(), duplicate = page.click(true);
+  await page.context.refresh();
+  const afterRedraw = button.disabled;
+  await page.select('b');
+  const otherProject = button.disabled;
+  await page.select('a');
+  const afterReturn = button.disabled;
+  const afterSwitchClick = page.click(true);
+  finish();
+  // Release each old handler as well when running the regression against the parent.
+  await Promise.all([first, duplicate, afterSwitchClick].filter(Boolean));
+  page.onPost(page.reply);
+  await page.click();
+  pauseCounts(t, page);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}, {project:'a', paused:false}]);
+  assert.deepEqual([afterRedraw, otherProject, afterReturn], [true, false, true]);
+  assert.equal(button.textContent, '暂停运行');
+});
+
+for (const destination of ['b', 'a']) {
+  test(`pause button suppresses old rejection after switching ${destination === 'b' ? 'away' : 'away and back'}`, async t => {
+    const page = pausePage();
+    let reject;
+    page.onPost(() => new Promise(resolve => { reject = () => resolve(response({error_code:'invalid_request'}, 400)); }));
+    const first = page.click();
+    await page.select('b');
+    if (destination === 'a') await page.select('a');
+    vm.runInContext('toast("当前页面反馈")', page.context);
+    reject();
+    await first;
+    pauseCounts(t, page);
+    assert.deepEqual(page.posts, [{project:'a', paused:true}]);
+    assert.equal(page.node('toast').textContent, '当前页面反馈');
+    assert.equal(page.node('pause-button').disabled, false);
+  });
+}
+
+test('pause button keeps a saved receipt when the read fails and retries with GET before reversing', async t => {
+  const page = pausePage(), button = page.node('pause-button'), notice = page.node('toast');
+  page.onRead(() => { throw new TypeError('state unavailable'); });
+  await page.click();
+  const failedRead = {label: button.textContent, notice: notice.textContent};
+  const beforeRetry = page.posts.length;
+  await page.click();
+  const afterFailedRetry = page.posts.length;
+  page.onRead(project => response({...page.stateFor(project), runs: [{project:'a', task_title:'旧工作仍在收尾', started:1}]}));
+  await page.click();
+  const afterRead = {label: button.textContent, running: page.node('current-work').textContent, posts: page.posts.length};
+  await page.click();
+  pauseCounts(t, page);
+  assert.deepEqual([beforeRetry, afterFailedRetry, afterRead.posts], [1, 1, 1]);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}, {project:'a', paused:false}]);
+  assert.deepEqual(page.reads, ['a', 'a', 'a', 'a']);
+  assert.equal(failedRead.label, '刷新运行状态');
+  assert.match(failedRead.notice, /调度暂停请求已保存.*运行状态暂未刷新/);
+  assert.deepEqual([afterRead.label, afterRead.running], ['开始运行', '旧工作仍在收尾']);
+});
+
+test('pause button clears its old failure on retry and requires saved true before reporting success', async t => {
+  const page = pausePage(), notice = page.node('toast');
+  page.onPost(() => response({error_code:'invalid_request'}, 400));
+  await page.click();
+  const visibleFailure = !notice.hidden && notice.className === 'error';
+  let finish;
+  page.onPost(() => new Promise(resolve => { finish = () => resolve(response({saved:false})); }));
+  const retry = page.click();
+  const hidOldFailure = notice.hidden;
+  finish();
+  await retry;
+  const unconfirmed = {label:page.node('pause-button').textContent, notice:notice.textContent};
+  page.onPost(page.reply);
+  await page.click();
+  pauseCounts(t, page);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}, {project:'a', paused:true}]);
+  assert.deepEqual(page.reads, ['a']);
+  assert.deepEqual([visibleFailure, hidOldFailure], [true, true]);
+  assert.deepEqual(unconfirmed, {label:'刷新运行状态', notice:'运行状态变更结果未确认，请先刷新运行状态。'});
+  assert.equal(notice.hidden, true);
+  assert.equal(page.node('pause-button').textContent, '暂停运行');
+});
+
+test('pause button ignores the second click of a double click even after a fast refresh', async t => {
+  const page = pausePage();
+  await page.click();
+  await page.click(false, 2);
+  const countAfterDoubleClick = page.posts.length;
+  await page.click();
+  pauseCounts(t, page);
+  assert.equal(countAfterDoubleClick, 1);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}, {project:'a', paused:false}]);
+});
+
+test('pause button never treats a pre-write snapshot as the confirmed state', async t => {
+  const page = pausePage();
+  let finishOld;
+  page.onRead((project, signal) => {
+    if (page.reads.length > 1) return response(page.stateFor(project));
+    const old = page.stateFor(project);
+    return new Promise(resolve => {
+      finishOld = () => resolve(response(old));
+      signal.addEventListener('abort', finishOld, {once:true});
+    });
+  });
+  const old = page.context.refresh();
+  const write = page.click();
+  await new Promise(setImmediate);
+  finishOld();
+  await Promise.all([old, write]);
+  pauseCounts(t, page);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}]);
+  assert.deepEqual(page.reads, ['a', 'a']);
+  assert.equal(page.node('pause-button').textContent, '开始运行');
+});
+
+test('pause button does not replay an update rejection after the user changes projects', async t => {
+  const page = pausePage();
+  page.onPost(body => page.posts.length === 1 ? rejected() : page.reply(body));
+  const pending = page.click();
+  await new Promise(setImmediate);
+  await page.select('b');
+  if (page.timers.some(timer => timer.active && timer.delay === 1000)) await page.resume();
+  await pending;
+  pauseCounts(t, page);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}]);
+  assert.deepEqual(page.reads, ['b']);
+  assert.equal(page.node('pause-button').textContent, '开始运行');
+});
+
 test('a failed capability probe reports the connection error rather than an upgrade hint', async () => {
   const page = browser();
   let calls = 0;

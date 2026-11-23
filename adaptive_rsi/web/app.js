@@ -19,6 +19,9 @@ const formRevisions=new WeakMap(), settingsDrafts=new Map(), settingsClean=new M
 let navigationSequence=0,projectImportRevision=0;
 let settingsContext='',settingsGeneration=0,goalDraftRestoredProject=null;
 let configurationRepairBusy=false;
+// null means a write is pending. A sequence means we need a state read started after it.
+const pauseRequests=new Map();
+let pauseFeedback=null;
 let refreshSequence=0,refreshPromise=null,refreshController=null,refreshProject=null,refreshKey=null,refreshQueued=false,refreshForce=false,refreshWaiters=[],refreshPollTimer=null,lastUpdateToast='',sessionExpired=false,lastRefreshAt=0;
 let capabilitySequence=0,scopeChosen=false,scopeInitialized=false,taskOffset=0;
 const readinessCache=new Map(),bootBuild=document.documentElement?.dataset?.build||'';
@@ -242,7 +245,7 @@ function lazyEvidence(label,produce){
   controls.append(search,previous,next,anchor,download,status);box.append(controls,raw);paint();
  });return box;
 }
-function toast(message,error=false){ $('toast').textContent=message; $('toast').className=error?'error':''; $('toast').hidden=false; clearTimeout(toastTimer); if(!error)toastTimer=setTimeout(()=>$('toast').hidden=true,6500);else{const close=el('button','×','toast-close');close.type='button';close.setAttribute('aria-label',t('关闭'));close.addEventListener('click',()=>$('toast').hidden=true);$('toast').append(close);} }
+function toast(message,error=false){ pauseFeedback=null; $('toast').textContent=message; $('toast').className=error?'error':''; $('toast').hidden=false; clearTimeout(toastTimer); if(!error)toastTimer=setTimeout(()=>$('toast').hidden=true,6500);else{const close=el('button','×','toast-close');close.type='button';close.setAttribute('aria-label',t('关闭'));close.addEventListener('click',()=>$('toast').hidden=true);$('toast').append(close);} }
 let serviceCapabilities=null,serviceContractPromise=null;
 function featureForPath(path){
  const route=path.split('?')[0];
@@ -514,6 +517,12 @@ async function refresh(options={}){
    if(!next.sections){if(Object.hasOwn(next,'candidates'))returned.add('candidates');if(['cases','quality','usage','model_usage'].every(key=>Object.hasOwn(next,key)))returned.add('analytics');}
    if(previousProject!==undefined&&previousProject!==next.selected_project){const merged={...(state||{}),...next};if(!returned.has('candidates'))delete merged.candidates;if(!returned.has('analytics'))for(const key of ['cases','quality','usage','model_usage'])delete merged[key];state=merged;}
    else state={...(state||{}),...next};
+   for(const [id,after] of pauseRequests){
+    if(after===null||ticket<=after)continue;
+    const paused=next.projects?.find(project=>project.id===id)?.paused;
+    // SQLite supplies 0/1 in normal snapshots; configuration errors can supply a boolean.
+    if([0,1,false,true].includes(paused))pauseRequests.delete(id);
+   }
    if(returned.has('analytics')){loadedStateSections.analyticsProject=next.selected_project??null;loadedStateSections.analyticsAt=Date.now();}
    if(returned.has('candidates')){loadedStateSections.candidatesProject=next.selected_project??null;loadedStateSections.candidatesAt=Date.now();}
    lastRefreshAt=Date.now();$('connection').textContent=t('已连接');$('version').textContent='Adaptive RSI '+state.version;
@@ -591,7 +600,7 @@ function render(){
  renderNavigation();$('onboarding').hidden=!!project;$('project-workspace').hidden=!project;$('pause-button').hidden=!project;
  $('focus-goal').hidden=!project;
  const configError=project?.configuration_error,configErrorText=typeof configError==='string'?configError:configError?.message||configError?.error||'';
- $('pause-button').disabled=!project||!!(configError&&project.paused);$('pause-button').textContent=t(!project||project.paused?'开始运行':'暂停运行');
+ renderPauseButton(project);
  $('project-config-error').hidden=!configError;$('project-config-error').textContent=configError?t('项目配置异常，已暂停运行。请修复后再启动。')+(configErrorText?' '+configErrorText:'')+' '+t('重置会丢弃项目单独覆盖并改为跟随通用默认；原始配置仅保存在本地审计备份中。修复后仍保持暂停，需要手动启动。'):'';
  if(configError){const repair=el('button',t('重置损坏设置'),'text-button');repair.type='button';repair.disabled=configurationRepairBusy;repair.addEventListener('click',()=>safe(async()=>{
   if(configurationRepairBusy)return;const project=projectId;if(!project||!(await uiConfirm(t('确认重置损坏设置？这会删除当前项目单独覆盖并改为跟随通用默认；原始配置仅保存在本地审计备份中。修复后仍保持暂停，需要你手动启动。'))))return;
@@ -1355,7 +1364,64 @@ $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(
   }
  }finally{$('project-submit').disabled=false;}
 },event.target);});
-$('pause-button').addEventListener('click',()=>safe(async()=>{const project=currentProject();await api('pause',{project:project.id,paused:!project.paused});await refresh();toast(project.paused?t('项目已启用'):t('已暂停，正在中断当前工作'));}));
+function clearPauseFeedback(){
+ if(!pauseFeedback)return;
+ $('toast').hidden=true;pauseFeedback=null;
+}
+function renderPauseButton(project=currentProject()){
+ if(pauseFeedback&&!pauseFeedback())clearPauseFeedback();
+ const button=$('pause-button'),after=pauseRequests.get(project?.id);
+ button.disabled=!project||after===null||(after===undefined&&!!(project.configuration_error&&project.paused));
+ button.textContent=typeof after==='number'?t('刷新运行状态'):t(!project||project.paused?'开始运行':'暂停运行');
+}
+async function refreshPauseState(after,current){
+ try{
+  // A read already in flight before the receipt cannot confirm the new state.
+  await refresh({force:!!refreshPromise&&refreshSequence<=after});
+ }catch{if(current()&&!sessionExpired)$('connection').textContent=t('连接中断');}
+}
+async function toggleProjectPause(){
+ if(!state||sessionExpired)return;
+ const project=currentProject(),navigation=navigationSequence;
+ if(!project)return;
+ const {id}=project,paused=!project.paused,after=pauseRequests.get(id);
+ const current=()=>projectId===id&&navigationSequence===navigation;
+ const feedback=(message,error=false)=>{
+  if(!current()||sessionExpired)return;
+  toast(message,error);pauseFeedback=current;
+ };
+ if(typeof after==='number'){
+  const previousFeedback=pauseFeedback;
+  await refreshPauseState(after,current);
+  if(current()&&!pauseRequests.has(id)&&pauseFeedback===previousFeedback)clearPauseFeedback();
+  return;
+ }
+ if(after===null||project.configuration_error&&project.paused)return;
+ clearPauseFeedback();pauseRequests.set(id,null);renderPauseButton();
+ let receipt;
+ try{
+  // An update rejection requires a new click. Never replay an old project's intent.
+  receipt=await sendApi('pause',{project:id,paused});
+ }catch(error){
+  const updating=error.status===503&&error.code==='update_in_progress';
+  if(updating||[400,401,403].includes(error.status)){
+   pauseRequests.delete(id);renderPauseButton();
+   feedback(updating?t('服务正在更新，请稍后重试。'):error.message,true);return;
+  }
+ }
+ const saved=receipt?.saved===true,refreshAfter=refreshSequence;
+ pauseRequests.set(id,refreshAfter);renderPauseButton();
+ if(!saved){feedback(t('运行状态变更结果未确认，请先刷新运行状态。'),true);return;}
+ if(projectId!==id)return;
+ const message=paused?t('调度暂停请求已保存。'):t('项目已启用');
+ feedback(message);
+ await refreshPauseState(refreshAfter,current);
+ if(pauseRequests.get(id)===refreshAfter&&pauseFeedback===current)feedback(message+' '+t('运行状态暂未刷新。'));
+}
+$('pause-button').addEventListener('click',event=>{
+ if(event.detail>1)return;
+ safe(toggleProjectPause);
+});
 document.querySelector('#view-overview')?.addEventListener('click',event=>{if(event.target.id!=='archive-project')return;safe(async()=>{const project=currentProject();if(!project)return;
  if(!(await uiConfirm(t('归档会停止调度并隐藏此项目，但保留任务、运行记录和审计历史。确认归档？'))))return;
  await api('project/archive',{project:project.id,confirmation:'archive-project'});
