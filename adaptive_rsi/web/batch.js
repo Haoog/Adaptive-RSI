@@ -1,7 +1,20 @@
 'use strict';
 window.RSIBatch=(()=>{
- const selected=new Map(),pending=new Set(),boxes=new Map();
- let historyBox=null,visible=[],anchor=-1,pageKey='';
+ const selected=new Map(),pending=new Set(),boxes=new Map(),recommendationSelections=new Map();
+ let historyBox=null,recommendationDialog=null,visible=[],anchor=-1,pageKey='';
+ function batchView(project){
+  const machine=window.__RSI_MACHINE_KEY__||'',navigation=navigationSequence;
+  return {machine,current:()=>project===projectId&&machine===(window.__RSI_MACHINE_KEY__||'')&&navigation===navigationSequence};
+ }
+ function viewChanged(){
+  if(recommendationDialog&&!recommendationDialog.current())recommendationDialog.controller.abort();
+ }
+ async function confirmRecommendation(message,current){
+  const dialog={current,controller:new AbortController()};
+  recommendationDialog=dialog;
+  try{return await uiConfirm(message,undefined,{signal:dialog.controller.signal});}
+  finally{if(recommendationDialog===dialog)recommendationDialog=null;}
+ }
  const actionLabels={group:'合并任务',ungroup:'拆分任务',split_retry:'拆分失败任务组并重做',retry:'重试',cancel:'取消任务',approve:'批准交付'};
  const stateLabels={accepted:'已受理',unknown:'结果待核对',executing:'正在处理',grouped:'已合并',restored:'已恢复',failed:'操作失败',skipped:'已跳过'};
  async function history(){
@@ -51,6 +64,11 @@ window.RSIBatch=(()=>{
   else window.RSIDraftStore?.remove('batch',project,machine);
  }
  function ids(){if(!selected.has(projectId))selected.set(projectId,new Set());return selected.get(projectId);}
+ function deselect(id){
+  // 取消后重新勾选属于新选择，旧推荐回执不能清掉它。
+  ids().delete(id);
+  recommendationSelections.get(projectId)?.delete(id);
+ }
 // 选择只保留当前页仍可见的任务：筛选或翻页后不会再用用户看不见的 id 发起批量操作。
 function syncPage(tasks){
  if(!Array.isArray(tasks))return;
@@ -58,7 +76,7 @@ function syncPage(tasks){
  if(key!==pageKey){pageKey=key;anchor=-1;}
  visible=idsOnPage;
  const current=ids();
- for(const id of current)if(!visible.includes(id))current.delete(id);
+ for(const id of current)if(!visible.includes(id))deselect(id);
  for(const id of [...boxes.keys()])if(!visible.includes(id))boxes.delete(id);
 }
 function paint(){for(const [id,box] of boxes)box.checked=ids().has(id);}
@@ -68,30 +86,45 @@ function paint(){for(const [id,box] of boxes)box.checked=ids().has(id);}
  }
  async function recommendations(){
   const project=projectId,tasks=Array.from(ids()).sort();if(!project||!tasks.length||pending.has(project))return;
+  const {machine,current}=batchView(project),requestOptions={current},originalSelection=new Set(tasks);
+  recommendationSelections.set(project,originalSelection);
+  const clearCompleted=cluster=>{
+   for(const id of cluster.tasks)if(originalSelection.has(id))deselect(id);
+  };
   pending.add(project);toolbar();
   try{
-   const report=await api('tasks/batch',{project,tasks,action:'recommend',preview:true});
+   const report=await api('tasks/batch',{project,tasks,action:'recommend',preview:true},requestOptions);
+   if(!current())return;
    if(!report.recommendations.length){toast(t('没有可推荐的任务簇，请核对范围与验证证据。'));return;}
    for(const cluster of report.recommendations){
     const titles=cluster.tasks.map(id=>report.tasks.find(task=>task.id===id)?.title||id).join('\n');
-    if(!(await uiConfirm(t('确认合并此推荐任务簇？')+'\n'+titles+'\n'+costText(cluster.verification_cost))))continue;
-    // Reuse the same receipt identity as ordinary batch operations so a lost
-    // response can be reconciled instead of creating a second request.
-    const saved=findReceipt(project,'group',cluster.tasks);
+    const confirmed=await confirmRecommendation(t('确认合并此推荐任务簇？')+'\n'+titles+'\n'+costText(cluster.verification_cost),current);
+    if(!current())return;
+    if(!confirmed)continue;
+    const saved=findReceipt(project,'group',cluster.tasks,machine);
     let prior=null;
     if(saved){
-     try{prior=(await api('tasks/batch?project='+encodeURIComponent(project)+'&id='+encodeURIComponent(saved.id))).receipt;}
+     // 查询失败时沿用已经确认的请求编号，由服务端按回执核对。
+     try{prior=(await api('tasks/batch?project='+encodeURIComponent(project)+'&id='+encodeURIComponent(saved.id),undefined,requestOptions)).receipt;}
      catch{prior=null;}
     }
-    if(prior?.complete){forgetReceipt(project,saved.id);for(const id of cluster.tasks)selected.get(project)?.delete(id);continue;}
+    if(prior?.complete)forgetReceipt(project,saved.id,machine);
+    if(!current())return;
+    if(prior?.complete){clearCompleted(cluster);continue;}
     const request_id=saved?.id||crypto.randomUUID();
-    rememberReceipt(project,{id:request_id,tasks:cluster.tasks,action:'group'});
-    const result=await api('tasks/batch',{project,tasks:cluster.tasks,action:'group',request_id,revision:cluster.revision,preview:false});
-    if(result.complete){forgetReceipt(project,request_id);for(const id of cluster.tasks)selected.get(project)?.delete(id);}
+    rememberReceipt(project,{id:request_id,tasks:cluster.tasks,action:'group'},machine);
+    const result=await api('tasks/batch',{project,tasks:cluster.tasks,action:'group',request_id,revision:cluster.revision,preview:false},requestOptions);
+    if(result.complete)forgetReceipt(project,request_id,machine);
+    if(!current())return;
+    if(result.complete)clearCompleted(cluster);
     else toast(t('部分结果待核对，请打开批次记录。'));
    }
    await refresh({force:true});
-  }finally{pending.delete(project);toolbar();}
+  }catch(error){if(current())throw error;}
+  finally{
+   recommendationSelections.delete(project);pending.delete(project);
+   if(project===projectId)toolbar();
+  }
  }
  async function evidence(task){
   const project=projectId,navigation=navigationSequence,data=await api('task?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));
@@ -149,10 +182,10 @@ function paint(){for(const [id,box] of boxes)box.checked=ids().has(id);}
    const index=visible.indexOf(task.id);
    if(event.shiftKey&&anchor>=0&&index>=0&&anchor!==index){
     const [from,to]=anchor<index?[anchor,index]:[index,anchor];
-    for(let position=from;position<=to;position++){if(box.checked)ids().add(visible[position]);else ids().delete(visible[position]);}
+    for(let position=from;position<=to;position++){if(box.checked)ids().add(visible[position]);else deselect(visible[position]);}
     toolbar();return;
    }
-   if(box.checked)ids().add(task.id);else ids().delete(task.id);
+   if(box.checked)ids().add(task.id);else deselect(task.id);
    if(index>=0)anchor=index;
    toolbar();
   });
@@ -161,8 +194,7 @@ function paint(){for(const [id,box] of boxes)box.checked=ids().has(id);}
  }
  async function perform(kind){
   const project=projectId,tasks=Array.from(ids()).sort();if(!project||!tasks.length||pending.has(project))return;
-  const machine=window.__RSI_MACHINE_KEY__||'',navigation=navigationSequence;
-  const current=()=>project===projectId&&machine===(window.__RSI_MACHINE_KEY__||'')&&navigation===navigationSequence;
+  const {machine,current}=batchView(project);
   pending.add(project);toolbar();
   try{
    const saved=findReceipt(project,kind,tasks,machine);
@@ -203,5 +235,5 @@ function paint(){for(const [id,box] of boxes)box.checked=ids().has(id);}
   finally{pending.delete(project);if(project===projectId)toolbar();}
  }
  toolbar();
- return {row,toolbar,costText,evidence};
+ return {row,toolbar,costText,evidence,viewChanged};
 })();

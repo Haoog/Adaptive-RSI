@@ -15,18 +15,18 @@ function element(tag,text,cls){
   setAttribute(){},remove(){},focus(){},showModal(){node.open=true;},close(){node.open=false;node.onclose?.();},
   addEventListener(type,fn){(node.listeners[type]??=[]).push(fn);},
   dispatch(type,extra){let result;for(const fn of node.listeners[type]||[])result=fn({type,target:node,...extra});return result;},
-  click(){if(!node.disabled)return node.dispatch('click');}};
+  click(){if(!node.disabled)return node.onclick?.()??node.dispatch('click');}};
  return node;
 }
 // Drives the real toolbar entry point so the regression covers the user path, not a private helper.
-function harness(api,{confirm=true,clickConfirm=false}={}){
+function harness(api,{confirm=true,clickConfirm=false,capabilities}={}){
  const drafts=new Map(),calls=[],toasts=[],confirms=[],refreshes=[],rows={};
  let panel=null,dialog=null,requestNumber=0;
  const host=element('div');host.after=node=>{panel=node;};
- const context={window:{},Map,Set,JSON,crypto:{randomUUID:()=>++requestNumber===1?'request-new':'request-new-'+requestNumber},console,projectId:'project',navigationSequence:0,t:value=>value,
+ const context={window:{},Map,Set,JSON,AbortController,DOMException,crypto:{randomUUID:()=>++requestNumber===1?'request-new':'request-new-'+requestNumber},console,projectId:'project',navigationSequence:0,t:value=>value,
   statusNames:{queued:'排队'},reviewNames:{},el:element,
   toast:(message,error=false)=>toasts.push({message,error}),
-  uiConfirm:async message=>{confirms.push(message);return clickConfirm?confirmDialog(message):confirm;},
+  uiConfirm:async (message,...options)=>{confirms.push(message);return clickConfirm?confirmDialog(message,...options):confirm;},
   refresh:async options=>{refreshes.push(options);},
   safe:async fn=>{try{await fn();}catch(error){context.toast(error.message,true);}},
   api:async(path,body)=>{calls.push({path,body});return api(path,body);},
@@ -34,6 +34,17 @@ function harness(api,{confirm=true,clickConfirm=false}={}){
  const app=fs.readFileSync('adaptive_rsi/web/app.js','utf8');
  vm.createContext(context);
  const confirmDialog=vm.runInContext('('+app.slice(app.indexOf('function uiConfirm('),app.indexOf('function elapsedCopy('))+')',context);
+ if(capabilities){
+  Object.assign(context,{structuredClone,setTimeout,clearTimeout,state:{csrf:'test'},featureForPath:()=> 'task-batch',
+   configReasonLabels:{},apiErrors:{},negotiateCapabilities:capabilities,
+   fetch:async(url,options)=>{
+    const path=url.slice('/api/'.length),body=options.body===undefined?undefined:JSON.parse(options.body);
+    calls.push({path,body});
+    const data=await api(path,body),status=data.error_code?409:200;
+    return {ok:status===200,status,json:async()=>data};
+   }});
+  vm.runInContext(app.slice(app.indexOf('async function sendApi('),app.indexOf('const goalSubmissionLimit=')),context);
+ }
  if(clickConfirm){
   context.structuredClone=structuredClone;
   context.sessionStorage={getItem:key=>drafts.get(key)??null,setItem:(key,value)=>drafts.set(key,value)};
@@ -48,10 +59,13 @@ function harness(api,{confirm=true,clickConfirm=false}={}){
  // Mirror a real checkbox click: the browser toggles checked before dispatching click.
  const check=(id,shiftKey=false)=>{const box=rows[id];box.checked=!box.checked;box.dispatch('click',{shiftKey});};
  return {calls,toasts,confirms,refreshes,drafts,store:context.window.RSIDraftStore,rows,panel,dialog:()=>dialog,
-  project(value){context.projectId=value;context.navigationSequence++;},
-  machine(value){context.window.__RSI_MACHINE_KEY__=value;},
-  navigate(){context.navigationSequence++;},
+  project(value){context.projectId=value;context.navigationSequence++;context.window.RSIBatch.viewChanged?.();},
+  machine(value){context.window.__RSI_MACHINE_KEY__=value;context.window.RSIBatch.viewChanged?.();},
+  navigate(){context.navigationSequence++;context.window.RSIBatch.viewChanged?.();},
   confirm(){dialog.children.at(-1).children[1].click();},
+  decline(){dialog.children.at(-1).children[0].click();},
+  recommend:()=>panel.children.find(node=>node.textContent==='推荐任务簇').click(),
+  notify:message=>context.toast(message),
   batch:context.window.RSIBatch,button,render,check,count:()=>panel.children[0].textContent,
   buttonByText:text=>panel.children.find(node=>node.textContent===text),click:()=>button().click()};
 }
@@ -264,6 +278,169 @@ for(const stage of ['complete receipt lookup','successful execution','failed exe
   assert.equal(original?.[0]?.id??null,failed?requestId:null);
  });
 }
+
+const recommendedClusters=[['t1','t2'],['t3','t4']];
+const recommendation={...previewFor(recommendedClusters.flat()),recommendations:recommendedClusters.map((tasks,index)=>({tasks,revision:'cluster-'+index}))};
+const groupDraft={signature:'["group",["t1","t2"]]',id:'group-1',tasks:recommendedClusters[0],action:'group'};
+const nextTurn=()=>new Promise(setImmediate);
+function selectRecommendations(fixture){
+ fixture.render(recommendation.tasks.map(task=>task.id));
+ fixture.buttonByText('全选当前页').click();
+}
+async function confirmRecommendations(fixture,pending){
+ await nextTurn();
+ while(fixture.dialog()?.open){fixture.confirm();await nextTurn();}
+ await pending;
+}
+function recommendationCounts(fixture){
+ return {previews:fixture.calls.filter(({body})=>body?.action==='recommend').length,
+  lookups:fixture.calls.filter(({body})=>!body).length,confirmations:fixture.confirms.length,
+  posts:executionCount(fixture),refreshes:fixture.refreshes.length};
+}
+
+for(const [stage,switchView] of [
+ ['preview after project switch',fixture=>fixture.project('other')],
+ ['empty preview after navigation round trip',fixture=>{fixture.navigate();fixture.navigate();}],
+ ['failed preview after runtime switch',fixture=>fixture.machine('other')],
+ ['open confirmation after project round trip',fixture=>{fixture.project('other');fixture.project('project');}],
+ ['open confirmation after runtime switch',fixture=>fixture.machine('other')],
+]){
+ test(`recommendation ownership ignores ${stage}`,async()=>{
+  const reply=deferred(),confirming=stage.startsWith('open');
+  const fixture=harness((_path,body)=>body.preview?(confirming?recommendation:reply.promise):completedBatch,{clickConfirm:true});
+  selectRecommendations(fixture);
+  const pending=fixture.recommend();
+  if(confirming){await nextTurn();assert.equal(fixture.dialog()?.open,true);}
+  switchView(fixture);
+  const dialogLeftOpen=fixture.dialog()?.open===true;
+  fixture.notify('新视图提示');
+  if(stage.startsWith('failed'))reply.reject(new TypeError('旧预览连接失败'));
+  else reply.resolve(stage.startsWith('empty')?{recommendations:[]}:recommendation);
+  await confirmRecommendations(fixture,pending);
+  assert.deepEqual({...recommendationCounts(fixture),dialogLeftOpen,notice:fixture.toasts.at(-1)?.message},
+   {previews:1,lookups:0,confirmations:confirming?1:0,posts:0,refreshes:0,dialogLeftOpen:false,notice:'新视图提示'});
+ });
+}
+
+for(const [stage,outcome] of [['lookup','complete'],['lookup','failed'],['execution','complete'],['execution','partial'],['execution','failed']]){
+ test(`recommendation ownership isolates ${outcome} ${stage} in the original runtime`,async()=>{
+  const lookup=stage==='lookup',reply=deferred(),started=deferred();
+  const fixture=harness((_path,body)=>{
+   if(body?.preview)return recommendation;
+   if(!body||(!lookup&&body.tasks[0]==='t1')){started.resolve();return reply.promise;}
+   return completedBatch;
+  },{clickConfirm:true});
+  fixture.machine('original');
+  if(lookup)fixture.store.set('batch','project',groupDraft);
+  selectRecommendations(fixture);
+  const pending=fixture.recommend();
+  await nextTurn();fixture.confirm();await started.promise;
+  const requestId=lookup?groupDraft.id:fixture.calls.at(-1).body.request_id;
+  fixture.machine('other');
+  const currentDraft={...groupDraft,id:requestId};
+  fixture.store.set('batch','project',currentDraft);
+  fixture.notify('新运行环境提示');
+  if(outcome==='failed')reply.reject(new TypeError('原运行环境应答失败'));
+  else if(lookup)reply.resolve({receipt:completedBatch});
+  else reply.resolve(outcome==='complete'?completedBatch:{complete:false,receipts:[]});
+  await confirmRecommendations(fixture,pending);
+  const current=fixture.store.get('batch','project');
+  fixture.machine('original');
+  const saved=fixture.store.get('batch','project');
+  assert.deepEqual({...recommendationCounts(fixture),current,originalId:saved?.[0]?.id??saved?.id??null,
+   selection:fixture.count(),notice:fixture.toasts.at(-1)?.message},
+   {previews:1,lookups:lookup?1:0,confirmations:1,posts:lookup?0:1,refreshes:0,current:currentDraft,
+    originalId:outcome==='complete'?null:requestId,selection:'当前页已选 · 4 / 4',notice:'新运行环境提示'});
+ });
+}
+
+test('recommendation ownership blocks a confirmed POST still waiting on capability negotiation',async()=>{
+ const negotiation=deferred(),started=deferred();
+ let checks=0;
+ const fixture=harness((_path,body)=>body.preview?recommendation:completedBatch,{clickConfirm:true,capabilities:()=>{
+  if(++checks!==2)return new Set(['task-batch']);
+  started.resolve();return negotiation.promise;
+ }});
+ selectRecommendations(fixture);
+ const pending=fixture.recommend();
+ await nextTurn();fixture.confirm();await started.promise;
+ fixture.navigate();fixture.navigate();
+ negotiation.resolve(new Set(['task-batch']));
+ await confirmRecommendations(fixture,pending);
+ assert.deepEqual(recommendationCounts(fixture),{previews:1,lookups:0,confirmations:1,posts:0,refreshes:0});
+});
+
+test('recommendation ownership stops the update retry after leaving the view',async()=>{
+ const status=deferred(),pollStarted=deferred();
+ let attempted=false;
+ const fixture=harness((path,body)=>{
+  if(path==='state'){pollStarted.resolve();return status.promise;}
+  if(body.preview)return recommendation;
+  if(!attempted){attempted=true;return {error_code:'update_in_progress'};}
+  return completedBatch;
+ },{clickConfirm:true,capabilities:()=>new Set(['task-batch'])});
+ selectRecommendations(fixture);
+ const pending=fixture.recommend();
+ await nextTurn();fixture.confirm();await pollStarted.promise;
+ fixture.navigate();fixture.navigate();fixture.notify('新视图提示');
+ status.resolve({update:{busy:false}});
+ await confirmRecommendations(fixture,pending);
+ assert.deepEqual({posts:executionCount(fixture),confirmations:fixture.confirms.length,refreshes:fixture.refreshes.length,
+  notice:fixture.toasts.at(-1)?.message},
+  {posts:1,confirmations:1,refreshes:0,notice:'新视图提示'});
+});
+
+test('recommendation ownership preserves a newer checkbox selection during execution',async()=>{
+ const reply=deferred();
+ const fixture=harness((_path,body)=>body.preview?{...recommendation,recommendations:recommendation.recommendations.slice(0,1)}:reply.promise,{clickConfirm:true});
+ fixture.render(['t1','t2','t3']);
+ fixture.check('t1');fixture.check('t2');
+ const pending=fixture.recommend();
+ await nextTurn();fixture.confirm();await nextTurn();
+ fixture.check('t1');fixture.check('t1');fixture.check('t3');
+ reply.resolve(completedBatch);await pending;
+ assert.deepEqual({...recommendationCounts(fixture),selection:['t1','t2','t3'].map(id=>fixture.rows[id].checked)},
+  {previews:1,lookups:0,confirmations:1,posts:1,refreshes:1,selection:[true,false,true]});
+});
+
+test('recommendation ownership skips a declined cluster and reconciles a partial cluster by request ID',async()=>{
+ const fixture=harness((path,body)=>{
+  if(body?.preview)return recommendation;
+  if(!body){assert.match(path,/id=request-new$/);return {receipt:completedBatch};}
+  return {complete:false,receipts:[{id:'t3',state:'grouped'},{id:'t4',state:'unknown'}]};
+ },{clickConfirm:true});
+ selectRecommendations(fixture);
+ let pending=fixture.recommend();await nextTurn();
+ assert.match(fixture.confirms.at(-1),/任务 t1/);
+ fixture.decline();await nextTurn();
+ assert.match(fixture.confirms.at(-1),/任务 t3/);
+ fixture.confirm();await pending;
+ assert.equal(executionCount(fixture),1);
+ const write=fixture.calls.at(-1).body;
+ assert.deepEqual(Array.from(write.tasks),recommendedClusters[1]);
+ assert.equal(write.revision,'cluster-1');
+ assert.equal(fixture.store.get('batch','project')[0].id,write.request_id);
+ assert.match(fixture.toasts.at(-1).message,/部分结果待核对/);
+ assert.equal(fixture.count(),'当前页已选 · 4 / 4');
+ pending=fixture.recommend();await nextTurn();fixture.decline();await nextTurn();fixture.confirm();await pending;
+ assert.deepEqual(recommendationCounts(fixture),{previews:2,lookups:1,confirmations:4,posts:1,refreshes:2});
+ assert.equal(fixture.store.get('batch','project'),null);
+ assert.equal(fixture.count(),'当前页已选 · 2 / 4');
+});
+
+test('recommendation ownership reuses the confirmed request ID when lookup fails',async()=>{
+ const fixture=harness((_path,body)=>{
+  if(!body)throw new TypeError('Receipt unavailable');
+  if(body.preview)return {...recommendation,recommendations:recommendation.recommendations.slice(0,1)};
+  return completedBatch;
+ },{clickConfirm:true});
+ fixture.store.set('batch','project',groupDraft);
+ selectRecommendations(fixture);
+ await confirmRecommendations(fixture,fixture.recommend());
+ assert.deepEqual(recommendationCounts(fixture),{previews:1,lookups:1,confirmations:1,posts:1,refreshes:1});
+ assert.equal(fixture.calls.at(-1).body.request_id,groupDraft.id);
+ assert.equal(fixture.store.get('batch','project'),null);
+});
 
 test('batch history ignores a response after a round trip through another project', async () => {
  let finish;
