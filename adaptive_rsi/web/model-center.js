@@ -614,13 +614,33 @@ window.RSIModelCenter = (() => {
       if(!(await uiConfirm(t('此连接与本机保存的凭据（钥匙串或私有文件）会一并删除且不可恢复；重新添加将生成新连接，启用、收藏、验证与价格记录不会恢复。若仍被角色分工或备用模型引用，服务端会拒绝移除。'))))return;
       await request('remove',{provider:active});await load();await refresh();setStatus(t('连接已移除。'));
     }));
-    $('mc-add-model').addEventListener('click',()=>{$('mc-custom-form').reset();$('mc-custom-error').textContent='';$('mc-custom-dialog').showModal();});
-    $('mc-custom-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
-      const unchanged=unchangedForm(event.target),project=scope,provider=active,button=event.target.querySelector('button[type="submit"]');button.disabled=true;$('mc-custom-error').textContent='';
-      try{const id=$('mc-custom-id').value.trim();await api('model-center/model',{project,provider,model:{id,name:$('mc-custom-name').value.trim(),manual:true}});if(unchanged()&&scope===project)$('mc-custom-dialog').close();if(scope===project)await load();}
-      catch(error){if(unchanged()&&scope===project)$('mc-custom-error').textContent=message(error);else toast(t('先前的提交未成功。当前输入已保留，请回到原来的项目或设置范围检查。'),true);}
-      finally{button.disabled=false;}
-    },event.target);});
+    const customForm=$('mc-custom-form'),customDialog=$('mc-custom-dialog'),customError=$('mc-custom-error');
+    let customSession=null;
+    $('mc-add-model').addEventListener('click',()=>{
+      if(data?.project!==scope||customDialog.open)return;
+      const project=scope,provider=active;
+      customSession={project,provider,ownsFeedback:connectionFeedbackOwner(provider,project)};
+      customForm.reset();customError.textContent='';
+      customForm.querySelector('button[type="submit"]').disabled=false;
+      customDialog.showModal();
+    });
+    customForm.addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
+      const session=customSession,button=customForm.querySelector('button[type="submit"]');
+      if(!customDialog.open||!session?.ownsFeedback()||button.disabled)return;
+      const {project,provider,ownsFeedback}=session,unchanged=unchangedForm(customForm,{projectSensitive:false});
+      const ownsForm=()=>customSession===session&&customDialog.open&&ownsFeedback()&&unchanged();
+      const model={id:$('mc-custom-id').value.trim(),name:$('mc-custom-name').value.trim(),manual:true};
+      button.disabled=true;customError.textContent='';
+      try{await api('model-center/model',{project,provider,model});}
+      catch(error){if(ownsForm())customError.textContent=message(error);return;}
+      finally{if(customSession===session&&customDialog.open)button.disabled=false;}
+      const closeAfterSave=ownsForm();
+      if(closeAfterSave)customDialog.close();
+      if(scope!==project)return;
+      // 即使表单已经关闭或换了连接，同范围仍应读取已保存的目录。
+      try{await load({reportError:false});}
+      catch{if(closeAfterSave&&customSession===session&&ownsFeedback())setStatus(t('模型已保存，但模型列表刷新失败。'),true);}
+    });});
     $('mc-save-routes').addEventListener('click',()=>safe(async()=>{
       const project=scope,key=scopeKey();if(savingRoutes.has(key))return;
       if(resetConflict(key)){setStatus(t(resetConflictCopy),true);return;}

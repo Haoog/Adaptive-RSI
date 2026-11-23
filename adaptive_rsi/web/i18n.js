@@ -1274,6 +1274,7 @@ const english = {
   "模型 ID 最多 256 个字符；自定义显示名称最多 160 个字符，获取模型时保留。": "Model IDs allow up to 256 characters. Custom display names allow up to 160 characters and are kept when fetching models.",
   "移除连接": "Remove connection",
   "模型选择范围已保存。": "Model selection preferences saved.",
+  "模型已保存，但模型列表刷新失败。": "The model was saved, but the model list could not be refreshed.",
   "没有匹配的模型。": "No matching models.",
   "连接后点击「获取模型」，也可以添加自定义模型。": "Connect and fetch models, or add a custom model.",
   "查找有依据的改进": "Find evidenced improvements",

@@ -3640,15 +3640,130 @@ test('Magpie preset fills the local OpenAI-compatible gateway without a credenti
   assert.equal(page.node('mc-input-auth').value,'none');
 });
 
+async function customModelPage(){
+  const page=modelScopePage(new Map(),{connections:true});
+  const form=page.node('mc-custom-form'),dialog=page.node('mc-custom-dialog'),button=page.node('custom-submit');
+  const id=page.node('mc-custom-id'),name=page.node('mc-custom-name'),error=page.node('mc-custom-error');
+  form.querySelector=selector=>selector==='button[type="submit"]'?button:null;
+  form.reset=()=>{id.value='';name.value='';page.listeners.get('reset')({target:form});};
+  dialog.tagName='DIALOG';dialog.querySelector=()=>form;
+  page.click('model-test-view-models');await page.context.lastAction;
+  const provider=label=>page.node('mc-provider-list').children.find(item=>item.attributes['aria-label']===label).handlers.click();
+  provider('Ollama');
+  const api=page.context.api,requests=[],reads=[];
+  let nextRead;
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/model')return new Promise((resolve,reject)=>requests.push({body:structuredClone(body),resolve,reject}));
+    if(path==='model-center'||path.startsWith('model-center?')){
+      reads.push(path);
+      const beforeRead=nextRead;nextRead=null;
+      if(beforeRead)await beforeRead();
+    }
+    return api(path,body,options);
+  };
+  return {...page,dialog,button,id,name,error,requests,reads,provider,
+    open(modelId,displayName=''){page.click('mc-add-model');id.value=modelId;name.value=displayName;page.input(id.id,form.id);},
+    close(){dialog.close();page.listeners.get('close')({target:dialog});},
+    submit(){return page.submit(form.id);},
+    beforeRead(fn){nextRead=fn;}
+  };
+}
+
 for(const length of [160,161,256])for(const name of ['', '短显示名'])test(`custom model form preserves ${length}-character ID with ${name?'explicit':'blank'} name`,async()=>{
-  const page=modelScopePage();await page.show('a');
-  page.node('mc-custom-form').querySelector=()=>page.node('custom-submit');
-  page.node('mc-custom-dialog').showModal();
-  const id='x'.repeat(length);
-  page.node('mc-custom-id').value=id;page.node('mc-custom-name').value=name;
-  await page.submit('mc-custom-form');
-  assert.deepEqual(page.posts[0],{path:'model-center/model',body:{project:'a',provider:'ollama',model:{id,name,manual:true}}});
-  assert.equal(page.node('mc-custom-dialog').open,false);
+  const page=await customModelPage(),id='x'.repeat(length);
+  page.open(id,name);const pending=page.submit();
+  assert.deepEqual(page.requests[0].body,{project:'a',provider:'ollama',model:{id,name,manual:true}});
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,false);
+});
+
+for(const failure of [false,true])test(`custom model form ignores stale ${failure?'failure':'success'} after reopening with the same inputs`,async()=>{
+  const page=await customModelPage();page.open('fixture-model','Fixture');const pending=page.submit();
+  page.close();page.open('fixture-model','Fixture');
+  if(failure)page.requests[0].reject(new Error('Old POST failed'));
+  else page.requests[0].resolve({});
+  await pending;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.id.value,'fixture-model');
+  assert.equal(page.name.value,'Fixture');
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.button.disabled,false);
+  assert.deepEqual(page.reads,failure?[]:['model-center?project=a']);
+});
+
+for(const target of ['same','provider','scope'])test(`custom model form keeps a reopened ${target} submission pending when the previous POST finishes`,async()=>{
+  const page=await customModelPage();page.open('fixture-model');const old=page.submit();page.close();
+  if(target==='provider')page.provider('OpenAI');
+  if(target==='scope'){page.click('model-test-settingsScope-global');await page.context.lastAction;}
+  page.open('fixture-model');
+  assert.equal(page.button.disabled,false,'a reopened form can submit independently');
+  const current=page.submit();page.submit();
+  assert.deepEqual(page.requests.map(request=>request.body),[
+    {project:'a',provider:'ollama',model:{id:'fixture-model',name:'',manual:true}},
+    {project:target==='scope'?null:'a',provider:target==='provider'?'openai':'ollama',model:{id:'fixture-model',name:'',manual:true}}
+  ]);
+  const reads=page.reads.length;
+  page.requests[0].resolve({});await old;
+  assert.deepEqual(page.reads.slice(reads),target==='scope'?[]:['model-center?project=a']);
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.button.disabled,true);
+  page.requests[1].reject(new Error('Current POST failed'));await current;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.error.textContent,'Current POST failed');
+  assert.equal(page.button.disabled,false);
+});
+
+for(const failure of [false,true])test(`custom model form preserves real drafts after ${failure?'a POST failure':'a successful POST'}`,async()=>{
+  const page=await customModelPage();page.edit('high');page.open('fixture-model');const pending=page.submit();
+  page.name.value='New draft';page.input(page.name.id,'mc-custom-form');
+  if(failure)page.requests[0].reject(new Error('Outdated draft error'));
+  else page.requests[0].resolve({});
+  await pending;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.name.value,'New draft');
+  assert.equal(page.draft().planning.effort,'high');
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.button.disabled,false);
+  assert.deepEqual(page.reads,failure?[]:['model-center?project=a']);
+});
+
+test('custom model form stays closed and still refreshes the catalog after a late save',async()=>{
+  const page=await customModelPage();page.open('fixture-model');const pending=page.submit();page.close();
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,false);
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.deepEqual(page.reads,['model-center?project=a']);
+});
+
+test('custom model form reports a saved model separately from a failed catalog read',async()=>{
+  const page=await customModelPage();page.open('fixture-model');const pending=page.submit();
+  page.beforeRead(()=>{throw new Error('Fixture snapshot read failed');});
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,false);
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.node('mc-feedback').textContent,'模型已保存，但模型列表刷新失败。');
+  assert.deepEqual(page.reads,['model-center?project=a']);
+});
+
+test('custom model form ignores a late catalog read failure after reopening',async()=>{
+  const page=await customModelPage();page.open('fixture-model');const saved=page.submit();
+  let rejectRead;
+  page.beforeRead(()=>new Promise((_,reject)=>{rejectRead=reject;}));
+  page.requests[0].resolve({});await waitFor(()=>rejectRead);
+  assert.equal(page.dialog.open,false);
+  page.open('new-fixture-model');const current=page.submit();
+  page.requests[1].reject(new Error('Current POST failed'));await current;
+  rejectRead(new Error('Old snapshot read failed'));await saved;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.id.value,'new-fixture-model');
+  assert.equal(page.error.textContent,'Current POST failed');
+  assert.equal(page.button.disabled,false);
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.equal(page.node('toast').hidden,true);
 });
 
 test('provider form sends full custom IDs without inventing truncated display names',async()=>{
