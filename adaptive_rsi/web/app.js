@@ -724,11 +724,50 @@ function savedViewControls(){
  const input=el('input');input.type='file';input.accept='application/json,.json';input.setAttribute('aria-label',t('导入视图文件'));input.addEventListener('change',()=>safe(async()=>{const file=input.files[0];if(!file)return;if(file.size>4096)throw Error(t('视图文件无效或项目不可用。'));importSavedView(await file.text());input.value='';}));
  box.append(action(t('导出当前视图'),()=>{const url=URL.createObjectURL(new Blob([exportSavedView()],{type:'application/json'})),link=el('a');link.href=url;link.download='rsi-view.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);},'text-button'),input);$('tasks-page').after(box);
 }
+// 列表与详情只登记当前按钮，重绘时仍沿用同一笔未确认请求。
+const taskRetries=new Map(),listTaskRetryButtons=new Map(),detailTaskRetryButtons=new Map();
+function taskRetryKey(task){return JSON.stringify([window.__RSI_MACHINE_KEY__||'',task.project,task.id]);}
+function taskRetryButton(task,buttons,label,body,current,onAccepted,cls){
+ const key=taskRetryKey(task),machine=window.__RSI_MACHINE_KEY__,sameRuntime=()=>window.__RSI_MACHINE_KEY__===machine;
+ const updateButtons=update=>{
+  for(const registered of [listTaskRetryButtons,detailTaskRetryButtons]){
+   const visible=registered.get(key);
+   if(visible)update(visible,registered);
+  }
+ };
+ const button=action(label,async()=>{
+  if(button.disabled||!button.isConnected||buttons.get(key)!==button||!sameRuntime()||!current()||taskRetries.has(key))return;
+  const pending={accepted:false};
+  taskRetries.set(key,pending);
+  updateButtons(visible=>{visible.disabled=true;});
+  try{
+   await api('retry',body);
+   pending.accepted=true;
+  }catch(error){
+   if(sameRuntime()&&current())throw error;
+   return;
+  }finally{
+   taskRetries.delete(key);
+   updateButtons((visible,registered)=>{
+    if(pending.accepted){visible.remove();registered.delete(key);}
+    else visible.disabled=false;
+   });
+  }
+  if(sameRuntime())await onAccepted();
+ },cls);
+ button.disabled=taskRetries.has(key);
+ buttons.set(key,button);
+ return button;
+}
+function listTaskRetryButton(task,label,body){
+ return taskRetryButton(task,listTaskRetryButtons,t(label),body,()=>projectId===task.project,()=>refresh(),'text-button');
+}
 function renderTasks(){
  savedViewControls();
  const list=$('tasks-list'),filter=$('task-filter').value;
  const waitingRetries=scoped(state.tasks).filter(task=>task.state==='queued'&&task.wait_reason!=='working_hours'&&task.available>Date.now()/1000).map(task=>task.id);
- if(!changedList(list,[filter,$('show-system-tasks').checked,taskOffset,state.selected_project,state.pagination,scoped(state.tasks),scoped(state.runs),waitingRetries]))return;
+ if(!changedList(list,[filter,$('show-system-tasks').checked,taskOffset,state.selected_project,state.pagination,scoped(state.tasks),scoped(state.runs),waitingRetries,window.__RSI_MACHINE_KEY__]))return;
+ listTaskRetryButtons.clear();
  const focused=document.activeElement,focusedRow=focused?.closest?.('.task-row'),focusedTask=focusedRow?.dataset.taskId,focusIndex=focusedRow?[...focusedRow.querySelectorAll('button,input,a[href]')].indexOf(focused):-1;
  const oldIndex=focusedRow?[...list.children].indexOf(focusedRow):-1;
  list.replaceChildren();
@@ -756,9 +795,9 @@ function renderTasks(){
   const proof=[];if(latest?.evaluation_decision)proof.push(t('运行检查')+' '+t(statusNames[latest.evaluation_decision]||latest.evaluation_decision));if(latest?.review_decision)proof.push(t('代码评审')+' '+t(statusNames[latest.review_decision]||latest.review_decision));
   for(const [kind,label]of [['release','发布'],['deploy','部署']]){const operation=latest?.automation?.[kind];if(operation)proof.push(t(label)+' '+t(releaseStates[operation.state]||operation.state));}if(proof.length)title.append(el('p',proof.join(' · '),'task-meta'));
 
-  if(['waiting_budget','blocked','failed','interrupted','cancelled','insufficient_evidence','deferred','rejected','expired','obsolete'].includes(task.state))actions.append(action(t('重试'),async()=>{await api('retry',{task:task.id,force:task.source==='system_evolve'});await refresh();},'text-button'));
+  if(['waiting_budget','blocked','failed','interrupted','cancelled','insufficient_evidence','deferred','rejected','expired','obsolete'].includes(task.state))actions.append(listTaskRetryButton(task,'重试',{task:task.id,force:task.source==='system_evolve'}));
   // 仅自动退避（有未来 available）的排队任务可提前重试；普通排队任务没有可用操作。
-  else if(task.state==='queued'&&task.wait_reason!=='working_hours'&&task.available>Date.now()/1000)actions.append(action(t('立即重试'),async()=>{await api('retry',{task:task.id});await refresh();},'text-button'));
+  else if(task.state==='queued'&&task.wait_reason!=='working_hours'&&task.available>Date.now()/1000)actions.append(listTaskRetryButton(task,'立即重试',{task:task.id}));
   actions.append(action(t('查看详情'),()=>showTask(task),'text-button'));
   if(!task.source.startsWith('system_')&&window.RSIBatch)row.append(window.RSIBatch.row(task));
   const metrics=el('div',undefined,'task-metrics');

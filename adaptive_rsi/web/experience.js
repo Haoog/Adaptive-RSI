@@ -19,7 +19,7 @@ window.RSIExperience = (() => {
     liveState = "",
     inboxBusy = false,
     inboxAt = 0;
-  const queueSaves = new Map(), taskRetries = new Map();
+  const queueSaves = new Map();
   let queueEditor, backoffRetry, liveRetryButton;
   let usageButton;
   const queueKey = task => JSON.stringify([task.project, task.id]);
@@ -384,15 +384,15 @@ window.RSIExperience = (() => {
       );
   }
   async function taskControls(task, body, ticket, queueDraft, editor) {
-    const project = projectId, baselineVersion = editor.version;
-    const current = () => projectId === project && ticket === detailSequence && body.isConnected;
+    const project = projectId, baselineVersion = editor.version, retryKey = taskRetryKey(task);
+    const current = () => projectId === project && ticket === detailSequence && body.isConnected && taskRetryKey(task) === retryKey;
     async function refreshTaskDetail() {
       await refresh();
       if (!current()) return;
       const updated = await api("task?id=" + encodeURIComponent(task.id) + "&project=" + encodeURIComponent(task.project));
       if (current()) await showTask(updated);
     }
-    const retryAtRead = taskRetries.get(editor.key);
+    const retryAtRead = taskRetries.get(retryKey);
     const metadata = await api(
       "task?id=" +
         encodeURIComponent(task.id) +
@@ -441,37 +441,17 @@ window.RSIExperience = (() => {
     ].includes(metadata.state);
     // A metadata read started during a write may still describe the old retryable state.
     if ((canRecheck || inBackoff) && !retryAtRead?.accepted) {
-      const retry = action(canRecheck ? t("基于当前输入重新检查") : t("立即重试"), async () => {
-        if (!current() || retry.disabled || taskRetries.has(editor.key)) return;
-        const pending = {button: retry, accepted: false};
-        taskRetries.set(editor.key, pending);
-        retry.disabled = true;
-        try {
-          await api("retry", { task: task.id });
-          pending.accepted = true;
-        } catch (error) {
-          if (current()) throw error;
-          return;
-        } finally {
-          taskRetries.delete(editor.key);
-          if (!pending.accepted) pending.button.disabled = false;
-        }
-        pending.button.remove();
-        if (backoffRetry === pending.button) backoffRetry = null;
-        try {
-          await refreshTaskDetail();
-        } catch {
-          if (!current()) return;
-          toast(t("已安排重试"));
-          liveFailures += 1;
-          liveNotice();
-        }
-      });
-      const pending = taskRetries.get(editor.key);
-      if (pending) {
-        pending.button = retry;
-        retry.disabled = true;
-      }
+      const retry = taskRetryButton(task, detailTaskRetryButtons,
+        canRecheck ? t("基于当前输入重新检查") : t("立即重试"), {task: task.id}, current, async () => {
+          try {
+            await refreshTaskDetail();
+          } catch {
+            if (!current()) return;
+            toast(t("已安排重试"));
+            liveFailures += 1;
+            liveNotice();
+          }
+        });
       if (inBackoff) backoffRetry = retry;
       controls.append(retry);
     }
@@ -821,6 +801,7 @@ window.RSIExperience = (() => {
   }
   function taskOpened(task, queueDraft) {
     const key = queueKey(task);
+    detailTaskRetryButtons.clear();
     if (queueEditor?.key !== key)
       queueEditor = {key, project: task.project, task: task.id, version: 0};
     queueEditor.draft = queueDraft;
@@ -1492,7 +1473,7 @@ window.RSIExperience = (() => {
     if (!window.RSIDesktop && "serviceWorker" in navigator && isSecureContext)
       navigator.serviceWorker.register("/sw.js").catch(() => {});
   });
-  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { queueEditor = null; liveFailures = 0; liveNotice(); clearTimeout(liveTimer); }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时");const inbox=$("attention-inbox");if(inbox)inbox.textContent=t("所有项目待办")+(inbox.textContent.match(/ · \d+$/)?.[0]||''); } };
+  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { detailTaskRetryButtons.clear(); queueEditor = null; liveFailures = 0; liveNotice(); clearTimeout(liveTimer); }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时");const inbox=$("attention-inbox");if(inbox)inbox.textContent=t("所有项目待办")+(inbox.textContent.match(/ · \d+$/)?.[0]||''); } };
 })();
 
 'use strict';

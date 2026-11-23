@@ -2539,6 +2539,102 @@ function taskRetryPage(...tasks) {
   return {page, posts, metadata, click, offline, failDetailRead: value => { failDetailRead = value; }};
 }
 
+for (const direction of ['list → detail', 'detail → list', 'list redraw']) {
+  test(`task retry POST is shared across ${direction}`, async t => {
+    const task = direction === 'list redraw'
+      ? {...fixtureTask('child', 'queued'), available: 1700000100}
+      : {...fixtureTask(), source: 'system_evolve'};
+    const f = taskRetryPage(task), {page} = f;
+    page.context.listTask = task;
+    page.node('task-filter').value = 'all';
+    page.node('show-system-tasks').checked = true;
+    vm.runInContext('state={...state,tasks:[listTask],runs:[]};renderTasks()', page.context);
+    const row = () => page.node('tasks-list').children[0];
+    const listLabel = direction === 'list redraw' ? '立即重试' : '重试';
+    const open = async () => {
+      await f.click(buttonWith(row(), '查看详情'));
+      await page.context.lastAction;
+      return page.node('detail-body').children.find(node => node.className === 'task-controls');
+    };
+    const detailLabel = '基于当前输入重新检查';
+    const firstButton = direction === 'detail → list'
+      ? buttonWith(await open(), detailLabel) : buttonWith(row(), listLabel);
+    const pending = f.click(firstButton);
+    const firstDisabled = firstButton.disabled;
+    let secondButton;
+    if (direction === 'list → detail') {
+      const committed = f.metadata.get(task.id);
+      f.metadata.set(task.id, task); // A detail read can return the last retryable snapshot.
+      secondButton = buttonWith(await open(), detailLabel);
+      f.metadata.set(task.id, committed);
+    } else if (direction === 'detail → list') {
+      page.node('detail-dialog').handlers.cancel({preventDefault() {}});
+      secondButton = buttonWith(row(), listLabel);
+    } else {
+      vm.runInContext('state.tasks=[{...listTask,updated:1}];renderTasks()', page.context);
+      secondButton = buttonWith(row(), listLabel);
+      assert.notEqual(secondButton, firstButton);
+    }
+    const secondDisabled = secondButton.disabled;
+    const duplicate = f.click(secondButton);
+    f.posts.forEach(post => post.finish());
+    await Promise.all([pending, duplicate]);
+    t.diagnostic(JSON.stringify({posts: f.posts.length, statuses: f.posts.map(post => post.status)}));
+    assert.equal(f.posts.length, 1);
+    assert.deepEqual(f.posts[0].body, direction === 'list → detail'
+      ? {task: task.id, force: true} : {task: task.id});
+    assert.equal(firstDisabled, true);
+    assert.equal(secondDisabled, true);
+    assert.equal(secondButton.isConnected, false);
+  });
+}
+
+test('task retry POST rejection re-enables both list and detail controls', async () => {
+  const task = fixtureTask(), f = taskRetryPage(task), {page} = f;
+  page.context.listTask = task;
+  page.node('task-filter').value = 'all';
+  vm.runInContext('state={...state,tasks:[listTask],runs:[]};renderTasks()', page.context);
+  const detail = buttonWith(await openExperienceTask(page, task), '基于当前输入重新检查');
+  const list = buttonWith(page.node('tasks-list'), '重试');
+  const pending = f.click(detail);
+  assert.equal(list.disabled, true);
+  f.metadata.set(task.id, task);
+  f.posts[0].finish(f.offline);
+  await pending;
+  assert.equal(detail.disabled, false);
+  assert.equal(list.disabled, false);
+  page.node('detail-dialog').handlers.cancel({preventDefault() {}});
+  const later = f.click(list);
+  f.posts[1].finish();
+  await later;
+  assert.deepEqual(f.posts.map(post => post.body), [{task: task.id}, {task: task.id, force: false}]);
+});
+
+test('task retry POST keeps separate pending buttons for the same task in distinct runtime scopes', async () => {
+  const task = fixtureTask(), f = taskRetryPage(task), {page} = f;
+  page.context.listTask = task;
+  page.node('task-filter').value = 'all';
+  page.context.window.__RSI_MACHINE_KEY__ = 'local';
+  vm.runInContext('state={...state,tasks:[listTask],runs:[]};renderTasks()', page.context);
+  const local = f.click(buttonWith(page.node('tasks-list'), '重试'));
+  // Desktop reloads on a runtime switch. Exercise the scope keys directly in one VM.
+  page.context.window.__RSI_MACHINE_KEY__ = 'remote';
+  vm.runInContext('renderTasks()', page.context);
+  const remoteButton = buttonWith(page.node('tasks-list'), '重试');
+  assert.equal(remoteButton.disabled, false);
+  f.metadata.set(task.id, task);
+  const remote = f.click(remoteButton);
+  assert.equal(f.posts.length, 2);
+  page.context.toast('当前运行机器反馈');
+  f.posts[0].finish(f.offline);
+  await local;
+  assert.equal(remoteButton.disabled, true);
+  assert.equal(page.node('toast').textContent, '当前运行机器反馈');
+  f.posts[1].finish();
+  await remote;
+  assert.equal(remoteButton.isConnected, false);
+});
+
 for (const [state, label, navigation] of [
   ['failed', '基于当前输入重新检查', 'task'],
   ['queued', '立即重试', 'project'],
