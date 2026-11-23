@@ -123,6 +123,7 @@ class DataHardeningTest(unittest.TestCase):
         self.assertNotIn("candidates", core)
         self.assertNotIn("quality", core)
         self.assertEqual(core["sections"], ["core"])
+        self.assertEqual(core["instance"], self.runtime.store.setting("instance-id"))
         self.assertLess(measurements[1]["bytes"], measurements[0]["bytes"])
         self.assertLess(measurements[1]["select_queries"], measurements[0]["select_queries"])
         print("/api/state SQLite evidence: " + json.dumps({"legacy": measurements[0], "core": measurements[1]}))

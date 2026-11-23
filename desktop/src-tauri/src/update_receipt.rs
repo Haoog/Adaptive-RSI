@@ -1,4 +1,6 @@
 use super::*;
+use native_update::open_bounded_file;
+#[cfg(unix)]
 use native_update::{same_identity, single_link};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -70,6 +72,15 @@ fn valid_receipt(value: &Value) -> bool {
         && value["artifact_sha256"].as_str().is_some_and(hex_digest)
         && value["signature_sha256"].as_str().is_some_and(hex_digest)
         && value["signature_verified"].as_bool().is_some()
+        && (value["state"] != "succeeded" || value["signature_verified"] == true)
+        && bounded(value["artifact_url"].as_str(), 8192)
+        && value["artifact_url"].as_str().and_then(|url| reqwest::Url::parse(url).ok())
+            .is_some_and(|url| url.scheme() == "https" && url.host_str().is_some()
+                && url.username().is_empty() && url.password().is_none())
+        && value["authorization_revision"].as_u64().is_some_and(|revision| revision > 0)
+        && matches!(value["install_window"].as_str(), Some("any" | "night" | "weekend"))
+        && bounded(value["platform"].as_str(), 32)
+        && bounded(value["arch"].as_str(), 32)
         && value["created_at"].is_u64()
         && value["updated_at"].is_u64()
         && value.get("error_code").is_some()
@@ -79,17 +90,11 @@ fn valid_receipt(value: &Value) -> bool {
 pub(super) fn read_receipt(path: &Path) -> Result<Value, String> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(_) => return Err("update_receipt_missing".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err("update_receipt_missing".into()),
+        Err(_) => return Err("update_receipt_invalid".into()),
     };
-    // A planted symlink or hard link is not evidence of a real transaction.
-    if !metadata.is_file() || !single_link(&metadata) || metadata.len() == 0 || metadata.len() > MAX_RECEIPT {
-        return Err("update_receipt_invalid".into());
-    }
-    let file = File::open(path).map_err(|_| "update_receipt_invalid")?;
-    let opened = file.metadata().map_err(|_| "update_receipt_invalid")?;
-    if !same_identity(&opened, &metadata) || opened.len() > MAX_RECEIPT {
-        return Err("update_receipt_invalid".into());
-    }
+    if !metadata.is_file() { return Err("update_receipt_invalid".into()); }
+    let (file, _) = open_bounded_file(path, MAX_RECEIPT).map_err(|_| "update_receipt_invalid")?;
     let mut text = String::new();
     file.take(MAX_RECEIPT + 1).read_to_string(&mut text)
         .map_err(|_| "update_receipt_invalid")?;
@@ -201,8 +206,27 @@ pub(super) fn begin_pending(path: &Path, transaction: &Transaction) -> Result<Va
         "created_at": now,
         "updated_at": now,
     });
+    if !valid_receipt(&record) { return Err("update_receipt_invalid".into()); }
+    if let Ok(previous) = read_receipt(path) {
+        if previous["state"] != "pending" { archive_terminal(path, &previous)?; }
+    }
     write_receipt(path, &record)?;
     Ok(record)
+}
+
+fn archive_terminal(path: &Path, record: &Value) -> Result<(), String> {
+    let id = record["operation_id"].as_str().ok_or("update_receipt_invalid")?;
+    let archive = path.with_file_name(format!("update-receipt-{id}.json"));
+    let directory = archive.parent().ok_or("update_receipt_unavailable")?;
+    let mut temp = tempfile::NamedTempFile::new_in(directory).map_err(|_| "update_receipt_unavailable")?;
+    serde_json::to_writer_pretty(&mut temp, record).map_err(|_| "update_receipt_unavailable")?;
+    temp.as_file().sync_all().map_err(|_| "update_receipt_unavailable")?;
+    match temp.persist_noclobber(&archive) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists
+            && read_receipt(&archive).is_ok_and(|saved| saved == *record) => Ok(()),
+        Err(_) => Err("update_receipt_unavailable".into()),
+    }
 }
 
 /// A pending record can only move forward once; a finished transaction stays as
@@ -229,7 +253,7 @@ pub(super) fn transition(path: &Path, state: &str, error_code: Option<&str>,
     }
     if state == "succeeded" {
         let current = current_version.unwrap_or_default();
-        if record["to_version"].as_str() != Some(current) {
+        if record["signature_verified"] != true || record["to_version"].as_str() != Some(current) {
             return Err("update_receipt_state".into());
         }
         record["error_code"] = Value::Null;

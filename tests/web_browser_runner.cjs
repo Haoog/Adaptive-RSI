@@ -4,10 +4,11 @@ const test = require('node:test');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const {EventEmitter} = require('node:events');
+const {fixtureReady, stopFixture} = require('./fixture_browser.cjs');
 
-function run(args, files) {
+function run(args, files, env = {}, started = []) {
   const signals = [];
-  const started = [], output = [], errors = [], timers = [], kills = [];
+  const output = [], errors = [], timers = [], kills = [];
   const context = {
     __dirname: require('node:path').resolve('scripts'),
     require(name) {
@@ -22,7 +23,7 @@ function run(args, files) {
       }};
       return require(name);
     },
-    process: {argv: ['node', 'test_browser.cjs', ...args], env: {}, execPath: process.execPath,
+    process: {argv: ['node', 'test_browser.cjs', ...args], env, execPath: process.execPath,
       on(signal, handler) {signals.push({signal, handler});},
       kill(pid, signal) {
         const child = started.find(item => item.child && -item.child.pid === pid);
@@ -66,10 +67,52 @@ test('browser selectors select individual hardening groups and reject mistakes',
   const selected = run(['browser_hardening.cjs:routes'], files);
   assert.equal(selected.started.length, 1);
   assert.equal(selected.started[0].options.env.RSI_BROWSER_HARDENING_GROUP, 'routes');
-  assert.equal(run(['--list', 'browser_hardening.cjs'], files).output.length, 6);
-  assert.throws(() => run(['missing.cjs'], files), /Unknown browser selector/);
-  assert.throws(() => run(['browser_smoke.cjs', 'browser_smoke.cjs'], files), /must be unique/);
-  assert.throws(() => run([], []), /No browser scenarios/);
+  const allGroups = run(['--list', 'browser_hardening.cjs'], files).output;
+  assert.equal(allGroups.length, 7);
+  const overlapping = ['browser_hardening.cjs', 'browser_hardening.cjs:routes'];
+  assert.deepEqual(run(['--list', ...overlapping], files).output, allGroups);
+  const result = run(overlapping, files);
+  for (const {child} of result.started) {
+    child.groupAlive = false;
+    child.close(0);
+  }
+  assert.deepEqual(result.started.map(({options}) => 'browser_hardening.cjs:' + options.env.RSI_BROWSER_HARDENING_GROUP), allGroups);
+  const started = [];
+  assert.throws(() => run(['missing.cjs'], files, {}, started), /Unknown browser selector/);
+  assert.throws(() => run(['browser_smoke.cjs', 'browser_smoke.cjs'], files, {}, started), /must be unique/);
+  assert.throws(() => run([], [], {}, started), /No browser scenarios/);
+  assert.deepEqual(started, []);
+});
+
+test('serial uses the full browser catalog and dispatches just one worker', () => {
+  const files = ['browser_experience.cjs', 'browser_hardening.cjs', 'browser_smoke.cjs'];
+  const parallel = run(['--list'], files);
+  const serial = run(['--serial', '--list'], files);
+  assert.deepEqual(serial.output, parallel.output);
+  assert.ok(serial.output.includes('browser_experience.cjs:queue'));
+  assert.ok(serial.output.includes('browser_hardening.cjs:obsolete'));
+  assert.deepEqual(serial.started, []);
+  const result = run(['--serial'], files, {RSI_BROWSER_WORKERS: '4', RSI_BROWSER_QUEUE_ONLY: '1'});
+  assert.equal(result.started.length, 1);
+  assert.equal(result.started[0].options.env.RSI_BROWSER_QUEUE_ONLY, '');
+  result.started[0].child.groupAlive = false;
+  result.started[0].child.close(0);
+  assert.equal(result.started.length, 2);
+  assert.equal(result.started[1].options.env.RSI_BROWSER_QUEUE_ONLY, '1');
+});
+
+test('browser workers throttle dispatch and invalid values spawn nothing', () => {
+  const files = ['browser_a.cjs', 'browser_b.cjs', 'browser_c.cjs', 'browser_d.cjs'];
+  const result = run([], files, {RSI_BROWSER_WORKERS: '3'});
+  assert.equal(result.started.length, 3);
+  result.started[1].child.groupAlive = false;
+  result.started[1].child.close(0);
+  assert.equal(result.started.length, 4);
+  const started = [];
+  for (const value of ['0', '5', '-1', '1.5', 'NaN']) {
+    assert.throws(() => run([], files, {RSI_BROWSER_WORKERS: value}, started), /must be 1\.\.4/);
+  }
+  assert.deepEqual(started, []);
 });
 
 test('per-scenario timeout escalates to SIGKILL and finalizes only after close', () => {
@@ -155,6 +198,33 @@ test('SIGINT stops dispatching and finalizes only after the group escalations se
   assert.equal(result.exitCode(), 1, 'an interrupted run must fail');
 });
 
+test('settling a reaped group cancels only its own delayed SIGKILL', () => {
+  const result = run([], ['browser_smoke.cjs', 'browser_task_detail.cjs']);
+  const [first, second] = result.started.map(({child}) => child);
+  result.signals.find(item => item.signal === 'SIGINT').handler();
+  const [firstEscalation, secondEscalation] = result.timers.filter(timer => timer.delay === 1500);
+  const keepAlive = result.timers.find(timer => timer.interval);
+
+  first.groupAlive = false;
+  first.close(null);
+  second.close(null);
+  assert.equal(firstEscalation.cleared, true, 'the reaped group timer must be cancelled');
+  assert.equal(secondEscalation.cleared, false, 'the surviving group still needs escalation');
+  assert.equal(keepAlive.cleared, false);
+  assert.equal(result.isCleanupPending(), true);
+  assert.equal(result.exitCode(), undefined);
+
+  firstEscalation.fire();
+  secondEscalation.fire();
+  assert.deepEqual(result.kills, [
+    {pid: -first.pid, signal: 'SIGTERM'}, {pid: -second.pid, signal: 'SIGTERM'},
+    {pid: -second.pid, signal: 'SIGKILL'},
+  ]);
+  assert.equal(keepAlive.cleared, true);
+  assert.equal(result.isCleanupPending(), false);
+  assert.equal(result.exitCode(), 1);
+});
+
 // close 之后场景超时定时器已 clear，剩下的唯一定时器就是 unref 的升级定时器。
 // 旧实现里主流程此时已写 exitCode、事件循环一空 runner 就退出，unref 定时器没机会触发；
 // 修复后 runner 推迟结算，升级 SIGKILL 真实发出后才落 exitCode。
@@ -176,4 +246,32 @@ test('stub descendant ignoring SIGTERM is killed by the escalated SIGKILL before
     'cleanup path must escalate to a real group SIGKILL');
   assert.equal(result.isCleanupPending(), false);
   assert.equal(result.exitCode(), 0, 'finalization happens only after the kill landed');
+});
+
+test('a fixture exit or spawn error rejects startup immediately', async () => {
+  const server = new EventEmitter(), output = new EventEmitter();
+  const exited = fixtureReady(server, output);
+  server.emit('exit', null, 'SIGTERM');
+  await assert.rejects(exited, /exited before startup: SIGTERM/);
+  assert.equal(output.listenerCount('line'), 0);
+  const failed = fixtureReady(server, output);
+  server.emit('error', new Error('ENOENT'));
+  await assert.rejects(failed, /could not start: ENOENT/);
+  assert.equal(server.listenerCount('exit'), 0);
+});
+
+test('fixture teardown skips exited children and reaps a child that ignores SIGTERM', async () => {
+  const server = Object.assign(new EventEmitter(), {pid: 100, exitCode: 0, signalCode: null});
+  await stopFixture(server);
+  assert.equal(server.listenerCount('exit'), 0);
+  server.exitCode = null;
+  const signals = [];
+  server.stdin = Object.assign(new EventEmitter(), {end() {this.emit('error', {code: 'EPIPE'});}});
+  server.kill = signal => {
+    signals.push(signal);
+    if (signal === 'SIGKILL') server.emit('exit', null, signal);
+  };
+  await stopFixture(server, 10);
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+  assert.equal(server.listenerCount('exit'), 0);
 });

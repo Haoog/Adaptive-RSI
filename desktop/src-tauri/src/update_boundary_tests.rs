@@ -49,7 +49,7 @@ fn space_check_includes_cache_application_and_extraction_volumes() {
     assert_eq!(native_update::require_space(&paths, 100, |_| Err(std::io::Error::other("unavailable"))).unwrap_err(), "update_disk_unavailable");
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 #[test]
 fn extraction_volume_matches_the_updaters_same_device_selection() {
     let folder = tempfile::tempdir().unwrap();
@@ -58,6 +58,58 @@ fn extraction_volume_matches_the_updaters_same_device_selection() {
     std::fs::write(&executable, b"fixture").unwrap();
     assert_eq!(native_update::extraction_root(&executable, folder.path()).unwrap(), folder.path());
     assert_eq!(native_update::extraction_root(&executable, &folder.path().join("missing")).unwrap(), folder.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_update_preflight_checks_tauri_candidates_in_order() {
+    let root = tempfile::tempdir().unwrap();
+    let system = root.path().join("system");
+    let user_cache = root.path().join("user-cache");
+    let app = root.path().join("app");
+    let executable = app.join("Fixture.AppImage");
+    std::fs::create_dir(&app).unwrap();
+    std::fs::create_dir(&user_cache).unwrap();
+    std::fs::write(&executable, b"fixture").unwrap();
+    let candidates = [Some(system.as_path()), Some(user_cache.as_path()), Some(app.as_path())];
+    let mut checked = Vec::new();
+    let mut available = |path: &std::path::Path| {
+        let candidate = path.parent().unwrap();
+        checked.push(candidate.to_path_buf());
+        Ok(if candidate == user_cache { 99 } else { 100 })
+    };
+    // Missing system temp is skipped. AppImage selects user cache and the
+    // installer won't try the next candidate merely because space is low.
+    assert_eq!(native_update::linux_extraction_space(&executable, candidates, false, 100, &mut available),
+        Err("update_disk_space".into()));
+    // deb/rpm can continue to the app directory if the package won't fit.
+    assert!(native_update::linux_extraction_space(&executable, candidates, true, 100, &mut available).is_ok());
+    assert_eq!(checked, [user_cache.as_path(), user_cache.as_path(), app.as_path()]);
+    assert!(native_update::linux_extraction_space(&executable, [Some(&system), None, Some(&app)], false, 100,
+        |path| { assert_eq!(path.parent(), Some(app.as_path())); Ok(100) }).is_ok());
+    assert_eq!(native_update::linux_extraction_space(&executable, [Some(&system), None, None], false, 100,
+        |_| panic!("missing candidate cannot be used")), Err("update_disk_unavailable".into()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_appimage_skips_a_candidate_on_another_device() {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    // /dev/shm is a distinct writable tmpfs on Linux runners that provide it.
+    let other = Path::new("/dev/shm");
+    let app = tempfile::tempdir().unwrap();
+    let executable = app.path().join("Fixture.AppImage");
+    std::fs::write(&executable, b"fixture").unwrap();
+    if !other.metadata().is_ok_and(|metadata| metadata.dev() != executable.metadata().unwrap().dev())
+        || tempfile::tempdir_in(other).is_err()
+    {
+        eprintln!("different writable volume unavailable");
+        return;
+    }
+    assert!(native_update::linux_extraction_space(&executable, [Some(other), None, Some(app.path())], false, 100,
+        |path| { assert_eq!(path.parent(), Some(app.path())); Ok(100) }).is_ok());
 }
 
 #[test]

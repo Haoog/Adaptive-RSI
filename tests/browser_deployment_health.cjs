@@ -1,23 +1,19 @@
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
-const {createInterface} = require('node:readline');
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const {chromium} = require('playwright');
 
 (async () => {
   const server = spawn(process.env.PYTHON || 'python3', ['-m', 'tests.browser_fixture'],
     {stdio: ['pipe', 'pipe', 'pipe'], env: {...process.env, PYTHONDONTWRITEBYTECODE: '1'}});
-  let browser;
+  let browser, scenarioError;
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(Error('Fixture startup timed out')), 30000);
-      createInterface({input: server.stdout}).once('line', line => {clearTimeout(timer); resolve(line);});
-      server.once('exit', code => {clearTimeout(timer); reject(Error('Fixture exited: ' + code));});
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
     const page = await browser.newPage(), errors = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(url);
-    await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+    await waitForPausedProject(page);
     await page.evaluate(async () => {
       await api('config', {project: projectId, values: {github:{repository:'example/project'}, delivery:{mode:'pr',deploy:{enabled:true,workflow:'.github/workflows/deploy.yml',ref:'trusted-v1',sha:'a'.repeat(40),health_url:'https://app.example/health',health_urls:['https://eu.example/health'],health_attempts:4,health_consecutive_successes:2}}}});
       await refresh({force:true});
@@ -51,9 +47,10 @@ const {chromium} = require('playwright');
     assert.equal(await streak.isDisabled(),true);
     assert.deepEqual(errors, []);
     console.log('Deployment health endpoints, consecutive gate, persistence and bilingual controls passed.');
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    server.stdin.end();
-    await new Promise(resolve => {server.once('exit', resolve); setTimeout(()=>{server.kill('SIGKILL');resolve();},5000).unref();});
+    await closeFixture(server, browser, scenarioError);
   }
 })().catch(error => {console.error(error); process.exitCode = 1;});

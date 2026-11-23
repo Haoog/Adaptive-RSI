@@ -4,10 +4,15 @@ const {readdirSync,mkdirSync,writeFileSync}=require('node:fs');
 const path=require('node:path');
 const root=path.resolve(__dirname,'..');
 const files=readdirSync(path.join(root,'tests')).filter(name=>/^browser_.*\.cjs$/.test(name)).sort();
-const concurrency=Number(process.env.RSI_BROWSER_WORKERS||2);
+const args=process.argv.slice(2),listing=args.includes('--list');
+const selectors=args.filter(arg=>arg!=='--list'&&arg!=='--serial');
+const concurrency=args.includes('--serial')?1:Number(process.env.RSI_BROWSER_WORKERS||2);
 if(!Number.isInteger(concurrency)||concurrency<1||concurrency>4)throw Error('RSI_BROWSER_WORKERS must be 1..4');
-const available=files.flatMap(file=>file==='browser_hardening.cjs'?['core','providers','routes','updates','settings','recovery'].map(group=>({file,group,label:file+':'+group})):[{file,label:file}]);
-const args=process.argv.slice(2),listing=args.includes('--list'),selectors=args.filter(arg=>arg!=='--list');
+const available=files.flatMap(file=>{
+ const groups=file==='browser_hardening.cjs'?['core','providers','routes','updates','settings','recovery','obsolete']:[null];
+ if(file==='browser_experience.cjs')groups.push('queue');
+ return groups.map(group=>({file,group,label:group?file+':'+group:file}));
+});
 if(new Set(selectors).size!==selectors.length)throw Error('Browser selectors must be unique');
 for(const selector of selectors)if(!available.some(item=>item.file===selector||item.label===selector))throw Error('Unknown browser selector: '+selector);
 const pending=available.filter(item=>!selectors.length||selectors.includes(item.file)||selectors.includes(item.label)),active=new Set(),timings={};
@@ -24,6 +29,7 @@ function settle(child){
  const entry=upgrades.get(child);
  if(!entry||!entry.closed)return;
  if(!entry.fired&&groupAlive(child.pid))return;
+ clearTimeout(entry.timer);
  upgrades.delete(child);
  if(!upgrades.size&&keepAlive){clearInterval(keepAlive);keepAlive=null;for(const finish of finalizers.splice(0))finish();}
 }
@@ -42,7 +48,10 @@ for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>{stopping=true;fa
 function next(){
  while(!stopping&&active.size<concurrency&&pending.length){
   const {file,group,label}=pending.shift(),began=Date.now();let timedOut=false;
-  const child=spawn(process.execPath,[path.join(root,'tests',file)],{cwd:root,stdio:'inherit',detached:true,env:{...process.env,RSI_BROWSER_HARDENING_GROUP:group||''}});
+  const env={...process.env,RSI_BROWSER_HARDENING_GROUP:'',RSI_BROWSER_QUEUE_ONLY:''};
+  if(file==='browser_hardening.cjs')env.RSI_BROWSER_HARDENING_GROUP=group;
+  if(file==='browser_experience.cjs'&&group==='queue')env.RSI_BROWSER_QUEUE_ONLY='1';
+  const child=spawn(process.execPath,[path.join(root,'tests',file)],{cwd:root,stdio:'inherit',detached:true,env});
   active.add(child);
   const limit=setTimeout(()=>{failed=true;timedOut=true;console.error('[browser] timeout: '+label);terminate(child);},180000);
   child.once('error',error=>{failed=true;console.error('[browser] '+label+': '+error.message);});

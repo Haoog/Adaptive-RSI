@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
-const {createInterface} = require('node:readline');
+const {fixtureReady, closeFixture} = require('./fixture_browser.cjs');
 const {chromium} = require('playwright');
 const fs = require('node:fs');
 
@@ -123,15 +123,11 @@ async function main() {
   const server = spawn(process.env.PYTHON || 'python3', ['-m', 'tests.browser_fixture'], {
     stdio: ['pipe', 'pipe', 'pipe'], env: {...process.env, PYTHONDONTWRITEBYTECODE: '1'}
   });
-  let browser;
+  let browser, scenarioError;
   const errors = [];
   server.stderr.on('data', chunk => process.stderr.write(chunk));
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(Error('Console startup timed out')), 30000);
-      createInterface({input: server.stdout}).once('line', line => {clearTimeout(timeout); resolve(line);});
-      server.once('exit', code => {clearTimeout(timeout); reject(Error('Console exited: ' + code));});
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
     const page = await browser.newPage({viewport: {width: 1380, height: 1000}});
     const saveSettings = async () => {
@@ -360,13 +356,11 @@ async function main() {
     assert(state.projects.every(project => project.paused));
     assert.equal(state.usage.length, 0);
     console.log('Browser checks passed: forms, hot settings, pagination, project isolation, languages, mobile, account authorization, release authorization, zero paid calls.');
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    server.stdin.end('\n');
-    const ended = new Promise(resolve => server.once('exit', resolve));
-    const timeout = setTimeout(() => server.kill('SIGTERM'), 5000);
-    if (server.exitCode === null && server.signalCode === null) await ended;
-    clearTimeout(timeout);
+    await closeFixture(server, browser, scenarioError);
   }
 }
 main().catch(error => {console.error(error); process.exitCode = 1;});

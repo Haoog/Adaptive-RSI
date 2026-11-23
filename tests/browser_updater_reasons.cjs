@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
-const { createInterface } = require("node:readline");
+const {fixtureReady, closeFixture} = require('./fixture_browser.cjs');
 const { chromium } = require("playwright");
 
 // 更新器原因文案回归：真实 Chromium + 暂停的临时项目，零模型调用、零 GitHub 调用。
@@ -25,18 +25,14 @@ const cases = [
   const server = spawn(process.env.PYTHON || "python3", ["-m", "tests.browser_fixture"],
     { stdio: ["pipe", "pipe", "pipe"] });
   server.stderr.on("data", (chunk) => process.stderr.write(chunk));
-  const output = createInterface({ input: server.stdout });
-  let browser;
+  let browser, scenarioError;
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(Error("Fixture timed out")), 60000);
-      output.once("line", (line) => { clearTimeout(timer); resolve(line); });
-      server.once("exit", (code) => reject(Error("Fixture exited " + code)));
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(
       process.env.RSI_BROWSER_CHANNEL ? { channel: process.env.RSI_BROWSER_CHANNEL } : {},
     );
     // 真实服务器仍提供认证、项目与状态骨架；只替换 update 字段。
+    const errors = [];
     let payload = null;
     const injectUpdate = async (route) => {
       const response = await route.fetch();
@@ -50,6 +46,7 @@ const cases = [
       if (language === "en") await context.addInitScript(() => localStorage.setItem("rsi-language", "en"));
       await context.route("**/api/state*", injectUpdate);
       const page = await context.newPage();
+      page.on('pageerror', error => errors.push(language + ': ' + (error.stack || error.message)));
       for (const item of cases) {
         payload = { ...item.update, busy: false };
         await page.goto(url, { waitUntil: "load" });
@@ -65,16 +62,13 @@ const cases = [
       }
       await context.close();
     }
+    assert.deepEqual(errors, []);
     console.log("Updater reason browser regressions passed: real Chromium, paused projects, zero model calls.");
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    if (server.exitCode === null && server.signalCode === null) {
-      const ended = new Promise((resolve) => server.once("exit", resolve));
-      server.stdin.end("\n");
-      const timeout = setTimeout(() => server.kill("SIGTERM"), 5000);
-      await ended;
-      clearTimeout(timeout);
-    }
+    await closeFixture(server, browser, scenarioError);
   }
 })().catch((error) => {
   console.error(error);

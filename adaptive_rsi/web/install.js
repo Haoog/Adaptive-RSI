@@ -1,8 +1,9 @@
 "use strict";
-let installPrompt;
+let installPrompt, installMessage;
 const installButton = document.getElementById("install-app"),
   installStatus = document.getElementById("install-status");
 function installCopy() {
+  if (installMessage) installStatus.textContent = t(installMessage);
   document.getElementById("origin-note").textContent =
     location.protocol === "https:"
       ? t("当前安装地址：") + location.origin + "/install"
@@ -29,11 +30,13 @@ installButton.onclick = async () => {
   installButton.hidden = true;
 };
 window.addEventListener("appinstalled", () => {
-  installStatus.textContent = t("已安装，可以从主屏幕打开。");
+  installMessage = "已安装，可以从主屏幕打开。";
+  installCopy();
   installButton.hidden = true;
 });
 if ("serviceWorker" in navigator && window.isSecureContext)
   navigator.serviceWorker.register("/sw.js").catch(() => {
-    installStatus.textContent = t("请使用浏览器菜单添加到主屏幕。");
+    if (!installMessage) installMessage = "请使用浏览器菜单添加到主屏幕。";
+    installCopy();
   });
 installCopy();

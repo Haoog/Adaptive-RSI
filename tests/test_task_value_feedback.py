@@ -190,27 +190,41 @@ class TaskValueFeedbackTest(unittest.TestCase):
     def test_empty_checks_pass_is_downgraded_in_every_read_model(self):
         # 空列表兼容只说明“没有可执行检查”；同一形状上的 pass 没有可验证证据，
         # 读模型必须降级为 insufficient_evidence，不能计成 passed/accepted。
+        from adaptive_rsi.dashboard import records
         from adaptive_rsi.store import decode_evidence
         from adaptive_rsi.telemetry import quality_summary, workflow_metrics
         self.store.execute("UPDATE tasks SET state='merged' WHERE id=?", (self.task,))
-        self.store.execute("UPDATE runs SET state='merged',result=? WHERE id=?", (json.dumps({
-            "summary": "Legacy pass without checks", "files": ["legacy.py"], "reason": "historical",
-            "review": {"decision": "pass"},
-            "evaluation": {"decision": "pass", "checks": []}}), self.record["id"]))
-        raw = self.store.one("SELECT result FROM runs WHERE id=?", (self.record["id"],))["result"]
-        decoded = decode_evidence(raw)
-        self.assertNotIn("evidence_error", decoded)
-        self.assertEqual((decoded["summary"], decoded["files"], decoded["reason"]),
-                         ("Legacy pass without checks", ["legacy.py"], "historical"))
-        self.assertEqual(decoded["evaluation"], {"decision": "insufficient_evidence", "checks": {}})
-        quality = quality_summary(self.store, "p")[0]
-        self.assertEqual((quality["passed"], quality["evaluated"], quality["reviewed"]), (0, 1, 1))
-        metrics = workflow_metrics(self.store, "p")
-        self.assertEqual((metrics["accepted"], metrics["first_pass"]), (0, 0))
-        report = task_feedback.summary(self.store, self.record["id"])
-        self.assertEqual((report["summary"], report["files"], report["checks"]),
-                         ("Legacy pass without checks", ["legacy.py"], {}))
-        self.assertEqual(self.store.one("SELECT result FROM runs WHERE id=?", (self.record["id"],))["result"], raw)
+        empty_groups = {"candidate": [], "acceptance_candidate": []}
+        zero_totals = {"candidate": {"passed": 0, "total": 0},
+                       "acceptance_candidate": {"passed": 0, "total": 0}}
+        for fields, normalized, check_totals in (
+            ({}, {}, {}),
+            ({"checks": []}, {"checks": {}}, {}),
+            ({"checks": {}}, {"checks": {}}, {}),
+            ({"checks": empty_groups}, {"checks": empty_groups}, zero_totals),
+        ):
+            with self.subTest(fields=fields):
+                raw = json.dumps({"summary": "Legacy pass without checks", "files": ["legacy.py"],
+                                  "reason": "historical", "review": {"decision": "pass"},
+                                  "evaluation": {"decision": "pass", **fields}})
+                self.store.execute("UPDATE runs SET state='merged',result=? WHERE id=?",
+                                   (raw, self.record["id"]))
+                decoded = decode_evidence(raw)
+                self.assertNotIn("evidence_error", decoded)
+                self.assertEqual((decoded["summary"], decoded["files"], decoded["reason"]),
+                                 ("Legacy pass without checks", ["legacy.py"], "historical"))
+                self.assertEqual(decoded["evaluation"], {"decision": "insufficient_evidence", **normalized})
+                run = next(item for item in records(self.store, "p")["runs"] if item["id"] == self.record["id"])
+                self.assertEqual(run["evaluation_decision"], "insufficient_evidence")
+                self.assertIsNone(run["evidence_error"])
+                quality = quality_summary(self.store, "p")[0]
+                self.assertEqual((quality["passed"], quality["evaluated"], quality["reviewed"]), (0, 1, 1))
+                metrics = workflow_metrics(self.store, "p")
+                self.assertEqual((metrics["accepted"], metrics["first_pass"]), (0, 0))
+                report = task_feedback.summary(self.store, self.record["id"])
+                self.assertEqual((report["summary"], report["files"], report["checks"]),
+                                 ("Legacy pass without checks", ["legacy.py"], check_totals))
+                self.assertEqual(self.store.one("SELECT result FROM runs WHERE id=?", (self.record["id"],))["result"], raw)
 
     def test_non_empty_checks_list_is_rejected_without_erasing_other_evidence(self):
         from adaptive_rsi.store import decode_evidence
@@ -284,7 +298,7 @@ class TaskValueFeedbackTest(unittest.TestCase):
                     db.execute("INSERT INTO runs(id,task,project,state,started,ended,result) "
                                "VALUES ('q-run',?,?,?,?,?,?)",
                                (task, "q", "merged", time.time(), time.time(), json.dumps({
-                                   "evaluation": {"decision": "pass", "checks": {}},
+                                   "evaluation": {"decision": "pass", "checks": {"candidate": [{"passed": True}]}},
                                    "review": {"decision": "pass"}})))
                 writes.append(True)
             return rows

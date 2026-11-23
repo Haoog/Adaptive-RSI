@@ -4321,13 +4321,14 @@ function usagePage() {
   vm.runInContext(usageSource, page.context);
   ready();
   page.node('view-usage').hidden = false;
+  page.node('usage-totals').before = notice => { page.node('usage-totals').staleNotice=notice; };
   page.node('usage-period').value = 'all';
   page.node('usage-scope').value = 'current';
   page.node('usage-sort').value = 'recent';
   vm.runInContext('view="usage"', page.context);
   page.context.fetch = url => new Promise(resolve => {
-    requests.push({params: new URLSearchParams(url.split('?')[1]), finish(title, status = 200) {
-      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [], calls: [], call_total: 0,
+    requests.push({params: new URLSearchParams(url.split('?')[1]), finish(title, status = 200, callTotal = 0) {
+      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [], calls: [], call_total: callTotal,
         tasks: [{task: title, title, project: 'a', state: 'failed', tokens: 100, attempts: 1}], total: 60}, status));
     }});
   });
@@ -4904,4 +4905,200 @@ test('a non-session connection failure keeps retrying on the normal 15 second in
   assert.equal(calls, 2);
   assert.equal(page.timers.filter(timer => timer.active && timer.delay === 15000).length, 1, 'the retry loop continues');
   assert.equal(vm.runInContext('sessionExpired', page.context), false);
+});
+
+test('cancelling during an update wait stops polling and never resubmits', async () => {
+  const page=browser(),calls=[],controller=new AbortController();
+  page.context.fetch=async url=>{calls.push(url);return rejected();};
+  const pending=page.context.api('retry',{task:'example'},{signal:controller.signal});
+  await waitFor(()=>page.timers.some(timer=>timer.active&&timer.delay===1000));
+  const result=assert.rejects(pending,{name:'AbortError'});
+  controller.abort();await result;
+  assert.deepEqual(calls,['/api/retry']);
+  assert.equal(page.timers.some(timer=>timer.active&&timer.delay===1000),false);
+});
+
+test('a forced refresh discards an identical already running forced refresh', async () => {
+  const page=browser(),requests=[];
+  page.context.fetch=(url,{signal})=>new Promise(resolve=>{requests.push({url,signal,resolve});});
+  const older=page.context.refresh({force:true});
+  await waitFor(()=>requests.length===1);
+  const newer=page.context.refresh({force:true});
+  assert.equal(requests[0].signal.aborted,true);
+  requests[0].resolve(response({...snapshot('old'),selected_project:'a',tasks:[],runs:[]}));
+  await older;await waitFor(()=>requests.length===2);
+  assert.equal(requests[0].url,requests[1].url);
+  requests[1].resolve(response({...snapshot('fresh'),selected_project:'a',tasks:[],runs:[]}));
+  await newer;
+  assert.equal(vm.runInContext('state.version',page.context),'fresh');
+});
+
+test('advanced settings reject reserved object keys before saving', async () => {
+  const page=settingsSavePage();page.context.safe=page.context.originalSafe;
+  const settings=page.node('advanced-json');
+  settings.value=JSON.stringify({schedule:{['__proto__']:{reserved:true}}});
+  await page.submit('settings-form');
+  assert.equal(page.posts.length,0);
+  assert.match(page.node('toast').textContent,/设置格式或字段无效/);
+});
+
+test('invalid range marks the previous usage report stale and makes no new request', async () => {
+  const page=usagePage(),initial=page.show();
+  page.requests[0].finish('Last good report');await initial;
+  page.node('usage-period').value='custom';
+  page.node('usage-start').value='2026-11-24';
+  page.node('usage-end').value='2026-11-20';
+  await page.show();
+  assert.equal(page.requests.length,1);
+  assert.equal(page.title(),'Last good report');
+  const notice=page.node('usage-totals').staleNotice;
+  assert.equal(notice.hidden,false);
+  assert.match(notice.children[0].textContent,/请选择有效的日期范围.*最后成功更新.*本次筛选尚未加载/);
+});
+
+test('runtime restoration preserves an explicit task route and its settings scope', () => {
+  const page=browser();
+  const hash='#view=overview&project=b&task=record&scope=global';
+  Object.assign(page.context,{location:{href:'https://fixture.test/'+hash,pathname:'/',search:'',hash},history:{replaceState(){assert.fail('unexpected route rewrite');}}});
+  page.context.window.__RSI_MACHINE_KEY__='https://remote.example.test';
+  page.context.localStorage.setItem('rsi-project:https://remote.example.test','a');
+  page.context.localStorage.setItem('rsi-navigation:https://remote.example.test',JSON.stringify({view:'models',filter:'history'}));
+  page.context.restoreRuntimeNavigation();
+  assert.equal(page.context.location.hash,hash);
+  assert.equal(vm.runInContext('projectId',page.context),'b');
+  assert.equal(vm.runInContext('view',page.context),'overview');
+  assert.equal(page.node('config-scope').value,'global');
+});
+
+test('log navigation finds an offset zero anchor before moving to the next anchor', async () => {
+  const page=browser();
+  const lines='[planning]\n'+'x'.repeat(500)+'\n[review]';
+  const log=page.context.lazyEvidence('日志',()=>lines);log.open=true;log.handlers.toggle();
+  const controls=log.children[1],jump=controls.children.find(node=>node.textContent==='下一个时间或阶段');
+  jump.handlers.click();await page.context.lastAction;
+  assert.equal(log.children[2].textContent,lines);
+  jump.handlers.click();await page.context.lastAction;
+  assert.notEqual(log.children[2].textContent,lines);
+  assert.ok(log.children[2].textContent.endsWith('[review]'));
+});
+
+test('clearing provider search restores the selection and does not restore a hidden key', async () => {
+  const page=browser(),saved=[];
+  page.context.fetch=async(url,options)=>{
+    if(url.endsWith('/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:[]}});
+    if(url.includes('/auth/providers?'))return response({providers:[{id:'chosen',name:'Chosen provider',methods:[{type:'api',index:0,label:'API Key'}]}]});
+    if(url.endsWith('/auth/key'))saved.push(JSON.parse(options.body));
+    return response({});
+  };
+  vm.runInContext(authSource,page.context);
+  page.context.window.RSIAuth.show('opencode',async()=>{});
+  const nodes=()=>descendants(page.node('mc-auth'));
+  const picker=()=>nodes().find(node=>node.id==='mc-auth-provider');
+  await waitFor(()=>picker()?.children.length===2);
+  picker().value='chosen';picker().handlers.change();
+  const form=nodes().find(node=>node.tagName==='FORM');
+  nodes().find(node=>node.dataset.authField==='key:chosen').value='fixture-key';
+  const search=()=>nodes().find(node=>node.id==='mc-auth-provider-search');
+  search().value='unrelated';search().handlers.input({});
+  assert.equal(picker().value,'');
+  assert.equal(nodes().some(node=>node.tagName==='FORM'),false);
+  form.handlers.submit({preventDefault(){}});
+  assert.deepEqual(saved,[]);
+  search().value='';search().handlers.input({});
+  assert.equal(picker().value,'chosen');
+  assert.equal(nodes().find(node=>node.dataset.authField==='key:chosen').value,'');
+});
+
+test('an earlier provider save cannot close an editor opened while it was pending', async () => {
+  const page=modelScopePage();await page.show('a');
+  page.node('mc-provider-form').reset=()=>{page.node('mc-provider-preset').value='custom';};
+  page.node('mc-input-auth').querySelector=()=>page.node('keychain-option');
+  const api=page.context.api;let release;
+  page.context.api=async(path,body)=>path==='model-center/provider'?new Promise(resolve=>{release=resolve;}):api(path,body);
+  const dialog=page.node('mc-provider-dialog');
+  page.node('mc-add-provider').handlers.click();
+  page.node('mc-input-name').value='First';
+  const pending=page.submit('mc-provider-form');
+  await waitFor(()=>release);
+  dialog.close();page.node('mc-add-provider').handlers.click();
+  page.node('mc-input-name').value='Second';
+  release({id:'ollama'});await pending;
+  assert.equal(dialog.open,true);
+  assert.equal(page.node('mc-input-name').value,'Second');
+  assert.equal(page.node('mc-provider-submit').disabled,false);
+});
+
+test('closing usage details discards an in-flight page', async () => {
+  const page=usagePage(),initial=page.show();
+  page.requests[0].finish('Report');await initial;
+  page.node('usage-tasks').children[0].children[2].handlers.click();
+  const detail=page.context.lastAction;
+  page.requests[1].finish('First page',200,60);await detail;
+  const dialog=page.node('usage-detail'),content=page.node('usage-detail-content');
+  descendants(content).find(node=>node.textContent==='下一页').handlers.click();
+  const pending=page.context.lastAction;
+  assert.equal(page.requests[2].params.get('offset'),'25');
+  dialog.close();page.requests[2].finish('Late page',200,60);await pending;
+  assert.equal(dialog.open,false);
+  assert.equal(descendants(content).some(node=>node.textContent==='上一页'),false);
+});
+
+test('authorization polling backs off, pauses, and can resume the same session', async () => {
+  const page=browser();let now=5000,calls=0,available=false;
+  page.context.Date=class extends Date {static now(){return now;}};
+  page.document.visibilityState='visible';
+  page.context.fetch=async url=>{
+    if(url.endsWith('/auth/status'))return response({sessions:[{backend:'codex',id:'same-auth',state:'awaiting_authorization'}],codex:{available:true,state:'signed_out'}});
+    if(url.endsWith('/auth/session?id=same-auth')){
+      calls++;
+      return available||calls===1?response({id:'same-auth',backend:'codex',state:'awaiting_authorization'}):response({},503);
+    }
+    return response({});
+  };
+  vm.runInContext(authSource,page.context);
+  page.context.window.RSIAuth.show('openai',async()=>{});
+  for(const delay of [1500,3000,6000,12000,24000,48000]){
+    await waitFor(()=>page.timers.some(timer=>timer.active&&timer.delay===delay));
+    now+=delay;page.fireTimer(delay);await new Promise(setImmediate);
+  }
+  assert.equal(calls,7);
+  assert.equal(page.timers.some(timer=>timer.active&&[1500,3000,6000,12000,24000,48000,60000].includes(timer.delay)),false);
+  const retry=descendants(page.node('mc-auth')).find(node=>node.textContent==='重试');
+  assert.ok(retry);
+  available=true;retry.handlers.click();await page.context.lastAction;
+  assert.equal(calls,8);
+  assert.ok(page.timers.some(timer=>timer.active&&timer.delay===1500));
+});
+
+test('acceptance compares checks by name and displays missing, unknown, and failed results distinctly', () => {
+  const page=experiencePage(),outcome=page.document.createElement('div');
+  page.context.window.RSIExperience.enhanceOutcome(outcome,{ended:1,result:{evaluation:{checks:{
+    acceptance_baseline:[{name:'A',passed:true},{name:'B',passed:null},{name:'C',passed:true}],
+    acceptance_candidate:[{name:'B',passed:false},{name:'A',passed:true},{name:'D',passed:true}],
+  }}}});
+  const table=outcome.children.find(node=>node.tagName==='TABLE');
+  assert.deepEqual(table.children.slice(1).map(row=>row.children.map(cell=>cell.textContent)),[
+    ['A','通过','通过'],['B','未知','未通过'],['C','通过','未知'],['D','未知','通过'],
+  ]);
+  assert.equal(page.context.evaluationDecision({checks:{},decision:'pass'}),'insufficient_evidence');
+});
+
+test('permission recovery delivers an unseen browser notification once', async () => {
+  const page=experiencePage(),notified=[];
+  let now=30000;
+  page.context.Date=class extends Date {static now(){return now;}};
+  page.context.location.hash='';
+  const notification=class {static permission='denied';constructor(title){notified.push(title);}};
+  page.context.Notification=page.context.window.Notification=notification;
+  page.context.localStorage.setItem('rsi-notifications:http://fixture.test','true');
+  const seenKey='rsi-notifications:http://fixture.test:seen:fixture';
+  page.context.api=async()=>({instance:'fixture',pagination:{total:1},projects:[{id:'a',name:'A'}],
+    notifications:[{id:'example',project:'a',state:'failed',run:'run'}]});
+  async function poll(){page.context.window.RSIExperience.refreshed();await page.context.lastAction;now+=16000;}
+  await poll();
+  assert.deepEqual(notified,[]);
+  assert.deepEqual(JSON.parse(page.context.localStorage.getItem(seenKey)),{});
+  notification.permission='granted';
+  await poll();await poll();
+  assert.deepEqual(notified,['Adaptive RSI · A']);
 });

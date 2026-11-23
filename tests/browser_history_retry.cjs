@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
-const {createInterface} = require('node:readline');
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const {chromium} = require('playwright');
 
 (async () => {
@@ -9,20 +9,16 @@ const {chromium} = require('playwright');
     env:{...process.env, PYTHONDONTWRITEBYTECODE:'1', RSI_BROWSER_REVISION_FLOW:'1', RSI_BROWSER_TASK_DETAIL:'1'}
   });
   server.stderr.on('data', chunk => process.stderr.write(chunk));
-  let browser;
+  let browser, scenarioError;
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timeout=setTimeout(() => reject(Error('Fixture startup timed out')), 30000);
-      createInterface({input:server.stdout}).once('line', line => {clearTimeout(timeout); resolve(line);});
-      server.once('exit', code => {clearTimeout(timeout); reject(Error('Fixture exited: '+code));});
-    });
-    browser = await chromium.launch();
+    const url = await fixtureReady(server);
+    browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
     // Route-controlled outages must not depend on service-worker activation timing.
     const page = await browser.newPage({serviceWorkers:'block'}), errors=[];
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(url);
     await page.waitForLoadState('networkidle');
-    await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor({timeout:15000});
+    await waitForPausedProject(page);
     await page.locator('[data-task-filter="active"]').click();
     let mode='fail', failures=0, held=0, heldTask=null, releaseRetry;
     const waitRetry = new Promise(resolve => {releaseRetry=resolve;});
@@ -114,8 +110,10 @@ const {chromium} = require('playwright');
     assert.ok(failures>=3, 'all history outages were observed');
     assert.deepEqual(errors,[]);
     console.log('Browser history retry preserved inputs and disclosure state.');
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if(browser) await browser.close();
-    server.kill();
+    await closeFixture(server, browser, scenarioError);
   }
 })().catch(error => {console.error(error); process.exitCode=1;});

@@ -95,6 +95,25 @@ class BatchPlanningTest(unittest.TestCase):
         self.assertFalse(evidence['all_passed'])
         self.assertTrue(all(item['state'] == 'unknown' for item in evidence['requirements']))
 
+    def test_duplicate_check_names_are_unknown_and_unlinked_in_group_evidence(self):
+        group = execute(self.runtime, 'p', self.tasks, 'group', 'g', False)['id']
+        unique_spec = {'name': 'shared', 'criteria': [0]}
+        pass_row = {'name': 'shared', 'passed': True, 'cwd': 'client'}
+        fail_row = {'name': 'shared', 'passed': False, 'cwd': 'server'}
+        self.store.execute("INSERT INTO runs(id,task,project,state,started,ended) VALUES ('r',?,'p','merged',1,2)",
+                           (group,))
+        for coverage, checks in (([unique_spec], [pass_row, fail_row]),
+                                 ([unique_spec], [pass_row, {**fail_row, 'passed': True}]),
+                                 ([unique_spec, {'name': 'shared', 'criteria': [1]}], [pass_row])):
+            with self.subTest(coverage=coverage, checks=checks):
+                evaluation = {'decision': 'pass', 'criteria': ['same criterion', 'another criterion'],
+                              'coverage': coverage, 'checks': {'acceptance_candidate': checks}}
+                self.store.execute("UPDATE runs SET result=? WHERE id='r'", (json.dumps({'evaluation': evaluation}),))
+                evidence = lineage(self.store, group, 'p')['acceptance_evidence']
+                self.assertFalse(evidence['all_passed'])
+                self.assertEqual([(row['state'], row['checks']) for row in evidence['requirements']],
+                                 [('unknown', []), ('unknown', [])])
+
     def test_group_summary_without_coverage_never_marks_requirements_passed(self):
         group = execute(self.runtime, 'p', self.tasks, 'group', 'g', False)['id']
         self.store.execute("INSERT INTO runs(id,task,project,state,started,ended,result) VALUES ('r',?,'p','merged',1,2,?)",

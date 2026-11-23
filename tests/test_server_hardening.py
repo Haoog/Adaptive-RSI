@@ -508,11 +508,37 @@ class ServerHardeningTest(unittest.TestCase):
                 capacity.release()
         self.assertEqual(self.request("/api/state")[0], 200)
 
-    def test_backup_rejects_large_files_symlinks_fifo_and_bad_offsets(self):
+    def test_large_backup_advertises_exact_length_and_streams_with_legacy_offsets(self):
+        boundary = 1024 * 1024 * 1024
         with self.backup.open("wb") as stream:
-            stream.truncate(1024 * 1024 * 1024 + 1)
-        self.assertEqual(self.request("/api/backup?id=" + self.identifier)[0], 400)
-        self.backup.unlink()
+            stream.write(b"first")
+            stream.seek(boundary)
+            stream.write(b"last")
+        size = boundary + 4
+        path = "/api/backup?id=" + self.identifier
+        status, headers, body = self.request(path, "HEAD")
+        self.assertEqual((status, headers["Content-Length"], body), (200, str(size), b""))
+        status, _, body = self.request(f"{path}&format=json&offset={boundary}")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"size": size, "offset": boundary, "data": "bGFzdA==", "length": 4})
+
+        # Exercise the real HTTP stream with virtual elapsed time. The first
+        # chunk fits the large backup's budget, while the next exceeds it.
+        with patch("adaptive_rsi.server.time", wraps=time) as clock:
+            clock.monotonic.side_effect = [10, 132, 2180]
+            connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+            try:
+                connection.request("GET", path, headers={"Cookie": f"{self.server.cookie}={self.server.token}"})
+                with connection.getresponse() as response:
+                    self.assertEqual((response.status, response.getheader("Content-Length")), (200, str(size)))
+                    self.assertEqual(response.read(64 * 1024), b"first".ljust(64 * 1024, b"\x00"))
+                    self.assertEqual(response.read(1), b"")
+            finally:
+                connection.close()
+            self.assertEqual(clock.monotonic.call_count, 3)
+        self.assertEqual(self.request("/api/health")[0], 200)
+
+    def test_backup_rejects_symlinks_fifo_and_bad_offsets(self):
         self.backup.symlink_to(self.root / "missing-private-target")
         status, _, body = self.request("/api/backup?id=" + self.identifier)
         self.assertEqual(status, 500)
@@ -637,7 +663,8 @@ class ServerHardeningTest(unittest.TestCase):
                 reads.append(size)
                 return self.stream.read(size)
 
-        def verify(path):
+        def verify(path, *, deadline):
+            self.assertGreater(deadline, time.monotonic())
             # Reopening the path after verification would hash different bytes.
             replacement = path.with_suffix('.replacement')
             replacement.write_bytes(b"replacement content")
@@ -662,9 +689,15 @@ class ServerHardeningTest(unittest.TestCase):
         handler.send_header = lambda *_: None
         handler.end_headers = lambda: None
         handler.wfile = io.BytesIO()
-        with patch("adaptive_rsi.server.time.monotonic", side_effect=[10, 131]):
+        with patch("adaptive_rsi.server.time.monotonic", side_effect=[10, 132]):
             handler.backup(self.backup, {})
         self.assertEqual(handler.wfile.getvalue(), b"")
+        self.assertTrue(handler.close_connection)
+
+        # The size-based allowance still lets the second chunk through at 120 s.
+        with patch("adaptive_rsi.server.time.monotonic", side_effect=[10, 129, 130]):
+            handler.backup(self.backup, {})
+        self.assertEqual(handler.wfile.getvalue(), self.backup.read_bytes())
         self.assertTrue(handler.close_connection)
 
     def test_respond_treats_socket_write_timeout_as_client_disconnect(self):

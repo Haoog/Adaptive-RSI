@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | **English**
 
-Let AI inspect, fix, and improve your software projects continuously inside isolated workspaces.
+Adaptive RSI is a standalone application that uses AI to continuously inspect, fix, and improve your software projects in isolated workspaces. Run it locally or on a server and manage either setup from the desktop app.
 
 Adaptive RSI turns project inspections, user goals, and GitHub Issues into maintenance tasks that must pass value assessment. Changes go through planning, isolated implementation, host checks, and code review before a project's own authorization allows a PR, merge, or delivery. Independent acceptance is reserved for high-risk and performance work.
 

@@ -129,6 +129,7 @@ def report(store, params):
         args.append(query)
     scope = " WHERE " + " AND ".join(where)
     background = "(t.id IS NULL OR substr(t.source,1,7)='system_')"
+    group = "coalesce(t.id,'background:' || coalesce(c.project,'global'))"
     summary = store.one("SELECT " + TOTALS + ",count(DISTINCT t.id) AS tasks" + JOIN + scope, args)
     summary["reused"] = summary["reused_calls"] > 0
     buckets = {}
@@ -140,7 +141,7 @@ def report(store, params):
         for row in rows:
             if row["created"] is None:
                 continue
-            local = datetime.datetime.fromtimestamp(row["created"], zone).date()
+            local = datetime.datetime.fromtimestamp(math.floor(row["created"]), zone).date()
             bucket = buckets.setdefault(local, _bucket())
             bucket["calls"] += 1
             bucket["tokens"] += row["tokens"] or 0
@@ -162,8 +163,10 @@ def report(store, params):
         rows.close()
     daily = []
     if buckets:
-        first = datetime.datetime.fromtimestamp(start, zone).date() if start else min(buckets)
-        last = datetime.datetime.fromtimestamp(end - 0.001, zone).date()
+        first = datetime.datetime.fromtimestamp(math.floor(start), zone).date() if start else min(buckets)
+        # Local dates change on whole-second boundaries. Use the final second that
+        # intersects [start, end) without rounding across midnight.
+        last = datetime.datetime.fromtimestamp(math.ceil(end) - 1, zone).date()
         if (last - first).days <= DAILY_MAX_DAYS:
             day = first
             while day <= last:
@@ -188,19 +191,24 @@ def report(store, params):
         daily.append({"day": midnight.timestamp(), "date": day.isoformat(), **bucket,
                       "reused": bucket["reused_calls"] > 0,
                       "reuse_ratio": bucket["cache_read_tokens"] / denominator if denominator else None})
-    retry_rows = store.query("SELECT c.run AS run,r.task AS task,c.project,t.source AS kind,c.role,"
-                             "c.provider,c.model,c.effort,count(*) AS calls" + JOIN + scope +
+    # Probe for a prior call per in-window group using the (run, created) index.
+    # When one exists, every call in the window is a retry for that group.
+    retry_rows = store.query("SELECT c.run,c.project,t.source AS kind,c.role,c.provider,c.model,c.effort,"
+                             + group + " AS task_group,count(*)-1+EXISTS ("
+                             "SELECT 1 FROM calls prior WHERE prior.run=c.run AND prior.created<?"
+                             " AND prior.project IS c.project AND prior.role IS c.role"
+                             " AND prior.provider IS c.provider AND prior.model IS c.model"
+                             " AND prior.effort IS c.effort) AS retries" + JOIN + scope +
                              " AND c.run IS NOT NULL"
                              " GROUP BY c.run,c.role,c.provider,c.model,c.effort,c.project,t.source"
-                             " HAVING count(*)>1 ORDER BY c.run,c.role LIMIT ?",
-                             [*args, RETRY_GROUP_LIMIT + 1])
+                             " HAVING retries>0 ORDER BY c.run,c.role,c.provider,c.model,c.effort,c.project LIMIT ?",
+                             [start, *args, RETRY_GROUP_LIMIT + 1])
     retries_truncated = len(retry_rows) > RETRY_GROUP_LIMIT
     run_retries, task_retries, role_retries, stage_retries = {}, {}, {}, {}
     for row in retry_rows[:RETRY_GROUP_LIMIT]:
-        extra = (row["calls"] or 0) - 1
+        extra = row["retries"]
         run_retries[row["run"]] = run_retries.get(row["run"], 0) + extra
-        if row["task"]:
-            task_retries[row["task"]] = task_retries.get(row["task"], 0) + extra
+        task_retries[row["task_group"]] = task_retries.get(row["task_group"], 0) + extra
         role_key = (row["role"], row["provider"], row["model"], row["effort"])
         role_retries[role_key] = role_retries.get(role_key, 0) + extra
         stage_key = (row["project"], row["kind"], row["role"], row["provider"], row["model"], row["effort"])
@@ -210,7 +218,6 @@ def report(store, params):
     for row in roles:
         row["retry_calls"] = role_retries.get((row["role"], row["provider"], row["model"], row["effort"]), 0)
         row["reused"] = row["reused_calls"] > 0
-    group = "coalesce(t.id,'background:' || coalesce(c.project,'global'))"
     count = store.one("SELECT count(*) AS n FROM (SELECT " + group + JOIN + scope + " GROUP BY 1)", args)["n"]
     sort = {"tokens": "tokens DESC", "recent": "last_call DESC", "duration": "model_seconds DESC",
             "cost": "estimated_usd DESC"}.get(value("sort", "recent"))
@@ -222,7 +229,7 @@ def report(store, params):
                         "group_concat(DISTINCT c.provider || '/' || c.model) AS models," + TOTALS + JOIN + scope +
                         " GROUP BY 1 ORDER BY " + sort + ",id LIMIT ? OFFSET ?", [*args, limit, offset])
     for row in tasks:
-        row["retry_calls"] = task_retries.get(row["task"], 0)
+        row["retry_calls"] = task_retries.get(row["id"], 0)
         row["reused"] = row["reused_calls"] > 0
     runs = store.query("SELECT r.id,r.task,r.project,t.title,t.source AS kind,r.state,r.started,r.ended,"
                        "max(c.created) AS last_call,"

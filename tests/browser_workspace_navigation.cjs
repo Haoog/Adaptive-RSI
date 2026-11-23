@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
-const {createInterface} = require('node:readline');
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const {chromium} = require('playwright');
 
 (async () => {
@@ -8,18 +8,14 @@ const {chromium} = require('playwright');
     stdio:['pipe','pipe','pipe'], env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'}
   });
   server.stderr.on('data', chunk => process.stderr.write(chunk));
-  let browser;
+  let browser, scenarioError;
   try {
-    const url = await new Promise((resolve,reject) => {
-      const timer = setTimeout(() => reject(Error('Fixture startup timed out')),30000);
-      createInterface({input:server.stdout}).once('line',line => {clearTimeout(timer);resolve(line);});
-      server.once('exit',code => {clearTimeout(timer);reject(Error('Fixture exited: '+code));});
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel:process.env.RSI_BROWSER_CHANNEL} : {});
     const page = await browser.newPage({viewport:{width:1440,height:1000}});
     const errors = [];page.on('pageerror',error => errors.push(error.message));
     await page.goto(url);
-    await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+    await waitForPausedProject(page);
     await page.locator('.sidebar [data-view=models]').click();
     assert.equal(await page.locator('#page-name').textContent(),'模型服务');
     assert.equal(await page.locator('.sidebar [data-view=models]').getAttribute('aria-current'),'page');
@@ -97,9 +93,10 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('#goal-form button[type=submit]').textContent(),'添加到当前项目');
     assert.deepEqual(errors,[]);
     console.log('Page identity, model/settings separation, navigation persistence and mobile task access passed.');
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if(browser)await browser.close();
-    server.stdin.end('\n');
-    await new Promise(resolve=>server.once('exit',resolve));
+    await closeFixture(server, browser, scenarioError);
   }
 })().catch(error=>{console.error(error);process.exitCode=1;});

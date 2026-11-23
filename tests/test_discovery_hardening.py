@@ -437,17 +437,29 @@ class DiscoveryHardeningTest(unittest.TestCase):
             with self.assertRaises(AttributeError):
                 self.synchronize([broken])
             self.assertEqual(self.store.setting(key)["pending"]["42"]["attempts"], cycle - 1)
-        # attempts 已累到上限-1；下一周期 pending replay 推到上限即隔离。本周期远端不再
-        # 重投该行（传 []），隔离的 pop 才不会被同一次远端扫描立即以 attempts=0 重新暂存。
+        good = self.issue(number=7)
         with self.assertRaises(AttributeError):
-            self.synchronize([])
-        self.assertNotIn("42", self.store.setting(key)["pending"])
+            self.synchronize([broken, broken, good])
+        progress = self.store.setting(key)
+        self.assertNotIn("42", progress["pending"])
+        self.assertEqual(progress["quarantined"]["42"]["updated_at"], broken["updated_at"])
         self.assertIsNotNone(self.store.one(
-            "SELECT 1 FROM events WHERE kind='issue_sync_quarantined'"))
-        # 隔离后远端再重投同一修订：作为新暂存重新计数（attempts 重置），不复活旧隔离计数。
-        with self.assertRaises(AttributeError):
-            self.synchronize([broken])
-        self.assertEqual(self.store.setting(key)["pending"]["42"]["attempts"], 0)
+            "SELECT id FROM tasks WHERE fingerprint='issue:owner/project:7'"))
+
+        self.store.close()
+        self.store = self.runtime.store = Store(self.root)
+        self.config["github"]["exclude_labels"] = ["excluded"]
+        self.synchronize([broken, broken])
+        self.assertNotIn("42", self.store.setting(key)["pending"])
+        self.assertEqual(len(self.store.query("SELECT 1 FROM events WHERE kind='issue_sync_quarantined'")), 1)
+        self.assertEqual(len(self.store.query("SELECT 1 FROM events WHERE kind='issue_sync_error'")),
+                         ISSUE_SYNC_PENDING_MAX_ATTEMPTS * 2)
+
+        repaired = {**broken, "state": "open", "updated_at": "2026-11-02T00:00:00Z"}
+        self.synchronize([repaired, broken])
+        self.assertIsNotNone(self.store.one(
+            "SELECT id FROM tasks WHERE fingerprint='issue:owner/project:42'"))
+        self.assertNotIn("42", self.store.setting(key)["pending"])
 
     def test_malformed_pending_entry_is_removed_not_requarantined_each_cycle(self):
         # pending 条目缺 number 或不可转 int：除记 issue_sync_quarantined 外还必须把
@@ -547,10 +559,12 @@ class DiscoveryHardeningTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertGreater(after.hits, before.hits)
 
-    def test_related_work_closes_history_connection_after_invalid_evidence(self):
+    def test_related_work_returns_history_connection_to_pool_after_invalid_evidence(self):
         self.add_related("broken", "Handle client response", ["client.py"])
+        self.add_related("valid", "Handle client response", ["client.py"])
         self.store.execute("UPDATE tasks SET evidence='invalid-json' WHERE id='broken'")
-        task = {"id": "subject", "title": "Handle client response", "body": "", "evidence": "[]"}
+        task = {"id": "subject", "title": "Handle client response", "body": "",
+                "evidence": '[null, {"path": "client.py"}]'}
         opened = []
         connect = self.store.connect
 
@@ -561,11 +575,13 @@ class DiscoveryHardeningTest(unittest.TestCase):
                 yield db
 
         with patch.object(self.store, "connect", tracked_connection):
-            with self.assertRaises(json.JSONDecodeError):
-                related_work(self.store, "p", task)
+            related = related_work(self.store, "p", task)
+        self.assertEqual(related[0]["id"], "valid")
+        self.assertEqual(related[0]["shared_paths"], ["client.py"])
         self.assertEqual(len(opened), 1)
-        with self.assertRaises(sqlite3.ProgrammingError):
-            opened[0].execute("SELECT 1")
+        with connect() as reused:
+            self.assertIs(reused, opened[0])
+            self.assertEqual(reused.execute("SELECT 1").fetchone()[0], 1)
 
 
 class IssueRequirementsTest(unittest.TestCase):
@@ -1121,6 +1137,112 @@ class IssueRequirementsTest(unittest.TestCase):
             self.assertTrue(claimed is None or claimed["task"] != publication)
         finally:
             self.store.execute("DROP TRIGGER reject_issue_update")
+
+    def test_quarantined_update_freezes_delivery_and_recovers_without_remote_relisting(self):
+        from adaptive_rsi.discovery import ISSUE_SYNC_PENDING_MAX_ATTEMPTS
+
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.store.transition(run["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        publication = self.runtime.deliver(run["id"])
+        key = "issue-sync:" + self.project_id
+        self.store.execute("CREATE TRIGGER reject_issue_update BEFORE UPDATE OF body ON tasks "
+                           "WHEN OLD.source='issue' AND NEW.body='changed' "
+                           "BEGIN SELECT RAISE(ABORT, 'Injected issue write failure'); END")
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.update("changed")
+            for _ in range(ISSUE_SYNC_PENDING_MAX_ATTEMPTS):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.synchronize([])
+            self.assertIn("7", self.store.setting(key)["quarantined"])
+            self.assertNotIn("7", self.store.setting(key)["pending"])
+            errors = self.store.query("SELECT seq FROM events WHERE kind='issue_sync_error'")
+            for _ in range(2):
+                self.synchronize([self.issue, self.issue, DiscoveryHardeningTest.issue(number=8)])
+                with self.assertRaisesRegex(ValueError, "pending synchronization"):
+                    self.runtime.deliver(run["id"])
+                claim = self.store.claim(self.project_id, self.config)
+                self.assertTrue(claim is None or claim["task"] != publication)
+            self.assertEqual(self.store.query("SELECT seq FROM events WHERE kind='issue_sync_error'"), errors)
+            self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='issue_sync_quarantined'")), 1)
+            self.assertIsNotNone(self.store.one("SELECT id FROM tasks WHERE fingerprint='issue:owner/project:8'"))
+        finally:
+            self.store.execute("DROP TRIGGER reject_issue_update")
+
+        self.synchronize([])
+        self.assertNotIn("7", self.store.setting(key)["quarantined"])
+        self.assertEqual((self.task()["state"], self.task()["body"]), ("queued", "changed"))
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "superseded")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (publication,))["state"], "cancelled")
+
+    def test_newer_failed_revision_replaces_quarantine_without_replaying_older_rows(self):
+        from adaptive_rsi.discovery import ISSUE_SYNC_PENDING_MAX_ATTEMPTS
+
+        old = self.issue.copy()
+        quarantined = {**old, "updated_at": "2026-10-21T00:00:00Z", "body": "first edit"}
+        replacement = {**old, "updated_at": "2026-10-22T00:00:00Z", "body": "latest edit"}
+        key = "issue-sync:" + self.project_id
+        self.store.execute("CREATE TRIGGER reject_first_edit BEFORE UPDATE OF body ON tasks "
+                           "WHEN NEW.body='first edit' "
+                           "BEGIN SELECT RAISE(ABORT, 'Injected first edit failure'); END")
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.synchronize([quarantined])
+            for _ in range(ISSUE_SYNC_PENDING_MAX_ATTEMPTS):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.synchronize([])
+        finally:
+            self.store.execute("DROP TRIGGER reject_first_edit")
+
+        self.store.execute("CREATE TRIGGER reject_latest_edit BEFORE UPDATE OF body ON tasks "
+                           "WHEN NEW.body='latest edit' "
+                           "BEGIN SELECT RAISE(ABORT, 'Injected latest edit failure'); END")
+        try:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "latest edit failure"):
+                self.synchronize([quarantined, replacement, quarantined, old])
+            progress = self.store.setting(key)
+            self.assertNotIn("7", progress["quarantined"])
+            self.assertEqual(progress["pending"]["7"]["updated_at"], replacement["updated_at"])
+            self.assertEqual(self.task()["body"], old["body"])
+        finally:
+            self.store.execute("DROP TRIGGER reject_latest_edit")
+
+        self.synchronize([quarantined, old])
+        self.assertEqual(self.task()["body"], replacement["body"])
+        self.assertEqual(self.store.setting(key)["pending"], {})
+
+    def test_legacy_quarantine_retries_on_schedule_with_automatic_discovery_disabled(self):
+        key = "issue-sync:" + self.project_id
+        revision = {**self.issue, "updated_at": "2026-10-21T00:00:00Z", "body": "legacy recovery"}
+        self.runtime.pause(self.project_id, False)
+        candidate = self.store.claim(self.project_id, self.config)
+        self.store.transition(candidate["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        progress = self.store.setting(key)
+        progress["quarantined"] = {"7": revision["updated_at"]}
+        self.store.put_setting(key, progress)
+        with self.assertRaisesRegex(ValueError, "pending synchronization"):
+            self.runtime.deliver(candidate["id"])
+        self.runtime.schedule(self.project_id, self.config, now=100)
+        scan = self.store.claim(self.project_id, self.config)
+        self.assertEqual(self.store.one("SELECT source,urgency FROM tasks WHERE id=?", (scan["task"],)),
+                         {"source": "system_issues", "urgency": 0})
+        self.store.transition(scan["id"], "completed", {}, True)
+        self.runtime.schedule(self.project_id, self.config, now=101)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (scan["task"],))["state"], "completed")
+
+        calls = []
+
+        def remote(args, **kwargs):
+            calls.append(args[4])
+            return encode(revision if args[4].endswith("/7") else [])
+
+        sync(self.runtime, self.project, self.config, remote)
+        self.assertEqual(calls, ["repos/owner/project/issues", "repos/owner/project/issues/7"])
+        self.assertEqual(self.task()["body"], revision["body"])
+        self.assertEqual(self.store.setting(key)["quarantined"], {})
 
     def test_oversized_pending_keeps_snapshot_and_fetches_remote_recovery(self):
         self.runtime.revise_task(self.task_id, "local")

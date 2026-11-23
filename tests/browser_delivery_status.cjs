@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
-const {createInterface} = require('node:readline');
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const {chromium} = require('playwright');
 
 // 「发布与上线」面板回归：服务端 error 字符串有中文映射；等待中状态用中性样式，
@@ -87,14 +87,10 @@ async function main() {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {...process.env, PYTHONDONTWRITEBYTECODE: '1', RSI_BROWSER_TASK_DETAIL: '1'},
   });
-  let browser;
+  let browser, scenarioError;
   const errors = [];
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(Error('Console startup timed out')), 30000);
-      createInterface({input: server.stdout}).once('line', line => {clearTimeout(timeout); resolve(line);});
-      server.once('exit', code => {clearTimeout(timeout); reject(Error('Console exited: ' + code));});
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
     const page = await browser.newPage({viewport: {width: 1380, height: 1000}});
     page.on('pageerror', error => errors.push(error.message));
@@ -117,7 +113,7 @@ async function main() {
         body: JSON.stringify({...page, runs: [...page.runs].reverse()})});
     });
     await page.goto(url);
-    await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor({timeout: 15000});
+    await waitForPausedProject(page);
 
     // 中文界面：逐一注入状态，断言映射文案与红/中性样式。
     await openDetail(page, '查看详情');
@@ -251,13 +247,11 @@ async function main() {
 
     assert.deepEqual(errors, [], 'no page errors: ' + JSON.stringify(errors));
     console.log('Delivery status browser checks passed.');
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    server.stdin.end('\n');
-    const ended = new Promise(resolve => server.once('exit', resolve));
-    const timeout = setTimeout(() => server.kill('SIGTERM'), 5000);
-    if (server.exitCode === null && server.signalCode === null) await ended;
-    clearTimeout(timeout);
+    await closeFixture(server, browser, scenarioError);
   }
 }
 main().catch(error => {console.error(error); process.exitCode = 1;});

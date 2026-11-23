@@ -1,3 +1,4 @@
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
 const { createInterface } = require("node:readline");
@@ -64,7 +65,7 @@ async function checkGoalRecovery(page, evidence) {
     assert.deepEqual(requests.slice(0, 2).map(({project: id, text}) => [id, text]),
       [[project, original], [project, changed]]);
     await page.reload();
-    await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+    await waitForPausedProject(page);
     const chinese = page.getByRole('combobox', {name: '待确认的目标', exact: true});
     await chinese.waitFor();
     assert.equal(await input.inputValue(), changed, 'reload keeps the newer draft');
@@ -249,7 +250,7 @@ async function checkQueueEditor(page, evidence) {
         await expandTaskEditor(box, '.task-supplement-editor');
         await box.getByRole('textbox', {name: 'Supplement requirements (on this task)', exact: true}).fill('Save acknowledgement race supplement');
         await box.getByRole('button', {name: 'Save supplement and reassess', exact: true}).click();
-        await box.getByText('Save acknowledgement race supplement', {exact: false}).waitFor({state: 'attached'});
+        await box.locator('#task-requirements').filter({hasText: 'Save acknowledgement race supplement'}).waitFor({state: 'attached'});
       } else {
         await page.route('**/api/task?id=*', pollState);
         await box.getByText('Blocked', {exact: true}).waitFor();
@@ -303,16 +304,9 @@ async function checkQueueEditor(page, evidence) {
     server.stdin.write(JSON.stringify({goal_evidence: texts}) + '\n');
     return JSON.parse((await next)[0]);
   };
-  let browser;
+  let browser, scenarioError;
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(Error("Fixture timed out")), 30000);
-      output.once("line", (line) => {
-        clearTimeout(timer);
-        resolve(line);
-      });
-      server.once("exit", (code) => reject(Error("Fixture exited " + code)));
-    });
+    const url = await fixtureReady(server, output);
     browser = await chromium.launch(
       process.env.RSI_BROWSER_CHANNEL
         ? { channel: process.env.RSI_BROWSER_CHANNEL }
@@ -327,10 +321,7 @@ async function checkQueueEditor(page, evidence) {
       errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
     await page.goto(url);
-    await page
-      .locator("#project-status")
-      .filter({ hasText: "已暂停" })
-      .waitFor();
+    await waitForPausedProject(page);
     if (process.env.RSI_BROWSER_QUEUE_ONLY) {
       await checkQueueEditor(page, evidence);
       assert.deepEqual(errors, []);
@@ -438,6 +429,7 @@ async function checkQueueEditor(page, evidence) {
       .getByRole("button", { name: "关闭", exact: true })
       .click();
     const installPage = await context.newPage();
+    installPage.on('pageerror', error => errors.push('Install: ' + (error.stack || error.message)));
     await installPage.goto(install);
     await installPage
       .getByRole("heading", { name: "把工作台装进口袋" })
@@ -579,6 +571,7 @@ async function checkQueueEditor(page, evidence) {
     await page.locator('#live-task-outcome .release-outcome').filter({hasText:'部署'}).waitFor();
     const deepUrl = page.url();
     const deep = await context.newPage();
+    deep.on('pageerror', error => errors.push('Task deep link: ' + (error.stack || error.message)));
     await deep.goto(deepUrl);
     await deep.locator('#detail-dialog[open] #detail-title').filter({hasText:'Fix addition'}).waitFor();
     await deep.close();
@@ -769,15 +762,11 @@ async function checkQueueEditor(page, evidence) {
     console.log(
       "Mobile fresh navigation, install assets, idempotency, revisions, lazy history, evidence, diff and backup passed.",
     );
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    if (server.exitCode === null && server.signalCode === null) {
-      const ended = once(server, 'exit');
-      server.stdin.end("\n");
-      const timeout = setTimeout(() => server.kill('SIGTERM'), 5000);
-      await ended;
-      clearTimeout(timeout);
-    }
+    await closeFixture(server, browser, scenarioError);
   }
 })().catch((error) => {
   console.error(error);

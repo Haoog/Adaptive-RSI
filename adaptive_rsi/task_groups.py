@@ -1,5 +1,6 @@
 """Group lineage and conservative split-redo of failed grouped requirements."""
 import json
+from collections import Counter
 
 from .config import fingerprint
 from .store import decode_object
@@ -61,20 +62,29 @@ def acceptance_evidence(store, task, project):
     check_groups = evaluation.get("checks")
     checks = check_groups.get("acceptance_candidate", []) if isinstance(check_groups, dict) else []
     checks = checks if isinstance(checks, list) else []
+    coverage = [entry for entry in coverage if isinstance(entry, dict) and isinstance(entry.get("name"), str)]
+    coverage_counts = Counter(entry["name"] for entry in coverage)
+    result_rows = [(i, check) for i, check in enumerate(checks)
+                   if isinstance(check, dict) and isinstance(check.get("name"), str)]
+    result_counts = Counter(check["name"] for _, check in result_rows)
     requirements = []
     for original in originals if isinstance(originals, list) else []:
-        if not isinstance(original, dict):
+        if not isinstance(original, dict) or not isinstance(original.get("acceptance"), list):
             continue
-        for index, criterion in enumerate(original.get("acceptance", [])):
+        for index, criterion in enumerate(original["acceptance"]):
             indexes = [i for i, value in enumerate(criteria) if value == criterion]
-            names = {entry.get("name") for entry in coverage if isinstance(entry, dict) and
-                     isinstance(entry.get("criteria"), list) and any(i in entry["criteria"] for i in indexes) and
-                     isinstance(entry.get("name"), str)}
+            names = {entry["name"] for entry in coverage if isinstance(entry.get("criteria"), list)
+                     and any(i in entry["criteria"] for i in indexes)}
+            unique = {name for name in names if coverage_counts[name] == result_counts[name] == 1}
+            ambiguous = any(coverage_counts[name] > 1 or result_counts[name] > 1 for name in names)
             linked = [{**check, "run": run["id"], "stage": "acceptance_candidate", "index": i}
-                      for i, check in enumerate(checks) if isinstance(check, dict) and check.get("name") in names]
-            state = "fail" if any(check.get("passed") is False for check in linked) else (
-                "pass" if linked and names == {check.get("name") for check in linked} and
-                all(check.get("passed") is True for check in linked) else "unknown")
+                      for i, check in result_rows if check["name"] in unique]
+            state = "unknown"
+            if not ambiguous:
+                if any(check.get("passed") is False for check in linked):
+                    state = "fail"
+                elif linked and names == unique and all(check.get("passed") is True for check in linked):
+                    state = "pass"
             requirements.append({"task": original["id"], "index": index, "criterion": criterion,
                                  "state": state, "checks": linked})
     from .batching import verification_cost

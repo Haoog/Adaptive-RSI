@@ -119,7 +119,15 @@ window.RSIAuth = (() => {
       render();
     }
   }
-  function schedule(){clearTimeout(timer);if(!pollingStopped&&[...sessions.values()].some(s=>!terminal.has(s.state)||s.refreshStage)){const delay=document.visibilityState==='hidden'?30000:1500;timer=setTimeout(()=>safe(poll),delay);}}
+  function schedule(){
+    clearTimeout(timer);
+    if(pollingStopped)return;
+    const active=[...sessions.values()].filter(session=>session.refreshStage||(!terminal.has(session.state)&&!session.pollPaused));
+    if(!active.length)return;
+    const delay=document.visibilityState==='hidden'?30000:1500;
+    const next=Math.min(...active.map(session=>(session.nextPollAt||0)-Date.now()));
+    timer=setTimeout(()=>safe(poll),Math.max(delay,next));
+  }
   async function refreshCompleted(id,session){
     if(session.refreshing||sessions.get(id)!==session)return;session.refreshing=true;
     try{
@@ -171,7 +179,7 @@ window.RSIAuth = (() => {
     try{for(const [id,session] of sessions){
       if(request!==pollRequest)return;
       if(session.refreshStage){await refreshCompleted(id,session);if(request!==pollRequest)return;continue;}
-      if(terminal.has(session.state))continue;
+      if(terminal.has(session.state)||session.pollPaused||session.nextPollAt>Date.now())continue;
       try{const next=await api('auth/session?id='+encodeURIComponent(session.id));if(request!==pollRequest)return;if(sessions.get(id)!==session)continue;
         const updated={...next,refresh:session.refresh,pollMessage:'',refreshStage:next.state==='completed'?'status':''};sessions.set(id,updated);
         if(updated.refreshStage){if(updated.backend==='opencode'){providerCountsFresh=false;providerRequest++;}render();await refreshCompleted(id,updated);if(request!==pollRequest)return;}
@@ -181,7 +189,12 @@ window.RSIAuth = (() => {
         if(error.code==='session_required'){pollingStopped=true;sessions.set(id,{...session,pollMessage:'控制台登录已失效，请重新打开控制台后继续授权。'});continue;}
         const terminalState={auth_expired:'expired',auth_timeout:'expired',process_interrupted:'interrupted',unknown_session:'interrupted',invalid_auth_state:'interrupted',authorization_failed:'failed'}[error.code];
         if(terminalState){sessions.set(id,{...session,state:terminalState,error:error.code,pollMessage:''});continue;}
-        if(error instanceof TypeError||error.name==='AbortError'||error.status>=500||error.status===429){sessions.set(id,{...session,pollMessage:error.status===429?'尝试过于频繁，请稍候再继续授权。':'暂时无法连接，授权状态已保留，正在重试。'});continue;}
+        if(error instanceof TypeError||error.name==='AbortError'||error.status>=500||error.status===429){
+          const failures=(session.pollFailures||0)+1,pollPaused=failures>=6;
+          const pollMessage=pollPaused?'授权状态暂时无法读取，可手动继续检查。':error.status===429?'尝试过于频繁，请稍候再继续授权。':'暂时无法连接，授权状态已保留，正在重试。';
+          sessions.set(id,{...session,pollFailures:failures,pollPaused,nextPollAt:Date.now()+Math.min(60000,1500*2**failures),pollMessage});
+          continue;
+        }
         sessions.set(id,{...session,state:'failed',error:error.code||'authorization_failed',pollMessage:''});
       }
     }}finally{if(request===pollRequest){polling=false;render();schedule();}}
@@ -208,12 +221,17 @@ window.RSIAuth = (() => {
     if(same)for(const node of box.querySelectorAll('[data-auth-field]')){if(values.has(node.dataset.authField))node.value=values.get(node.dataset.authField);if(focus?.key===node.dataset.authField){node.focus({preventScroll:true});if(typeof focus.start==='number')node.setSelectionRange(focus.start,focus.end);}}
     if(same)box.querySelectorAll('[data-auth-prompt]').forEach(node=>node.dispatchEvent(new Event('change')));
   }
+  function providerMatches(id,name=''){
+    const query=providerQuery.trim().toLocaleLowerCase();
+    return !query||id.toLocaleLowerCase().includes(query)||name.toLocaleLowerCase().includes(query);
+  }
   function renderBody(){
     const box=$('mc-auth');if(!context){box.hidden=true;return;}box.hidden=false;box.replaceChildren();
     const sessionKey=key(),backend=context.backend,account=snapshot?.[backend],session=sessions.get(sessionKey),connected=backend==='opencode'?account?.authenticated_providers?.includes(context.provider):account?.state==='authenticated';
     const selected=backend==='opencode'&&Array.isArray(providers)?providers.find(item=>item.id===context.provider):null,connections=connected?connectionLabel(selected):'';
-    const heading=connected?t('账号已连接')+(connections?' · '+connections:''):account?.available===false?t('运行机器尚未安装此工具'):t('尚未登录');
-    if($('mc-step-account'))$('mc-step-account').dataset.state=connected?'done':'current';
+    const selectionVisible=backend!=='opencode'||providerMatches(context.provider,selected?.name);
+    const heading=connected&&selectionVisible?t('账号已连接')+(connections?' · '+connections:''):account?.available===false?t('运行机器尚未安装此工具'):t('尚未登录');
+    if($('mc-step-account'))$('mc-step-account').dataset.state=connected&&selectionVisible?'done':'current';
     if(connected&&$('mc-step-models')?.dataset.state==='pending')$('mc-step-models').dataset.state='current';
     box.append(text('h3','账号连接'),text('p',snapshot?heading:'正在读取账号状态…','mc-secondary'));
     if(connected&&backend==='codex')for(const row of accountRows(session)){
@@ -225,34 +243,45 @@ window.RSIAuth = (() => {
     if(backend==='opencode'){
       box.append(text('p','OpenCode Go 使用 API Key。请在供应商列表选择对应的 OpenCode 服务并保存密钥；ChatGPT 登录不提供 Go 凭据。','mc-secondary'));
       const guide=external('https://opencode.ai/v2/docs/console/go/','OpenCode Go 官方说明');if(guide)box.append(guide);
-      const label=text('label','先选择 OpenCode 供应商'),select=el('select');select.id='mc-auth-provider';select.setAttribute('aria-label',t('OpenCode 供应商'));select.dataset.authField='provider';
+      const label=text('label','先选择 OpenCode 供应商'),select=el('select');select.id='mc-auth-provider';select.setAttribute('aria-label',t('OpenCode 供应商'));
       const search=el('input');search.type='search';search.id='mc-auth-provider-search';search.value=providerQuery;search.dataset.authField='provider-query';
       search.placeholder=t('搜索供应商');search.setAttribute('aria-label',t('搜索供应商'));
-      const fill=()=>{const query=providerQuery.trim().toLocaleLowerCase();const allProviders=providers||[];const first=text('option','选择供应商');first.value='';select.replaceChildren(first);
-        for(const provider of allProviders.filter(item=>!query||item.name.toLocaleLowerCase().includes(query)||item.id.toLocaleLowerCase().includes(query))){
+      const fill=()=>{const allProviders=providers||[];const first=text('option','选择供应商');first.value='';select.replaceChildren(first);
+        for(const provider of allProviders.filter(item=>providerMatches(item.id,item.name))){
           const connections=provider.connected?connectionLabel(provider):'';
           const option=el('option',provider.name+(provider.connected?' · '+t('已连接')+(connections?' · '+connections:''):''));option.value=provider.id;select.append(option);
         }
         const activeOpenCodeProviders=[...sessions].filter(([key,session])=>key.startsWith('opencode:')&&!terminal.has(session.state)).map(([key])=>key.slice('opencode:'.length));
         for(const provider of activeOpenCodeProviders){
-          if(!allProviders.some(item=>item.id===provider)){
+          if(providerMatches(provider)&&!allProviders.some(item=>item.id===provider)){
             const option=el('option',provider);option.value=provider;select.append(option);
           }
         }
-        if(context.provider&&!allProviders.some(provider=>provider.id===context.provider)&&!activeOpenCodeProviders.includes(context.provider)){
+        if(context.provider&&providerMatches(context.provider)&&!allProviders.some(provider=>provider.id===context.provider)&&!activeOpenCodeProviders.includes(context.provider)){
           const option=el('option',context.provider);option.value=context.provider;option.disabled=true;select.append(option);
         }
         select.value=context.provider||'';};
-      fill();search.addEventListener('input',()=>{providerQuery=search.value;fill();});
+      fill();const filterProviders=event=>{
+        if(event?.isComposing)return;
+        const wasVisible=providerMatches(context.provider,selected?.name);
+        providerQuery=search.value;
+        if(wasVisible!==providerMatches(context.provider,selected?.name))render();else fill();
+      };
+      search.addEventListener('input',filterProviders);search.addEventListener('compositionend',filterProviders);
       select.addEventListener('change',()=>{context.provider=select.value;rememberSelection(backend,select.value);render();});
       box.append(search);label.append(select);box.append(label);
       if(!providers)box.append(action(t('读取可连接的供应商'),()=>getProviders(),'text-button'));
-      if(!context.provider)return;
+      if(!context.provider||!selectionVisible)return;
     }
     const running=session&&!terminal.has(session.state);
     if(session){
       const feedback=text('p',labels[session.state]||session.state,session.state==='failed'?'mc-error':'mc-secondary');feedback.setAttribute('role','status');box.append(feedback);
       if(session.pollMessage)box.append(el('p',t(session.pollMessage),'mc-secondary'));
+      if(session.pollPaused)box.append(action(t('重试'),()=>{
+        if(sessions.get(sessionKey)!==session)return;
+        sessions.set(sessionKey,{...session,pollPaused:false,pollFailures:0,nextPollAt:0,pollMessage:''});
+        render();return poll();
+      },'text-button'));
       if(session.catalogFailed)box.append(el('p',t('登录已完成，但模型目录刷新失败。可稍后在模型列表手动刷新目录，或重新登录。'),'mc-secondary'));
       if(running){
         const link=external(session.verification_url,'打开官方授权页面');if(link)box.append(link);
@@ -275,12 +304,12 @@ window.RSIAuth = (() => {
       if(method.type==='api'){
         if(method.supported===false){box.append(el('p',authMessage(method.unsupported_reason,'此登录方式暂不支持远程页面，请使用供应商密钥。'),'mc-secondary'));continue;}
         const form=el('form'),label=text('label','API 密钥'),input=el('input');input.type='password';input.dataset.authField='key:'+context.provider;input.autocomplete='new-password';input.required=true;input.maxLength=8192;label.append(input);const submit=text('button','保存供应商密钥','button');submit.type='submit';submit.disabled=pending;form.append(label,submit);
-        form.addEventListener('submit',event=>{event.preventDefault();const current={...context};safe(async()=>{const secret=input.value;input.value='';await mutate('key',{backend:'opencode',provider:current.provider,key:secret});readinessCache.clear();await freshStatus();safe(()=>refreshProviders());await current.refresh();});});box.append(form);continue;
+        form.addEventListener('submit',event=>{event.preventDefault();if(!input.isConnected||key()!==sessionKey||!providerMatches(context.provider,selected?.name))return;const current={...context};safe(async()=>{const secret=input.value;input.value='';await mutate('key',{backend:'opencode',provider:current.provider,key:secret});readinessCache.clear();await freshStatus();safe(()=>refreshProviders());await current.refresh();});});box.append(form);continue;
       }
       const form=el('form'),fields=new Map();
       const updatePrompts=()=>{for(const prompt of method.prompts||[]){const field=fields.get(prompt.key),condition=prompt.when,show=!condition||(condition.op==='neq'?fields.get(condition.key)?.input.value!==condition.value:fields.get(condition.key)?.input.value===condition.value);field.label.hidden=!show;field.input.disabled=!show;field.input.required=show;}};
       for(const prompt of method.prompts||[]){const label=el('label',prompt.message),input=el(prompt.type==='select'?'select':'input');input.dataset.authField='prompt:'+method.index+':'+prompt.key;input.dataset.authPrompt='true';input.setAttribute('aria-label',prompt.message);if(prompt.placeholder)input.placeholder=prompt.placeholder;if(prompt.type==='select')for(const option of prompt.options||[]){const node=el('option',option.label);node.value=option.value;input.append(node);}label.append(input);fields.set(prompt.key,{input,label});input.addEventListener('change',updatePrompts);form.append(label);}
-      updatePrompts();const button=text('button',connected?'重新登录':backend==='codex'?'前往 Codex 官方登录':'官方登录','button primary');if(backend!=='codex')button.append(document.createTextNode(' · '+method.label));button.type='submit';button.disabled=pending||method.supported===false;form.append(button);form.addEventListener('submit',event=>{event.preventDefault();safe(()=>start(method,Object.fromEntries([...fields].filter(([,field])=>!field.input.disabled).map(([name,field])=>[name,field.input.value]))));});box.append(form);
+      updatePrompts();const button=text('button',connected?'重新登录':backend==='codex'?'前往 Codex 官方登录':'官方登录','button primary');if(backend!=='codex')button.append(document.createTextNode(' · '+method.label));button.type='submit';button.disabled=pending||method.supported===false;form.append(button);form.addEventListener('submit',event=>{event.preventDefault();if(!form.isConnected||key()!==sessionKey||(backend==='opencode'&&!providerMatches(context.provider,selected?.name)))return;safe(()=>start(method,Object.fromEntries([...fields].filter(([,field])=>!field.input.disabled).map(([name,field])=>[name,field.input.value]))));});box.append(form);
       if(method.supported===false)box.append(el('p',t(authErrors[method.unsupported_reason]||method.unsupported_reason||'此供应商暂不支持页面登录，请使用密钥连接。'),'mc-secondary'));
     }
     box.append(text('p','账号保存在运行机器上；授权成功后只刷新模型目录，不自动测试模型。','mc-secondary'));

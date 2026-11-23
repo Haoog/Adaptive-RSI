@@ -529,23 +529,24 @@ class CodexAgent:
                 for field in ["stdout", "stderr"]:
                     result[field] = result[field].replace(secret_value, "[REDACTED]")
             (agent_dir / "events.jsonl").write_text(result["stdout"], encoding="utf-8")
+            from .usage import codex_usage
             usage = None
             for line in result["stdout"].splitlines():
                 try:
                     event = json.loads(line)
-                    if event.get("type") == "turn.completed":
-                        from .usage import usage as normalized_usage
-                        value = event.get("usage", {})
-                        cached = int(value.get("cached_input_tokens", 0))
-                        current = normalized_usage(max(0, int(value.get("input_tokens", 0)) - cached),
-                                                   int(value.get("output_tokens", 0)), cached)
-                        if usage is None:
-                            usage = current
-                        else:
-                            for key in ["tokens", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"]:
-                                usage[key] += current[key]
-                except (ValueError, TypeError):
+                except ValueError:
                     continue
+                if not isinstance(event, dict) or event.get("type") != "turn.completed":
+                    continue
+                current = codex_usage(event.get("usage"))
+                if current is None:
+                    usage = None
+                    break
+                if usage is None:
+                    usage = current
+                else:
+                    for key in ["tokens", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"]:
+                        usage[key] += current[key]
             self.store.record_usage(call, run, usage, time.time() - started)
             if cancelled is not None:
                 raise cancelled

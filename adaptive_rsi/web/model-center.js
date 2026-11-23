@@ -428,7 +428,7 @@ window.RSIModelCenter = (() => {
   }
   function syncAuth(){const mode=$('mc-input-auth').value;$('mc-key-field').hidden=!['keychain','session','file'].includes(mode);$('mc-input-key').disabled=!['keychain','session','file'].includes(mode);$('mc-env-field').hidden=mode!=='env';$('mc-input-env').disabled=mode!=='env';$('mc-input-env').required=mode==='env';$('mc-input-env').pattern='[A-Za-z_][A-Za-z0-9_]*';$('mc-session-hint').hidden=mode!=='session';}
   function openEditor(provider=null){
-    editorSession={project:scope};editing=provider;$('mc-provider-form').reset();$('mc-provider-error').textContent='';$('mc-provider-dialog-title').textContent=t(provider?'连接设置':'添加模型服务');
+    editorSession={project:scope};editing=provider;$('mc-provider-submit').disabled=false;$('mc-provider-form').reset();$('mc-provider-error').textContent='';$('mc-provider-dialog-title').textContent=t(provider?'连接设置':'添加模型服务');
     $('mc-connection-advanced').open=false;$('mc-go-hint').hidden=true;
     $('mc-provider-preset-field').hidden=!!provider;
     $('mc-input-auth').querySelector('[value="keychain"]').disabled=!data.keychain;
@@ -509,7 +509,7 @@ window.RSIModelCenter = (() => {
     $('mc-picker-provider').addEventListener('change',()=>{pickerPage=0;renderPicker();});
     $('mc-picker-prev').addEventListener('click',()=>{pickerPage--;renderPicker();});$('mc-picker-next').addEventListener('click',()=>{pickerPage++;renderPicker();});
     $('mc-fetch').addEventListener('click',()=>safe(()=>fetchProvider()));
-    $('mc-provider-dialog').addEventListener('close',()=>{editorSession=null;$('mc-input-key').value='';});
+    $('mc-provider-dialog').addEventListener('close',()=>{if(!$('mc-provider-dialog').open){editorSession=null;$('mc-input-key').value='';}});
     $('mc-provider-form').addEventListener('invalid',event=>{const detail=event.target.closest('details');if(detail)detail.open=true;},true);
     $('mc-provider-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
       const button=$('mc-provider-submit'),session=editorSession;if(button.disabled||!session)return;const project=session.project,unchanged=unchangedForm(event.target);button.disabled=true;$('mc-provider-error').textContent='';
@@ -523,9 +523,9 @@ window.RSIModelCenter = (() => {
         connectionSaved=true;remaining=[...models];
         if(editorSession===session)editing={...provider,id:result.id};
         for(const id of models){await api('model-center/model',{project,provider:result.id,model:{id,manual:true}});remaining.shift();}
-        if(scope===project){await refresh();await load();if(unchanged()&&scope===project){active=result.id;tab='providers';render();$('mc-provider-dialog').close();}setStatus(t('连接配置已保存。'));}
+        if(scope===project){await refresh();await load();if(editorSession===session&&$('mc-provider-dialog').open&&unchanged()&&scope===project){active=result.id;tab='providers';render();$('mc-provider-dialog').close();}setStatus(t('连接配置已保存。'));}
         await fetchProvider(result.id,project);
-      }catch(error){if(editorSession===session){$('mc-provider-error').textContent=(connectionSaved?t('连接已保存；部分后续操作未完成。尚未添加的模型：')+' '+remaining.join(', ')+' · ':'')+message(error);if(connectionSaved&&unchanged())$('mc-input-models').value=remaining.join('\n');}}finally{button.disabled=false;}
+      }catch(error){if(editorSession===session){$('mc-provider-error').textContent=(connectionSaved?t('连接已保存；部分后续操作未完成。尚未添加的模型：')+' '+remaining.join(', ')+' · ':'')+message(error);if(connectionSaved&&unchanged())$('mc-input-models').value=remaining.join('\n');}}finally{if(editorSession===session)button.disabled=false;}
     });});
     $('mc-remove-provider').addEventListener('click',()=>safe(async()=>{
       // 移除立即退役连接并删除本机凭据，重新添加生成新 id；必须先确认，取消路径不发出任何请求。

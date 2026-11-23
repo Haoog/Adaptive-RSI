@@ -1,25 +1,24 @@
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
-const {createInterface} = require('node:readline');
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const {chromium} = require('playwright');
 
 (async () => {
   const server = spawn(process.env.PYTHON || 'python3', ['-m', 'tests.browser_fixture'],
     {stdio: ['pipe', 'pipe', 'pipe'], env: {...process.env, PYTHONDONTWRITEBYTECODE: '1'}});
-  let browser;
+  server.stderr.on('data', chunk => process.stderr.write(chunk));
+  let browser, scenarioError;
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(Error('Fixture startup timed out')), 30000);
-      createInterface({input: server.stdout}).once('line', line => {clearTimeout(timer); resolve(line);});
-      server.once('exit', code => {clearTimeout(timer); reject(Error('Fixture exited: ' + code));});
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
     const page = await browser.newPage(), errors = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(url);
-    await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
-    const firstStep=await browser.newPage();await firstStep.goto(url);
-    await firstStep.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+    await waitForPausedProject(page);
+    const firstStep = await browser.newPage();
+    firstStep.on('pageerror', error => errors.push('Initial route: ' + (error.stack || error.message)));
+    await firstStep.goto(url);
+    await waitForPausedProject(firstStep);
     const home=await firstStep.locator('#project-select').inputValue(),away=await firstStep.locator('#project-select option').evaluateAll((options,home)=>options.find(option=>option.value!==home).value,home);
     await firstStep.locator('#project-select').selectOption(away);await firstStep.waitForFunction(project=>projectId===project,away);
     await firstStep.reload();await firstStep.waitForFunction(project=>projectId===project,away);
@@ -97,9 +96,10 @@ const {chromium} = require('playwright');
     assert.equal(writes,0,'navigation and notification inspection must not mutate tasks');
     assert.deepEqual(errors, []);
     console.log('Cross-project back/forward, initial-route restoration, notification details and draft retention passed.');
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    server.stdin.end();
-    await new Promise(resolve => {server.once('exit', resolve); setTimeout(()=>{server.kill('SIGKILL');resolve();},5000).unref();});
+    await closeFixture(server, browser, scenarioError);
   }
 })().catch(error => {console.error(error); process.exitCode = 1;});

@@ -31,7 +31,7 @@ function fakeClock(start=1700000000000){
 function fixture({visibility='visible',readyState,policy,versionScope='patch',respond}={}){
  let panel;const saved=new Map(),calls=[],listeners={},writes={total:0,option:0};
  const clock=fakeClock();
- let reply=respond||(()=>({state:'latest'}));
+ const reply=respond||(args=>args.action==='authorize'?{authorization_revision:args.revision}:{state:'latest'});
  const counted=(node,kind)=>{
   let text='';
   Object.defineProperty(node,'textContent',{get(){return text;},set(value){text=String(value);writes.total++;if(kind)writes[kind]++;}});
@@ -45,7 +45,10 @@ function fixture({visibility='visible',readyState,policy,versionScope='patch',re
  const document={activeElement:null,visibilityState:visibility,readyState,documentElement:{lang:'zh-CN'},
   addEventListener(type,handler){(listeners[type]||(listeners[type]=[])).push(handler);},
   createElement:()=>el('a')};
- const invoke=async(_,args)=>{calls.push({action:args.action,at:clock.now()});return reply(args);};
+ const invoke=async(_,args)=>{
+  calls.push({action:args.action,at:clock.now()});
+  return reply(args);
+ };
  const context={
   window:{RSIDesktop:{invoke,ready:Promise.resolve({kind:'local',owned:true})}},
   document,el,$:()=>el('anchor'),t:x=>x,
@@ -211,6 +214,7 @@ test('a long automatic download keeps status reads, progress and cancel live',as
  const gate=new Promise(()=>{});
  let started=false,bytes=0;
  const f=fixture({respond:args=>{
+  if(args.action==='authorize')return {authorization_revision:args.revision};
   if(args.action==='download'){started=true;return gate;}
   return started?{state:'downloading',bytes:bytes+=1000,total:100000}:{state:'available',version:'1.2.4',current_version:'1.2.3'};
  }});
@@ -233,6 +237,7 @@ test('a user-started download replaces the pending idle timer',async()=>{
  const gate=new Promise(()=>{});
  let started=false;
  const f=fixture({respond:args=>{
+  if(args.action==='authorize')return {authorization_revision:args.revision};
   if(args.action==='download'){started=true;return gate;}
   return started?{state:'downloading',bytes:25000,total:100000}:{state:'latest',version:'1.2.3'};
  }});
@@ -251,7 +256,8 @@ test('a user-started download replaces the pending idle timer',async()=>{
 
 test('a failed status read retries after its backoff instead of waiting for the idle cadence',async()=>{
  let calls=0;
- const f=fixture({respond:()=>{
+ const f=fixture({respond:args=>{
+  if(args.action==='authorize')return {authorization_revision:args.revision};
   calls++;
   if(calls===2)throw Error('temporary status failure');
   return {state:'latest'};
@@ -298,6 +304,38 @@ test('a DOMContentLoaded startup tick cannot run an automatic action before auth
  await f.advance(5000);
  assert.ok(f.calls.findIndex(call=>call.action==='authorize')<f.calls.findIndex(call=>call.action==='install'));
  assert.equal(f.calls.filter(call=>call.action==='install').length,1,'the authorized automatic action starts without a rejected attempt');
+});
+
+test('automatic install resumes after startup authorization retries with backoff',async()=>{
+ const revisions=[];
+ const f=fixture({readyState:'complete',policy:'automatic',respond:args=>{
+  if(args.action==='authorize'){
+   revisions.push(args.revision);
+   if(revisions.length<3)throw Error('update_authorization_failed');
+   return {authorization_revision:args.revision};
+  }
+  if(args.action==='install'){
+   assert.equal(args.revision,revisions.at(-1));
+   assert.equal(args.automatic,true);
+   return {state:'restarting'};
+  }
+  return {state:'ready',current_version:'1.2.3',version:'1.2.4'};
+ }});
+ f.boot();
+ await f.advance(9999);
+ assert.deepEqual(revisions,[1]);
+ assert.equal(f.authorizationErrorVisible(),true);
+ assert.equal(f.calls.some(call=>call.action==='install'),false);
+ await f.advance(1);
+ assert.deepEqual(revisions,[1,2]);
+ await f.advance(9999);
+ assert.equal(f.statusCount(),3,'status polling continues during authorization backoff');
+ assert.equal(f.calls.some(call=>call.action==='install'),false);
+ await f.advance(1);
+ assert.deepEqual(revisions,[1,2,3]);
+ assert.equal(f.authorizationErrorVisible(),false);
+ assert.equal(f.calls.filter(call=>call.action==='install').length,1);
+ assert.equal(f.pendingTimers(),1);
 });
 
 test('a failed startup authorization can recover through changed settings and manual install',async()=>{

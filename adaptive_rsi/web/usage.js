@@ -18,14 +18,14 @@ window.RSIUsage=(()=>{
  function renderNotice(){
   if(!staleNotice){staleNotice=el('p',undefined,'form-error');staleNotice.id='usage-stale';staleNotice.setAttribute('role','status');const totals=$('usage-totals');if(typeof totals?.before==='function')totals.before(staleNotice);else totals?.parentElement?.insertBefore(staleNotice,totals);}
   if(!lastError){staleNotice.hidden=true;staleNotice.replaceChildren();return;}
-  const copy=reportMeta?t('用量刷新失败：当前显示「{range}」的数据（最后成功更新 {time}）。本次筛选尚未加载。').replace('{range}',describeSelection(reportMeta.choice)).replace('{time}',stamp(reportMeta.at/1000)):lastError.message?t('用量加载失败：{message}。当前没有可显示的数据，请重试。').replace('{message}',lastError.message):t('用量加载失败。当前没有可显示的数据，请重试。');
+  const copy=reportMeta?(lastError.invalidRange?t('请选择有效的日期范围。')+' ':'')+t('用量刷新失败：当前显示「{range}」的数据（最后成功更新 {time}）。本次筛选尚未加载。').replace('{range}',describeSelection(reportMeta.choice)).replace('{time}',stamp(reportMeta.at/1000)):lastError.message?t('用量加载失败：{message}。当前没有可显示的数据，请重试。').replace('{message}',lastError.message):t('用量加载失败。当前没有可显示的数据，请重试。');
   staleNotice.replaceChildren(document.createTextNode(copy),action(t('重试'),load,'text-button'));staleNotice.hidden=false;
  }
  async function load(){
   if(view!=='usage')return;
   clearTimers();const ticket=++sequence,requested=offset;let unsupported=false;$('usage-refresh').disabled=$('usage-prev').disabled=$('usage-next').disabled=true;
   const choice=selection();let params;
-  try{params=parameters();}catch(error){$('usage-refresh').disabled=false;pageBar();throw error;}
+  try{params=parameters();}catch(error){offset=renderedOffset;lastError={message:error.message,invalidRange:true};renderNotice();$('usage-refresh').disabled=false;pageBar();return;}
   try{const result=await api('usage?'+params);if(ticket!==sequence||view!=='usage')return;report=result;reportMeta={choice,params:params.toString(),at:Date.now()};lastError=null;renderNotice();
    const last=Math.max(0,Math.ceil((report.total||0)/25)-1)*25;
    if(offset>last){offset=last;safe(load);return;}
@@ -64,6 +64,7 @@ window.RSIUsage=(()=>{
   new MutationObserver(()=>{if($('view-usage').hidden)cancel();}).observe($('view-usage'),{attributes:true,attributeFilter:['hidden']});
   for(const id of ['usage-period','usage-scope','usage-sort','usage-start','usage-end'])$(id).addEventListener('change',()=>{$('usage-custom').hidden=$('usage-period').value!=='custom';show();});
   $('usage-search').addEventListener('input',()=>{cancel();offset=0;if(view==='usage')searchTimer=setTimeout(show,350);});
+  $('usage-detail').addEventListener('close',()=>{if(!$('usage-detail').open)detailSequence++;});
   $('usage-refresh').onclick=()=>safe(load);$('usage-prev').onclick=()=>{offset=Math.max(0,offset-25);safe(load);};$('usage-next').onclick=()=>{offset+=25;safe(load);};
   $('project-select').addEventListener('change',()=>{if(view==='usage')show();else cancel();});
  });

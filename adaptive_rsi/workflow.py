@@ -231,14 +231,15 @@ def change_kind(task, plan=None):
     if declared == "performance" or any(word in title for word in
             ["benchmark", "latency", "throughput", "speedup", "性能", "提速", "耗时", "吞吐", "延迟"]):
         return "performance"
-    if declared in ["documentation", "configuration", "ui"] and not any(
-            word in title for word in ["bug", "broken", "incorrect", "修复", "缺陷", "失效", "异常"]):
-        return declared
+    bug_fix = any(word in title for word in
+                  ["fix", "bug", "broken", "incorrect", "修复", "错误", "缺陷", "失效", "异常"])
+    if declared in ["documentation", "configuration", "ui"]:
+        return "behavior" if bug_fix else declared
     if any(word in title for word in ["performance", "benchmark", "optimize", "optimized", "optimization",
                                       "optimise", "optimised", "latency", "throughput", "speedup", "faster",
                                       "性能", "优化", "提速", "耗时", "吞吐"]):
         return "performance"
-    if any(word in title for word in ["fix", "bug", "broken", "incorrect", "修复", "错误", "缺陷", "失效", "异常"]):
+    if bug_fix:
         return "behavior"
     if declared == "refactor" and not any(word in title for word in ["refactor", "重构", "保持行为不变", "preserve behavior"]):
         return "behavior"
@@ -324,11 +325,12 @@ def improvement(results, acceptance):
         return {"decision": "pass" if preserved else "insufficient_evidence", "kind": kind,
                 "basis": "preserved_behavior_requires_maintainability_review"}
     if kind == "performance":
-        threshold = acceptance.get("contract", {}).get("threshold")
-        if not threshold:
+        contract = acceptance.get("contract")
+        threshold = contract.get("threshold") if isinstance(contract, dict) else None
+        if not threshold or any(row.get("passed") is not True or row.get("error") or
+                                row.get("exit_code", 0) != 0 for row in before):
             return {"decision": "insufficient_evidence", "kind": kind}
         import statistics
-        contract = acceptance.get("contract", {})
         repeats = contract.get("repetitions", 1)
         loads = contract.get("load_conditions", [None])
         if type(repeats) is not int or not 1 <= repeats <= 100 or not isinstance(loads, list) or not loads or len(loads) > 20:

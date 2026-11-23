@@ -166,14 +166,15 @@ class OperabilityTest(unittest.TestCase):
         task = self.store.add_task("p", "goal", "goal", "test")
         system = self.store.add_task("p", "system_light", "inspection", "inspect")
         plan = {"value": {"benefit": "fix defect"}, "scope": ["file.py"], "plan_decision": "ready", "plan_reason": "evidence"}
+        evaluation = {"decision": "pass", "checks": {"candidate": [{"passed": True}]}}
         for run, task_id in [("first", task), ("second", task), ("passed", task), ("system", system)]:
             self.store.execute("INSERT INTO runs(id,task,project,state,config,started) VALUES (?,?, 'p','planning','{}',?)", (run, task_id, time.time()))
             self.store.transition(run, "executing", plan)
             self.store.transition(run, "evaluating")
             if run in ["first", "second"]:
-                self.store.transition(run, "failed", {"evaluation": {"decision": "pass"}, "review": {"decision": "fail"}}, True)
+                self.store.transition(run, "failed", {"evaluation": evaluation, "review": {"decision": "fail"}}, True)
             else:
-                self.store.transition(run, "awaiting_approval", {"evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+                self.store.transition(run, "awaiting_approval", {"evaluation": evaluation, "review": {"decision": "pass"}}, True)
         result = json.loads(self.store.one("SELECT result FROM runs WHERE id='first'")["result"])
         self.assertEqual(result["scope"], ["file.py"])
         self.assertEqual(result["plan_reason"], "evidence")
@@ -641,6 +642,8 @@ class OperabilityTest(unittest.TestCase):
         store = self.store
         now = time.time()
         store.execute("INSERT INTO projects VALUES (?,?,?,?,?,?)", ("proj01", "fixture", str(Path(self.temp.name) / "project"), "{}", 1, now))
+        evidence = json.dumps({"evaluation": {"decision": "pass", "checks": {"candidate": [{"passed": True}]}},
+                               "review": {"decision": "pass"}, "merged_at": now})
         for index in range(1100):
             task = "t%05d" % index
             run = "r%05d" % index
@@ -648,8 +651,7 @@ class OperabilityTest(unittest.TestCase):
                           "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)",
                           (task, "proj01", "goal", "fp" + task, "t", "b", "[]", "[]", "merged", 50, 0, "{}", now, now))
             store.execute("INSERT INTO runs(id,task,project,state,config,started,ended,result) VALUES (?,?,?,?,?,?,?,?)",
-                          (run, task, "proj01", "completed", "{}", now, now,
-                           json.dumps({"evaluation": {"decision": "pass"}, "review": {"decision": "pass"}, "merged_at": now})))
+                          (run, task, "proj01", "completed", "{}", now, now, evidence))
             store.execute("INSERT INTO calls(id,project,run,role,model,effort,state,tokens,seconds,created,provider,unit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                           ("c" + run, "proj01", run, "implementation", "m", "high", "completed", 10, 1.0, now, "openai", "http_request"))
         result = workflow_metrics(store)

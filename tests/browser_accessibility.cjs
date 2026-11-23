@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
-const {createInterface} = require('node:readline');
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const {chromium} = require('playwright');
 
 async function audit(page) {
@@ -72,18 +72,15 @@ async function main() {
     stdio: ['pipe', 'pipe', 'pipe'], env: {...process.env, PYTHONDONTWRITEBYTECODE: '1'}
   });
   server.stderr.on('data', chunk => process.stderr.write(chunk));
-  let browser;
+  let browser, scenarioError;
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(Error('Console startup timed out')), 30000);
-      createInterface({input: server.stdout}).once('line', line => {clearTimeout(timer); resolve(line);});
-      server.once('exit', code => {clearTimeout(timer); reject(Error('Console exited: ' + code));});
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
-    const page = await browser.newPage();
+    const page = await browser.newPage(), pageErrors = [];
+    page.on('pageerror', error => pageErrors.push(error.stack || error.message));
     for (const locale of ['zh-CN', 'en']) {
       await page.goto(url);
-      await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+      await waitForPausedProject(page);
       const style = await page.request.get(new URL('/workspace.css', url).href);
       assert.equal(style.status(), 200, 'authenticated redesign stylesheet is served');
       assert.match(style.headers()['content-type'], /text\/css/);
@@ -150,11 +147,14 @@ async function main() {
       assert(options[1].top >= options[0].bottom, 'dependency choices form a vertical list without overlap');
       assert(options.every(option => option.width > 100), 'dependency labels have readable width');
     }
+    await page.close();
+    assert.deepEqual(pageErrors, []);
     console.log('Accessible names, dialog names, labels, ARIA references and page language passed at desktop/mobile sizes in both languages.');
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    server.stdin.end('\n');
-    await new Promise(resolve => server.once('exit', resolve));
+    await closeFixture(server, browser, scenarioError);
   }
 }
 main().catch(error => {console.error(error); process.exitCode = 1;});

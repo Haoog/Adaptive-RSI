@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
-const { createInterface } = require("node:readline");
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const { chromium } = require("playwright");
 
 // 系统通知回归：真实 Chromium + 暂停的临时项目，零模型调用。
@@ -69,7 +69,7 @@ function signatureOf(run, state, result) {
 }
 
 async function waitPaused(page) {
-  await page.locator("#project-status").filter({ hasText: "已暂停" }).waitFor();
+  await waitForPausedProject(page);
   // 首次加载会完成一次 attention 轮询（此时通知开关未开启，只做 seen 预置）。
   await page.waitForTimeout(800);
 }
@@ -228,12 +228,14 @@ function seenKeyPrefix(page) {
 // 才能在应用脚本运行前预置 5000 条记录复现裁剪场景。
 async function discoverInstance(newScenario, url) {
   const context = await newScenario(null);
-  const page = await context.newPage();
+  const page = await context.newPage(), errors = [];
+  page.on("pageerror", error => errors.push(error.message));
   await page.goto(url);
   await waitPaused(page);
   const prefix = await seenKeyPrefix(page);
   assert.ok(prefix, "instance-scoped seen key exists after the first poll");
   await context.close();
+  assert.deepEqual(errors, []);
   return prefix.slice("rsi-notifications:".length + new URL(url).origin.length + ":seen:".length);
 }
 
@@ -318,14 +320,9 @@ async function checkConstructorUnavailable(newScenario, url, projectId, payload)
   const server = spawn(process.env.PYTHON || "python3", ["-m", "tests.browser_fixture"],
     { stdio: ["pipe", "pipe", "pipe"] });
   server.stderr.on("data", (chunk) => process.stderr.write(chunk));
-  const output = createInterface({ input: server.stdout });
-  let browser;
+  let browser, scenarioError;
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(Error("Fixture timed out")), 60000);
-      output.once("line", (line) => { clearTimeout(timer); resolve(line); });
-      server.once("exit", (code) => reject(Error("Fixture exited " + code)));
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(
       process.env.RSI_BROWSER_CHANNEL ? { channel: process.env.RSI_BROWSER_CHANNEL } : {},
     );
@@ -344,11 +341,13 @@ async function checkConstructorUnavailable(newScenario, url, projectId, payload)
       return context;
     };
     const probeContext = await browser.newContext();
-    const probePage = await probeContext.newPage();
+    const probePage = await probeContext.newPage(), probeErrors = [];
+    probePage.on("pageerror", error => probeErrors.push(error.message));
     await probePage.goto(url);
-    await probePage.locator("#project-status").filter({ hasText: "已暂停" }).waitFor();
+    await waitForPausedProject(probePage);
     const projectId = await probePage.evaluate(() => projectId);
     await probeContext.close();
+    assert.deepEqual(probeErrors, []);
     // RSI_NOTIFICATION_ONLY=<名称> 可单独运行一个场景，便于排查。
     const only = process.env.RSI_NOTIFICATION_ONLY;
     const scenarios = [
@@ -360,15 +359,11 @@ async function checkConstructorUnavailable(newScenario, url, projectId, payload)
     for (const [name, check] of scenarios)
       if (!only || only === name) await check(newScenario, url, projectId, payload);
     console.log("Notification browser regressions passed: real Chromium, paused projects, zero model calls.");
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    if (server.exitCode === null && server.signalCode === null) {
-      const ended = new Promise((resolve) => server.once("exit", resolve));
-      server.stdin.end("\n");
-      const timeout = setTimeout(() => server.kill("SIGTERM"), 5000);
-      await ended;
-      clearTimeout(timeout);
-    }
+    await closeFixture(server, browser, scenarioError);
   }
 })().catch((error) => {
   console.error(error);

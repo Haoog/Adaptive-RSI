@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from scripts.sbom import components
+from desktop.scripts import engine
+from scripts.sbom import components, engine_inventory
 from scripts.package_desktop import desktop_build_mode, package_updater
 
 
@@ -36,6 +37,84 @@ class DesktopInventoryBoundaryTest(unittest.TestCase):
 
     def test_dependency_inventory_changes_require_full_desktop_build(self):
         self.assertEqual(desktop_build_mode(["scripts/sbom.py"]), "full")
+        workflow = Path(__file__).resolve().parents[1] / ".github/workflows/desktop.yml"
+        pull_request = workflow.read_text().split("  pull_request:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
+        self.assertIn("      - 'scripts/sbom.py'", pull_request.splitlines())
+
+    def test_formal_inventory_rejects_missing_and_legacy_engine_receipts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generated, _ = self.fixture(root)
+            inventory = generated / "engine-inventory.json"
+            with self.assertRaisesRegex(ValueError, "actual engine dependency inventory"):
+                components(root, require_inventory=True)
+            inventory.write_text(json.dumps({"components": [{"name": "PyInstaller"}]}))
+            with self.assertRaisesRegex(ValueError, "runtime-only"):
+                components(root, require_inventory=True)
+
+    def test_engine_records_runtime_dependencies_before_installing_build_tools(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generated, _ = self.fixture(root)
+            installed = []
+            commands = []
+            windows = engine.os.name == "nt"
+            target = "x86_64-pc-windows-msvc" if windows else "aarch64-apple-darwin"
+            frozen_name = "adaptive-rsi-engine.exe" if windows else "adaptive-rsi-engine"
+            sidecar = f"adaptive-rsi-engine-{target}" + (".exe" if windows else "")
+
+            def run(args, **kwargs):
+                commands.append(args)
+                if args[:3] == ["uv", "pip", "install"]:
+                    installed.append("pyinstaller" if "--requirement" in args else "adaptive-rsi")
+                elif any(Path(arg).name == "sbom.py" for arg in args):
+                    from importlib.metadata import PathDistribution
+                    for name in installed:
+                        info = root / (name + ".dist-info")
+                        info.mkdir()
+                        (info / "METADATA").write_text(f"Name: {name}\nVersion: 1\n")
+                    with patch("importlib.metadata.distributions", return_value=[
+                        PathDistribution(root / (name + ".dist-info")) for name in installed
+                    ]):
+                        engine_inventory(args[-1])
+                elif "PyInstaller" in args:
+                    dist = Path(args[args.index("--distpath") + 1])
+                    dist.mkdir()
+                    (dist / frozen_name).write_bytes(b"frozen engine")
+
+            def check_output(args, **kwargs):
+                if "-vV" in args:
+                    return f"host: {target}\n"
+                return json.dumps({"packages": [{"name": "fixture", "version": "1.0.0", "license": "MIT",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index"}]})
+
+            with patch.object(engine, "ROOT", root), patch.object(engine, "DESKTOP", root / "desktop"), \
+                    patch.object(engine, "rust_tool", side_effect=lambda name: name), \
+                    patch.object(engine.subprocess, "run", side_effect=run), \
+                    patch.object(engine.subprocess, "check_output", side_effect=check_output):
+                engine.build()
+            self.assertEqual(installed, ["adaptive-rsi", "pyinstaller"])
+            self.assertTrue(any("--constraint" in call for call in commands))
+            bundle, output = root / "bundle", root / "output"
+            bundle.mkdir()
+            (bundle / "app.app.tar.gz").write_bytes(b"test archive")
+            (bundle / "app.app.tar.gz.sig").write_text("test signature")
+            with patch("scripts.package_desktop.ROOT", root), patch("scripts.package_desktop.subprocess.run"):
+                package_updater(bundle, output, "1.2.3", require_inventory=True)
+            sbom = json.loads((output / "sbom.cdx.json").read_text(encoding="utf-8"))
+            self.assertEqual({item["name"] for item in sbom["components"]},
+                             {"adaptive-rsi-desktop", "adaptive-rsi-engine", "CPython", "adaptive-rsi", "fixture"})
+            self.assertEqual((root / "desktop/src-tauri/binaries" / sidecar).read_bytes(), b"frozen engine")
+            self.assertEqual({path.name for path in generated.iterdir()},
+                             {"cargo-inventory.json", "engine-inventory.json"})
+
+    def test_engine_paths_match_tauri_sidecar_conventions(self):
+        venv = Path("fixture") / "python"
+        self.assertEqual(engine.build_paths(venv, "x86_64-pc-windows-msvc", windows=True),
+                         (venv / "Scripts/python.exe", "adaptive-rsi-engine.exe",
+                          "adaptive-rsi-engine-x86_64-pc-windows-msvc.exe"))
+        self.assertEqual(engine.build_paths(venv, "aarch64-apple-darwin", windows=False),
+                         (venv / "bin/python", "adaptive-rsi-engine", "adaptive-rsi-engine-aarch64-apple-darwin"))
 
     def test_failed_inventory_validation_does_not_publish_partial_assets(self):
         with tempfile.TemporaryDirectory() as directory:

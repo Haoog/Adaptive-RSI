@@ -1,4 +1,6 @@
 """Consistent private backups and deliberately minimal shareable diagnostics."""
+import ctypes
+import errno
 import json
 import gzip
 import hashlib
@@ -6,6 +8,7 @@ import math
 import os
 import sqlite3
 import stat
+import sys
 import tempfile
 import time
 import copy
@@ -23,6 +26,28 @@ def _regular_reader(path):
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise ValueError("Archive source must be a regular file")
         yield stream
+
+
+def _publish_snapshot(staging, target):
+    """Publish a completed snapshot atomically without replacing another file."""
+    try:
+        os.link(staging, target)
+        return
+    except OSError as exc:
+        if exc.errno not in (errno.ENOTSUP, errno.ENOSYS, errno.EPERM):
+            raise
+        libc = ctypes.CDLL(None, use_errno=True)
+        source, destination = os.fsencode(staging), os.fsencode(target)
+        if sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+            result = libc.renamex_np(source, destination, ctypes.c_uint(0x00000004))  # RENAME_EXCL
+        elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+            at_fdcwd, rename_noreplace = -100, 1
+            result = libc.renameat2(at_fdcwd, source, at_fdcwd, destination, ctypes.c_uint(rename_noreplace))
+        else:
+            raise
+        if result != 0:
+            code = ctypes.get_errno()
+            raise OSError(code, os.strerror(code), target) from None
 
 
 def archive(store, max_mb=1024, compression=6, timeout=300, cancel=None):
@@ -110,7 +135,7 @@ def _archive(store, max_mb, compression=6, timeout=300, cancel=None):
             output.flush()
             os.fsync(output.fileno())
         check_budget()
-        os.link(staging, target)
+        _publish_snapshot(staging, target)
         published = True
         return {"id": snapshot["id"], "path": str(target), "bytes": target.stat().st_size,
                 "capacity_bytes": capacity, "source_bytes": snapshot["bytes"], "history_deleted": False,
@@ -204,7 +229,7 @@ def backup(store, cancel=None, progress=None, timeout=300, reserve_bytes=16 * 10
             # A portable snapshot must not require adjacent WAL/SHM files on restore.
             target.execute("PRAGMA journal_mode=DELETE")
         # Publish only the closed snapshot; a name collision must preserve the old backup.
-        os.link(staging, path)
+        _publish_snapshot(staging, path)
         store._storage_snapshot = None
         return {"id": path.stem, "bytes": path.stat().st_size, "created": time.time()}
     finally:

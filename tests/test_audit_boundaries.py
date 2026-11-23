@@ -9,6 +9,7 @@ import sys
 import urllib.error
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -26,6 +27,7 @@ from adaptive_rsi.recovery import BudgetExhausted, FAILURE_ACTIONS, failure
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store
 from adaptive_rsi.usage import opencode_usage
+from adaptive_rsi.usage_report import report
 from tests.test_runtime import FakeAgent, fixture
 
 
@@ -277,6 +279,88 @@ class AuditUsageBoundariesTest(unittest.TestCase):
                 self.assertNotIn(secret, raised.exception.result["stdout"])
                 self.assertFalse(store.query("SELECT * FROM events WHERE kind='fallback'"))
                 self.assertFalse(store.query("SELECT * FROM settings WHERE key LIKE 'provider-health:%'"))
+
+    def test_partial_native_usage_completes_without_inventing_a_price(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with closing(Store(root / "state")) as store:
+                workspace = root / "workspace"
+                workspace.mkdir()
+                route = {"model": "test", "effort": "default"}
+                incomplete = [
+                    ("responses", {"input_tokens": 12}),
+                    ("responses", {"input_tokens": 12, "output_tokens": 3, "total_tokens": 9}),
+                    ("chat_completions", {"prompt_tokens_details": {"cached_tokens": 7}}),
+                    ("anthropic", {"cache_creation_input_tokens": 4, "output_tokens": 2}),
+                    ("gemini", {"promptTokenCount": 12, "thoughtsTokenCount": 3}),
+                    ("ollama", {"eval_count": 2}),
+                ]
+                cases = [(protocol, payload, 0, "unknown") for protocol, payload in incomplete]
+                cases += [
+                    ("responses", {"input_tokens": 12, "output_tokens": 0}, 12, "components"),
+                    ("responses", {"input_tokens": 12, "total_tokens": 12}, 12, "mixed"),
+                    ("gemini", {"totalTokenCount": 17}, 17, "mixed"),
+                ]
+                for index, (protocol, payload, tokens, basis) in enumerate(cases):
+                    with self.subTest(protocol=protocol, payload=payload):
+                        provider = {"id": "native", "protocol": protocol, "base_url": "http://127.0.0.1:9",
+                                    "credential": "none", "env_key": ""}
+                        response = self.finish_response(protocol, payload)
+                        if protocol == "ollama":
+                            response.update(payload)
+                        entry = {"id": "test", "prices": {"input": 1, "output": 2}, "unit_price": 3}
+                        project = "usage-" + str(index)
+                        with patch("adaptive_rsi.native.post_json", return_value=response), \
+                                patch.object(store, "catalog_entry", return_value=({"models": [entry]}, False)):
+                            result = NativeAgent(store).invoke("probe", "test", workspace, project, project,
+                                                               copy.deepcopy(DEFAULTS), route, provider)
+                        self.assertEqual(result, {"summary": "RSI_OK"})
+                        self.assertEqual(store.one("SELECT state,tokens,usage_known,price_basis FROM calls WHERE project=?",
+                                                   (project,)),
+                                         {"state": "completed", "tokens": tokens, "usage_known": int(basis != "unknown"),
+                                          "price_basis": basis})
+                summary = report(store, {})["summary"]
+                self.assertEqual((summary["unknown_calls"], summary["unpriced_calls"]), (6, 6))
+                self.assertEqual((summary["component_priced_calls"], summary["unit_price_priced_calls"]), (1, 2))
+                self.assertAlmostEqual(summary["estimated_usd"], (12 + (12 + 17) * 3) / 1_000_000)
+
+    def test_codex_partial_turn_marks_session_usage_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            events = [
+                {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 0}},
+                {"type": "turn.completed", "usage": {"input_tokens": 5}},
+            ]
+
+            def execute(argv, *args):
+                Path(argv[argv.index("--output-last-message") + 1]).write_text('{"summary":"done"}')
+                return {"exit_code": 0, "error": None, "stderr": "", "stdout": "\n".join(map(json.dumps, events))}
+
+            with closing(Store(root / "state")) as store, \
+                    patch("adaptive_rsi.agent.platform.system", return_value="Darwin"), \
+                    patch("adaptive_rsi.agent.shutil.which", return_value="/fake/codex"), \
+                    patch("adaptive_rsi.agent.Sandbox.codex_permissions", return_value=[]), \
+                    patch("adaptive_rsi.agent.run_process", side_effect=execute):
+                config = copy.deepcopy(DEFAULTS)
+                config["models"]["probe"] = config["models"]["analysis"]
+                result = CodexAgent(store).invoke("probe", "test", workspace, "project", "run", config)
+                self.assertEqual(result, {"summary": "done"})
+                self.assertEqual(store.one("SELECT state,usage_known,price_basis FROM calls"),
+                                 {"state": "completed", "usage_known": 0, "price_basis": "unknown"})
+
+    def test_opencode_missing_usage_step_cannot_be_silently_dropped(self):
+        for partial in ({}, {"tokens": {"input": 5}}, {"tokens": None}):
+            with self.subTest(part=partial):
+                events = [
+                    {"type": "step_finish", "part": {"id": "complete", "tokens": {"input": 10, "output": 0}}},
+                    {"type": "step_finish", "part": {"id": "partial", **partial}},
+                    {"type": "text", "part": {"text": '{"summary":"done"}'}},
+                ]
+                data, steps = parse_events("\n".join(map(json.dumps, events)))
+                self.assertEqual(data, {"summary": "done"})
+                self.assertIsNone(opencode_usage(steps))
 
     def test_gemini_blocked_response_preserves_billable_usage_once(self):
         with tempfile.TemporaryDirectory() as directory:

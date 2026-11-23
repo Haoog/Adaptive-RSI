@@ -945,18 +945,21 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (obsolete_task,))["state"], "queued")
 
     def test_failing_system_scan_gets_circuit_breaker_backoff(self):
+        self.runtime.configure({"sources": {"inspection": True}}, self.project)
         self.runtime.pause(self.project, False)
-        self.runtime.request(self.project, "light")
+        self.runtime.request(self.project, "light", automatic=True)
         task = self.store.one("SELECT id FROM tasks WHERE fingerprint='system:light'")["id"]
-        for round_index in range(3):
+        for _ in range(3):
             self.store.execute("UPDATE tasks SET state='queued',available=0 WHERE id=?", (task,))
             run = self.store.claim(self.project, self.runtime.config(self.project))
             self.store.transition(run["id"], "blocked", {"reason": "gh not authenticated"}, True)
-            # 退避期内 request 不会重新入队，避免每周期产生新的失败 run。
-            self.runtime.request(self.project, "light")
+            self.runtime.request(self.project, "light", automatic=True)
             self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "blocked")
-        self.store.execute("UPDATE runs SET ended=ended-86400 WHERE task=?", (task,))
         self.runtime.request(self.project, "light")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
+        self.store.execute("UPDATE tasks SET state='blocked' WHERE id=?", (task,))
+        self.store.execute("UPDATE runs SET ended=ended-86400 WHERE task=?", (task,))
+        self.runtime.request(self.project, "light", automatic=True)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
 
     def test_manual_retry_can_pull_a_backing_off_task_forward(self):

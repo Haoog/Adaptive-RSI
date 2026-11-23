@@ -24,9 +24,8 @@ from .catalog import CatalogError, list_models
 from .credentials import CredentialError
 from .model_center import CenterError
 from .telemetry import quality_summary
-from .config import BUILTIN_PROVIDERS, compatibility
+from .config import BUILTIN_PROVIDERS
 from .contracts import API_VERSION, descriptor
-from .gitops import git
 from .evolution import Evolution
 from .maintenance import MAINTENANCE_INTERVAL
 from .release import ReconciliationRejected
@@ -586,21 +585,32 @@ class Handler(BaseHTTPRequestHandler):
                 if not stat.S_ISREG(info.st_mode):
                     raise RequestError("Invalid backup file")
                 size = info.st_size
-                if size > 1024 * 1024 * 1024:
-                    raise RequestError("Backup exceeds download size limit")
+                # Bound work by the size of the open snapshot and retain an idle socket timeout.
+                minimum_rate = 512 * 1024
+                transfer_budget = 120 + (size + minimum_rate - 1) // minimum_rate
                 if params.get("format", [""])[0] == "manifest":
                     from .storage_tools import verify_backup
                     import hashlib
+                    deadline = time.monotonic() + transfer_budget
                     try:
-                        verification = verify_backup(path)
+                        verification = verify_backup(path, deadline=deadline)
                     except (ValueError, OSError, sqlite3.Error):
                         raise RequestError("Backup verification failed") from None
+                    if verification["bytes"] != size:
+                        raise RequestError("Backup size changed")
                     digest = hashlib.sha256()
-                    for chunk in iter(lambda: stream.read(64 * 1024), b""):
+                    remaining = size
+                    while remaining:
+                        if time.monotonic() >= deadline:
+                            raise RequestError("Backup verification timed out")
+                        chunk = stream.read(min(64 * 1024, remaining))
+                        if not chunk:
+                            raise RequestError("Backup size changed")
                         digest.update(chunk)
+                        remaining -= len(chunk)
                     self.respond({
                         "format": 1,
-                        "backup": {"id": path.stem, "bytes": verification["bytes"],
+                        "backup": {"id": path.stem, "bytes": size,
                                    "schema_version": verification["schema_version"],
                                    "sha256": digest.hexdigest()},
                         "restore": {"artifacts_restored": False, "projects_paused": True,
@@ -634,7 +644,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.close_connection = True
                     return
                 remaining = size
-                deadline = time.monotonic() + 120
+                deadline = time.monotonic() + transfer_budget
                 try:
                     while remaining:
                         budget = deadline - time.monotonic()
@@ -1106,7 +1116,8 @@ class Handler(BaseHTTPRequestHandler):
                                 project["config"] = global_config
                             schedule["next_effective"] = None
                     data = {"version": __version__, "build": BUILD_ID, "selected_project": selected,
-                            "csrf": self.server.csrf, "projects": projects, **rows, "config": global_config,
+                            "csrf": self.server.csrf, "instance": store.setting("instance-id"),
+                            "projects": projects, **rows, "config": global_config,
                             "config_revision": store.config_revision(selected if selected else None),
                             "global_config_revision": store.config_revision(),
                             "update": update, "schedules": schedules,
@@ -1195,8 +1206,10 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/capabilities":
                 project = runtime.project(params.get("project", [""])[0])
                 data = detect(project["path"])
-                proof = store.setting("verified-checks:" + project["id"])
-                if proof and proof["base"] == git(project["path"], "rev-parse", "HEAD") and proof["compatibility"] == compatibility(runtime.config(project["id"])):
+                from .readiness import verified_check_proof
+
+                proof = verified_check_proof(store, project, runtime.config(project["id"]))
+                if proof:
                     verified = {(c.get("cwd", "."), tuple(c["argv"])) for c in proof["checks"]}
                     for module in data["modules"]:
                         if module["checks"] and all((c.get("cwd", "."), tuple(c["argv"])) in verified for c in module["checks"]):

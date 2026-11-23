@@ -331,20 +331,27 @@ class Sandbox:
             # Docker rejects a second mount registered at the same container
             # path, so mounts are deduplicated by destination; protected
             # entries stay read-only and win over writable mounts.
-            protected_mounts = {}
-            for item in protected:
-                item = Path(item).resolve()
-                relative = item.relative_to(workspace).as_posix()
-                protected_mounts[relative] = docker_mount(item, "/workspace/" + relative, read_only=True)
+            protected_paths = dict.fromkeys(Path(item).resolve() for item in protected)
             if writes is not None:
-                mounted = set()
-                for item in writes:
+                requested = dict.fromkeys(item for item in writes if item not in protected_paths)
+                existing = dict.fromkeys(item for item in requested if item.exists())
+                directories = {item for item in existing if item.is_dir()}
+                for item in requested:
+                    if item in existing:
+                        continue
+                    if (directories.intersection(item.parents)
+                            and not any(parent in protected_paths for parent in item.parents)):
+                        continue
+                    # A bind mount needs a source of the right type. An untyped missing
+                    # path cannot be mounted without changing it or granting its parent.
+                    raise ValueError("Docker writable path does not exist and has no approved writable directory: "
+                                     + item.relative_to(workspace).as_posix())
+                for item in existing:
                     relative = item.relative_to(workspace).as_posix()
-                    if item.exists() and relative not in protected_mounts and relative not in mounted:
-                        mounted.add(relative)
-                        command += ["--mount", docker_mount(item, "/workspace/" + relative)]
-            for mount in protected_mounts.values():
-                command += ["--mount", mount]
+                    command += ["--mount", docker_mount(item, "/workspace/" + relative)]
+            for item in protected_paths:
+                relative = item.relative_to(workspace).as_posix()
+                command += ["--mount", docker_mount(item, "/workspace/" + relative, read_only=True)]
             # Preserve custom image initialization; the image must forward the command arguments.
             return command + [image] + list(argv), None
         # Read only toolchains/system files; tests get no network, credentials, or controller data.

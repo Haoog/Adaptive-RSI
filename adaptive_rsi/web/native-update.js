@@ -2,7 +2,7 @@
 window.RSINativeUpdate=(()=>{
  const labels={checking:'正在检查更新',latest:'已是最新稳定版',available:'发现新版本',downloading:'正在下载新版本…',verifying:'正在校验签名',replacing:'正在替换应用',ready:'新版本已准备好',waiting_idle:'等待当前任务结束后更新',installing:'正在安装更新',restarting:'正在重启应用',error:'更新未完成'};
  const errors={update_target_changed:'更新目标已变化或撤回，请重新检查并确认。',update_window_closed:'安装窗口已结束，下一次允许的空闲窗口会重新尝试。',updater_key_missing:'当前安装包尚未配置更新签名，请手动安装支持自动更新的版本。',update_disk_space:'磁盘可用空间不足，请清理后重试。',update_download_or_signature_failed:'下载或签名验证失败，当前版本继续可用。',update_wait_cancelled:'已取消等待更新，当前任务继续运行。',update_install_failed:'安装未完成，请重试或手动安装。',update_incompatible_platform:'此更新包与当前系统或架构不兼容，当前版本继续可用。',update_connect_timeout:'连接更新服务器超时，当前版本继续可用。请检查网络后重试。',update_response_timeout:'更新服务器响应超时，当前版本继续可用。',update_download_timeout:'下载新版本超过总时限，已停止。当前版本继续可用。',update_transfer_stalled:'下载长时间没有数据，已停止。当前版本继续可用。',update_connection_failed:'无法连接更新服务器，当前版本继续可用。',update_download_incomplete:'更新包下载不完整，已重新开始；请重试。',update_range_rejected:'服务器拒绝续传分段，已删除分段；请重试重新下载。',update_cache_unavailable:'更新缓存不可用，请检查磁盘权限或空间后重试。',update_size_limit:'更新包超过允许的大小上限，已停止。当前版本继续可用。',update_unsupported_platform:'当前平台不支持应用内更新，请手动安装。',update_authorization_changed:'更新授权已变化，本次安装已撤销；请按当前设置重新确认。',update_authorization_invalid:'更新设置无效，请重新选择更新策略、版本范围与安装时间。',update_authorization_failed:'更新设置未能同步到本机，请重试。',update_cancel_failed:'未能确认本机已撤销安装，请查看更新状态后再操作。',update_receipt_missing:'本机还没有已持久化的升级回执。',update_receipt_unavailable:'升级回执无法写入本机，安装未开始。',update_version_mismatch:'重启后的版本与升级目标不一致，已记录为未生效。',update_health_failed:'升级后的本机服务未通过健康检查，已记录为升级失败。'};
- let snapshot={},busy=false,checking=false,nodes=null,failures=0,retryAt=0,statusRetryAt=0,storageError=false,polling=false,installRetryAt=0;
+ let snapshot={},busy=false,checking=false,nodes=null,failures=0,retryAt=0,statusRetryAt=0,polling=false,installRetryAt=0;
  let runtimeInfo=null,lastSample=null,currentSpeed=0;
  // A running download needs per-second progress; a settled client does not. The
  // panel used to run a 1s interval for the life of the page even when nothing
@@ -18,14 +18,22 @@ window.RSINativeUpdate=(()=>{
  // Every settings change gets a new revision, and every install is bound to the
  // revision it was approved under. The native side rejects a stale binding, and
  // its counter survives a webview reload, so it is adopted instead of restarted.
+ let settingsAuthorization=null;
  let revision=0,authorizationError='',installPending=false,initialAuthorization=null;
+ let authorizationRetryAt=null,authorizationFailures=0;
  const enabled=()=>!!window.RSIDesktop;
  const preference=()=>policy;
  function adoptRevision(source){
   const reported=Number(source&&source.authorization_revision);
   if(Number.isFinite(reported)&&reported>revision)revision=reported;
  }
- function persist(key,value){try{localStorage.setItem(key,value);return true;}catch{storageError=true;return false;}}
+ const unsavedPreferences=new Map();
+ function persist(key,value){
+  unsavedPreferences.set(key,value);
+  for(const [name,pending] of unsavedPreferences){
+   try{localStorage.setItem(name,pending);unsavedPreferences.delete(name);}catch{}
+  }
+ }
  function formatBytes(value){
   const size=Number(value);
   if(!Number.isFinite(size)||size<0)return '';
@@ -101,38 +109,60 @@ window.RSINativeUpdate=(()=>{
     result=await window.RSIDesktop.invoke('native_update',{action:'authorize',revision:pending,policy,versionScope,installationWindow:installWindow});
     reported=Number(result&&result.authorization_revision);
    }
+   if(pending!==revision)return true;
    if(reported!==pending){
-    // A newer local change superseded this request; its own reply decides.
-    if(pending!==revision)return true;
     adoptRevision(result);authorizationError='update_authorization_failed';return false;
    }
    authorizationError='';return true;
-  }catch(error){authorizationError=String(error&&error.message||error||'update_authorization_failed');return false;}
+  }catch(error){if(pending!==revision)return true;authorizationError=String(error&&error.message||error||'update_authorization_failed');return false;}
  }
  // A settings change revokes a waiting install (or the old manual-policy download
  // cancel). A failed cancel is reported, never swallowed: the settled install
  // result stays the only source of truth about whether a replacement stopped.
- async function revokeInstall(){
+ async function revokeInstall(current){
   const wanted=installPending||snapshot.state==='waiting_idle'||(policy==='manual'&&snapshot.state==='downloading');
   if(!wanted)return true;
   try{
    const result=await window.RSIDesktop.invoke('native_update',{action:'cancel'});
-   if(result&&result.error_code&&!authorizationError)authorizationError=String(result.error_code);
+   if(current()&&result&&result.error_code&&!authorizationError)authorizationError=String(result.error_code);
    return true;
-  }catch(error){authorizationError=String(error&&error.message||error||'update_cancel_failed');return false;}
+  }catch(error){if(current())authorizationError=String(error&&error.message||error||'update_cancel_failed');return false;}
  }
  function trackAuthorization(authorization){
   initialAuthorization=authorization;
-  authorization.then(accepted=>{if(!accepted&&initialAuthorization===authorization)initialAuthorization=null;});
+  authorizationRetryAt=0;
+  authorization.then(accepted=>{
+   if(initialAuthorization!==authorization)return;
+   if(accepted){
+    authorizationFailures=0;
+   }else{
+    initialAuthorization=null;
+    const delay=Math.min(POLL_IDLE,POLL_VISIBLE*2**Math.min(authorizationFailures++,6));
+    authorizationRetryAt=Date.now()+delay;
+   }
+   render();
+   schedulePoll();
+  });
   return authorization;
+ }
+ async function waitForAuthorization(){
+  while(initialAuthorization){
+   const authorization=initialAuthorization;
+   const accepted=await authorization;
+   if(initialAuthorization===authorization)return accepted;
+  }
+  return false;
  }
  // A settings change revokes a waiting install even when the new revision could
  // not be stored: an install approved under stale consent must not continue.
  async function settingsChanged(){
   const authorization=trackAuthorization(syncAuthorization());
+  const current=()=>settingsAuthorization===authorization;
+  settingsAuthorization=authorization;
   const accepted=await authorization;
-  await revokeInstall();
-  if(!accepted&&!authorizationError)authorizationError='update_authorization_failed';
+  if(!current())return;
+  await revokeInstall(current);
+  if(current()&&!accepted&&!authorizationError)authorizationError='update_authorization_failed';
   render();
  }
  function sampleSpeed(previous,current,elapsed){
@@ -150,7 +180,7 @@ window.RSINativeUpdate=(()=>{
    const option=el('option');option.value=value;select.append(option);options.push([option,text]);
   }
   select.value=policy;
-  select.onchange=()=>{policy=select.value;storageError=false;persist('rsi-native-update-policy',policy);safe(settingsChanged);};
+  select.onchange=()=>{policy=select.value;persist('rsi-native-update-policy',policy);safe(settingsChanged);};
   label.append(labelText,select);
   const scopeLabel=el('label'),scopeText=el('span'),scopeSelect=el('select'),scopeOptions=[];
   for(const [value,text] of [['patch','仅补丁版本'],['minor','同主版本内更新'],['stable','所有稳定版本']]){const option=el('option');option.value=value;scopeSelect.append(option);scopeOptions.push([option,text]);}
@@ -216,7 +246,7 @@ window.RSINativeUpdate=(()=>{
   }
   setText(n.manual,t('手动下载安装包'));
   setText(n.receipt,t('导出升级回执'));
-  setHidden(n.saved,!storageError);setText(n.saved,t('偏好未保存到磁盘，本次会话已生效。'));
+  setHidden(n.saved,!unsavedPreferences.size);setText(n.saved,t('偏好未保存到磁盘，本次会话已生效。'));
  }
  async function exportReceipt(){
   // The transaction comes from the persisted record written before replacement,
@@ -239,7 +269,7 @@ window.RSINativeUpdate=(()=>{
    transaction,transaction_error:transactionError||null};
   const blob=new Blob([JSON.stringify(receipt,null,2)],{type:'application/json'});
   const link=document.createElement('a');link.href=URL.createObjectURL(blob);
-  link.download='adaptive-rsi-update-receipt.json';link.click();URL.revokeObjectURL(link.href);
+  link.download='adaptive-rsi-update-receipt.json';link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);
   return receipt;
  }
  function eligible(current,target,scope=versionScope){
@@ -267,7 +297,7 @@ window.RSINativeUpdate=(()=>{
     if(!initialAuthorization){
      trackAuthorization(syncAuthorization());
     }
-    if(!await initialAuthorization||authorizationError){
+    if(!await waitForAuthorization()||authorizationError){
      if(!authorizationError)authorizationError='update_authorization_failed';
      return;
     }
@@ -295,12 +325,15 @@ window.RSINativeUpdate=(()=>{
  async function act(){
   if(checking||busy||!enabled()||Date.now()<retryAt)return;checking=true;
   try{
-   // app.js can call tick() from its earlier DOMContentLoaded listener. Wait
-   // until this module starts the initial authorization sync before any action.
-   if(['interactive','complete'].includes(document.readyState)&&!initialAuthorization)return;
-   // Status reads must continue during startup authorization, but automatic
-   // actions must still wait for the authorization reply.
-   if(initialAuthorization)await initialAuthorization;
+   // app.js can tick before the delayed startup sync. After it starts, retry
+   // authorization independently of status reads and release actions on success.
+   if(!initialAuthorization){
+    if(authorizationRetryAt!==null){
+     if(Date.now()<authorizationRetryAt)return;
+     trackAuthorization(syncAuthorization());
+    }else if(['interactive','complete'].includes(document.readyState))return;
+   }
+   if(initialAuthorization&&!await waitForAuthorization())return;
    const last=Number(localRead('rsi-native-update-checked')||0);
    if(preference()!=='manual'&&((failureCounts.check||0)+(failureCounts.download||0)>0||Date.now()-last>6*3600000)){
     await run('check');
@@ -330,8 +363,9 @@ window.RSINativeUpdate=(()=>{
   if(busy||ACTIVE_PHASES.includes(phase))return POLL_ACTIVE;
   // Settled clients have nothing to show that changes faster than the six-hourly
   // feed check; the five-minute read is only a safety net.
-  if(!snapshot.state||snapshot.state==='latest'||snapshot.state==='idle')return POLL_IDLE;
-  return POLL_VISIBLE;
+  const delay=!snapshot.state||snapshot.state==='latest'||snapshot.state==='idle'?POLL_IDLE:POLL_VISIBLE;
+  return authorizationRetryAt>0&&!initialAuthorization
+   ?Math.min(delay,Math.max(POLL_ACTIVE,authorizationRetryAt-Date.now())):delay;
  }
  function stopPoll(){if(pollTimer!==null){clearTimeout(pollTimer);pollTimer=null;}}
  function schedulePoll(){

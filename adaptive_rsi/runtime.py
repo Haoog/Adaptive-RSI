@@ -752,9 +752,11 @@ class Runtime(Maintenance):
                     if prior["state"] == "queued":
                         db.execute("UPDATE tasks SET priority=max(priority,?) WHERE id=?", (priority, prior["id"]))
                         if not automatic:
-                            db.execute("UPDATE tasks SET evidence=? WHERE id=?", (encode([{"scan_trigger": "manual"}]), prior["id"]))
+                            db.execute("UPDATE tasks SET evidence=?,available=0 WHERE id=?",
+                                       (encode([{"scan_trigger": "manual"}]), prior["id"]))
+                            self.wake.set()
                     return prior["id"]
-                if prior["state"] in ["failed", "blocked"]:
+                if automatic and prior["state"] in ["failed", "blocked"]:
                     # 周期任务持续故障时按连败次数退避，避免每周期产生新的失败 run。
                     rows = db.execute("SELECT state,ended FROM runs WHERE task=? ORDER BY started DESC,rowid DESC LIMIT 4", (prior["id"],)).fetchall()
                     streak, last_failure = 0, 0.0
@@ -1405,9 +1407,17 @@ class Runtime(Maintenance):
                     replayable):
                 scan = self.request(project, "issues", priority=1000)
                 self.store.execute("UPDATE tasks SET urgency=1 WHERE id=? AND state='queued'", (scan,))
+        quarantined = progress.get("quarantined") if isinstance(progress, dict) else None
         mapping = [("light", "inspection"), ("issues", "issues")]
         for kind, source in mapping:
-            if not config["sources"][source] or (kind == "issues" and not config["github"]["repository"]):
+            if kind == "issues" and not config["github"]["repository"]:
+                continue
+            # Quarantined work stays on the regular Issue interval, including
+            # projects that disabled automatic discovery after observing it.
+            recovery_only = (kind == "issues" and not config["sources"][source]
+                             and isinstance(quarantined, dict) and bool(quarantined)
+                             and progress.get("repository") == config["github"]["repository"])
+            if not config["sources"][source] and not recovery_only:
                 continue
             row = self.store.one("SELECT * FROM schedules WHERE project=? AND kind=?", (project, kind))
             interval = config["schedule"][kind + "_minutes"] * 60
@@ -1418,7 +1428,7 @@ class Runtime(Maintenance):
                     "SELECT count(*) AS n FROM tasks WHERE project=? AND state='queued' "
                     "AND source NOT LIKE 'system_%'", (project,))["n"]
                 priority = 55 if queued else 90
-                scan = self.request(project, kind, priority=priority, automatic=True)
+                scan = self.request(project, kind, priority=priority, automatic=not recovery_only)
                 if kind != "issues" or not pending:
                     # request() 对排队任务只按 max() 抬升优先级；手动触发会写入
                     # scan_trigger=manual，周期重算不能把该提升降回积压深度推导值。
@@ -1430,7 +1440,7 @@ class Runtime(Maintenance):
         key = "deferred-check:" + project
         if now - self.store.setting(key, 0) >= config["schedule"]["light_minutes"] * 60:
             if self.store.one("SELECT 1 FROM tasks WHERE project=? AND state='deferred'", (project,)):
-                self.request(project, "reassess", priority=40)
+                self.request(project, "reassess", priority=40, automatic=True)
             self.store.put_setting(key, now)
 
     def next_effective_schedule(self, project, due, now=None):
@@ -2058,8 +2068,9 @@ class Runtime(Maintenance):
             data = decode_object(row["result"])
             item = {"run": row["id"], **{key: data[key] for key in
                     ["value", "summary", "files", "delivery_status", "merged_sha"] if key in data}}
-            if data.get("feedback"):
-                item["feedback"] = {key: data["feedback"][key] for key in ["state", "head"] if key in data["feedback"]}
+            feedback = data.get("feedback")
+            if isinstance(feedback, dict) and feedback:
+                item["feedback"] = {key: feedback[key] for key in ["state", "head"] if key in feedback}
             result.append(item)
         return result
 
@@ -2869,6 +2880,8 @@ class Runtime(Maintenance):
                              run["project"], run["id"])
 
     def inspect(self, project, workspace, kind, run, strategies):
+        from .discovery import evidence_anchors, evidence_paths
+
         head = git(workspace, "rev-parse", "HEAD")
         key = "inspection-head:" + project["id"] + ":" + kind
         ci = self.store.setting("ci:" + project["id"], [])
@@ -2894,7 +2907,8 @@ class Runtime(Maintenance):
         module_changes = (sorted(self._relevant_module_paths(selected, changed_paths))
                           if changed_paths is not None else None)
         relevant_change = previous_head is None or changed_paths is None or bool(module_changes)
-        effective_head = head if relevant_change else previous_head
+        signature_head_key = selected_key + ":signature-head"
+        effective_head = head if relevant_change else self.store.setting(signature_head_key, previous_head)
         module_scope = str((selected or {}).get("cwd", "."))
         context_paths = module_changes if module_changes else ([module_scope] if module_scope != "." else None)
         def relevant_path(path):
@@ -2908,11 +2922,7 @@ class Runtime(Maintenance):
         backlog = []
         for item in self.store.query("SELECT id,title,state,evidence FROM tasks WHERE project=? AND source NOT LIKE 'system_%' "
                                      "ORDER BY created DESC LIMIT 100", (project["id"],)):
-            try:
-                evidence = json.loads(item["evidence"])
-            except (TypeError, ValueError):
-                evidence = []
-            paths = [entry.get("path", "") for entry in evidence if isinstance(entry, dict)]
+            paths = evidence_paths([entry.get("path") for entry in evidence_anchors(item["evidence"])])
             if any(relevant_path(path) for path in paths):
                 backlog.append({"id": item["id"], "title": item["title"], "state": item["state"],
                                 "paths": paths, "evidence": item["evidence"]})
@@ -2920,20 +2930,17 @@ class Runtime(Maintenance):
         for item in self.store.query("SELECT r.id,r.state,r.result,t.evidence FROM runs r JOIN tasks t ON t.id=r.task "
                                      "WHERE r.project=? AND r.state IN ('failed','blocked') ORDER BY r.started DESC LIMIT 100",
                                      (project["id"],)):
-            try:
-                result = json.loads(item["result"])
-                evidence = json.loads(item["evidence"])
-            except (TypeError, ValueError):
-                continue
-            paths = result.get("files", []) + [entry.get("path", "") for entry in evidence if isinstance(entry, dict)]
+            result = decode_object(item["result"])
+            files = evidence_paths(result.get("files"))
+            paths = files + evidence_paths([entry.get("path") for entry in evidence_anchors(item["evidence"])])
             if any(relevant_path(path) for path in paths):
                 history.append({"id": item["id"], "state": item["state"],
-                                "reason": str(result.get("reason", ""))[:500], "files": result.get("files", [])})
+                                "reason": str(result.get("reason", ""))[:500], "files": files})
                 if len(history) == 8:
                     break
         recent_failed_ids = [{"id": item["id"], "state": item["state"]} for item in history]
         module_outcomes = [item for item in self.outcomes(project["id"])
-                           if any(relevant_path(path) for path in item.get("files", []))]
+                           if any(relevant_path(path) for path in evidence_paths(item.get("files")))]
         self.store.put_setting("rotation:" + project["id"], rotation + 1)
         prs_context = [{key: item[key] for key in ["number", "title", "headRefName"] if key in item}
                        for item in self.store.setting("prs:" + project["id"], [])[:20]]
@@ -2944,7 +2951,8 @@ class Runtime(Maintenance):
                                              "model": json.loads(run["config"] or "{}").get("models", {}).get("analysis")})
         if self.store.setting(selected_key) == inspection_signature:
             self.store.event("inspection_skip", "Committed snapshot unchanged; no model call", project["id"], run["id"])
-            self.store.put_setting(module_head_key, head)
+            self.store.execute("INSERT OR REPLACE INTO settings VALUES (?,?), (?,?)",
+                               (signature_head_key, encode(effective_head), module_head_key, encode(head)))
             return
         selected_context = ({key: selected[key] for key in ["language", "manifest", "cwd", "tool", "checks"]
                              if key in selected} if selected else None)
@@ -3100,8 +3108,9 @@ class Runtime(Maintenance):
             queued += decision == "ready"
             deferred += decision == "deferred"
             rejected += decision == "rejected"
-        self.store.put_setting(selected_key, inspection_signature)
-        self.store.put_setting(module_head_key, head)
+        self.store.execute("INSERT OR REPLACE INTO settings VALUES (?,?), (?,?), (?,?)",
+                           (selected_key, encode(inspection_signature), signature_head_key, encode(effective_head),
+                            module_head_key, encode(head)))
         self.store.event("inspection", str(added) + " evidenced findings considered", project["id"], run["id"],
                          {"queued": queued, "deferred": deferred, "rejected": rejected})
 
@@ -3207,7 +3216,7 @@ class Runtime(Maintenance):
                              project, data={"signature": signature,
                                             "previous": attempt.get("status") if isinstance(attempt, dict) else None})
             return
-        self.request(project, "evolve", priority=30)
+        self.request(project, "evolve", priority=30, automatic=True)
         # 入队先于水位落库：水位标记丢失时重放会重新判定（attempt_due 未变仍 due，
         # request 以 system:evolve 指纹去重返回既有任务），不丢一次应得的进化尝试。
         self.store.put_setting("last-evolution:" + project, count)

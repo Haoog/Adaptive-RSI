@@ -1,24 +1,20 @@
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
-const {createInterface} = require('node:readline');
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const {chromium} = require('playwright');
 
 (async () => {
   const server = spawn(process.env.PYTHON || 'python3', ['-m', 'tests.browser_fixture'],
     {stdio: ['pipe', 'pipe', 'pipe'], env: {...process.env, PYTHONDONTWRITEBYTECODE: '1'}});
-  let browser;
+  let browser, scenarioError;
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(Error('Fixture startup timed out')), 30000);
-      createInterface({input: server.stdout}).once('line', line => {clearTimeout(timer); resolve(line);});
-      server.once('exit', code => {clearTimeout(timer); reject(Error('Fixture exited: ' + code));});
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
     const page = await browser.newPage();
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(url);
-    await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+    await waitForPausedProject(page);
     for (const title of ['批量目标一', '批量目标二']) {
       await page.locator('#goal-text').fill(title);
       await page.locator('#goal-form button[type=submit]').click();
@@ -73,9 +69,10 @@ const {chromium} = require('playwright');
     assert.equal(restored.tasks.filter(task => ['批量目标一', '批量目标二'].includes(task.title) && task.state === 'queued').length, 2);
     assert.deepEqual(errors, []);
     console.log('Batch grouping and restore browser checks passed with paused projects and no model calls.');
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    server.stdin.end('\n');
-    await new Promise(resolve => server.once('exit', resolve));
+    await closeFixture(server, browser, scenarioError);
   }
 })().catch(error => {console.error(error); process.exitCode = 1;});

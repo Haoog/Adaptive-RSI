@@ -11,6 +11,28 @@ from .agent import CodexAgent
 from .process import Sandbox, run_process
 
 
+def verified_check_proof(store, project, config):
+    proof = store.setting("verified-checks:" + project["id"])
+    if not isinstance(proof, dict) or proof.get("compatibility") != compatibility(config):
+        return None
+    checks = proof.get("checks")
+    if not isinstance(checks, list) or not checks or type(proof.get("at")) not in (int, float):
+        return None
+    for check in checks:
+        if not isinstance(check, dict) or not isinstance(check.get("cwd", "."), str):
+            return None
+        argv = check.get("argv")
+        if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
+            return None
+    from .gitops import git
+    try:
+        if proof.get("base") == git(project["path"], "rev-parse", "HEAD"):
+            return proof
+    except (RuntimeError, OSError, ValueError):
+        pass
+    return None
+
+
 def github_capabilities(repo):
     """Inspect repository permissions without exercising any write capability."""
     import json
@@ -203,15 +225,7 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
                                "tool_tested": selected[4]["probe"].get("state") == "pass",
                                "task_verified": task_verified})
     usage = budget(runtime.store, project["id"], config, required, run)
-    proof = runtime.store.setting("verified-checks:" + project["id"])
-    from .gitops import git
-    try:
-        head = git(root, "rev-parse", "HEAD")
-        verified = bool(proof and proof["base"] == head and
-                        proof["compatibility"] == compatibility(config))
-    except (RuntimeError, OSError, ValueError):
-        # 仓库缺失或损坏时 readiness 仍应给出可操作的结果，而不是整体报错。
-        verified = False
+    verified = verified_check_proof(runtime.store, project, config) is not None
     protection = None
     capabilities = None
     if config["delivery"]["mode"] == "pr" and config["github"]["repository"]:
