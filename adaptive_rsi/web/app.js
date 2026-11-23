@@ -954,17 +954,41 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
 
  if(ticket!==detailSequence||projectId!==project)return;
  // 与 runtime.cancel_task 的 cancellable 状态保持一致；待批准的候选取消前需确认后果。
- if(['queued','planning','executing','evaluating','blocked','waiting_budget','deferred','insufficient_evidence','failed','interrupted','awaiting_approval'].includes(task.state)){const secondary=el('details',undefined,'task-secondary-actions');secondary.append(el('summary',t('更多操作')),action(t('取消任务'),async()=>{
-  if(ticket!==detailSequence||projectId!==project)return;
-  const plan=await api('task-cancel-preview?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));
-  if(ticket!==detailSequence||projectId!==project)return;
-  const preview=el('div'),cascade=el('input'),reason=el('textarea');cascade.type='checkbox';reason.maxLength=2000;reason.rows=2;
-  preview.append(el('p',t('取消后待批准的候选将被撤销，需要重新验证才能再次交付；已创建的 PR 不受影响。确认取消？')));
-  if(plan.affected.length){preview.append(el('p',t('以下后继任务依赖本任务；默认只取消当前任务。')));for(const item of plan.affected)preview.append(el('p',item.title+' · '+t(statusNames[item.state]||item.state)));if(!plan.truncated){const label=el('label',t('同时取消可取消的后继任务'));label.prepend(cascade);preview.append(label);}}
-  if(plan.truncated)preview.append(el('p',t('后继过多，预览仅展示前 999 项；本次只能取消当前任务。')));
-  const reasonLabel=el('label',t('干预原因（可选，保留原文）'));reasonLabel.append(reason);preview.append(reasonLabel);
-  if(!(await uiConfirm(t('确认取消任务及所选后继？'),preview))||!stillCurrent())return;
-  await api('cancel',{task:task.id,cascade:cascade.checked,revision:plan.revision,reason:reason.value});if(stillCurrent())closeTaskDetail();await refresh();}));
+ if(['queued','planning','executing','evaluating','blocked','waiting_budget','deferred','insufficient_evidence','failed','interrupted','awaiting_approval'].includes(task.state)){
+  const secondary=el('details',undefined,'task-secondary-actions'),machine=window.__RSI_MACHINE_KEY__;
+  const sameScope=()=>projectId===project&&window.__RSI_MACHINE_KEY__===machine;
+  const cancelCurrent=()=>sameScope()&&stillCurrent();
+  const cancelButton=action(t('取消任务'),async()=>{
+   if(cancelButton.disabled||!cancelCurrent())return;
+   cancelButton.disabled=true;
+   try{
+    const plan=await api('task-cancel-preview?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));
+    if(!cancelCurrent())return;
+    const preview=el('div'),cascade=el('input'),reason=el('textarea');cascade.type='checkbox';reason.maxLength=2000;reason.rows=2;
+    preview.append(el('p',t('取消后待批准的候选将被撤销，需要重新验证才能再次交付；已创建的 PR 不受影响。确认取消？')));
+    if(plan.affected.length){preview.append(el('p',t('以下后继任务依赖本任务；默认只取消当前任务。')));for(const item of plan.affected)preview.append(el('p',item.title+' · '+t(statusNames[item.state]||item.state)));if(!plan.truncated){const label=el('label',t('同时取消可取消的后继任务'));label.prepend(cascade);preview.append(label);}}
+    if(plan.truncated)preview.append(el('p',t('后继过多，预览仅展示前 999 项；本次只能取消当前任务。')));
+    const reasonLabel=el('label',t('干预原因（可选，保留原文）'));reasonLabel.append(reason);preview.append(reasonLabel);
+    if(!(await uiConfirm(t('确认取消任务及所选后继？'),preview))||!cancelCurrent())return;
+    // 服务若为更新拒绝这次提交，必须重新预览和确认，不能在后台重放旧授权。
+    const result=await sendApi('cancel',{task:task.id,cascade:cascade.checked,revision:plan.revision,reason:reason.value});
+    if(result?.saved!==true||!Array.isArray(result.receipts)||!result.receipts.some(row=>row?.id===task.id&&row.state==='cancelled')){
+     throw Error(t('未收到取消回执，请先刷新列表确认任务状态。'));
+    }
+   }catch(error){
+    if(!cancelCurrent())return;
+    if(error.code==='update_in_progress'){toast(t('服务正在更新，请稍后重新预览并确认取消。'),true);return;}
+    throw error;
+   }finally{cancelButton.disabled=false;}
+   if(!sameScope())return;
+   const acceptedHere=cancelCurrent();
+   if(acceptedHere){closeTaskDetail();toast(t('已申请取消任务'));}
+   const feedbackTicket=detailSequence;
+   try{await refresh();}catch{
+    if(acceptedHere&&sameScope()&&feedbackTicket===detailSequence)toast(t('已申请取消任务，但列表刷新失败。'),true);
+   }
+  });
+  secondary.append(el('summary',t('更多操作')),cancelButton);
   if(task.state==='queued'){
    // 预约授权一个绝对时刻：时区与重复小时一起提交，由后端拒绝缺失/歧义时刻。
    const scheduleBox=el('div',undefined,'task-schedule-editor'),time=el('input'),zone=el('input'),repeat=el('select'),draft=draftStore.get('task-schedule',task.id);

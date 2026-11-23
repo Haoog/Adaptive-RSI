@@ -996,7 +996,12 @@ test('out-of-order task details cannot attach cancellation for the previous task
     if (url.includes('run?id=ra')) return new Promise(resolve => { finishA = () => resolve(response(detail)); });
     if (url.includes('run?id=rb')) return response(detail);
     if (url.includes('task-cancel-preview?')) return response({affected: [], revision: 'preview-b'});
-    if (url.endsWith('/cancel')) { cancellations.push(JSON.parse(options.body)); return response({saved: true}); }
+    if (url.endsWith('/cancel')) {
+      const body = JSON.parse(options.body);
+      cancellations.push(body);
+      return response({saved: true, revision: body.revision, cascade: body.cascade, impact_truncated: false,
+        receipts: [{id: body.task, state: 'cancelled', previous_state: 'executing', candidates: [], publications: []}]});
+    }
     return response(snapshot());
   };
   const pendingA = page.context.showTask(a);
@@ -1008,6 +1013,198 @@ test('out-of-order task details cannot attach cancellation for the previous task
   assert.equal(buttons.length, 1);
   await buttons[0].handlers.click();
   assert.deepEqual(cancellations, [{task: 'b', cascade: false, revision: 'preview-b', reason: ''}]);
+});
+
+async function taskCancellationPage({preview, post, refresh} = {}) {
+  const page = browser(), task = fixtureTask('cancel-me', 'executing');
+  const previews = [], posts = [], refreshes = [];
+  page.document.body = page.node('fixture-body');
+  page.context.window.__RSI_MACHINE_KEY__ = 'runtime-a';
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.fetch = async (url, options) => {
+    const {pathname, searchParams} = new URL(url, 'http://fixture.test');
+    if (pathname === '/api/task-runs') return response([]);
+    if (pathname === '/api/task-cancel-preview') {
+      previews.push(Object.fromEntries(searchParams));
+      const plan = {task, revision: 'preview-' + previews.length, limit: 1000, truncated: false,
+        affected: [{id: 'child', title: 'Downstream task', state: 'queued', cancellable: true}]};
+      return preview ? preview(plan) : response(plan);
+    }
+    if (pathname === '/api/cancel') {
+      const body = JSON.parse(options.body);
+      posts.push(body);
+      const receipt = {saved: true, revision: body.revision, cascade: body.cascade, impact_truncated: false, receipts: [
+        {id: task.id, state: 'cancelled', previous_state: task.state, candidates: [], publications: []},
+        {id: 'child', state: body.cascade ? 'cancelled' : 'unchanged', previous_state: 'queued', candidates: [], publications: []},
+      ]};
+      return post ? post(receipt) : response(receipt);
+    }
+    assert.equal(pathname, '/api/state');
+    refreshes.push(searchParams.get('project'));
+    return refresh ? refresh() : response(snapshot());
+  };
+  await page.context.showTask(task);
+  const click = label => {
+    const button = buttonWith(page.node('detail-body'), label);
+    assert.ok(button && button.tagName === 'BUTTON');
+    return button.handlers.click();
+  };
+  const dialogs = () => descendants(page.document.body).filter(node => node.className === 'confirm-dialog' && node.open);
+  const choose = (dialog, label) => buttonWith(dialog, label).handlers.click();
+  async function navigate(scope) {
+    if (scope === 'task') await page.context.showTask(fixtureTask('other', 'failed'));
+    if (scope === 'project') {
+      const picker = page.node('project-select');
+      picker.value = 'b';
+      picker.handlers.change();
+      await page.context.lastAction;
+    }
+    if (scope === 'runtime') page.context.window.__RSI_MACHINE_KEY__ = 'runtime-b';
+    page.context.toast('当前界面');
+  }
+  return {page, previews, posts, refreshes, click, dialogs, choose, navigate, toast: page.node('toast')};
+}
+
+test('task cancellation rapid clicks open one preview and require a fresh confirmation after dismissal', async () => {
+  const replies = [];
+  const f = await taskCancellationPage({preview: plan => new Promise(resolve => replies.push(() => resolve(response(plan))))});
+  const pending = f.click('取消任务');
+  const duplicates = [f.click('取消任务'), f.click('取消任务')];
+  for (const reply of replies) reply();
+  await new Promise(setImmediate);
+  assert.deepEqual([f.previews.length, f.dialogs().length, f.posts.length], [1, 1, 0], 'preview, open confirmations, POSTs');
+  f.choose(f.dialogs()[0], '取消');
+  await Promise.all([pending, ...duplicates]);
+  assert.equal(f.posts.length, 0);
+  const confirmed = f.click('取消任务');
+  replies.at(-1)();
+  await waitFor(() => f.dialogs().length === 1);
+  const dialog = f.dialogs()[0], fields = descendants(dialog);
+  const cascade = fields.find(node => node.type === 'checkbox');
+  assert.equal(cascade.checked, false);
+  assert.ok(fields.some(node => node.textContent.includes('Downstream task')));
+  cascade.checked = true;
+  fields.find(node => node.tagName === 'TEXTAREA').value = '  原文\n保留  ';
+  f.choose(dialog, '确认');
+  await confirmed;
+  assert.deepEqual(f.posts, [{task: 'cancel-me', cascade: true, revision: 'preview-2', reason: '  原文\n保留  '}]);
+  assert.equal(f.toast.textContent, '已申请取消任务');
+});
+
+for (const scope of ['task', 'project', 'runtime']) {
+  for (const phase of ['preview', 'preview failure', 'confirm', 'POST failure', 'POST receipt']) {
+    test(`task cancellation ignores a stale ${phase} after switching ${scope}`, async () => {
+      let reply;
+      const rejected = response({}, 503);
+      const f = await taskCancellationPage({
+        preview: phase.startsWith('preview') ? plan => new Promise(resolve => {
+          reply = () => resolve(phase === 'preview' ? response(plan) : rejected);
+        }) : undefined,
+        post: phase.startsWith('POST') ? receipt => new Promise(resolve => {
+          reply = () => resolve(phase === 'POST receipt' ? response(receipt) : rejected);
+        }) : undefined,
+        refresh: phase === 'POST receipt' && scope === 'task' ? () => rejected : undefined,
+      });
+      const pending = f.click('取消任务');
+      if (!phase.startsWith('preview')) await waitFor(() => f.dialogs().length === 1);
+      if (phase.startsWith('POST')) {
+        f.choose(f.dialogs()[0], '确认');
+        await waitFor(() => f.posts.length === 1);
+      }
+      await f.navigate(scope);
+      const refreshCount = f.refreshes.length;
+      if (phase === 'confirm') f.choose(f.dialogs()[0], '确认');
+      else reply();
+      await new Promise(setImmediate);
+      assert.deepEqual([f.dialogs().length, f.posts.length, f.toast.textContent],
+        [0, phase.startsWith('POST') ? 1 : 0, '当前界面'], 'open confirmations, POSTs, toast');
+      await pending;
+      assert.equal(f.refreshes.length - refreshCount, phase === 'POST receipt' && scope === 'task' ? 1 : 0);
+      assert.equal(f.page.node('detail-dialog').open, scope !== 'project');
+      if (scope === 'task') assert.equal(f.page.node('detail-title').textContent, 'Task other');
+    });
+  }
+}
+
+test('task cancellation distinguishes a committed receipt from a refresh failure', async () => {
+  let failRefresh;
+  const f = await taskCancellationPage({refresh: () => new Promise(resolve => { failRefresh = () => resolve(response({}, 503)); })});
+  const pending = f.click('取消任务');
+  await waitFor(() => f.dialogs().length === 1);
+  f.choose(f.dialogs()[0], '确认');
+  await waitFor(() => Boolean(failRefresh));
+  const before = f.toast.textContent;
+  failRefresh();
+  await pending;
+  assert.deepEqual([f.posts.length, f.refreshes.length, before, f.toast.textContent, f.page.node('detail-dialog').open],
+    [1, 1, '已申请取消任务', '已申请取消任务，但列表刷新失败。', false]);
+});
+
+test('task cancellation keeps a later task open when a post-receipt refresh fails', async () => {
+  let failRefresh;
+  const f = await taskCancellationPage({refresh: () => new Promise(resolve => { failRefresh = () => resolve(response({}, 503)); })});
+  const pending = f.click('取消任务');
+  await waitFor(() => f.dialogs().length === 1);
+  f.choose(f.dialogs()[0], '确认');
+  await waitFor(() => Boolean(failRefresh));
+  await f.navigate('task');
+  failRefresh();
+  await pending;
+  assert.equal(f.toast.textContent, '当前界面');
+  assert.equal(f.page.node('detail-dialog').open, true);
+  assert.equal(f.page.node('detail-title').textContent, 'Task other');
+});
+
+for (const [post, message] of [
+  [() => response({saved: true}), '未收到取消回执，请先刷新列表确认任务状态。'],
+  [() => rejected(), '服务正在更新，请稍后重新预览并确认取消。'],
+]) {
+  test(`task cancellation keeps details open and reports ${message}`, async () => {
+    const f = await taskCancellationPage({post});
+    const pending = f.click('取消任务');
+    await waitFor(() => f.dialogs().length === 1);
+    f.choose(f.dialogs()[0], '确认');
+    await pending;
+    assert.equal(f.toast.textContent, message);
+    assert.equal(f.page.node('detail-dialog').open, true);
+    assert.deepEqual([f.posts.length, f.refreshes.length], [1, 0]);
+  });
+}
+
+test('task cancellation requires new confirmation after revision rejection', async () => {
+  let rejected = true;
+  const f = await taskCancellationPage({post: receipt => rejected
+    ? response({error: 'Cancellation preview changed; review it again', error_code: 'validation_error'}, 400)
+    : response(receipt)});
+  const first = f.click('取消任务');
+  await waitFor(() => f.dialogs().length === 1);
+  f.choose(f.dialogs()[0], '确认');
+  await first;
+  assert.equal(f.toast.textContent, '任务或依赖已变化，请重新查看取消预览。');
+  assert.equal(f.page.node('detail-dialog').open, true);
+  assert.deepEqual([f.posts.length, f.refreshes.length], [1, 0]);
+  rejected = false;
+  const second = f.click('取消任务');
+  await waitFor(() => f.dialogs().length === 1);
+  assert.equal(f.posts.length, 1, 'a newer preview still needs explicit confirmation');
+  f.choose(f.dialogs()[0], '确认');
+  await second;
+  assert.deepEqual(f.posts.map(post => [post.revision, post.cascade]), [['preview-1', false], ['preview-2', false]]);
+});
+
+test('task cancellation cannot replay an update-rejected confirmation after switching project', async () => {
+  const f = await taskCancellationPage({post: () => rejected()});
+  const pending = f.click('取消任务');
+  await waitFor(() => f.dialogs().length === 1);
+  f.choose(f.dialogs()[0], '确认');
+  await new Promise(setImmediate);
+  await f.navigate('project');
+  const retry = f.page.timers.find(timer => timer.active && timer.delay === 1000);
+  if (retry) {
+    f.page.fireTimer(1000);
+    await new Promise(setImmediate);
+  } else await pending;
+  assert.deepEqual([f.posts.length, f.toast.textContent], [1, '当前界面']);
 });
 
 test('task run history loads and appends earlier pages with a visible count', async () => {
