@@ -119,14 +119,25 @@ if(window.__TAURI_INTERNALS__){
    }catch(e){
     switching=switched;
     const message=String(e);
+    const checkRejected=/^(?:Error: )?Runtime (?:health|state) check failed \(HTTP 40[13]\)$/.test(message);
     if(args.sshTunnel){
-     const authenticationFailed=/^(?:Error: )?(?:SSH tunnel authentication was rejected|Missing runtime authentication)$/.test(message)
-      ||/^(?:Error: )?Runtime (?:health|state) check failed \(HTTP 40[13]\)$/.test(message);
+     const authenticationFailed=checkRejected||/^(?:Error: )?(?:SSH tunnel authentication was rejected|Missing runtime authentication)$/.test(message);
      showConnectionError(authenticationFailed
       ?'SSH 隧道可达，但认证失败。请生成新的认证地址后重试。'
       :'未能通过 SSH 隧道连接。请检查终端中的转发仍在运行，并核对本机端口后重试。',
       /^(?:Error: )?Server connection failed$/.test(message)?'Server connection failed':'');
-    }else showConnectionError(message);
+    }else if(args.url===null){
+     showConnectionError(message);
+    }else if(checkRejected){
+     showConnectionError('HTTPS 认证被拒绝。请生成新的认证地址后重试。');
+    }else if(/^(?:Error: )?(?:Server connection failed|Cannot connect to the selected runtime)$/.test(message)){
+     showConnectionError('无法连接 HTTPS 服务。请检查网络和服务器是否可达后重试。');
+    }else if(/^(?:Error: )?Update the remote runtime before connecting$/.test(message)){
+     showConnectionError('远端服务版本不兼容。请升级远端服务后重试。');
+    }else{
+     // Native uses its generic server rejection for any unexpected status on the initial request.
+     showConnectionError('未能完成 HTTPS 连接。请核对完整的认证地址，并确认远端服务正在运行后重试。');
+    }
    }finally{
     if(!switching)mode.disabled=connect.disabled=local.disabled=close.disabled=false;
    }

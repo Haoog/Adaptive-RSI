@@ -3,6 +3,7 @@ const test=require('node:test'),assert=require('node:assert/strict'),vm=require(
 const {webcrypto}=require('node:crypto');
 const desktopSource=fs.readFileSync('adaptive_rsi/web/desktop.js','utf8');
 const appSource=fs.readFileSync('adaptive_rsi/web/app.js','utf8');
+const i18nSource=fs.readFileSync('adaptive_rsi/web/i18n.js','utf8');
 // Loads the desktop transport with a stubbed Tauri bridge; app.js is loaded by tests that exercise api().
 function desktop(reply){
  const element=()=>({textContent:'',dataset:{},children:[],classList:{add(){},remove(){},toggle(){}},addEventListener(){},append(){},prepend(){},setAttribute(){},querySelector(){return null},querySelectorAll(){return[]},remove(){},focus(){},showModal(){},close(){},style:{}});
@@ -98,43 +99,94 @@ for(const [rejection,expected] of [
  ['Runtime health check failed (HTTP 503)',sshNetworkError],
  ['Runtime state check failed (HTTP 401): session at http://127.0.0.1:6090/?token=fixture',sshNetworkError],
 ]){
- test(`SSH connection rejection is safe and keeps the old page usable: ${rejection}`,async()=>{
+ testConnectionRejection(`SSH connection rejection is safe and keeps the old page usable: ${rejection}`,{mode:'ssh',rejection,expected});
+}
+
+const httpsAuth=[
+ 'HTTPS 认证被拒绝。请生成新的认证地址后重试。',
+ 'HTTPS authentication was rejected. Generate a fresh authentication URL and try again.',
+];
+const httpsNetwork=[
+ '无法连接 HTTPS 服务。请检查网络和服务器是否可达后重试。',
+ 'Could not reach the HTTPS service. Check your network and server reachability, then try again.',
+];
+const httpsUnknown=[
+ '未能完成 HTTPS 连接。请核对完整的认证地址，并确认远端服务正在运行后重试。',
+ 'Could not complete the HTTPS connection. Verify the full authentication URL and make sure the remote service is running, then try again.',
+];
+for(const [name,rejection,[expected,english]] of [
+ ['address preflight',null,['请输入 HTTPS 认证地址。','Enter an HTTPS authentication URL.']],
+ ['health 401','Runtime health check failed (HTTP 401)',httpsAuth],
+ ['health 403','Runtime health check failed (HTTP 403)',httpsAuth],
+ ['state 401','Runtime state check failed (HTTP 401)',httpsAuth],
+ ['state 403',new Error('Runtime state check failed (HTTP 403)'),httpsAuth],
+ ['initial transport failure','Server connection failed',httpsNetwork],
+ ['runtime transport failure','Cannot connect to the selected runtime',httpsNetwork],
+ ['ambiguous server rejection','Server did not accept this connection',httpsUnknown],
+ ['health 503','Runtime health check failed (HTTP 503)',httpsUnknown],
+ ['missing CSRF','Missing runtime authentication',httpsUnknown],
+ ['unknown error with credentials','Runtime state check failed (HTTP 401): https://user:fixture-password@rsi.example.test/?token=fixture-token',httpsUnknown],
+ ['upgrade required','Update the remote runtime before connecting',[
+  '远端服务版本不兼容。请升级远端服务后重试。',
+  'The remote service version is incompatible. Upgrade the remote service and try again.',
+ ]],
+]){
+ testConnectionRejection(`direct HTTPS connection rejection through the form: ${name}`,{mode:'https',rejection,expected,english});
+}
+testConnectionRejection('local connection rejection retains its existing error',{mode:'local',
+ rejection:'Local runtime is unavailable',expected:'Local runtime is unavailable',english:'Local runtime is unavailable'});
+
+function testConnectionRejection(name,{mode,rejection,expected,english}){
+ test(name,async()=>{
   const handlers={},elements={},calls=[];
   let finishRequest,failConnect;
-  const makeElement=()=>({textContent:'',append(){},prepend(){},addEventListener(){},
+  const makeElement=()=>({textContent:'',append(...children){this.children=children;},prepend(){},addEventListener(){},
    setAttribute(name,value){if(name==='role'&&value==='alert')elements.alert=this;}});
   const oldReply={status:200,body:'{"runtime":"old"}'};
+  const scope=mode==='ssh'?'local':'https://old.example.test';
   const window={fetch:async()=>{},__TAURI_INTERNALS__:{invoke:async(command,args)=>{
    calls.push({command,args});
-   if(command==='runtime_info')return {kind:'local',connected:true,scope:'local',connection_generation:7};
+   if(command==='runtime_info')return {kind:mode==='ssh'?'local':'remote',connected:true,scope,connection_generation:7};
    if(command==='request')return args.path==='state'?new Promise(resolve=>{finishRequest=resolve;}):oldReply;
-   if(command==='validate_connection_target')return true;
+   if(command==='validate_connection_target')return rejection!==null;
    if(command==='connect')return new Promise((_,reject)=>{failConnect=reject;});
   }}};
-  const document={body:makeElement(),querySelector:makeElement,getElementById:makeElement,
+  const document={body:makeElement(),querySelector:makeElement,querySelectorAll:()=>[],getElementById:makeElement,
+   documentElement:{style:{}},createTreeWalker:()=>({nextNode:()=>false}),
    createElement(tag){const element=makeElement();elements[tag]=element;return element;},
    addEventListener(name,handler){handlers[name]=handler;}};
   let reloads=0;
-  vm.runInNewContext(desktopSource,{window,document,t:value=>value,crypto:webcrypto,Response,DOMException,console,
+  const context=vm.createContext({window,document,NodeFilter:{SHOW_TEXT:4},crypto:webcrypto,Response,DOMException,console,
    location:{reload(){reloads++;}}});
+  vm.runInContext(i18nSource,context);
+  vm.runInContext(desktopSource,context);
   await handlers.DOMContentLoaded();
   const pending=window.fetch('/api/state');
   await new Promise(setImmediate);
-  elements.select.value='ssh';
-  elements.select.onchange();
-  const url='http://127.0.0.1:6090/?token=fixture';
-  elements.input.value=url;
-  elements.form.onsubmit({preventDefault(){}});
+  const sshTunnel=mode==='ssh'?true:undefined;
+  const url=mode==='ssh'?'http://127.0.0.1:6090/?token=fixture':
+   rejection===null?'https://rsi.example.test/':'https://rsi.example.test/?token=fixture-token';
+  if(mode==='local'){
+   elements.form.children.find(element=>element.textContent==='使用本机').onclick();
+  }else{
+   if(sshTunnel){elements.select.value='ssh';elements.select.onchange();}
+   else assert.equal(elements.select.value,'https');
+   elements.input.value=url;
+   elements.form.onsubmit({preventDefault(){}});
+  }
   await new Promise(setImmediate);
-  assert.deepEqual(calls.slice(2).map(({command,args})=>[command,args.url,args.sshTunnel]),[
-   ['validate_connection_target',url,true],['connect',url,true],
-  ]);
-  failConnect(rejection);
-  await new Promise(setImmediate);
+  const expectedCalls=mode==='local'?[['connect',null,undefined]]:[['validate_connection_target',url,sshTunnel]];
+  if(mode!=='local'&&rejection!==null)expectedCalls.push(['connect',url,sshTunnel]);
+  assert.deepEqual(calls.slice(2).map(({command,args})=>[command,args.url,args.sshTunnel]),expectedCalls);
+  if(rejection!==null){failConnect(rejection);await new Promise(setImmediate);}
   assert.equal(elements.alert.hidden,false);
   assert.equal(elements.alert.textContent,expected);
+  if(english){
+   vm.runInContext('language="en";window.RSIDesktop.translate()',context);
+   assert.equal(elements.alert.textContent,english);
+  }
   assert.equal(elements.select.disabled,false);
-  assert.equal(window.__RSI_MACHINE_KEY__,'local');
+  assert.equal(window.__RSI_MACHINE_KEY__,scope);
   assert.equal(reloads,0);
   finishRequest(oldReply);
   assert.deepEqual(await (await pending).json(),{runtime:'old'});
