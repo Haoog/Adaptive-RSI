@@ -4331,7 +4331,11 @@ function usagePage() {
     requests.push({params, finish(title, status = 200, callTotal = 0, total = 60) {
       const tasks = Number(params.get('offset')) < total
         ? [{task: title, title, project: 'a', state: 'failed', tokens: 100, attempts: 1}] : [];
-      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [], calls: [], call_total: callTotal,
+      const offset = Number(params.get('offset')), limit = Number(params.get('limit'));
+      const calls = params.has('task') ? Array.from({length: Math.max(0, Math.min(limit, callTotal - offset))},
+        (_, index) => ({role: 'triage', model: `${title} ${offset + index + 1}`, provider: 'fixture',
+          effort: 'high', state: 'done', created: 1700000000 - offset - index, unit: 'http_request'})) : [];
+      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [], calls, call_total: callTotal,
         tasks, total}, status));
     }});
   });
@@ -4389,6 +4393,139 @@ test('usage details retain the visible report time window after a filter refresh
   assert.equal(page.requests[2].params.get('end'), originalEnd);
   page.requests[2].finish('Details'); await detail;
   assert.equal(page.node('usage-detail').open, true);
+});
+
+test('usage details recover when the call total shrinks during pagination', async () => {
+  const page = usagePage();
+  let now = 1700000000000;
+  page.context.Date = class extends Date { static now() { return now; } };
+  page.node('usage-period').value = '7';
+  page.search('fixture task');
+  page.fireTimer(350);
+  const report = page.context.lastAction;
+  page.requests[0].finish('fixture task'); await report;
+  const content = page.node('usage-detail-content');
+  const dialog = page.node('usage-detail');
+  const button = label => descendants(content).find(node => node.tagName === 'BUTTON' && node.textContent === label);
+  const calls = () => descendants(content).filter(node => node.className === 'usage-call');
+  const open = page.node('usage-tasks').children[0].children.at(-1);
+  assert.equal(open.textContent, '查看用量明细');
+  assert.equal(page.requests[0].params.get('q'), 'fixture task');
+  const expectedScope = new URLSearchParams(page.requests[0].params);
+  expectedScope.delete('q');
+  expectedScope.set('task', 'fixture task');
+  expectedScope.delete('offset');
+  function checkRequest(request, offset) {
+    const scope = new URLSearchParams(request.params);
+    assert.equal(scope.get('offset'), String(offset));
+    scope.delete('offset');
+    assert.deepEqual(Object.fromEntries(scope), Object.fromEntries(expectedScope));
+  }
+  function startPage(node, offset) {
+    const index = page.requests.length;
+    assert.ok(node);
+    node.handlers.click();
+    const request = page.requests[index];
+    checkRequest(request, offset);
+    return {pending: page.context.lastAction, request};
+  }
+  async function lastRequest(offset) {
+    const count = page.requests.length;
+    await new Promise(setImmediate);
+    assert.equal(page.requests.length, count + 1);
+    const request = page.requests[count];
+    checkRequest(request, offset);
+    return request;
+  }
+  async function loadPage(node, offset, label, total) {
+    const {pending, request} = startPage(node, offset);
+    request.finish(label, 200, total); await pending;
+  }
+
+  await loadPage(open, 0, 'First', 60);
+  assert.equal(calls().length, 25);
+  await loadPage(button('下一页'), 25, 'Second', 60);
+  assert.match(textOf(calls()[0]), /Second 26/);
+  now += 120000;
+  const next = startPage(button('下一页'), 50);
+  next.request.finish('Out of range', 200, 36);
+  await new Promise(setImmediate);
+  assert.equal(calls().length, 25, 'an empty out-of-range response must not replace the visible calls');
+  assert.equal(page.requests.length, 5);
+  checkRequest(page.requests[4], 25);
+  page.requests[4].finish('Last', 200, 36); await next.pending;
+  assert.equal(calls().length, 11);
+  assert.match(textOf(calls()[0]), /Last 26/);
+  assert.match(textOf(content.children.at(-1)), /36 次调用/);
+  assert.equal(button('下一页'), undefined);
+  assert.ok(button('上一页'));
+
+  dialog.close();
+  await loadPage(open, 0, 'First', 60);
+  await loadPage(button('下一页'), 25, 'Visible', 60);
+  const visibleRows = calls(), visibleSelection = content.children[2];
+  const shrinking = startPage(button('下一页'), 50);
+  shrinking.request.finish('Out of range', 200, 36);
+  const secondFallback = await lastRequest(25);
+  secondFallback.finish('Shrank again', 200, 25);
+  const firstFallback = await lastRequest(0);
+  assert.deepEqual(calls(), visibleRows);
+  firstFallback.finish('Unavailable', 503); await shrinking.pending;
+  assert.deepEqual(calls(), visibleRows);
+  const notice = content.querySelector('[data-form-error]');
+  assert.equal(notice.attributes.role, 'status');
+  assert.match(textOf(notice), /仍显示上次加载的记录/);
+  await loadPage(button('重试'), 0, 'Retried', 26);
+  assert.ok(!content.querySelector('[data-form-error]'));
+  assert.equal(content.children[2].textContent, visibleSelection.textContent);
+  assert.match(textOf(calls()[0]), /Retried 1/);
+  assert.equal(button('上一页'), undefined);
+
+  const exhausted = startPage(button('下一页'), 25);
+  const zeroRequestCount = page.requests.length;
+  exhausted.request.finish('No calls', 200, 0); await exhausted.pending;
+  assert.equal(page.requests.length, zeroRequestCount);
+  assert.equal(calls().length, 0);
+  assert.match(textOf(content.children.at(-1)), /0 次调用/);
+  assert.equal(button('上一页'), undefined);
+  assert.equal(button('下一页'), undefined);
+
+  const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')), page.context);
+  page.context.translateStatic = () => {};
+  for (const trigger of ['newer page', 'close', 'language', 'project']) {
+    if (dialog.open) dialog.close();
+    await loadPage(open, 0, 'First', 60);
+    await loadPage(button('下一页'), 25, 'Visible', 60);
+    const next = startPage(button('下一页'), 50);
+    next.request.finish('Out of range', 200, 36);
+    const fallback = await lastRequest(25);
+    if (trigger === 'newer page') {
+      await loadPage(button('上一页'), 0, 'Newer', 60);
+    } else if (trigger === 'close') {
+      dialog.close();
+    } else if (trigger === 'language') {
+      page.node('language-select').value = 'en';
+      page.node('language-select').handlers.change(); await page.context.lastAction;
+      assert.equal(page.context.t('无法加载此页用量明细，仍显示上次加载的记录。'),
+        'This page of usage details could not load. The last loaded records are still shown.');
+    } else {
+      vm.runInContext('projectId="b"', page.context);
+      page.node('project-select').handlers.change();
+      const project = page.context.lastAction;
+      assert.equal(page.requests.at(-1).params.get('project'), 'b');
+      page.requests.at(-1).finish('New project'); await project;
+    }
+    const visibleContent = [...content.children], requestCount = page.requests.length;
+    fallback.finish('Stale', trigger === 'language' ? 503 : 200, 12); await next.pending;
+    assert.equal(page.requests.length, requestCount, trigger);
+    assert.deepEqual(content.children, visibleContent, trigger);
+    assert.equal(dialog.open, trigger === 'newer page', trigger);
+    if (trigger === 'language') {
+      page.node('language-select').value = 'zh-CN';
+      page.node('language-select').handlers.change(); await page.context.lastAction;
+    }
+  }
 });
 
 test('usage coalesces repeated input, resets pagination and refreshes the latest query', async () => {
