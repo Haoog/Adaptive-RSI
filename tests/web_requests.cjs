@@ -4520,6 +4520,82 @@ test('usage retains the visible report when offset recovery fails after a filter
   assert.equal(notice.children[0].textContent, visibleWarning);
 });
 
+for (const status of [200, 503]) {
+  test(`usage language changes preserve visible pagination while loading (recovery ${status})`, async () => {
+    const page = usagePage();
+    const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+    vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')), page.context);
+    page.context.translateStatic = () => {};
+    async function changeLanguage(language) {
+      page.node('language-select').value = language;
+      page.node('language-select').handlers.change();
+      await page.context.lastAction;
+    }
+    function pagination() {
+      return {title: page.title(), label: page.node('usage-page').textContent,
+        disabled: ['usage-prev', 'usage-next', 'usage-refresh'].map(id => page.node(id).disabled)};
+    }
+    async function checkDetail(requestIndex, reportRequest, title, at) {
+      page.node('usage-tasks').children[0].children.at(-1).handlers.click();
+      const detail = page.context.lastAction, request = page.requests[requestIndex];
+      assert.equal(request.params.get('task'), title);
+      assert.equal(request.params.get('start'), reportRequest.params.get('start'));
+      assert.equal(request.params.get('end'), reportRequest.params.get('end'));
+      assert.equal(request.params.get('offset'), '0');
+      request.finish('Details'); await detail;
+      const stamp = vm.runInContext(`stamp(${at / 1000})`, page.context);
+      assert.equal(page.node('usage-detail-content').children[2].textContent, `All time · A · ${stamp}`);
+    }
+
+    let now = 1700000000000;
+    page.context.Date = class extends Date { static now() { return now; } };
+    const initial = page.show();
+    page.requests[0].finish('First page'); await initial;
+    page.node('usage-next').onclick(); const second = page.context.lastAction;
+    await changeLanguage('en');
+    const ordinary = pagination();
+    page.requests[1].finish('Second page'); await second;
+    const loaded = pagination();
+    page.node('usage-next').onclick(); const third = page.context.lastAction;
+    page.requests[2].finish('Visible last page'); await third;
+    const visibleAt = now;
+    await changeLanguage('zh-CN');
+
+    now += 60000;
+    page.node('usage-refresh').onclick(); const refresh = page.context.lastAction;
+    assert.equal(page.requests[3].params.get('offset'), '50');
+    page.requests[3].finish('Out of range', 200, 0, 36); await refresh;
+    const recovery = page.context.lastAction;
+    assert.equal(page.requests[4].params.get('offset'), '25');
+    await changeLanguage('en');
+    const recovering = pagination();
+    await checkDetail(5, page.requests[2], 'Visible last page', visibleAt);
+
+    page.requests[4].finish('Recovered page', status, 0, 36); await recovery;
+    const settled = pagination();
+    const notice = page.node('usage-totals').staleNotice;
+    if (status === 200) {
+      assert.equal(notice.hidden, true);
+      await checkDetail(6, page.requests[4], 'Recovered page', now);
+    } else {
+      assert.equal(notice.hidden, false);
+      await checkDetail(6, page.requests[2], 'Visible last page', visibleAt);
+      notice.children[1].handlers.click(); const retry = page.context.lastAction;
+      assert.equal(page.requests[7].params.get('offset'), '50');
+      page.requests[7].finish('Retried last page'); await retry;
+      assert.equal(page.title(), 'Retried last page');
+    }
+    assert.deepEqual({ordinary, loaded, recovering, settled}, {
+      ordinary: {title: 'First page', label: '60 records · 1–25', disabled: [true, true, true]},
+      loaded: {title: 'Second page', label: '60 records · 26–50', disabled: [false, false, false]},
+      recovering: {title: 'Visible last page', label: '60 records · 51–60', disabled: [true, true, true]},
+      settled: status === 200
+        ? {title: 'Recovered page', label: '36 records · 26–36', disabled: [false, true, false]}
+        : {title: 'Visible last page', label: '60 records · 51–60', disabled: [false, true, false]}
+    });
+  });
+}
+
 test('usage detail roles fall back to the usage role names for triage and acceptance', async () => {
   const page = usagePage(), initial = page.show();
   page.requests[0].finish('Initial'); await initial;

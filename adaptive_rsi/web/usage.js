@@ -3,8 +3,9 @@ window.RSIUsage=(()=>{
  let offset=0,sequence=0,detailSequence=0,report=null,renderedOffset=0,searchTimer=null,refreshTimer=null,reportMeta=null,lastError=null,staleNotice=null;
  function clearTimers(){clearTimeout(searchTimer);clearTimeout(refreshTimer);searchTimer=refreshTimer=null;}
  function cancel(){clearTimers();sequence++;$('usage-refresh').disabled=false;pageBar();clearDetail();}
- function pageBar(){if(!report)return;offset=Math.min(offset,Math.max(0,Math.ceil(report.total/25)-1)*25);
-  $('usage-page').textContent=number(report.total)+' '+t('条记录')+' · '+number(report.total?offset+1:0)+'–'+number(Math.min(offset+25,report.total));$('usage-prev').disabled=offset===0;$('usage-next').disabled=offset+25>=report.total;}
+ function pageBar(){if(!report)return;const loading=$('usage-refresh').disabled;
+  $('usage-page').textContent=number(report.total)+' '+t('条记录')+' · '+number(report.total?renderedOffset+1:0)+'–'+number(Math.min(renderedOffset+25,report.total));
+  $('usage-prev').disabled=loading||renderedOffset===0;$('usage-next').disabled=loading||renderedOffset+25>=report.total;}
  const usageRoleNames={triage:'价值初筛',acceptance:'验收设计'};
  const number=value=>Number(value||0).toLocaleString(language);
  const token=value=>value.unknown_calls?(Number(value.tokens)>0?number(value.tokens)+' + '+t('部分未知'):t('用量未知')):number(value.tokens);
