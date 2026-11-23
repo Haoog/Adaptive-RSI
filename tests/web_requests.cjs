@@ -3852,6 +3852,52 @@ test('the probe button cancels a running test without closing the dialog',async(
   assert.equal(page.node('mc-probe-dialog').open,true,'cancelling keeps the dialog open for another attempt');
 });
 
+for(const failure of [false,true])test(`model catalog ignores stale ${failure?'failure':'success'} after a provider round trip`,async()=>{
+  const page=await diagnosisPage(),api=page.context.api;
+  let finish,reads=0;
+  page.context.api=(path,body,options)=>{
+    if(path==='model-center/fetch')return new Promise((resolve,reject)=>{finish=()=>failure?reject(new Error('Old catalog error')):resolve({});});
+    if(path.startsWith('model-center?'))reads++;
+    return api(path,body,options);
+  };
+  const pending=page.click('mc-fetch');
+  assert.equal(page.node('mc-fetch').disabled,true);
+  await page.provider('OpenAI');await page.provider('Ollama');
+  assert.equal(page.node('mc-fetch').disabled,true);
+  finish();await pending;
+  assert.equal(reads,1,'the persisted catalog is still refreshed');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.node('mc-fetch').disabled,false);
+});
+
+test('model catalog does not surface a stale snapshot error after leaving the page',async()=>{
+  const page=await diagnosisPage(),api=page.context.api;
+  let rejectSnapshot;
+  page.context.api=(path,body,options)=>{
+    if(path==='model-center/fetch')return Promise.resolve({});
+    if(path==='model-center?project=a'&&!rejectSnapshot)return new Promise((_,reject)=>{rejectSnapshot=reject;});
+    return api(path,body,options);
+  };
+  const pending=page.click('mc-fetch');await new Promise(setImmediate);
+  page.click('model-test-view-overview');
+  rejectSnapshot(new Error('Old catalog snapshot error'));await pending;
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.node('mc-feedback').textContent,'');
+});
+
+for(const failure of [false,true])test(`model catalog keeps current ${failure?'failure':'success'} feedback`,async()=>{
+  const page=await diagnosisPage(),api=page.context.api;
+  page.context.api=async(path,body,options)=>{
+    if(path!=='model-center/fetch')return api(path,body,options);
+    if(failure)throw new Error('Current catalog error');
+    return {};
+  };
+  await page.click('mc-fetch');
+  assert.equal(page.node('mc-feedback').textContent,failure?'Current catalog error':'模型列表已更新，原来选择的模型没有改变。');
+  assert.equal(page.node('mc-fetch').disabled,false);
+});
+
 for(const fails of [false,true])test(`catalog callback ${fails?'failure':'success'} preserves feedback after provider switch`,async()=>{
   const page=browser();let release,callback;
   const modelSource=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/model-center.js'),'utf8');

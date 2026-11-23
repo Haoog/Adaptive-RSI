@@ -72,7 +72,7 @@ window.RSIModelCenter = (() => {
   function info(text,cls='mc-secondary'){return el('span',text,cls);}
   function findModel(route){return data?.providers.find(p=>p.id===route.provider)?.catalog.models.find(m=>m.id===route.model);}
   async function request(path,body){try{return await api('model-center/'+path,{...body,project:scope});}catch(error){error.message=message(error);setStatus(error.message,true);throw error;}}
-  async function load({reset=false}={}){
+  async function load({reset=false,reportError=true}={}){
     if(!state)return;
     const ticket=++sequence,requested=scope;
     loading=true;
@@ -86,7 +86,7 @@ window.RSIModelCenter = (() => {
     }
     let snapshot;
     try{snapshot=await api('model-center'+(scope?'?project='+encodeURIComponent(scope):''));}
-    catch(error){if(ticket===sequence){loading=false;setStatus(message(error),true);}throw error;}
+    catch(error){if(ticket===sequence){loading=false;if(reportError)setStatus(message(error),true);}throw error;}
     if(ticket!==sequence||requested!==scope)return;
     data=snapshot;loading=false;
     const key=scopeKey(),previous=baselines.get(key),draft=drafts.get(key);let conflicts=false;
@@ -113,10 +113,10 @@ window.RSIModelCenter = (() => {
     if(!selected())selectProvider(data.providers[0].id);
     render();if(conflicts)setStatus(t('服务器模型设置已变化，冲突分工未从旧草稿恢复。'),true);
   }
-  let diagnosisSequence=0;
-  function invalidateDiagnosis(){diagnosisSequence++;}
-  function selectProvider(next){if(active!==next)invalidateDiagnosis();active=next;}
-  function selectTab(next){if(tab!==next)invalidateDiagnosis();tab=next;}
+  let diagnosisSequence=0, connectionViewVersion=0;
+  function invalidateConnectionView(){diagnosisSequence++;connectionViewVersion++;}
+  function selectProvider(next){if(active!==next)invalidateConnectionView();active=next;}
+  function selectTab(next){if(tab!==next)invalidateConnectionView();tab=next;}
   function render(){
     if(!data||loading||data.project!==scope)return;
     $('view-models').dataset.scope=scopeKey();
@@ -449,10 +449,24 @@ window.RSIModelCenter = (() => {
   }
   async function fetchProvider(providerId=active,requested=scope,propagateError=false){
     const key=jobKey(providerId,requested);if(jobs.has(key)){if(propagateError)throw new Error('catalog_refresh_pending');return;}
+    const viewVersion=connectionViewVersion;
+    const ownsFeedback=()=>viewVersion===connectionViewVersion&&scope===requested&&active===providerId&&tab==='providers'&&!$('view-models').hidden;
     jobs.add(key);if(scope===requested)renderProvider();
-    try{await api('model-center/fetch',{provider:providerId,project:requested});if(scope===requested){await load();if(scope===requested&&active===providerId)setStatus(t('模型列表已更新，原来选择的模型没有改变。'));}}
-    catch(error){if(scope===requested){await load();if(scope===requested&&active===providerId)setStatus(message(error),true);}if(propagateError)throw error;}
-    finally{jobs.delete(key);if(scope===requested&&data)renderProvider();}
+    let failure;
+    try{
+      try{await api('model-center/fetch',{provider:providerId,project:requested});}
+      catch(error){failure=error;}
+      // Keep the stored catalog in sync even when an earlier selection no longer owns the feedback.
+      if(scope===requested){
+        try{await load({reportError:false});}
+        catch(error){failure??=error;}
+      }
+      if(ownsFeedback()){
+        if(failure)setStatus(message(failure),true);
+        else setStatus(t('模型列表已更新，原来选择的模型没有改变。'));
+      }
+      if(failure&&propagateError)throw failure;
+    }finally{jobs.delete(key);if(scope===requested&&data)renderProvider();}
   }
   // 基础能力测试由对话框独占：关闭、切换范围或改测别的模型时中止浏览器请求，服务端调用仍可能继续。
   function abortProbe(notify=false){
@@ -469,7 +483,7 @@ window.RSIModelCenter = (() => {
     const dialog=$('mc-probe-dialog');if(dialog.open)dialog.close();
     $('mc-probe-result').textContent='';$('mc-probe-start').disabled=true;
   }
-  function changeScope(next){if(scope!==next){invalidateDiagnosis();invalidateProbe();}scope=next;}
+  function changeScope(next){if(scope!==next){invalidateConnectionView();invalidateProbe();}scope=next;}
   function openProbe(provider,model){
     abortProbe();
     probeSession={project:scope,provider:provider.id,model:model.id};
@@ -607,5 +621,5 @@ window.RSIModelCenter = (() => {
     const next=requested||null,changed=scope!==next;changeScope(next);
     if(loading&&!changed)return;
     if(!data||changed||data.project!==scope||reload)safe(()=>load());
-  },connections:(reset=true)=>{const requested=location.href?new URLSearchParams(String(location.hash||'').replace(/^#/, '')).get('modelTab'):null;selectTab(!reset&&['providers','roles'].includes(requested)?requested:'providers');if(data)render();},leave:invalidateDiagnosis,translate,load};
+  },connections:(reset=true)=>{const requested=location.href?new URLSearchParams(String(location.hash||'').replace(/^#/, '')).get('modelTab'):null;selectTab(!reset&&['providers','roles'].includes(requested)?requested:'providers');if(data)render();},leave:invalidateConnectionView,translate,load};
 })();
