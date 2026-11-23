@@ -123,8 +123,16 @@ window.RSIModelCenter = (() => {
   let diagnosisSequence=0, connectionViewVersion=0;
   function invalidateConnectionView(){diagnosisSequence++;connectionViewVersion++;}
   function selectProvider(next){if(active!==next)invalidateConnectionView();active=next;}
-  let routeViewVersion=0;
-  function invalidateRouteView(){routeViewVersion++;if(routeFeedback)setStatus('');}
+  let routeViewVersion=0, ownsAdvancedView=null;
+  function invalidateRouteView(){
+    routeViewVersion++;ownsAdvancedView=null;
+    const dialog=$('mc-advanced-dialog');if(dialog.open)dialog.close();
+    if(routeFeedback)setStatus('');
+  }
+  function routeViewOwner(project){
+    const version=routeViewVersion;
+    return ()=>version===routeViewVersion&&scope===project&&tab==='roles'&&!$('view-models').hidden;
+  }
   function selectTab(next){if(tab!==next){invalidateConnectionView();invalidateRouteView();}tab=next;}
   function connectionFeedbackOwner(provider,project){
     const viewVersion=connectionViewVersion;
@@ -516,10 +524,12 @@ window.RSIModelCenter = (() => {
     if(!list.children.length)list.append(el('p',t('没有已启用的匹配模型，请先到模型服务页面获取或添加。'),'mc-empty'));
   }
   function openAdvanced(role){
+    const dialog=$('mc-advanced-dialog'),ownsView=routeViewOwner(scope);
+    if(dialog.open||data?.project!==scope||!ownsView())return;
     const route=routes()[role];$('mc-advanced-title').textContent=t(roleNames[role])+' · '+t('高级参数');
     $('mc-advanced-effort').replaceChildren(effortControl(route,t(roleNames[role]),()=>{},true));
     renderFallback(route.fallback);
-    $('mc-advanced-dialog').dataset.role=role;$('mc-advanced-error').textContent='';$('mc-advanced-dialog').showModal();
+    ownsAdvancedView=ownsView;dialog.dataset.role=role;$('mc-advanced-error').textContent='';dialog.showModal();
   }
   function renderFallback(fallback=null){
     const select=$('mc-fallback-provider');select.replaceChildren();
@@ -712,9 +722,9 @@ window.RSIModelCenter = (() => {
       catch{if(closeAfterSave&&customSession===session&&ownsFeedback())setStatus(t('模型已保存，但模型列表刷新失败。'),true);}
     });});
     $('mc-save-routes').addEventListener('click',()=>safe(async()=>{
-      const project=scope,key=scopeKey(),viewVersion=routeViewVersion;
+      const project=scope,key=scopeKey();
       if(savingRoutes.has(key)||data?.project!==project)return;
-      const ownsView=()=>viewVersion===routeViewVersion&&scope===project&&tab==='roles'&&!$('view-models').hidden;
+      const ownsView=routeViewOwner(project);
       if(resetConflict(key)){setStatus(t(resetConflictCopy),true,true);return;}
       const models=structuredClone(routes()),submittedReset=inheritanceResets.get(key);
       const inherit=inheritedRoles(models,submittedReset),save={posting:true};
@@ -756,7 +766,20 @@ window.RSIModelCenter = (() => {
       }
     }));
     $('mc-reset-inheritance').addEventListener('click',()=>{if(!scope)return;inheritanceResets.set(scopeKey(),{models:safeRoutes(data.global_models)});drafts.set(scopeKey(),structuredClone(data.global_models));renderRoles();setStatus(t('已选择跟随通用设置，保存后生效。'),false,true);});
-    $('mc-advanced-form').addEventListener('submit',event=>{event.preventDefault();try{const provider=$('mc-fallback-provider').value,model=$('mc-fallback-model').value;const fallback=provider?{provider,model,effort:$('mc-fallback-effort').querySelector('select').value}:null,route=routes()[$('mc-advanced-dialog').dataset.role];if(provider&&!model)throw Error(t('请先获取并启用备用模型。'));if(fallback&&provider===route.provider&&model===route.model)throw Error(t('备用模型应与主模型不同。'));route.fallback=fallback;route.effort=$('mc-advanced-effort').querySelector('select').value;$('mc-advanced-dialog').close();renderRoles();}catch(error){$('mc-advanced-error').textContent=error.message;}});
+    $('mc-advanced-form').addEventListener('submit',event=>{
+      event.preventDefault();
+      const dialog=$('mc-advanced-dialog');
+      if(!dialog.open||!ownsAdvancedView?.()||data?.project!==scope)return;
+      try{
+        const provider=$('mc-fallback-provider').value,model=$('mc-fallback-model').value;
+        const fallback=provider?{provider,model,effort:$('mc-fallback-effort').querySelector('select').value}:null;
+        const route=routes()[dialog.dataset.role];
+        if(provider&&!model)throw Error(t('请先获取并启用备用模型。'));
+        if(fallback&&provider===route.provider&&model===route.model)throw Error(t('备用模型应与主模型不同。'));
+        route.fallback=fallback;route.effort=$('mc-advanced-effort').querySelector('select').value;
+        dialog.close();renderRoles();
+      }catch(error){$('mc-advanced-error').textContent=error.message;}
+    });
     $('mc-probe-dialog').addEventListener('close',()=>{if($('mc-probe-dialog').open)return;abortProbe(true);probeSession=null;});
     $('mc-probe-start').addEventListener('click',event=>safe(async()=>{
       const button=$('mc-probe-start'),session=probeSession;

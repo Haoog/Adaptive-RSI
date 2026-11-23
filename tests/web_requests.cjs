@@ -3487,7 +3487,7 @@ test('an active run stopping error explains when retry and supplement become ava
   await assert.rejects(page.context.api('retry', {task: 'child'}), /任务仍在停止中，请等当前运行结束后再重试或补充需求。/);
 });
 
-function modelScopePage(savedDrafts = new Map(), {connections=false} = {}) {
+function modelScopePage(savedDrafts = new Map(), {connections=false,renderRoutes=false} = {}) {
   const page=browser(new Map(),connections?({document,window})=>{
     window.scrollTo=()=>{};
     const buttons=(attribute,values)=>values.map(value=>{
@@ -3535,9 +3535,18 @@ function modelScopePage(savedDrafts = new Map(), {connections=false} = {}) {
     throw new Error('Unexpected model request '+path);
   };
   page.context.refresh=async()=>{};
+  if(renderRoutes){
+    Object.assign(providers[0].catalog.models[0],{enabled:true,efforts:['low','medium','high']});
+    providers[1].catalog.models[0].enabled=true;
+    for(const role of ['analysis','implementation','review','evolution'])globals[role]=structuredClone(globals.planning);
+    for(const id of ['mc-fallback-provider','mc-fallback-model'])page.node(id).tagName='SELECT';
+    for(const id of ['mc-advanced-effort','mc-fallback-effort'])page.node(id).querySelector=()=>page.node(id).children[0];
+    page.context.history={state:null};
+  }
   const modelSource=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/model-center.js'),'utf8');
   // Keep production loading, saving, draft persistence and event handlers.
-  const instrumented=modelSource.replace('  init();',`  ${connections?'':'render='}renderRoles=()=>{updateDirty();persistRouteDraft();};
+  const stubRendering=renderRoutes?'':`${connections?'':'render='}renderRoles=()=>{updateDirty();persistRouteDraft();};`;
+  const instrumented=modelSource.replace('  init();',`  ${stubRendering}
   window.modelScopeTest={openProbe:()=>openProbe(data.providers[0],data.providers[0].catalog.models[0]),otherProbe:()=>openProbe({id:'ollama',name:'Ollama'},{id:'other-coder',name:'Other coder'}),edit:effort=>{routes().planning.effort=effort;renderRoles();},draft:()=>structuredClone(routes())};
   init();`);
   vm.runInContext(instrumented,page.context);
@@ -4146,6 +4155,78 @@ test('provider form sends full custom IDs without inventing truncated display na
   page.context.api=async(path,body)=>path==='model-center/provider'?{id:'ollama'}:api(path,body);
   await page.submit('mc-provider-form');
   assert.deepEqual(page.posts.find(post=>post.path==='model-center/model').body.model,{id,manual:true});
+});
+
+async function advancedRoutePage(savedDrafts){
+  const page=modelScopePage(savedDrafts,{connections:true,renderRoutes:true});
+  const navigate=async({view='models',project='a',scope='project',tab='roles'}={})=>{
+    page.context.location.hash=`#view=${view}&project=${project}&scope=${scope}&modelTab=${tab}`;
+    page.context.location.href='http://localhost/'+page.context.location.hash;
+    page.windowListeners.get('hashchange')();
+    await page.context.lastAction;
+    await new Promise(setImmediate);
+  };
+  await navigate();
+  return {...page,navigate,dialog:page.node('mc-advanced-dialog'),
+    openAdvanced(){
+      const planning=page.node('mc-role-list').children.find(row=>descendants(row).some(node=>node.id==='mc-role-model-planning'));
+      descendants(planning).find(node=>node.textContent==='高级参数').handlers.click();
+      assert.equal(page.node('mc-advanced-dialog').open,true);
+    },
+    effort(value){page.node('mc-advanced-effort').querySelector('select').value=value;},
+    fallback(provider,model){
+      page.node('mc-fallback-provider').value=provider;
+      page.node('mc-fallback-provider').handlers.change();
+      page.node('mc-fallback-model').value=model;
+      page.node('mc-fallback-model').handlers.change();
+    }
+  };
+}
+
+const advancedRouteTransitions={
+  'project switch through show':page=>page.show('b'),
+  'global scope through history':page=>page.navigate({scope:'global'}),
+  'tab switch through history':page=>page.navigate({tab:'providers'}),
+  'tab round trip through history':async page=>{await page.navigate({tab:'providers'});await page.navigate();},
+  'page round trip through history':async page=>{await page.navigate({view:'overview'});await page.navigate();}
+};
+for(const [transition,navigate] of Object.entries(advancedRouteTransitions))test(`advanced route form cannot edit a draft after ${transition}`,async()=>{
+  const page=await advancedRoutePage();page.openAdvanced();page.effort('high');page.fallback('openai','other-coder');
+  await navigate(page);
+  const closedOnNavigation=!page.dialog.open;
+  const feedback=page.node('mc-feedback').textContent,dirty=page.node('mc-dirty').textContent;
+  await page.submit('mc-advanced-form');
+  assert.equal(page.draft().planning.effort,'medium');
+  assert.equal(page.draft().planning.fallback,null);
+  assert.equal(page.savedDrafts.size,0);
+  assert.deepEqual(page.posts,[]);
+  assert.equal(page.node('mc-feedback').textContent,feedback);
+  assert.equal(page.node('mc-dirty').textContent,dirty);
+  assert.equal(closedOnNavigation,true);
+});
+
+test('advanced route form validates and persists a fallback within its current scope',async()=>{
+  const page=await advancedRoutePage();page.click('mc-reset-inheritance');
+  const feedback=page.node('mc-feedback').textContent;
+  assert.match(feedback,/已选择跟随通用设置/);
+  page.openAdvanced();page.effort('high');page.fallback('ollama','scope-coder');
+  await page.submit('mc-advanced-form');
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.node('mc-advanced-error').textContent,'备用模型应与主模型不同。');
+  assert.equal(page.draft().planning.effort,'medium');
+  page.fallback('openai','other-coder');
+  await page.submit('mc-advanced-form');
+  assert.equal(page.dialog.open,false);
+  const expected={provider:'ollama',model:'scope-coder',effort:'high',fallback:{provider:'openai',model:'other-coder',effort:'default'}};
+  assert.deepEqual(page.savedDrafts.get('a').routes.planning,expected);
+  assert.equal(page.node('mc-feedback').textContent,feedback);
+  assert.equal(page.node('mc-dirty').textContent,'模型分工有未保存的修改');
+  assert.deepEqual(page.posts,[]);
+  const reopened=await advancedRoutePage(page.savedDrafts);
+  assert.deepEqual(reopened.draft().planning,expected);
+  await reopened.click('mc-save-routes');
+  assert.deepEqual(reopened.posts.map(({path,body})=>[path,body.project,body.models.planning]),[['model-center/routes','a',expected]]);
+  assert.equal(reopened.savedDrafts.has('a'),false);
 });
 
 for(const failedRead of ['routes','state'])test(`route save acknowledges the write when the ${failedRead} read fails`,async()=>{
