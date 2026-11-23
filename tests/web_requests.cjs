@@ -4143,6 +4143,131 @@ test('model capability form ignores a late catalog read failure after reopening'
   assert.equal(page.node('toast').hidden,true);
 });
 
+async function providerFormPage({edit=false}={}){
+  const page=modelScopePage(new Map(),{connections:true});await page.show('a');
+  page.node('mc-provider-form').reset=()=>{page.node('mc-provider-preset').value='custom';};
+  page.node('mc-input-auth').querySelector=()=>page.node('keychain-option');
+  page.node(edit?'mc-edit-provider':'mc-add-provider').handlers.click();
+  page.node('mc-input-url').value='https://fixture.invalid/v1';
+  page.node('mc-input-env').value='FIXTURE_KEY';
+  return page;
+}
+
+for(const [stage,expected] of [
+  ['state refresh','连接配置已保存，但设置刷新失败。请刷新页面核对连接。'],
+  ['catalog snapshot','连接配置已保存，但设置刷新失败。请刷新页面核对连接。'],
+  ['catalog fetch','连接配置已保存，但模型目录更新失败。请重试获取模型。'],
+  ['catalog follow-up read','连接配置已保存，但模型目录更新失败。请重试获取模型。']
+])test(`provider form reports a saved connection after ${stage} fails`,async()=>{
+  const page=await providerFormPage(),api=page.context.api;
+  const secret='fixture-secret',failure=new Error(secret+' https://fixture.invalid/private');
+  let fetching=false;
+  page.node('mc-input-key').value=secret;
+  page.node('mc-input-models').value='fixture-model';
+  if(stage==='state refresh')page.context.refresh=async()=>{throw failure;};
+  page.context.api=async(path,body)=>{
+    if(path==='model-center/provider'){await api(path,body);return {id:'ollama'};}
+    if(path==='model-center?project=a'&&(stage==='catalog snapshot'||(fetching&&stage==='catalog follow-up read')))throw failure;
+    const result=await api(path,body);
+    if(path==='model-center/fetch'){fetching=true;if(stage==='catalog fetch')throw failure;}
+    return result;
+  };
+  await page.submit('mc-provider-form');
+  assert.deepEqual(page.posts.map(post=>post.path),['model-center/provider','model-center/model',
+    ...(['catalog fetch','catalog follow-up read'].includes(stage)?['model-center/fetch']:[])]);
+  assert.ok(page.posts.every(({body})=>body.project==='a'));
+  assert.equal(page.node('mc-provider-error').textContent,'');
+  assert.equal(page.node('mc-provider-dialog').open,false);
+  assert.equal(page.node('mc-feedback').textContent,expected);
+  assert.equal(page.node('toast').hidden,true);
+});
+
+test('provider form retains only unfinished custom models after a saved connection',async()=>{
+  const page=await providerFormPage({edit:true}),api=page.context.api;
+  const models=page.node('mc-input-models');models.value='done\nretry\nlater\nretry';
+  page.node('mc-input-auth').value='session';page.node('mc-input-key').value='fixture-key';
+  let failModel=true;
+  page.context.api=async(path,body)=>{
+    const result=await api(path,body);
+    if(path==='model-center/provider')return {id:'openai'};
+    if(failModel&&path==='model-center/model'&&body.model.id==='retry')throw new Error('fixture-key');
+    return result;
+  };
+  await page.submit('mc-provider-form');
+  assert.deepEqual(page.posts.map(({path,body})=>[path,body.project,body.model?.id]),[
+    ['model-center/provider','a',undefined],['model-center/model','a','done'],['model-center/model','a','retry']
+  ]);
+  assert.equal(page.posts[0].body.provider.id,'openai');
+  assert.deepEqual(page.posts[0].body.authentication,{mode:'session',value:'fixture-key'});
+  assert.equal(page.node('mc-input-key').value,'');
+  assert.equal(models.value,'retry\nlater');
+  assert.equal(page.node('mc-provider-dialog').open,true);
+  assert.equal(page.node('mc-provider-submit').disabled,false);
+  assert.equal(page.node('mc-provider-error').textContent,'连接配置已保存。尚未确认添加的自定义模型 ID 已保留，可重试。');
+  assert.equal(page.node('toast').hidden,true);
+  failModel=false;await page.submit('mc-provider-form');
+  assert.deepEqual(page.posts[3].body,{...page.posts[0].body,authentication:{mode:'session',value:''}});
+  assert.deepEqual(page.posts.slice(4).map(({path,body})=>[path,body.project,body.provider,body.model?.id]),[
+    ['model-center/model','a','openai','retry'],['model-center/model','a','openai','later'],['model-center/fetch','a','openai',undefined]
+  ]);
+  assert.equal(page.node('mc-provider-dialog').open,false);
+});
+
+test('provider form keeps its draft when the connection write is unconfirmed',async()=>{
+  const page=await providerFormPage(),api=page.context.api;
+  page.node('mc-input-models').value='unsaved-model';
+  page.node('mc-input-key').value='fixture-key';
+  page.context.api=async(path,body)=>{
+    const result=await api(path,body);
+    if(path==='model-center/provider')throw new Error('fixture-key https://fixture.invalid/private');
+    return result;
+  };
+  await page.submit('mc-provider-form');
+  assert.deepEqual(page.posts.map(post=>post.path),['model-center/provider']);
+  assert.equal(page.node('mc-provider-dialog').open,true);
+  assert.equal(page.node('mc-input-models').value,'unsaved-model');
+  assert.equal(page.node('mc-input-key').value,'');
+  assert.equal(page.node('mc-provider-error').textContent,'无法确认连接配置是否已保存。请先刷新页面核对连接。');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+});
+
+for(const switchScope of [false,true])test(`provider form keeps a newer draft after ${switchScope?'a scope change during refresh':'an earlier catalog fetch fails'}`,async()=>{
+  const page=await providerFormPage(),api=page.context.api,dialog=page.node('mc-provider-dialog');
+  let finish,globalReads=0;
+  page.node('mc-input-models').value='old-model';
+  if(switchScope)page.context.refresh=()=>new Promise(resolve=>{finish=resolve;});
+  page.context.api=async(path,body)=>{
+    if(path==='model-center'&&++globalReads>1)throw new Error('Old refresh read the new scope');
+    const result=await api(path,body);
+    if(path==='model-center/provider')return {id:'ollama'};
+    if(path==='model-center/fetch'&&!switchScope)return new Promise((_,reject)=>{finish=()=>reject(new Error('Old catalog fetch failed'));});
+    return result;
+  };
+  const pending=page.submit('mc-provider-form');await waitFor(()=>finish);
+  if(switchScope){
+    dialog.close();
+    page.node('mc-scope').value='global';page.node('mc-scope').handlers.change();
+    await page.context.lastAction;
+  }
+  page.node('mc-add-provider').handlers.click();
+  page.node('mc-input-name').value='New connection';
+  page.node('mc-input-key').value='new-fixture-key';
+  page.node('mc-input-models').value='new-model';
+  const currentFeedback=page.node('mc-feedback').textContent;
+  finish();await pending;
+  assert.equal(globalReads,switchScope?1:0);
+  assert.deepEqual(page.posts.find(post=>post.path==='model-center/fetch')?.body,{provider:'ollama',project:'a'});
+  assert.equal(dialog.open,true);
+  assert.equal(page.node('mc-input-name').value,'New connection');
+  assert.equal(page.node('mc-input-key').value,'new-fixture-key');
+  assert.equal(page.node('mc-input-models').value,'new-model');
+  assert.equal(page.node('mc-provider-error').textContent,'');
+  assert.equal(page.node('mc-provider-submit').disabled,false);
+  assert.equal(page.node('mc-feedback').textContent,currentFeedback);
+  assert.equal(page.node('toast').hidden,true);
+});
+
 test('provider form sends full custom IDs without inventing truncated display names',async()=>{
   const page=modelScopePage();await page.show('a');
   page.node('mc-provider-form').reset=()=>{page.node('mc-provider-preset').value='custom';};

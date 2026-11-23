@@ -580,7 +580,7 @@ window.RSIModelCenter = (() => {
     $('mc-input-key').placeholder=t(provider&&['stored','configured'].includes(provider.credential_status)?'留空保留当前密钥':'填写 API Key');
     $('mc-provider-dialog').showModal();
   }
-  async function fetchProvider(providerId=active,requested=scope,propagateError=false){
+  async function fetchProvider(providerId=active,requested=scope,propagateError=false,ownsSaveFeedback=null){
     const key=jobKey(providerId,requested);if(jobs.has(key)){if(propagateError)throw new Error('catalog_refresh_pending');return;}
     const ownsFeedback=connectionFeedbackOwner(providerId,requested);
     jobs.add(key);if(scope===requested)renderProvider();
@@ -593,8 +593,8 @@ window.RSIModelCenter = (() => {
         try{await load({reportError:false});}
         catch(error){failure??=error;}
       }
-      if(ownsFeedback()){
-        if(failure)setStatus(message(failure),true);
+      if(ownsFeedback()&&(!ownsSaveFeedback||ownsSaveFeedback())){
+        if(failure)setStatus(ownsSaveFeedback?t('连接配置已保存，但模型目录更新失败。请重试获取模型。'):message(failure),true);
         else setStatus(t('模型列表已更新，原来选择的模型没有改变。'));
       }
       if(failure&&propagateError)throw failure;
@@ -686,23 +686,64 @@ window.RSIModelCenter = (() => {
     $('mc-picker-provider').addEventListener('change',()=>{pickerPage=0;renderPicker();});
     $('mc-picker-prev').addEventListener('click',()=>{pickerPage--;renderPicker();});$('mc-picker-next').addEventListener('click',()=>{pickerPage++;renderPicker();});
     $('mc-fetch').addEventListener('click',()=>safe(()=>fetchProvider()));
-    $('mc-provider-dialog').addEventListener('close',()=>{if(!$('mc-provider-dialog').open){editorSession=null;$('mc-input-key').value='';}});
+    const providerDialog=$('mc-provider-dialog'),providerError=$('mc-provider-error');
+    // 保留会话标识，直到重开表单，以区分关闭后的自动目录反馈。
+    providerDialog.addEventListener('close',()=>{if(!providerDialog.open)$('mc-input-key').value='';});
     $('mc-provider-form').addEventListener('invalid',event=>{const detail=event.target.closest('details');if(detail)detail.open=true;},true);
     $('mc-provider-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
-      const button=$('mc-provider-submit'),session=editorSession;if(button.disabled||!session)return;const project=session.project,unchanged=unchangedForm(event.target);button.disabled=true;$('mc-provider-error').textContent='';
-      let connectionSaved=false,remaining=[];
-      try{const provider={name:$('mc-input-name').value.trim(),base_url:$('mc-input-url').value.trim(),protocol:$('mc-input-protocol').value,env_key:$('mc-input-env').value.trim()};if(editing)provider.id=editing.id;
-        const models=[...new Set($('mc-input-models').value.split(/\r?\n/).map(id=>id.trim()).filter(Boolean))];
-        if(models.some(id=>id.length>256)||models.length>50)throw Error(t('最多添加 50 个模型，每个模型 ID 不超过 256 个字符。'));
-        if(models.some(id=>!(/^[a-zA-Z0-9._/:-]+$/).test(id)))throw Error(t('模型 ID 只能包含字母、数字、点、下划线、斜线、冒号和连字符。'));
-        const authentication={mode:$('mc-input-auth').value,value:$('mc-input-key').value};$('mc-input-key').value='';
-        const result=await api('model-center/provider',{project,provider,authentication});
-        connectionSaved=true;remaining=[...models];
-        if(editorSession===session)editing={...provider,id:result.id};
-        for(const id of models){await api('model-center/model',{project,provider:result.id,model:{id,manual:true}});remaining.shift();}
-        if(scope===project){await refresh();await load();if(editorSession===session&&$('mc-provider-dialog').open&&unchanged()&&scope===project){selectProvider(result.id);selectTab('providers');render();$('mc-provider-dialog').close();}setStatus(t('连接配置已保存。'));}
-        await fetchProvider(result.id,project);
-      }catch(error){if(editorSession===session){$('mc-provider-error').textContent=(connectionSaved?t('连接已保存；部分后续操作未完成。尚未添加的模型：')+' '+remaining.join(', ')+' · ':'')+message(error);if(connectionSaved&&unchanged())$('mc-input-models').value=remaining.join('\n');}}finally{if(editorSession===session)button.disabled=false;}
+      const button=$('mc-provider-submit'),session=editorSession;
+      if(button.disabled||!providerDialog.open||!session||session.project!==scope)return;
+      const project=session.project,viewVersion=connectionViewVersion,submittedFeedback=feedbackVersion;
+      const unchanged=unchangedForm(event.target);
+      const ownsEditor=()=>editorSession===session&&providerDialog.open;
+      const ownsForm=()=>ownsEditor()&&scope===project&&connectionViewVersion===viewVersion&&unchanged();
+      const provider={name:$('mc-input-name').value.trim(),base_url:$('mc-input-url').value.trim(),protocol:$('mc-input-protocol').value,env_key:$('mc-input-env').value.trim()};
+      if(editing)provider.id=editing.id;
+      const remaining=[...new Set($('mc-input-models').value.split(/\r?\n/).map(id=>id.trim()).filter(Boolean))];
+      if(remaining.some(id=>id.length>256)||remaining.length>50){providerError.textContent=t('最多添加 50 个模型，每个模型 ID 不超过 256 个字符。');return;}
+      if(remaining.some(id=>!(/^[a-zA-Z0-9._/:-]+$/).test(id))){providerError.textContent=t('模型 ID 只能包含字母、数字、点、下划线、斜线、冒号和连字符。');return;}
+      const authentication={mode:$('mc-input-auth').value,value:$('mc-input-key').value};
+      $('mc-input-key').value='';button.disabled=true;providerError.textContent='';
+      try{
+        let result;
+        try{
+          result=await api('model-center/provider',{project,provider,authentication});
+          if(typeof result?.id!=='string'||!result.id)throw new Error('Missing provider save acknowledgement');
+        }catch(error){
+          if(ownsForm())providerError.textContent=errorCopy(error.code,'无法确认连接配置是否已保存。请先刷新页面核对连接。');
+          return;
+        }
+        if(ownsEditor())editing={...provider,id:result.id};
+        try{
+          while(remaining.length){
+            await api('model-center/model',{project,provider:result.id,model:{id:remaining[0],manual:true}});
+            remaining.shift();
+          }
+        }catch{
+          if(ownsForm()){
+            $('mc-input-models').value=remaining.join('\n');
+            providerError.textContent=t('连接配置已保存。尚未确认添加的自定义模型 ID 已保留，可重试。');
+          }
+          return;
+        }
+        if(ownsForm())$('mc-input-models').value='';
+        let refreshFailed=false;
+        if(scope===project){
+          try{await refresh();if(scope===project)await load({reportError:false});}
+          catch{refreshFailed=true;}
+        }
+        const closeAfterSave=ownsForm();
+        if(closeAfterSave){
+          if(!refreshFailed){selectProvider(result.id);selectTab('providers');render();}
+          providerDialog.close();
+        }
+        if(closeAfterSave&&feedbackVersion===submittedFeedback){
+          setStatus(t(refreshFailed?'连接配置已保存，但设置刷新失败。请刷新页面核对连接。':'连接配置已保存。'),refreshFailed);
+        }
+        if(refreshFailed)return;
+        const savedFeedback=feedbackVersion;
+        await fetchProvider(result.id,project,false,()=>closeAfterSave&&editorSession===session&&feedbackVersion===savedFeedback);
+      }finally{if(ownsEditor())button.disabled=false;}
     });});
     $('mc-remove-provider').addEventListener('click',()=>safe(async()=>{
       // 移除立即退役连接并删除本机凭据，重新添加生成新 id；必须先确认，取消路径不发出任何请求。
