@@ -16,6 +16,10 @@ from .store import uid
 OPERATION_DRAIN_TIMEOUT = 30
 
 
+class OperationNotFound(ValueError):
+    pass
+
+
 class Operations:
     def __init__(self, runtime):
         self.runtime, self.store = runtime, runtime.store
@@ -231,7 +235,7 @@ class Operations:
         from .store import decode_object
         row = self.store.one("SELECT * FROM operations WHERE id=?", (operation,))
         if not row:
-            raise ValueError("Operation not found")
+            raise OperationNotFound("Operation not found")
         row["result"] = decode_object(row["result"])
         with self.lock:
             if row["ended"] is None and operation in self.progress:

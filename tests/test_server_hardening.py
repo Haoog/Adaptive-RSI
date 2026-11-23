@@ -65,6 +65,24 @@ class ServerHardeningTest(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_operation_status_distinguishes_a_missing_operation_from_a_missing_route(self):
+        path = "/api/operation?id=" + self.identifier
+        status, _, payload = self.request(path)
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload), {
+            "error": "Operation not found", "error_code": "operation_not_found",
+        })
+
+        status, _, payload = self.request("/api/nonexistent-operation-route")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload), {"error": "Not found"})
+
+        self.store.execute("INSERT INTO operations VALUES (?,?,?,'{}',?,?)",
+                           (self.identifier, "restore-check", "completed", 1, 2))
+        status, _, payload = self.request(path)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["state"], "completed")
+
     def test_update_check_acknowledges_current_pending_state(self):
         pending = {"state": "checking", "busy": False, "current": "fixture"}
         starts = []
