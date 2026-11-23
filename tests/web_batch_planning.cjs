@@ -19,8 +19,8 @@ function element(tag,text,cls){
  return node;
 }
 // Drives the real toolbar entry point so the regression covers the user path, not a private helper.
-function harness(api,{confirm=true,clickConfirm=false,capabilities}={}){
- const drafts=new Map(),calls=[],toasts=[],confirms=[],refreshes=[],rows={};
+function harness(api,{confirm=true,clickConfirm=false,capabilities,asyncDialogClose=false}={}){
+ const drafts=new Map(),calls=[],toasts=[],confirms=[],refreshes=[],rows={},closeEvents=[];
  let panel=null,dialog=null,requestNumber=0,exportBlob;
  const downloads=[];
  const host=element('div');host.after=node=>{panel=node;};
@@ -30,6 +30,11 @@ function harness(api,{confirm=true,clickConfirm=false,capabilities}={}){
   el(tag,...args){
    const node=element(tag,...args);
    node.focus=()=>{context.document.activeElement=node;};
+   if(tag==='dialog'&&asyncDialogClose){
+    node.showModal=()=>{node.open=true;node.children.at(-1).focus();};
+    node.close=()=>{if(node.open){node.open=false;closeEvents.push(()=>node.onclose?.());}};
+    node.remove=()=>{node.isConnected=false;};
+   }
    if(tag==='input')node.value='';
    if(tag==='a')node.onclick=()=>downloads.push({name:node.download,blob:exportBlob});
    return node;
@@ -67,11 +72,12 @@ function harness(api,{confirm=true,clickConfirm=false,capabilities}={}){
  vm.runInContext(fs.readFileSync('adaptive_rsi/web/batch.js','utf8'),context);
  const checkbox=context.window.RSIBatch.row({id:'t1',title:'任务一',fingerprint:''});rows.t1=checkbox;
  const button=()=>panel.children.find(node=>node.textContent==='批量重试');
- const render=tasks=>{const list=tasks.map(task=>typeof task==='string'?{id:task}:task);context.window.RSIBatch.toolbar(list);for(const task of list)rows[task.id]=context.window.RSIBatch.row({id:task.id,title:'任务 '+task.id,fingerprint:''});};
+ const render=tasks=>{const list=tasks.map(task=>typeof task==='string'?{id:task}:task);context.window.RSIBatch.toolbar(list);for(const task of list)rows[task.id]=context.window.RSIBatch.row({title:'任务 '+task.id,...task});};
  // Mirror a real checkbox click: the browser toggles checked before dispatching click.
  const check=(id,shiftKey=false)=>{const box=rows[id];box.checked=!box.checked;box.dispatch('click',{shiftKey});};
  return {calls,toasts,confirms,refreshes,drafts,downloads,store:context.window.RSIDraftStore,rows,panel,dialog:()=>dialog,
   focused:()=>context.document.activeElement,
+  flushDialogCloses(){for(const close of closeEvents.splice(0))close();},
   project(value){context.projectId=value;context.navigationSequence++;context.window.RSIBatch.viewChanged?.();},
   machine(value){context.window.__RSI_MACHINE_KEY__=value;context.window.RSIBatch.viewChanged?.();},
   navigate(){context.navigationSequence++;context.window.RSIBatch.viewChanged?.();},
@@ -682,6 +688,99 @@ test('batch history keeps a current error retryable and returns focus after tool
  fixture.render(['t1']);
  reopened.children.at(-1).click();
  assert.equal(fixture.focused()===fixture.buttonByText('批次记录'),true);
+});
+
+function evidenceButtons(fixture){
+ fixture.render(['group-a','group-b'].map(id=>({id,fingerprint:'batch:'+id})));
+ return ['group-a','group-b'].map(id=>fixture.rows[id].children[1]);
+}
+function evidenceReport(criterion){
+ return {group_lineage:{acceptance_evidence:{all_passed:true,requirements:[
+  {task:'source',index:0,criterion,state:'pass',checks:[{run:'run',stage:'acceptance_candidate',index:0,name:'check',passed:true}]},
+ ]}}};
+}
+const evidenceCriterion=box=>box.children[2].children[0].textContent;
+function openEvidence(button){button.focus();return button.click();}
+
+for(const [scope,leave] of historyScopes.slice().reverse()){
+ test(`row evidence ignores a pending result after ${scope}`,async()=>{
+  const response=deferred(),fixture=harness(()=>response.promise,{asyncDialogClose:true});
+  const [first,second]=evidenceButtons(fixture),pending=openEvidence(first);
+  assert.equal(fixture.calls[0].path,'task?id=group-a&project=project');
+  leave(fixture);second.focus();
+  response.resolve(evidenceReport('旧证据'));await pending;
+  assert.deepEqual({opened:fixture.dialog()!==null,keptFocus:fixture.focused()===second,toasts:fixture.toasts},
+   {opened:false,keptFocus:true,toasts:[]});
+ });
+}
+
+for(const repeat of [false,true]){
+ test(`row evidence keeps the latest click when ${repeat?'reopening the same row':'opening two rows quickly'}`,async()=>{
+  const firstResponse=deferred(),secondResponse=deferred(),responses=[firstResponse,secondResponse];
+  const fixture=harness(()=>responses.shift().promise,{asyncDialogClose:true});
+  const [first,second]=evidenceButtons(fixture),latest=repeat?first:second;
+  const old=openEvidence(first),fresh=openEvidence(latest);
+  assert.deepEqual(fixture.calls.map(({path})=>path),['task?id=group-a&project=project',`task?id=group-${repeat?'a':'b'}&project=project`]);
+  if(repeat){
+   firstResponse.resolve(evidenceReport('旧证据'));await old;
+   assert.equal(fixture.dialog()===null,true,'a superseded response cannot open before the latest response');
+  }
+  (repeat?second:first).focus();
+  secondResponse.resolve(evidenceReport('最新证据'));await fresh;
+  const box=fixture.dialog(),close=box.children.at(-1);
+  if(!repeat){firstResponse.resolve(evidenceReport('旧证据'));await old;}
+  assert.equal(fixture.dialog()===box,true,'a superseded response cannot replace the latest dialog');
+  assert.equal(evidenceCriterion(box),'source · 1 · 最新证据');
+  assert.equal(fixture.focused(),close);
+  close.click();fixture.flushDialogCloses();
+  assert.equal(box.isConnected,false);
+  assert.equal(fixture.focused(),latest);
+ });
+}
+
+for(const supersede of [false,true]){
+ test(`row evidence ignores a late error after ${supersede?'a newer click':'a runtime switch'}`,async()=>{
+  const response=deferred(),fixture=harness(path=>{
+   if(path.includes('group-a'))return response.promise;
+   throw Error('当前请求失败');
+  },{asyncDialogClose:true});
+  const [first,second]=evidenceButtons(fixture),pending=openEvidence(first);
+  if(!supersede)fixture.machine('other');
+  await openEvidence(second);
+  response.reject(Error('旧请求失败'));await pending;
+  assert.deepEqual(fixture.toasts,[{message:'当前请求失败',error:true}]);
+  assert.equal(fixture.dialog(),null);
+  assert.equal(fixture.focused(),second);
+ });
+}
+
+test('row evidence dismisses an open dialog on runtime switch without restoring old focus',async()=>{
+ const fixture=harness(async path=>evidenceReport(path.includes('group-a')?'旧证据':'新证据'),{asyncDialogClose:true});
+ const [first,second]=evidenceButtons(fixture);
+ await openEvidence(first);
+ const old=fixture.dialog();assert.equal(old.open,true);
+ fixture.machine('other');
+ const dismissed=!old.open||!old.isConnected;
+ second.focus();fixture.flushDialogCloses();
+ assert.deepEqual({dismissed,oldRemoved:!old.isConnected,keptFocus:fixture.focused()===second},
+  {dismissed:true,oldRemoved:true,keptFocus:true});
+ await openEvidence(second);
+ const fresh=fixture.dialog(),close=fresh.children.at(-1);
+ assert.equal(evidenceCriterion(fresh),'source · 1 · 新证据');
+ assert.equal(fixture.focused(),close);
+ close.click();fixture.flushDialogCloses();
+ assert.equal(fixture.focused(),second);
+});
+
+test('row evidence does not restore old focus when a normal close arrives after reopening',async()=>{
+ const fixture=harness(async()=>evidenceReport('验收项'),{asyncDialogClose:true});
+ const [first,second]=evidenceButtons(fixture);
+ await openEvidence(first);
+ const old=fixture.dialog();old.children.at(-1).click();
+ await openEvidence(second);
+ const fresh=fixture.dialog();fixture.flushDialogCloses();
+ assert.equal(old.isConnected,false);
+ assert.equal(fixture.focused()===fresh.children.at(-1),true);
 });
 
 test('same-name checks at different positions are not attributed to grouped requirements', async () => {

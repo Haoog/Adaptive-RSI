@@ -1,7 +1,7 @@
 'use strict';
 window.RSIBatch=(()=>{
  const selected=new Map(),pending=new Set(),boxes=new Map(),recommendationSelections=new Map();
- let historyDialog=null,recommendationDialog=null,visible=[],anchor=-1,pageKey='';
+ let historyDialog=null,recommendationDialog=null,evidenceRequest=null,visible=[],anchor=-1,pageKey='';
  function batchView(project){
   const machine=window.__RSI_MACHINE_KEY__||'',navigation=navigationSequence;
   return {machine,current:()=>project===projectId&&machine===(window.__RSI_MACHINE_KEY__||'')&&navigation===navigationSequence};
@@ -9,6 +9,12 @@ window.RSIBatch=(()=>{
  function viewChanged(){
   if(historyDialog?.box.open&&!historyDialog.current())historyDialog.box.close();
   if(recommendationDialog&&!recommendationDialog.current())recommendationDialog.controller.abort();
+  if(evidenceRequest&&!evidenceRequest.viewCurrent()){
+   const {box}=evidenceRequest;
+   evidenceRequest=null;
+   // 移除失效的模态框，避免原生 close() 把焦点归还给旧视图。
+   box?.remove();
+  }
  }
  async function confirmRecommendation(message,current){
   const dialog={current,controller:new AbortController()};
@@ -153,10 +159,17 @@ function paint(){for(const [id,box] of boxes)box.checked=ids().has(id);}
    if(project===projectId)toolbar();
   }
  }
- async function evidence(task){
-  const project=projectId,navigation=navigationSequence,data=await api('task?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));
-  if(project!==projectId||navigation!==navigationSequence)return;
-  const mapping=data.group_lineage?.acceptance_evidence,box=el('dialog',undefined,'experience-dialog'),previousFocus=document.activeElement;
+ async function evidence(task,trigger=document.activeElement){
+  const project=projectId,{current:viewCurrent}=batchView(project),previous=evidenceRequest;
+  const request={viewCurrent,box:null};evidenceRequest=request;
+  previous?.box?.remove();
+  const current=()=>evidenceRequest===request&&viewCurrent();
+  let data;
+  try{data=await api('task?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project),undefined,{current});}
+  catch(error){if(current()){evidenceRequest=null;throw error;}return;}
+  if(!current())return;
+  const mapping=data.group_lineage?.acceptance_evidence,box=el('dialog',undefined,'experience-dialog');
+  request.box=box;
   const requirements=mapping?.requirements||[],positions=new Map();
   const checkIdentity=check=>JSON.stringify([check.run,check.stage,check.name]);
   for(const item of requirements)for(const check of item.checks||[]){
@@ -178,7 +191,14 @@ function paint(){for(const [id,box] of boxes)box.checked=ids().has(id);}
   if(saved.verification_cost)box.append(el('p',costText(saved.verification_cost)));
   const actual=mapping?.actual_verification_cost?.separate_seconds;
   box.append(el('p',t('实际完整检查耗时')+' · '+(Number.isFinite(actual)?actual.toFixed(1)+' s':t('未知'))));
-  const close=el('button',t('关闭'));close.onclick=()=>box.close();box.append(close);box.onclose=()=>{box.remove();previousFocus?.focus?.();};document.body.append(box);box.showModal();
+  const close=el('button',t('关闭'));close.onclick=()=>box.close();box.append(close);
+  box.onclose=()=>{
+   box.remove();
+   if(!current())return;
+   evidenceRequest=null;
+   if(trigger?.isConnected)trigger.focus();
+  };
+  document.body.append(box);box.showModal();
  }
  function toolbar(tasks){
   syncPage(tasks);
@@ -216,7 +236,7 @@ function paint(){for(const [id,box] of boxes)box.checked=ids().has(id);}
    if(index>=0)anchor=index;
    toolbar();
   });
-  if((task.fingerprint||'').startsWith('batch:')){const wrap=el('span');const button=el('button',t('逐条验收证据'),'text-button');button.type='button';button.onclick=()=>safe(()=>evidence(task));wrap.append(box,button);return wrap;}
+  if((task.fingerprint||'').startsWith('batch:')){const wrap=el('span');const button=el('button',t('逐条验收证据'),'text-button');button.type='button';button.onclick=()=>safe(()=>evidence(task,button));wrap.append(box,button);return wrap;}
   return box;
  }
  async function perform(kind){
