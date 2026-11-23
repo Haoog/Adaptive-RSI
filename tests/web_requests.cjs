@@ -3016,6 +3016,109 @@ for (const navigation of ['stay', 'close', 'project', 'other-task']) {
   });
 }
 
+async function liveRetryPage() {
+  const page = experiencePage(), task = fixtureTask('live-retry'), other = fixtureTask('other');
+  Object.assign(page.context, {language: 'zh-CN', tasksForRetry: [task, other]});
+  page.node('task-filter').value = 'all';
+  vm.runInContext('state={...state,tasks:tasksForRetry,runs:[]};renderTasks()', page.context);
+  let metadataReads = 0;
+  const offline = response({error: 'Fixture offline'}, 503);
+  let readMetadata = () => response(task), readHistory = () => response([]);
+  page.context.fetch = async url => {
+    if (url.includes('/task-runs?')) return readHistory();
+    if (url.includes('/task?id=other&')) return response(other);
+    assert.match(url, /\/task\?id=live-retry&/);
+    metadataReads++;
+    return readMetadata();
+  };
+  async function open(row) {
+    buttonWith(page.node('tasks-list').children[row], '查看详情').handlers.click();
+    await page.context.lastAction;
+    await new Promise(setImmediate);
+  }
+  let now = 1700000000000;
+  page.context.retryClock = () => now;
+  vm.runInContext('Date.now=retryClock', page.context);
+  await open(0);
+  // After boot settles, the detail's first poll is the active 5-second timer.
+  const backgroundTimers = new Set(page.timers.filter(timer => timer.delay !== 5000));
+  readMetadata = () => offline;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    now += 5000;
+    page.fireTimer(5000);
+    await new Promise(setImmediate);
+  }
+  const status = page.node('detail-live-status');
+  assert.equal(status.hidden, false);
+  assert.match(textOf(status), /详情可能不是最新/);
+  return {
+    page, status, open, offline,
+    get metadataReads() { return metadataReads; },
+    get pollDelays() { return page.timers.filter(timer => timer.active && !backgroundTimers.has(timer)).map(timer => timer.delay); },
+    holdMetadata() { return new Promise(resolve => { readMetadata = () => new Promise(done => resolve(done)); }); },
+    respondMetadata() { readMetadata = () => response(task); },
+    holdHistory() { return new Promise(resolve => { readHistory = () => new Promise(done => resolve(done)); }); },
+    clickRetry() {
+      buttonWith(status, '重试').handlers.click();
+      return page.context.lastAction;
+    }
+  };
+}
+
+test('live detail retry preserves stale feedback through failure until fresh history arrives', async () => {
+  const f = await liveRetryPage(), copy = textOf(f.status);
+  const started = f.holdMetadata(), reads = f.metadataReads;
+  const retry = buttonWith(f.status, '重试');
+  const failed = f.clickRetry();
+  const finish = await started;
+  assert.equal(f.status.hidden, false, '点击重试后，回包前仍显示详情可能不是最新');
+  assert.equal(textOf(f.status), copy, '重试期间保留上次成功更新时间');
+  assert.equal(retry.disabled, true);
+  await retry.handlers.click();
+  assert.equal(f.metadataReads, reads + 1, '重试进行中只发起一次请求');
+  finish(f.offline);
+  await failed;
+  assert.equal(f.status.hidden, false);
+  assert.equal(textOf(f.status), copy);
+  assert.equal(buttonWith(f.status, '重试').disabled, false);
+  assert.deepEqual(f.pollDelays, [20000]);
+
+  f.respondMetadata();
+  const historyStarted = f.holdHistory();
+  const recovered = f.clickRetry();
+  const finishHistory = await historyStarted;
+  assert.equal(f.status.hidden, false, '只收到未变的任务元数据时仍等待运行记录');
+  finishHistory(response({}));
+  await recovered;
+  assert.equal(f.status.hidden, false, '缺少运行记录的回包不算刷新成功');
+
+  const validHistoryStarted = f.holdHistory();
+  const successful = f.clickRetry();
+  const finishValidHistory = await validHistoryStarted;
+  finishValidHistory(response({runs: [], has_more: false}));
+  await successful;
+  assert.equal(f.status.hidden, true);
+  assert.equal(buttonWith(f.status, '重试'), undefined);
+  assert.deepEqual(f.pollDelays, [5000]);
+});
+
+for (const navigation of ['close', 'switch task']) {
+  test(`live detail retry ignores an in-flight failure after ${navigation}`, async () => {
+    const f = await liveRetryPage(), started = f.holdMetadata();
+    const pending = f.clickRetry();
+    const finish = await started;
+    if (navigation === 'close') f.page.node('detail-dialog').handlers.cancel({preventDefault() {}});
+    else await f.open(1);
+    assert.equal(f.status.hidden, true);
+    finish(f.offline);
+    await pending;
+    assert.equal(f.status.hidden, true, '旧重试失败不会恢复过期提示');
+    assert.equal(f.page.node('detail-dialog').open, navigation !== 'close');
+    if (navigation !== 'close') assert.equal(f.page.node('detail-title').textContent, 'Task other');
+    assert.deepEqual(f.pollDelays, navigation === 'close' ? [] : [5000]);
+  });
+}
+
 test('runless detail polling updates cancellation controls and preserves supplement drafts', async () => {
   const page = experiencePage(), task = fixtureTask('runless', 'queued');
   let metadata = task, reads = 0;

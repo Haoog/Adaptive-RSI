@@ -20,7 +20,7 @@ window.RSIExperience = (() => {
     inboxBusy = false,
     inboxAt = 0;
   const queueSaves = new Map();
-  let queueEditor, backoffRetry;
+  let queueEditor, backoffRetry, liveRetryButton;
   let usageButton;
   const queueKey = task => JSON.stringify([task.project, task.id]);
   function queueEditorCurrent(editor) {
@@ -874,6 +874,7 @@ window.RSIExperience = (() => {
   function liveNotice() {
     const node = liveStatusNode();
     if (!liveFailures) {
+      liveRetryButton = null;
       node.hidden = true;
       node.replaceChildren();
       return;
@@ -881,12 +882,12 @@ window.RSIExperience = (() => {
     const copy = liveLastSuccess
       ? t("实时刷新中断 · 上次成功更新 {time}。详情可能不是最新，可立即重试。").replace("{time}", stamp(liveLastSuccess / 1000))
       : t("实时刷新中断 · 尚未成功更新。详情可能不是最新，可立即重试。");
-    node.replaceChildren(document.createTextNode(copy), action(t("重试"), () => {
-      liveFailures = 0;
-      liveNotice();
-      clearTimeout(liveTimer);
-      return liveDetail();
-    }, "text-button"));
+    const retry = action(t("重试"), () => {
+      if (retry === liveRetryButton) return liveDetail();
+    }, "text-button");
+    retry.disabled = liveBusy;
+    liveRetryButton = retry;
+    node.replaceChildren(document.createTextNode(copy), retry);
     node.hidden = false;
   }
   // 隐藏页面或连续失败时退避；已结束的稳定交付仍保留 10 秒轮询，交付状态与价值反馈可以继续变化。
@@ -899,6 +900,8 @@ window.RSIExperience = (() => {
   async function liveDetail() {
     if (liveBusy || !detailTask || !$("detail-dialog").open) return;
     liveBusy = true;
+    clearTimeout(liveTimer);
+    if (liveRetryButton) liveRetryButton.disabled = true;
     const task = detailTask,
       ticket = detailSequence;
     const current = () => ticket === detailSequence && projectId === task.project && $("detail-dialog").open;
@@ -907,6 +910,9 @@ window.RSIExperience = (() => {
         "task?id=" + task.id + "&project=" + task.project,
       );
       if (!current()) return;
+      if (metadata?.id !== task.id || metadata.project !== task.project ||
+          typeof metadata.title !== "string" || typeof metadata.state !== "string")
+        throw Error("Invalid live task metadata");
       liveState = metadata.state || liveState;
       // Issue sync may revise title, body or evidence while the task stays queued.
       // Rebuild only when the visible input changed so unchanged polls keep drafts and DOM.
@@ -930,11 +936,15 @@ window.RSIExperience = (() => {
       );
       if (!current()) return;
       // `/api/task-runs` returns a page envelope; keep accepting the old bare array.
-      const history = Array.isArray(page) ? page : (Array.isArray(page?.runs) ? page.runs : []);
+      const history = Array.isArray(page) ? page : page?.runs;
+      if (!Array.isArray(history) || (history.length && !history[0]?.id))
+        throw Error("Invalid live task history");
       const latest = history[0];
       if (latest) {
         const data = await api("run?id=" + latest.id);
         if (!current()) return;
+        if (!data?.result || typeof data.result !== "object" || Array.isArray(data.result))
+          throw Error("Invalid live run result");
         liveEnded = data.ended != null;
         const signature = JSON.stringify([
           latest.id,
@@ -970,6 +980,7 @@ window.RSIExperience = (() => {
       }
     } finally {
       liveBusy = false;
+      if (liveRetryButton) liveRetryButton.disabled = false;
       if (detailTask && $("detail-dialog").open) {
         clearTimeout(liveTimer);
         liveTimer = setTimeout(liveDetail, liveDelay());
