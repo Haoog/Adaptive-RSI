@@ -343,74 +343,95 @@ window.RSIModelCenter = (() => {
       field('mc-capability-note','备注（可选）'),
       hint,error,actions);
     box.append(form);document.body.append(box);
-    box.addEventListener('close',()=>{capabilityTarget=null;});
-    clear.addEventListener('click',()=>clearCapabilities());
-    form.addEventListener('submit',event=>submitCapabilities(event));
+    // 每次打开替换目标，迟到的 close 事件无需修改新表单的状态。
+    clear.addEventListener('click',()=>safe(()=>updateCapabilities(true)));
+    form.addEventListener('submit',event=>{event.preventDefault();safe(()=>updateCapabilities(false));});
     return box;
   }
-  function openCapabilities(provider,model){
-    const box=capabilityDialog(),capability=model.capabilities||{};
-    const snapshot={context_tokens:capability.context_tokens==null?'':String(capability.context_tokens),
-      max_output_tokens:capability.max_output_tokens==null?'':String(capability.max_output_tokens),
-      source_url:capability.source_url||'',note:capability.note||''};
-    capabilityTarget={project:scope,provider:provider.id,model:model.id,capabilities:capability,snapshot};
-    $('mc-capability-title').textContent=(model.name||model.id)+' · '+t('能力元数据');
-    $('mc-capability-target').textContent=provider.name+' / '+model.id;
+  const capabilityFields={context_tokens:'mc-capability-context',max_output_tokens:'mc-capability-output',
+    source_url:'mc-capability-source-url',note:'mc-capability-note'};
+  function renderCapabilityFields(target,capability,submitted){
+    target.capabilities=capability;
     const summary=$('mc-capability-summary');summary.replaceChildren(document.createTextNode(capabilityStatus(capability)));
     if(capability.source_url){summary.append(' · ');const link=el('a',capability.source_url);link.href=capability.source_url;link.target='_blank';link.rel='noreferrer noopener';summary.append(link);}
-    $('mc-capability-context').value=snapshot.context_tokens;$('mc-capability-output').value=snapshot.max_output_tokens;
-    $('mc-capability-source-url').value=snapshot.source_url;$('mc-capability-note').value=snapshot.note;
-    $('mc-capability-error').textContent='';$('mc-capability-clear').hidden=capability.source!=='manual';
+    for(const [key,id] of Object.entries(capabilityFields)){
+      const input=$(id),value=String(capability[key]??'');
+      target.snapshot[key]=value;
+      if(!submitted||input.value===submitted[key])input.value=value;
+    }
+    $('mc-capability-clear').hidden=capability.source!=='manual';
+  }
+  function openCapabilities(provider,model){
+    const box=capabilityDialog(),project=scope,ownsFeedback=connectionFeedbackOwner(provider.id,project);
+    if(box.open||data?.project!==project||!ownsFeedback())return;
+    capabilityTarget={project,provider:provider.id,model:model.id,snapshot:{},ownsFeedback};
+    $('mc-capability-title').textContent=(model.name||model.id)+' · '+t('能力元数据');
+    $('mc-capability-target').textContent=provider.name+' / '+model.id;
+    renderCapabilityFields(capabilityTarget,model.capabilities||{});
+    $('mc-capability-error').textContent='';
     $('mc-capability-clear').disabled=false;$('mc-capability-save').disabled=false;
     box.showModal();
   }
-  function submitCapabilities(event){
-    event.preventDefault();
-    safe(async()=>{
-      const target=capabilityTarget;if(!target)return;
-      const project=scope,button=$('mc-capability-save');
-      $('mc-capability-error').textContent='';
-      try{
-        const values={
-          context_tokens:$('mc-capability-context').value.trim(),
-          max_output_tokens:$('mc-capability-output').value.trim(),
-          source_url:$('mc-capability-source-url').value.trim(),
-          note:$('mc-capability-note').value.trim()};
-        const override={};let changed=false;
-        for(const key of ['context_tokens','max_output_tokens']){
-          if(values[key]===target.snapshot[key])continue;
-          if(values[key]!==''&&(!/^\d+$/.test(values[key])||!Number.isSafeInteger(Number(values[key]))||Number(values[key])<=0))
-            throw Error(t('请输入正整数 token 数量。'));
-          override[key]=values[key]===''?null:Number(values[key]);changed=true;
-        }
-        if(values.source_url!==target.snapshot.source_url){
-          if(values.source_url&&!/^https?:\/\/\S+$/.test(values.source_url))throw Error(t('来源链接必须是 http(s) 地址。'));
-          override.source_url=values.source_url||null;changed=true;
-        }
-        if(values.note!==target.snapshot.note){override.note=values.note||null;changed=true;}
-        if(!changed){$('mc-capability-dialog').close();return;}
-        const context=override.context_tokens??target.capabilities.context_tokens;
-        const output=override.max_output_tokens??target.capabilities.max_output_tokens;
-        if(context!=null&&output!=null&&Number(output)>Number(context))throw Error(t('输出上限不能超过上下文上限。'));
-        button.disabled=true;
-        await api('model-center/model',{project:target.project,provider:target.provider,model:{id:target.model,capability_override:override}});
-        if(scope===project){await load();setStatus(t('模型能力元数据已保存。'));}
-        if(target===capabilityTarget)$('mc-capability-dialog').close();
-      }catch(error){$('mc-capability-error').textContent=message(error);}
-      finally{button.disabled=false;}
-    },event.target);
+  function capabilityOverride(target,submitted){
+    const override={};
+    for(const [key,raw] of Object.entries(submitted)){
+      const value=raw.trim();
+      if(value===target.snapshot[key])continue;
+      if(key==='context_tokens'||key==='max_output_tokens'){
+        if(value&&(!/^\d+$/.test(value)||!Number.isSafeInteger(Number(value))||Number(value)<=0))
+          throw Error(t('请输入正整数 token 数量。'));
+        override[key]=value?Number(value):null;
+      }else{
+        if(key==='source_url'&&value&&!/^https?:\/\/\S+$/.test(value))throw Error(t('来源链接必须是 http(s) 地址。'));
+        override[key]=value||null;
+      }
+    }
+    const context=override.context_tokens??target.capabilities.context_tokens;
+    const output=override.max_output_tokens??target.capabilities.max_output_tokens;
+    if(Object.keys(override).length&&context!=null&&output!=null&&Number(output)>Number(context))throw Error(t('输出上限不能超过上下文上限。'));
+    return override;
   }
-  function clearCapabilities(){
-    safe(async()=>{
-      const target=capabilityTarget;if(!target)return;
-      $('mc-capability-clear').disabled=true;
+  async function updateCapabilities(clearing){
+    const target=capabilityTarget,box=$('mc-capability-dialog'),save=$('mc-capability-save'),clear=$('mc-capability-clear');
+    if(!box.open||!target?.ownsFeedback()||save.disabled||(clearing&&clear.hidden))return;
+    const {project,provider,model,ownsFeedback}=target,errorNode=$('mc-capability-error');
+    const isOpen=()=>capabilityTarget===target&&box.open;
+    const unchanged=unchangedForm($('mc-capability-form'),{projectSensitive:false});
+    const ownsForm=()=>isOpen()&&ownsFeedback()&&unchanged();
+    const submitted=Object.fromEntries(Object.entries(capabilityFields).map(([key,id])=>[key,$(id).value]));
+    errorNode.textContent='';save.disabled=clear.disabled=true;
+    try{
+      let override;
       try{
-        await api('model-center/model',{project:target.project,provider:target.provider,model:{id:target.model,capability_override:null}});
-        if(scope===target.project){await load();setStatus(t('已清除人工能力覆盖。'));}
-        if(target===capabilityTarget)$('mc-capability-dialog').close();
-      }catch(error){$('mc-capability-error').textContent=message(error);}
-      finally{$('mc-capability-clear').disabled=false;}
-    });
+        override=clearing?null:capabilityOverride(target,submitted);
+        if(override&&!Object.keys(override).length){box.close();return;}
+        await api('model-center/model',{project,provider,model:{id:model,capability_override:override}});
+      }catch(error){if(ownsForm())errorNode.textContent=message(error);return;}
+      const closed=ownsForm();
+      if(closed)box.close();
+      if(scope!==project)return;
+      // 同一弹窗有后续编辑时，目录读取失败也保留已确认的保存差量。
+      if(isOpen()&&ownsFeedback()){
+        if(clearing)clear.hidden=true;
+        else for(const [key,value] of Object.entries(override)){
+          target.snapshot[key]=submitted[key].trim();
+          if(value!==null)target.capabilities={...target.capabilities,[key]:value};
+        }
+      }
+      const read=load({reportError:false}),ticket=sequence;
+      const ownsResult=()=>capabilityTarget===target&&ownsFeedback()&&ticket===sequence;
+      try{await read;}
+      catch{
+        if(closed&&ownsResult())setStatus(t(clearing?'已清除人工能力覆盖，但模型列表刷新失败。':'模型能力元数据已保存，但模型列表刷新失败。'),true);
+        return;
+      }
+      if(!ownsResult())return;
+      if(closed)setStatus(t(clearing?'已清除人工能力覆盖。':'模型能力元数据已保存。'));
+      else if(isOpen()){
+        const capability=data.providers.find(item=>item.id===provider)?.catalog.models.find(item=>item.id===model)?.capabilities;
+        if(capability)renderCapabilityFields(target,capability,submitted);
+      }
+    }finally{if(isOpen())save.disabled=clear.disabled=false;}
   }
   function effortOptions(route,advanced=false){
     const provider=data.providers.find(p=>p.id===route.provider),model=findModel(route);

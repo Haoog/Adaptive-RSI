@@ -3905,6 +3905,170 @@ test('model price form ignores a late catalog read failure after reopening',asyn
   assert.equal(page.node('toast').hidden,true);
 });
 
+async function modelCapabilityPage(){
+  const page=modelScopePage(new Map(),{connections:true}),requests=[],reads=[];
+  const baseApi=page.context.api,getElementById=page.document.getElementById;
+  const find=(element,id)=>element.id===id?element:element.children?.map(child=>find(child,id)).find(Boolean);
+  page.document.getElementById=id=>id.startsWith('mc-capability-')
+    ?find(page.document.body,id)||null:getElementById(id);
+  const node=id=>page.document.getElementById('mc-capability-'+id);
+  const manual={source:'manual',context_tokens:64000,max_output_tokens:4096,source_url:'https://fixture.invalid/model',note:'original'};
+  let capabilities=manual,nextRead;
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/model')return new Promise((resolve,reject)=>requests.push({body:structuredClone(body),resolve,reject}));
+    if(path==='model-center'||path.startsWith('model-center?')){
+      reads.push(path);
+      const beforeRead=nextRead;nextRead=null;
+      if(beforeRead)await beforeRead();
+      const snapshot=await baseApi(path,body,options);
+      snapshot.providers[0].catalog.models[0].capabilities=structuredClone(capabilities);
+      return snapshot;
+    }
+    return baseApi(path,body,options);
+  };
+  page.node('mc-model-filter').value='all';
+  page.click('model-test-view-models');await page.context.lastAction;
+  page.node('mc-provider-list').children.find(button=>button.attributes['aria-label']==='Ollama').handlers.click();
+  reads.length=0;
+  return {...page,requests,reads,field:node,
+    open(){
+      const menu=page.node('mc-model-list').children[0].children[1].children[1].children[1];
+      menu.children.find(action=>action.textContent==='能力元数据').handlers.click();
+    },
+    close(){node('form').children[0].children[1].handlers.click();},
+    change(field,value){const target=node(field);target.value=value;target.form=node('form');page.listeners.get('input')({target});},
+    run(action){
+      if(action==='clear')node('clear').handlers.click();
+      else node('form').handlers.submit({target:node('form'),preventDefault(){}});
+      return page.context.lastAction;
+    },
+    beforeRead(fn){nextRead=fn;},
+    catalog(value){capabilities=value;}
+  };
+}
+
+test('model capability form validates limits and links and submits only changed fields',async()=>{
+  const page=await modelCapabilityPage();page.open();
+  const link=page.field('summary').children.at(-1);
+  assert.equal(link.href,'https://fixture.invalid/model');
+  assert.equal(link.rel,'noreferrer noopener');
+  await page.run('save');
+  assert.equal(page.field('dialog').open,false);
+  page.open();page.change('context','1.5');await page.run('save');
+  assert.equal(page.field('error').textContent,'请输入正整数 token 数量。');
+  page.change('context','1024');await page.run('save');
+  assert.equal(page.field('error').textContent,'输出上限不能超过上下文上限。');
+  page.change('context','64000');page.change('source-url','ftp://fixture.invalid');await page.run('save');
+  assert.equal(page.field('error').textContent,'来源链接必须是 http(s) 地址。');
+  assert.deepEqual(page.requests,[]);
+  page.change('source-url','');page.change('note',' updated ');const pending=page.run('save');
+  assert.deepEqual(page.requests[0].body,{project:'a',provider:'ollama',model:{id:'scope-coder',capability_override:{source_url:null,note:'updated'}}});
+  page.requests[0].resolve({saved:true});await pending;
+  assert.equal(page.field('dialog').open,false);
+  assert.equal(page.node('mc-feedback').textContent,'模型能力元数据已保存。');
+});
+
+for(const action of ['save','clear']){
+  test(`model capability form ignores an old ${action} rejection after reopening`,async()=>{
+    const page=await modelCapabilityPage();page.open();page.change('note','old');const old=page.run(action);
+    page.close();page.open();page.change('note','new');const current=page.run(action);
+    page.requests[0].reject(new Error('Old capability POST failed'));await old;
+    assert.equal(page.field(action).disabled,true);
+    assert.equal(page.field('error').textContent,'');
+    assert.equal(page.field('note').value,'new');
+    page.requests[1].reject(new Error('Current capability POST failed'));await current;
+    assert.equal(page.field('dialog').open,true);
+    assert.equal(page.field('error').textContent,'Current capability POST failed');
+    assert.equal(page.field('save').disabled,false);
+    assert.equal(page.field('clear').disabled,false);
+    assert.equal(page.node('toast').hidden,true);
+    assert.deepEqual(page.reads,[]);
+  });
+
+  test(`model capability form ignores ${action} feedback after a scope round trip`,async()=>{
+    const page=await modelCapabilityPage();page.open();page.change('note','old');const old=page.run(action);page.close();
+    await page.click('model-test-settingsScope-global');
+    await page.click('model-test-settingsScope-project');
+    page.open();page.change('note','new');const current=page.run(action);page.reads.length=0;
+    page.requests[0].resolve({saved:true});await old;
+    assert.equal(page.field(action).disabled,true);
+    assert.equal(page.field('dialog').open,true);
+    assert.equal(page.field('note').value,'new');
+    assert.equal(page.node('mc-feedback').textContent,'');
+    assert.deepEqual(page.reads,['model-center?project=a']);
+    page.requests[1].resolve({saved:true});await current;
+    assert.equal(page.field('dialog').open,false);
+    assert.equal(page.node('mc-feedback').textContent,action==='save'?'模型能力元数据已保存。':'已清除人工能力覆盖。');
+  });
+
+  test(`model capability form separates a confirmed ${action} from a failed catalog read`,async()=>{
+    const page=await modelCapabilityPage();page.open();page.change('note','new');const pending=page.run(action);
+    if(action==='clear')assert.equal(page.requests[0].body.model.capability_override,null);
+    page.beforeRead(()=>{throw new Error('Fixture capability catalog read failed');});
+    page.requests[0].resolve({saved:true});await pending;
+    assert.equal(page.field('dialog').open,false);
+    assert.equal(page.field('error').textContent,'');
+    assert.equal(page.node('toast').hidden,true);
+    assert.equal(page.node('mc-feedback').textContent,action==='save'
+      ?'模型能力元数据已保存，但模型列表刷新失败。':'已清除人工能力覆盖，但模型列表刷新失败。');
+    assert.deepEqual(page.reads,['model-center?project=a']);
+  });
+
+  test(`model capability form suppresses a ${action} rejection after editing`,async()=>{
+    const page=await modelCapabilityPage();page.open();page.change('note','submitted');const pending=page.run(action);
+    page.change('note','draft');page.requests[0].reject(new Error('Outdated capability POST failed'));await pending;
+    assert.equal(page.field('dialog').open,true);
+    assert.equal(page.field('note').value,'draft');
+    assert.equal(page.field('error').textContent,'');
+    assert.equal(page.field('save').disabled,false);
+    assert.equal(page.field('clear').disabled,false);
+  });
+}
+
+test('model capability form preserves edits after saving and can restore a submitted field',async()=>{
+  const page=await modelCapabilityPage();page.open();page.change('context','65000');const pending=page.run('save');
+  page.change('context','64000');page.change('note','draft');
+  page.catalog({source:'manual',context_tokens:65000,max_output_tokens:4096,source_url:'https://fixture.invalid/model',note:'original'});
+  page.requests[0].resolve({saved:true});await pending;
+  assert.equal(page.field('dialog').open,true);
+  assert.equal(page.field('context').value,'64000');
+  assert.equal(page.field('note').value,'draft');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  const current=page.run('save');
+  assert.deepEqual(page.requests[1].body.model.capability_override,{context_tokens:64000,note:'draft'});
+  page.requests[1].resolve({saved:true});await current;
+});
+
+test('model capability form preserves edits after clearing and uses the refreshed limits',async()=>{
+  const page=await modelCapabilityPage();page.open();const pending=page.run('clear');
+  page.change('note','draft');
+  page.catalog({source:'conservative_default',context_tokens:32000,max_output_tokens:2048});
+  page.requests[0].resolve({saved:true});await pending;
+  assert.equal(page.field('dialog').open,true);
+  assert.equal(page.field('note').value,'draft');
+  assert.equal(page.field('context').value,'32000');
+  assert.equal(page.field('clear').hidden,true);
+  assert.equal(page.node('mc-feedback').textContent,'');
+  const current=page.run('save');
+  assert.deepEqual(page.requests[1].body.model.capability_override,{note:'draft'});
+  page.requests[1].resolve({saved:true});await current;
+});
+
+test('model capability form ignores a late catalog read failure after reopening',async()=>{
+  const page=await modelCapabilityPage();page.open();page.change('note','saved');const old=page.run('save');
+  let rejectRead;
+  page.beforeRead(()=>new Promise((_,reject)=>{rejectRead=reject;}));
+  page.requests[0].resolve({saved:true});await waitFor(()=>rejectRead);
+  if(page.field('dialog').open)page.close();
+  page.open();const current=page.run('clear');
+  page.requests[1].reject(new Error('Current capability POST failed'));await current;
+  rejectRead(new Error('Old capability catalog read failed'));await old;
+  assert.equal(page.field('dialog').open,true);
+  assert.equal(page.field('error').textContent,'Current capability POST failed');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+});
+
 test('provider form sends full custom IDs without inventing truncated display names',async()=>{
   const page=modelScopePage();await page.show('a');
   page.node('mc-provider-form').reset=()=>{page.node('mc-provider-preset').value='custom';};

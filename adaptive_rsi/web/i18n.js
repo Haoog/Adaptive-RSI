@@ -40,6 +40,8 @@ const english = {
  "输出上限不能超过上下文上限。": "Max output cannot exceed the context limit.",
  "模型能力元数据已保存。": "Model capability metadata saved.",
  "已清除人工能力覆盖。": "Manual capability override cleared.",
+ "模型能力元数据已保存，但模型列表刷新失败。": "Model capability metadata was saved, but the model list could not be refreshed.",
+ "已清除人工能力覆盖，但模型列表刷新失败。": "The manual capability override was cleared, but the model list could not be refreshed.",
  "能力覆盖必须使用正整数，并保证输出上限不超过上下文上限。": "Capability overrides require positive whole numbers and max output must not exceed the context limit.",
  "创建时间": "Created",
  "更新时间": "Updated",
