@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
-const {createInterface} = require('node:readline');
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const {chromium} = require('playwright');
 
 // 交付授权错误反馈回归：服务端校验错误给出可操作中文提示，工作流列表失败后可恢复。
@@ -18,15 +18,11 @@ async function main() {
   const server = spawn(process.env.PYTHON || 'python3', ['-m', 'tests.browser_fixture'], {
     stdio: ['pipe', 'pipe', 'pipe'], env: {...process.env, PYTHONDONTWRITEBYTECODE: '1'}
   });
-  let browser;
+  let browser, scenarioError;
   const errors = [];
   server.stderr.on('data', chunk => process.stderr.write(chunk));
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(Error('Console startup timed out')), 30000);
-      createInterface({input: server.stdout}).once('line', line => {clearTimeout(timeout); resolve(line);});
-      server.once('exit', code => {clearTimeout(timeout); reject(Error('Console exited: ' + code));});
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
 
     // S1 P2-2b：真实端点在本 fixture 上必然 origin 不一致，应显示可操作的中文提示，
@@ -35,7 +31,7 @@ async function main() {
       const page = await browser.newPage({viewport: {width: 1380, height: 1000}});
       page.on('pageerror', error => errors.push(error.message));
       await page.goto(url);
-      await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+      await waitForPausedProject(page);
       await openSettings(page);
       await page.locator('#release-authorization-feedback').filter({hasText: 'origin 不一致'}).waitFor({timeout: 15000});
       const options = await page.locator('#release-workflow-list option').allInnerTexts();
@@ -60,7 +56,7 @@ async function main() {
           workflows: [{workflow: '.github/workflows/release.yml', name: 'Release', compatible: true}]});
       });
       await page.goto(url);
-      await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+      await waitForPausedProject(page);
       await openSettings(page);
       await page.locator('#release-authorization-feedback').filter({hasText: 'origin 不一致'}).waitFor({timeout: 15000});
       let options = await page.locator('#release-workflow-list option').allInnerTexts();
@@ -81,7 +77,7 @@ async function main() {
       const page = await browser.newPage({viewport: {width: 1380, height: 1000}});
       page.on('pageerror', error => errors.push(error.message));
       await page.goto(url);
-      await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+      await waitForPausedProject(page);
       await openSettings(page);
       const feedback = page.locator('#settings-form [data-form-error]');
       await page.locator('#advanced-settings > summary').click();
@@ -110,7 +106,7 @@ async function main() {
       const configPosts = [];
       page.on('request', request => {if (request.url().endsWith('/api/config') && request.method() === 'POST') configPosts.push(request.postDataJSON());});
       await page.goto(url);
-      await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+      await waitForPausedProject(page);
       await openSettings(page);
       await page.locator('#release-workflow-settings summary').click();
       const sha = page.locator('[data-path="delivery.release.sha"]');
@@ -144,13 +140,11 @@ async function main() {
 
     assert.deepEqual(errors, [], 'no page errors: ' + JSON.stringify(errors));
     console.log('Delivery feedback browser checks passed.');
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    server.stdin.end('\n');
-    const ended = new Promise(resolve => server.once('exit', resolve));
-    const timeout = setTimeout(() => server.kill('SIGTERM'), 5000);
-    if (server.exitCode === null && server.signalCode === null) await ended;
-    clearTimeout(timeout);
+    await closeFixture(server, browser, scenarioError);
   }
 }
 main().catch(error => {console.error(error); process.exitCode = 1;});

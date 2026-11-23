@@ -206,7 +206,8 @@ jobs:
             tests.test_runtime.RuntimeTest.test_dependency_seed_is_frozen_for_both_checks_and_preserves_original \
             tests.test_runtime.RuntimeTest.test_sandbox_hides_controller_prevents_network_and_harness_writes \
             tests.test_runtime.RuntimeTest.test_read_only_model_cannot_mutate_sealed_candidate \
-            tests.test_runtime.RuntimeTest.test_paired_evolution_promotes_retrieves_and_rolls_back_verified_guidance
+            tests.test_runtime.RuntimeTest.test_paired_evolution_promotes_retrieves_and_rolls_back_verified_guidance \
+            tests.test_workflow_experience.BackupPublicationTest.test_backup_on_volume_without_hard_links_preserves_existing_names
 
   macos_sandbox_flows:
     needs: changes
@@ -289,6 +290,14 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - name: 浏览器真实表单与多项目检查
         run: npm run test:browser
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: browser-durations
+          path: .ci/browser-durations.json
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
 
   package:
     needs: changes

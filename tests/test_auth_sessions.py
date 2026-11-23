@@ -2537,6 +2537,57 @@ class AuthSessionTests(unittest.TestCase):
                     with self.assertRaisesRegex(AuthError, "auth_credentials_busy"):
                         self.manager.set_api_key("opencode", "openai", "PRIVATE-KEY")
 
+    def test_close_waits_for_api_key_credential_commit(self):
+        for modern in (False, True):
+            with self.subTest(modern=modern):
+                entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+                errors = []
+                writes = []
+                worker = FakeAuth("opencode")
+                self.created.append(worker)
+                manager = AuthSessions(self.root / str(modern), factory=lambda backend: worker)
+                worker.capabilities = types.SimpleNamespace(modern=modern)
+                worker.set_api_key = lambda *args: None
+                worker.export_credential = lambda *args: [{"fixture": True}]
+
+                def commit(*args):
+                    entered.set()
+                    if not release.wait(3):
+                        raise RuntimeError("test did not release credential commit")
+                    writes.append((closed.is_set(), worker.closed))
+
+                def save():
+                    try:
+                        manager.set_api_key("opencode", "openai", "fixture")
+                    except Exception as exc:
+                        errors.append(exc)
+
+                def close():
+                    manager.close()
+                    closed.set()
+
+                worker.install_credential = commit
+                writer = threading.Thread(target=save)
+                closer = threading.Thread(target=close)
+                with patch.object(auth_sessions, "_write_json", side_effect=commit) if not modern else contextlib.nullcontext():
+                    writer.start()
+                    try:
+                        self.assertTrue(entered.wait(1))
+                        closer.start()
+                        self.assertTrue(manager.shutdown.wait(1))
+                        self.assertFalse(closed.wait(0.1))
+                    finally:
+                        release.set()
+                        writer.join(3)
+                        if closer.ident is not None:
+                            closer.join(3)
+                        else:
+                            manager.close()
+                self.assertFalse(writer.is_alive())
+                self.assertTrue(closed.is_set())
+                self.assertEqual(errors, [])
+                self.assertEqual(writes, [(False, False)])
+
     def test_delayed_provider_lookup_cannot_save_key_after_service_closes(self):
         discovered, release, finished = threading.Event(), threading.Event(), threading.Event()
         errors = []

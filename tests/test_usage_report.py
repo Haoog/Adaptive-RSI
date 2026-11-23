@@ -1,3 +1,5 @@
+import datetime
+import math
 import tempfile
 import time
 import unittest
@@ -98,6 +100,22 @@ class UsageReportTest(unittest.TestCase):
         self.assertEqual(result['timezone'], 'America/Los_Angeles')
         self.assertEqual(result['daily'][0]['date'], '1969-12-31')
         self.assertTrue(result['daily'][0]['date'])
+
+    def test_daily_and_monthly_include_the_last_fractional_day(self):
+        self.store.execute("DELETE FROM calls")
+        zone = datetime.timezone(datetime.timedelta(hours=9))
+        midnight = datetime.datetime(2026, 2, 1, tzinfo=zone).timestamp()
+        previous = math.nextafter(midnight, -math.inf)
+        self.add_priced_call("before-midnight", created=previous)
+        for days, previous_label in [(1, "2026-01-31"), (100, "2026-01-01")]:
+            for end, includes_february in [(midnight, False), (math.nextafter(midnight, math.inf), True)]:
+                with self.subTest(days=days, end=end):
+                    result = self.query(start=midnight - days * 86400, end=end, timezone="Asia/Tokyo")
+                    tail = [(row["date"], row["calls"]) for row in result["daily"][-(1 + includes_february):]]
+                    expected = [(previous_label, 1)]
+                    if includes_february:
+                        expected.append(("2026-02-01", 0))
+                    self.assertEqual(tail, expected)
 
     def test_invalid_timezone_is_rejected(self):
         with self.assertRaisesRegex(ValueError, 'timezone'):
@@ -207,6 +225,23 @@ class UsageReportTest(unittest.TestCase):
         self.assertEqual(stages[("review", "reviewer")]["retry_calls"], 0)
         task = result["tasks"][0]
         self.assertEqual((task["attempts"], task["retry_calls"], task["kind"]), (2, 1, "goal"))
+
+    def test_window_counts_retries_without_including_prior_calls_in_totals(self):
+        self.store.execute("DELETE FROM calls")
+        self.add_priced_call("prior", created=99, state="failed", effort=None, tokens=1000, unit_price=2)
+        self.add_priced_call("retry", created=100, effort=None, tokens=20, unit_price=2)
+        self.add_priced_call("new-effort", created=100, tokens=10, unit_price=2)
+        self.add_priced_call("new-run", run="two", created=100, effort=None, tokens=10, unit_price=2)
+        self.add_priced_call("end-exclusive", created=101, effort=None, tokens=500, unit_price=2)
+        result = self.query(project="a", task="a", q="Task a", start=100, end=101)
+        self.assertEqual((result["summary"]["calls"], result["summary"]["tokens"], result["call_total"]), (3, 40, 3))
+        self.assertEqual(result["summary"]["failed_calls"], 0)
+        self.assertAlmostEqual(result["summary"]["estimated_usd"], 0.00008)
+        self.assertEqual({row["id"] for row in result["calls"]}, {"retry", "new-effort", "new-run"})
+        for key in ("runs", "roles", "tasks", "stages"):
+            self.assertEqual(sum(row["retry_calls"] for row in result[key]), 1, key)
+        self.assertEqual({row["id"]: row["retry_calls"] for row in result["runs"]}, {"one": 1, "two": 0})
+        self.assertEqual({row["effort"]: row["retry_calls"] for row in result["stages"]}, {None: 1, "high": 0})
 
     def test_price_denominators_are_consistent_across_aggregates(self):
         self.store.execute("UPDATE calls SET run='one' WHERE id='c5'")

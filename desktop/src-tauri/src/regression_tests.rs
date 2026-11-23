@@ -94,7 +94,12 @@ fn release_check_distinguishes_invalid_metadata_from_no_update() {
         let mut broken = fixture.clone();
         broken.as_object_mut().unwrap().remove(field);
         assert!(desktop_release(&broken, "1.0.0").is_err(), "{field}");
-        assert!(desktop_release(&broken, "1.2.3").is_err(), "{field}");
+        if field == "tag_name" {
+            assert!(desktop_release(&broken, "1.2.3").is_err());
+        } else {
+            assert!(desktop_release(&broken, "1.2.3").unwrap().is_none());
+            assert!(desktop_release(&broken, "1.2.4").unwrap().is_none());
+        }
     }
     for index in [0, 1] {
         let mut broken = fixture.clone();
@@ -319,8 +324,21 @@ fn private_handshake_stream_keeps_rotations_and_bounds_each_message() {
     assert_eq!(receiver.recv().unwrap().unwrap(), "first\n");
     assert_eq!(receiver.recv().unwrap().unwrap(), "rotated\n");
     assert!(receiver.recv().is_err());
-    let receiver = handshake_stream(std::io::Cursor::new(vec![b'x'; 65537]));
-    assert!(receiver.recv().unwrap().is_err());
+    struct NoNewline { remaining: usize }
+    impl Read for NoNewline {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let count = self.remaining.min(buffer.len());
+            buffer[..count].fill(b'x');
+            self.remaining -= count;
+            Ok(count)
+        }
+    }
+    let receiver = handshake_stream(NoNewline { remaining: 65537 });
+    let error = receiver.recv_timeout(Duration::from_secs(2)).unwrap().unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 }
 
 #[test]
@@ -340,6 +358,8 @@ fn private_rotation_is_bound_to_generation_and_service_identity() {
         assert!(!publish_runtime_session(&state, 0, 123, serde_json::from_value(invalid).unwrap()));
     }
     assert!(!publish_runtime_session(&state, 1, 123, serde_json::from_value(fixture.clone()).unwrap()));
+    // The serving PID is distinct from the child used to supervise the service.
+    state.pid.store(9000, Ordering::SeqCst);
     assert!(publish_runtime_session(&state, 0, 123, serde_json::from_value(fixture).unwrap()));
     assert_eq!(state.local.lock().unwrap().as_ref().unwrap().csrf, "new");
     assert_eq!(state.target.lock().unwrap().as_ref().unwrap().cookie.as_deref(), Some("rsi_fixture=new"));
@@ -358,11 +378,55 @@ fn shutdown_timeout_invalidates_connection_until_actual_exit_recovery() {
     let child = Command::new("python3").args(["-c", "import sys,time; sys.stdin.read(); time.sleep(0.2)"])
         .stdin(Stdio::piped()).spawn().unwrap();
     *state.child.lock().unwrap() = Some(child);
-    let mut exiting = shutdown_runtime(&state, Duration::from_millis(10)).expect("still exiting");
+    let exiting = shutdown_runtime(&state, Duration::from_millis(10)).expect("still exiting");
     assert!(state.child.lock().unwrap().is_none());
     assert!(state.local.lock().unwrap().is_none());
     assert!(state.target.lock().unwrap().is_none());
+    assert_eq!(state.connection_generation.load(Ordering::SeqCst), 1);
     assert!(state.recovering.load(Ordering::SeqCst));
     assert!(exiting.stdin.is_none());
-    assert!(wait_for_child(&mut exiting, Duration::from_secs(3)));
+    *state.child.lock().unwrap() = Some(exiting);
+    let _start = state.local_start_gate.lock().unwrap();
+    assert!(wait_for_child(state.child.lock().unwrap().as_mut().unwrap(), Duration::from_secs(3)));
+    assert!(reap_update_runtime(&state));
+    assert!(state.child.lock().unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn update_recovery_restores_local_without_replacing_selected_remote() {
+    let state = RuntimeState::default();
+    let connection = |origin: &str, owned| {
+        let (client, transport) = transport::clients().unwrap();
+        Connection { client, transport, origin: origin.into(), csrf_origin: origin.into(),
+            cookie: None, csrf: "fixture".into(), name: "fixture".into(), owned }
+    };
+    let remote = connection("https://remote.invalid", false);
+    let remote_meta = json!({"remote": true});
+    let old = connection("http://127.0.0.1:4321", true);
+    *state.target.lock().unwrap() = Some(remote.clone());
+    *state.remote_meta.lock().unwrap() = remote_meta.clone();
+    *state.local.lock().unwrap() = Some(old);
+    *state.child.lock().unwrap() = Some(Command::new("python3").args(["-c", "import sys; sys.stdin.read()"])
+        .stdin(Stdio::piped()).spawn().unwrap());
+
+    let _start = state.local_start_gate.lock().unwrap();
+    let mut stopped = shutdown_runtime(&state, Duration::from_secs(2)).unwrap();
+    assert!(stopped.try_wait().unwrap().is_some());
+    assert!(state.recovering.load(Ordering::SeqCst));
+    assert!(state.local.lock().unwrap().is_none());
+    assert!(state.target.lock().unwrap().as_ref().unwrap().transport.same_connection(&remote.transport));
+    assert_eq!(*state.remote_meta.lock().unwrap(), remote_meta);
+
+    let fresh = connection("http://127.0.0.1:4322", true);
+    let child = Command::new("python3").args(["-c", "pass"]).spawn().unwrap();
+    let pid = child.id();
+    assert_eq!(publish_local_runtime(&state, child, fresh.clone(), true), 1);
+    assert_eq!(state.pid.load(Ordering::SeqCst), pid);
+    assert!(!state.recovering.load(Ordering::SeqCst));
+    assert!(state.local.lock().unwrap().as_ref().unwrap().transport.same_connection(&fresh.transport));
+    assert!(state.target.lock().unwrap().as_ref().unwrap().transport.same_connection(&remote.transport));
+    assert_eq!(*state.remote_meta.lock().unwrap(), remote_meta);
+    assert_eq!(state.connection_generation.load(Ordering::SeqCst), 0);
+    state.child.lock().unwrap().take().unwrap().wait().unwrap();
 }

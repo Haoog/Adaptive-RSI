@@ -170,10 +170,11 @@ class ReliabilityTest(unittest.TestCase):
         self._strategy_candidate(now)
         agent = self._skill_retry_agent()
         self.runtime.agent = agent
-        task, run = self.claim("Fix addition")
+        task, run = self.claim("Document addition")
         with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
              patch.object(self.runtime.evaluator, "evaluate", return_value={
-                 "decision": "pass", "reason": "Fixed checks passed", "checks": {},
+                 "decision": "pass", "reason": "Configured checks passed",
+                 "checks": {"candidate": [{"name": CHECKS[0]["name"], "passed": True, "exit_code": 0}]},
                  "execution_environment": None}):
             self.runtime.process(run)
             self.assertEqual([role for role, _ in agent.roles].count("planning"), 1)
@@ -209,10 +210,11 @@ class ReliabilityTest(unittest.TestCase):
         self._strategy_candidate(now)
         agent = self._skill_retry_agent()
         self.runtime.agent = agent
-        task, run = self.claim("Fix addition")
+        task, run = self.claim("Document addition")
         with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
              patch.object(self.runtime.evaluator, "evaluate", return_value={
-                 "decision": "pass", "reason": "Fixed checks passed", "checks": {},
+                 "decision": "pass", "reason": "Configured checks passed",
+                 "checks": {"candidate": [{"name": CHECKS[0]["name"], "passed": True, "exit_code": 0}]},
                  "execution_environment": None}):
             self.runtime.process(run)
             self.assertEqual(agent.implementations, 1)

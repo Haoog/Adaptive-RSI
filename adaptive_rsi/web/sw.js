@@ -21,17 +21,15 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
   if (url.search || url.hash || !SHELL_ASSETS.has(url.pathname)) return;
-  event.respondWith(
-    (async () => {
-      const cache = await caches.open(SHELL_CACHE);
-      const cached = await cache.match(request);
-      const network = fetch(request)
-        .then((response) => {
-          if (response && response.ok && !response.redirected) event.waitUntil(cache.put(request, response.clone()));
-          return response;
-        })
-        .catch(() => cached);
-      return cached || network;
-    })(),
-  );
+  const cache = caches.open(SHELL_CACHE).catch(() => null);
+  const cached = cache.then((store) => store?.match(request)).catch(() => null);
+  const network = fetch(request);
+  const refresh = network.then(async (response) => {
+    if (response.ok && !response.redirected) {
+      const copy = response.clone();
+      await (await cache)?.put(request, copy);
+    }
+  });
+  event.waitUntil(refresh.catch(() => {}));
+  event.respondWith(cached.then((response) => response || network));
 });

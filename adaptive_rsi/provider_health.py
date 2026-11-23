@@ -213,6 +213,7 @@ class ProviderHealth:
                 error.local_admission = True
                 raise error
             attempt["generation"] = state.get("generation", 0)
+            attempt["reset_id"] = state.get("reset_id")
             if self._half_open_ready(config, state, now):
                 # Lease the recovered connection for the current bounded role, not
                 # the entire command budget, so later stages can continue.
@@ -276,6 +277,8 @@ class ProviderHealth:
                     old = {}
                 if not isinstance(old, dict):
                     old = {}
+                if attempt is not None and attempt.get("reset_id") != old.get("reset_id"):
+                    return
                 if not error:
                     # A late success from an older attempt cannot clear a newer failure.
                     if (attempt is not None and (attempt.get("generation") != old.get("generation", 0) or
@@ -293,6 +296,8 @@ class ProviderHealth:
                 if value is not None and error and getattr(error, "retry_after", 0):
                     value["retry_at"] = time.time() + error.retry_after
                 if value is not None:
+                    if "reset_id" in old:
+                        value["reset_id"] = old["reset_id"]
                     db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(value)))
                     if code == "rate_limit" and value.get("retry_at"):
                         shared_key = attempt.get("account_key") if attempt else self.account_key(config, provider)
@@ -327,5 +332,10 @@ class ProviderHealth:
                 logging.getLogger(__name__).warning("Provider lease cleanup failed (%s)", type(cleanup_error).__name__)
 
     def reset(self, config, provider, project, model=None):
-        self.store.put_setting(self.key(config, provider, project), {"failures": 0, "paused": False})
-        self.store.execute("DELETE FROM settings WHERE key=?", (self.account_key(config, provider),))
+        key = self.key(config, provider, project)
+        account_key = self.account_key(config, provider)
+        reset = {"failures": 0, "paused": False, "reset_id": uuid.uuid4().hex}
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(reset)))
+            db.execute("DELETE FROM settings WHERE key=?", (account_key,))

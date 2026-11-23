@@ -1087,6 +1087,23 @@ class AuditEvaluationTest(unittest.TestCase):
             self.assertEqual(rows['coverage.xml']['state'], 'rejected')
             self.assertEqual(rows['lcov.info']['state'], 'missing')
 
+    def test_unchanged_report_does_not_spend_the_next_check_artifact_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'junit.xml').write_bytes(b'earlier')
+            previous = evaluator.artifact_snapshot(root)
+            fresh = b'current'
+            (root / 'coverage.xml').write_bytes(fresh)
+            budget = len(fresh)
+
+            charged = evaluator.collect_test_artifacts(root, maximum=budget)
+            self.assertEqual(charged['coverage.xml']['reason'], 'type_or_size_limit')
+            rows = evaluator.collect_test_artifacts(root, maximum=budget, previous=previous)
+            self.assertEqual(rows['junit.xml'], {'state': 'missing'})
+            self.assertEqual(rows['coverage.xml']['state'], 'collected')
+            self.assertEqual(rows['coverage.xml']['bytes'], budget)
+            self.assertEqual(rows['coverage.xml']['content'], fresh.decode())
+
     def test_stage_artifacts_belong_only_to_the_check_that_wrote_them(self):
         """Checks share a workspace; a stale report must not be credited to a later check."""
         import hashlib

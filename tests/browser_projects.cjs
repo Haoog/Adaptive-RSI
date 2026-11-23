@@ -1,27 +1,16 @@
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
-const {createInterface} = require('node:readline');
 const path = require('node:path');
 const {chromium} = require('playwright');
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 
-async function startServer() {
+function startServer() {
   const server = spawn(process.env.PYTHON || 'python3', ['-m', 'tests.browser_fixture'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {...process.env, PYTHONDONTWRITEBYTECODE: '1', RSI_BROWSER_PROJECT_IDENTITY: '1'},
   });
   server.stderr.on('data', chunk => process.stderr.write(chunk));
-  const url = await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(Error('Console startup timed out')), 30000);
-    createInterface({input: server.stdout}).once('line', line => {
-      clearTimeout(timeout);
-      resolve(line);
-    });
-    server.once('exit', code => {
-      clearTimeout(timeout);
-      reject(Error('Console exited: ' + code));
-    });
-  });
-  return {server, url};
+  return server;
 }
 
 async function addLocalProject(page, repoPath, name, enabled) {
@@ -37,16 +26,17 @@ async function addLocalProject(page, repoPath, name, enabled) {
 }
 
 (async () => {
-  const {server, url} = await startServer();
-  let browser;
+  const server = startServer();
+  let browser, scenarioError;
   try {
+    const url = await fixtureReady(server);
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL
       ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
     const page = await browser.newPage({viewport: {width: 1380, height: 1000}});
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(url);
-    await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+    await waitForPausedProject(page);
 
     const state = await page.evaluate(async () => (await fetch('/api/state')).json());
     const sameName = state.projects.filter(project => project.name === '同名仓库');
@@ -94,7 +84,7 @@ async function addLocalProject(page, repoPath, name, enabled) {
     await page.waitForFunction(id => document.getElementById('project-select').value === id, added.id);
     assert.equal(await page.evaluate(() => localStorage.getItem('rsi-project')), added.id);
     await page.reload();
-    await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+    await waitForPausedProject(page);
     assert.equal(await page.locator('#project-select').inputValue(), added.id, 'reload keeps the newly added project');
     assert.equal(await page.evaluate(() => localStorage.getItem('rsi-project')), added.id);
     assert.equal(await page.locator('#workspace-title').innerText(), 'identity-new');
@@ -110,13 +100,11 @@ async function addLocalProject(page, repoPath, name, enabled) {
 
     assert.deepEqual(errors, []);
     console.log('Project identity browser passed: same-name paths distinguished, blank names normalized, duplicate registration reported accurately, new selection persisted across reload, bilingual copy, zero model calls.');
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    server.stdin.end('\n');
-    const ended = new Promise(resolve => server.once('exit', resolve));
-    const timeout = setTimeout(() => server.kill('SIGTERM'), 5000);
-    if (server.exitCode === null && server.signalCode === null) await ended;
-    clearTimeout(timeout);
+    await closeFixture(server, browser, scenarioError);
   }
 })().catch(error => {
   console.error(error);

@@ -1,17 +1,17 @@
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
-const {createInterface} = require('node:readline');
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const {chromium} = require('playwright');
 
 async function main(){
  const server=spawn(process.env.PYTHON||'python3',['-B','-m','tests.browser_fixture'],{stdio:['pipe','pipe','pipe']});
  server.stderr.on('data',chunk=>process.stderr.write(chunk));
- let browser;
+ let browser, scenarioError;
  try{
-  const url=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Startup timeout')),30000);createInterface({input:server.stdout}).once('line',line=>{clearTimeout(timer);resolve(line);});server.once('exit',code=>{clearTimeout(timer);reject(Error('Fixture exit '+code));});});
+  const url = await fixtureReady(server);
   browser=await chromium.launch(process.env.RSI_BROWSER_CHANNEL?{channel:process.env.RSI_BROWSER_CHANNEL}:{});
   const page=await browser.newPage();const errors=[];page.on('pageerror',error=>errors.push(error.message));
-  await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+  await page.goto(url);await waitForPausedProject(page);
   assert.equal(await page.evaluate(()=>typeof featureForPath),'function','client negotiates capabilities by feature');
   const negotiation=await page.evaluate(async()=>{
    const original=window.fetch;let blockedPosts=0;
@@ -57,12 +57,19 @@ async function main(){
   });assert.equal(benchmark.collapsedCalls,0);assert.equal(benchmark.rendered,16000);assert.ok(benchmark.searchMs<5000);console.log('Evidence measurement '+JSON.stringify(benchmark));
   const transfer=await page.evaluate(()=>{const original=view;const text=exportSavedView();view='settings';importSavedView(text);const restored=view;let rejected=false;try{importSavedView(JSON.stringify({version:1,view:'overview',project:'unknown',filter:'all',system:false}));}catch{rejected=true;}return {original,restored,rejected,text};});
   assert.equal(transfer.original,transfer.restored);assert.equal(transfer.rejected,true);assert.ok(!transfer.text.includes('csrf'));
-  const second=await browser.newPage();await second.goto(url);await second.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+  const second = await browser.newPage();
+  second.on('pageerror', error => errors.push('Saved-view import: ' + (error.stack || error.message)));
+  await second.goto(url);await waitForPausedProject(second);
   assert.equal(await second.evaluate(text=>{importSavedView(text);return view;},transfer.text),transfer.original);await second.close();
   await page.locator('#language-select').selectOption('en');await page.locator('#saved-view-controls > summary').filter({hasText:'Restore a view in another browser'}).waitFor();assert.equal(await page.locator('#saved-view-controls input').getAttribute('aria-label'),'Import view file');
   await page.locator('#language-select').selectOption('zh-CN');
   assert.deepEqual(errors,[]);
   console.log('Feature negotiation and lazy paginated searchable evidence passed.');
- }finally{await browser?.close();server.stdin.end('\n');await new Promise(resolve=>server.once('exit',resolve));}
+  } catch (error) {
+  scenarioError = error;
+  throw error;
+ } finally {
+  await closeFixture(server, browser, scenarioError);
+ }
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

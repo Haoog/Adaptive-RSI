@@ -4,6 +4,7 @@ use std::{fs::File, path::{Path, PathBuf}, time::Instant};
 use tauri_plugin_updater::UpdaterExt;
 
 const FEED: &str = "https://github.com/Haoog/Adaptive-RSI/releases/latest/download/desktop-latest.json";
+pub(super) static REPLACEMENT_GATE: Mutex<()> = Mutex::new(());
 pub(super) const MAX_PACKAGE: usize = 512 * 1024 * 1024;
 
 /// Persisted download segment. Resuming reads its length; a completed package is
@@ -43,12 +44,73 @@ where F: FnMut(&Path) -> std::io::Result<u64> {
     Ok(())
 }
 
-fn preflight_space(cache: &Path, package: u64) -> Result<(), String> {
-    let executable = std::env::current_exe().map_err(|_| "update_disk_unavailable")?;
+fn cache_space_required(package: u64, snapshot_pending: bool) -> u64 {
+    let copies = if cfg!(unix) && snapshot_pending { 4 } else { 3 };
+    package.saturating_mul(copies)
+}
+
+fn preflight_space(app: &tauri::AppHandle, cache: &Path, package: u64, snapshot_pending: bool) -> Result<(), String> {
+    let required = package.saturating_mul(3);
+    // This also covers extraction on the cache volume. Once the snapshot exists,
+    // its allocation is already reflected in the available space.
+    require_space(&[cache], cache_space_required(package, snapshot_pending), |path| available_space(path))?;
     let temporary = std::env::temp_dir();
-    let extraction = extraction_root(&executable, &temporary)?;
-    require_space(&[cache, executable.parent().ok_or("update_disk_unavailable")?, &extraction],
-                  package.saturating_mul(3), |path| available_space(path))
+    #[cfg(target_os = "linux")]
+    {
+        use tauri::utils::{config::BundleType, platform::{bundle_type, current_exe}};
+
+        // UpdaterExt uses the original AppImage, rather than its mounted executable.
+        let executable = match app.env().appimage {
+            Some(path) => PathBuf::from(path),
+            None => current_exe().map_err(|_| "update_disk_unavailable")?,
+        };
+        let user_cache = app.path().cache_dir().ok();
+        let app_dir = executable.parent().ok_or("update_disk_unavailable")?;
+        let candidates = [Some(temporary.as_path()), user_cache.as_deref(), Some(app_dir)];
+        let package_manager = matches!(bundle_type(), Some(BundleType::Deb | BundleType::Rpm));
+        // deb/rpm fall back when writing the package fails. AppImage selects
+        // the first usable same-device directory before writing the new image.
+        let extraction_bytes = if package_manager { package } else { required };
+        linux_extraction_space(&executable, candidates, package_manager, extraction_bytes,
+            |path| available_space(path))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = app;
+        let executable = std::env::current_exe().map_err(|_| "update_disk_unavailable")?;
+        let extraction = extraction_root(&executable, &temporary)?;
+        require_space(&[executable.parent().ok_or("update_disk_unavailable")?, &extraction],
+                      required, |path| available_space(path))
+    }
+}
+
+#[cfg(all(unix, any(target_os = "linux", test)))]
+pub(super) fn linux_extraction_space(
+    executable: &Path, candidates: [Option<&Path>; 3], package_manager: bool, required: u64,
+    mut available: impl FnMut(&Path) -> std::io::Result<u64>,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let device = if package_manager { None } else {
+        Some(executable.metadata().map_err(|_| "update_disk_unavailable")?.dev())
+    };
+    let mut insufficient = false;
+    for candidate in candidates.into_iter().flatten() {
+        // Tauri skips candidates where it cannot create its temporary directory.
+        let Ok(probe) = tempfile::Builder::new().prefix("rsi-update-preflight").tempdir_in(candidate)
+            else { continue; };
+        if device.is_some_and(|device| !probe.path().metadata().is_ok_and(|meta| meta.dev() == device)) {
+            continue;
+        }
+        match available(probe.path()) {
+            Ok(bytes) if bytes >= required => return Ok(()),
+            Ok(_) if !package_manager => return Err("update_disk_space".into()),
+            Ok(_) => insufficient = true,
+            Err(_) if !package_manager => return Err("update_disk_unavailable".into()),
+            Err(_) => {},
+        }
+    }
+    Err(if insufficient { "update_disk_space" } else { "update_disk_unavailable" }.into())
 }
 
 /// Use the size announced by the feed; an unknown size keeps the conservative bound.
@@ -63,6 +125,15 @@ pub(super) fn part_path(cache: &Path) -> PathBuf { cache.join(PART_NAME) }
 pub(super) fn cached_path(cache: &Path) -> PathBuf { cache.join(CACHED_NAME) }
 pub(super) fn part_meta_path(cache: &Path) -> PathBuf { cache.join(PART_META_NAME) }
 
+const MAX_PART_IDENTITY: u64 = 16 * 1024;
+
+fn read_part_identity(path: &Path) -> Option<String> {
+    let (file, _) = open_bounded_file(path, MAX_PART_IDENTITY).ok()?;
+    let mut value = String::new();
+    file.take(MAX_PART_IDENTITY + 1).read_to_string(&mut value).ok()?;
+    (value.len() as u64 <= MAX_PART_IDENTITY).then_some(value)
+}
+
 /// A segment belongs to one exact feed artifact, never just to a byte count.
 pub(super) fn part_identity(version: &str, url: &str) -> String {
     format!("{version}\n{url}\n")
@@ -75,7 +146,8 @@ pub(super) fn identity_matches(stored: Option<&str>, version: &str, url: &str) -
 /// Replaces the identity file without following a planted symlink or writing
 /// through a hard link; the same link checks used for the segment apply here.
 pub(super) fn write_part_identity(path: &Path, value: &str) -> Result<(), String> {
-    let _ = std::fs::remove_file(path);
+    if value.len() > MAX_PART_IDENTITY as usize { return Err("update_cache_unavailable".into()); }
+    discard_part(path);
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -125,11 +197,22 @@ pub(super) struct ContentRange {
     pub total: Option<u64>,
 }
 
+#[cfg(test)]
 pub(super) fn parse_content_range(value: &str) -> Option<ContentRange> {
-    let rest = value.trim().strip_prefix("bytes")?.trim_start();
-    let (range, total) = rest.split_once('/')?;
-    let (start, _end) = range.trim().split_once('-')?;
-    Some(ContentRange { start: start.trim().parse().ok()?, total: total.trim().parse().ok() })
+    parse_segment_range(value).map(|(range, _)| range)
+}
+
+fn parse_segment_range(value: &str) -> Option<(ContentRange, u64)> {
+    let (range, total) = value.trim().strip_prefix("bytes ")?.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?.checked_add(1)?;
+    let total = match total {
+        "*" => None,
+        value => Some(value.parse().ok()?),
+    };
+    (end > start && total.is_none_or(|total| end <= total))
+        .then_some((ContentRange { start, total }, end))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -184,8 +267,19 @@ pub(super) fn part_bytes(path: &Path) -> u64 {
 /// Removes anything squatting on the segment path, including directories, so a
 /// later resume can never write through a link or fail on a stale entry.
 pub(super) fn discard_part(path: &Path) {
-    if path.symlink_metadata().is_err() { return; }
-    if std::fs::remove_file(path).is_err() { let _ = std::fs::remove_dir(path); }
+    let Ok(metadata) = path.symlink_metadata() else { return; };
+    if !metadata.is_dir() {
+        let _ = std::fs::remove_file(path);
+    } else if std::fs::remove_dir(path).is_err() {
+        // Move a non-empty directory out of the cache slot and preserve its contents.
+        if let Some(parent) = path.parent() {
+            if let Ok(quarantine) = tempfile::Builder::new().prefix("staged-update-quarantine-").tempdir_in(parent) {
+                if std::fs::rename(path, quarantine.path().join("entry")).is_ok() {
+                    let _ = quarantine.keep();
+                }
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -389,7 +483,7 @@ pub(super) fn describe_snapshot(state: &mut Value, current_version: &str, platfo
     state["arch"] = json!(arch);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(super) fn extraction_root(executable: &Path, temporary: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::MetadataExt;
     let bundle = executable.ancestors().find(|path| path.extension().is_some_and(|ext| ext == "app"))
@@ -651,22 +745,138 @@ impl Drop for UpdateOperation {
     fn drop(&mut self) { self.busy.store(false, Ordering::SeqCst); }
 }
 
-fn read_package(path: &Path) -> Result<Vec<u8>, String> {
-    use std::io::Read;
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| "update_cache_unavailable")?;
-    if !metadata.is_file() || metadata.len() > MAX_PACKAGE as u64 {
-        return Err("update_size_limit".into());
+pub(super) fn open_bounded_file(path: &Path, limit: u64) -> Result<(File, u64), String> {
+    let before = std::fs::symlink_metadata(path).map_err(|_| "update_cache_unavailable")?;
+    if !before.is_file() || !single_link(&before) { return Err("update_cache_unavailable".into()); }
+    if before.len() > limit { return Err("update_size_limit".into()); }
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let mut file = File::open(path).map_err(|_| "update_cache_unavailable")?;
-    if file.metadata().map_err(|_| "update_cache_unavailable")?.len() != metadata.len() {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|_| "update_cache_unavailable")?;
+    let opened = file.metadata().map_err(|_| "update_cache_unavailable")?;
+    if !opened.is_file() || !single_link(&opened) || !same_identity(&before, &opened)
+        || opened.len() != before.len()
+    {
         return Err("update_cache_unavailable".into());
     }
-    let mut bytes = vec![0; metadata.len() as usize];
+    Ok((file, opened.len()))
+}
+
+#[cfg(unix)]
+struct PackageMapping {
+    address: std::ptr::NonNull<u8>,
+    len: usize,
+}
+
+#[cfg(unix)]
+impl Drop for PackageMapping {
+    fn drop(&mut self) {
+        // SAFETY: This instance owns the mapping established for exactly this range.
+        unsafe { libc::munmap(self.address.as_ptr().cast(), self.len) };
+    }
+}
+
+#[cfg(unix)]
+fn install_snapshot(mut source: File, size: u64, cache: &Path) -> Result<impl AsRef<[u8]>, String> {
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+
+    if size > MAX_PACKAGE as u64 { return Err("update_size_limit".into()); }
+    let cache_error = |_| "update_cache_unavailable";
+    let mut copy = tempfile::tempfile_in(cache).map_err(cache_error)?;
+    // Check that the tempfile fallback also successfully unlinked the file.
+    if copy.metadata().map_err(cache_error)?.nlink() != 0 {
+        return Err("update_cache_unavailable".into());
+    }
+    let copied = std::io::copy(&mut (&mut source).take(size), &mut copy).map_err(cache_error)?;
+    if copied != size || source.read(&mut [0u8; 1]).map_err(cache_error)? != 0 {
+        return Err("update_cache_unavailable".into());
+    }
+    if size == 0 { return Ok(InstallSnapshot(None)); }
+    // Surface delayed allocation/write errors before exposing the mapped slice.
+    copy.sync_all().map_err(cache_error)?;
+    let len = size as usize;
+    // SAFETY: The unlinked file has exactly `len` bytes, the offset is aligned,
+    // and the mapping is read-only. The sole writable handle is dropped below.
+    let address = unsafe {
+        libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, copy.as_raw_fd(), 0)
+    };
+    if address == libc::MAP_FAILED { return Err("update_cache_unavailable".into()); }
+    let Some(address_ptr) = std::ptr::NonNull::new(address.cast()) else {
+        // SAFETY: mmap succeeded, but Rust slices require a non-null pointer.
+        unsafe { libc::munmap(address, len) };
+        return Err("update_cache_unavailable".into());
+    };
+    drop(copy);
+    Ok(InstallSnapshot(Some(PackageMapping { address: address_ptr, len })))
+}
+
+#[cfg(unix)]
+struct InstallSnapshot(Option<PackageMapping>);
+
+#[cfg(unix)]
+impl AsRef<[u8]> for InstallSnapshot {
+    fn as_ref(&self) -> &[u8] {
+        match &self.0 {
+            Some(mapping) => {
+                // SAFETY: The private read-only mapping remains valid while borrowed.
+                // The bytes have no writable handle and len is bounded by MAX_PACKAGE.
+                unsafe { std::slice::from_raw_parts(mapping.address.as_ptr(), mapping.len) }
+            }
+            None => &[],
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn install_snapshot(mut file: File, size: u64, _cache: &Path) -> Result<impl AsRef<[u8]>, String> {
+    // Keep the verified bytes independent of the cache file for the whole install.
+    let mut bytes = vec![0; size as usize];
     file.read_exact(&mut bytes).map_err(|_| "update_cache_unavailable")?;
     if file.read(&mut [0u8; 1]).map_err(|_| "update_cache_unavailable")? != 0 {
         return Err("update_cache_unavailable".into());
     }
     Ok(bytes)
+}
+
+fn verify_cached_package(update: &tauri_plugin_updater::Update, path: &Path) -> Result<(), String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use minisign_verify::{PublicKey, Signature};
+
+    let (file, size) = open_bounded_file(path, MAX_PACKAGE as u64)?;
+    let invalid = "update_download_or_signature_failed";
+    let decode = |value: &str| -> Result<String, String> {
+        let bytes = STANDARD.decode(value).map_err(|_| invalid)?;
+        String::from_utf8(bytes).map_err(|_| invalid.into())
+    };
+    let key = PublicKey::decode(&decode(option_env!("RSI_UPDATER_PUBLIC_KEY").unwrap_or(""))?)
+        .map_err(|_| invalid)?;
+    let signature = Signature::decode(&decode(&update.signature)?).map_err(|_| invalid)?;
+    let mut verifier = key.verify_stream(&signature).map_err(|_| invalid)?;
+    let mut reader = file.take(size + 1);
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).map_err(|_| "update_cache_unavailable")?;
+        if count == 0 { break; }
+        verifier.update(&buffer[..count]);
+    }
+    if reader.limit() != 1 { return Err("update_cache_unavailable".into()); }
+    verifier.finalize().map_err(|_| invalid)?;
+    // Tauri signs the version as a tab-separated field in the trusted comment.
+    let signed = signature.trusted_comment().split('\t').find_map(|field| field.strip_prefix("version:"));
+    if signed.map(|version| version.trim_start_matches('v')) != Some(update.version.as_str()) {
+        return Err(invalid.into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -716,14 +926,76 @@ mod cache_tests {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("package");
         std::fs::write(&path, b"signed fixture").unwrap();
-        assert_eq!(read_package(&path).unwrap(), b"signed fixture");
+        let (file, size) = open_bounded_file(&path, MAX_PACKAGE as u64).unwrap();
+        assert_eq!(install_snapshot(file, size, folder.path()).unwrap().as_ref(), b"signed fixture");
         File::options().write(true).open(&path).unwrap().set_len(MAX_PACKAGE as u64 + 1).unwrap();
-        assert_eq!(read_package(&path).unwrap_err(), "update_size_limit");
+        assert_eq!(open_bounded_file(&path, MAX_PACKAGE as u64).unwrap_err(), "update_size_limit");
         #[cfg(unix)] {
             let link = folder.path().join("link");
             std::os::unix::fs::symlink(&path, &link).unwrap();
-            assert!(read_package(&link).is_err());
+            assert!(open_bounded_file(&link, MAX_PACKAGE as u64).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_snapshot_is_independent_of_the_staged_path_and_inode() {
+        let staged = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let path = staged.path().join("package");
+        let original = staged.path().join("original");
+        let package = vec![0x5a; 96 * 1024];
+        std::fs::write(&path, &package).unwrap();
+        let (file, size) = open_bounded_file(&path, MAX_PACKAGE as u64).unwrap();
+
+        std::fs::rename(&path, &original).unwrap();
+        std::fs::write(&path, vec![0x61; package.len()]).unwrap();
+        let snapshot = install_snapshot(file, size, cache.path()).unwrap();
+        assert_eq!(snapshot.as_ref(), package.as_slice());
+        assert!(cache.path().read_dir().unwrap().next().is_none());
+
+        std::fs::write(&original, b"truncated").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(snapshot.as_ref(), package.as_slice());
+        drop(snapshot);
+        assert!(cache.path().read_dir().unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_snapshot_cleans_up_after_a_length_mismatch() {
+        let staged = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let path = staged.path().join("package");
+        for changed_len in [1, 20] {
+            std::fs::write(&path, b"signed fixture").unwrap();
+            let (file, size) = open_bounded_file(&path, MAX_PACKAGE as u64).unwrap();
+            File::options().write(true).open(&path).unwrap().set_len(changed_len).unwrap();
+
+            assert_eq!(install_snapshot(file, size, cache.path()).err().unwrap(), "update_cache_unavailable");
+            assert!(cache.path().read_dir().unwrap().next().is_none());
+            assert_eq!(path.metadata().unwrap().len(), changed_len);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_install_snapshot_needs_no_mapping() {
+        let staged = tempfile::tempfile().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        assert!(install_snapshot(staged, 0, cache.path()).unwrap().as_ref().is_empty());
+        assert!(cache.path().read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn cache_preflight_charges_only_the_pending_unix_snapshot() {
+        let cache = Path::new("/cache");
+        let before_snapshot = cache_space_required(100, true);
+        let after_snapshot = cache_space_required(100, false);
+        assert_eq!(before_snapshot, if cfg!(unix) { 400 } else { 300 });
+        assert_eq!(after_snapshot, 300);
+        assert_eq!(require_space(&[cache], before_snapshot, |_| Ok(before_snapshot - 1)), Err("update_disk_space".into()));
+        assert!(require_space(&[cache], after_snapshot, |_| Ok(300)).is_ok());
     }
 }
 
@@ -737,6 +1009,7 @@ fn configured(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updater, S
         .endpoints(vec![FEED.parse().map_err(|_| "invalid_update_feed")?])
         .map_err(|_| "invalid_update_feed")?
         .timeout(Duration::from_secs(30))
+        .configure_client(|client| client.https_only(true))
         .build()
         .map_err(|_| "invalid_update_configuration".into())
 }
@@ -754,7 +1027,13 @@ pub fn snapshot(app: &tauri::AppHandle) -> Value {
 /// revokes a waiting install instead of letting it replace under stale consent.
 pub fn authorize(app: &tauri::AppHandle, revision: u64, policy: &str, scope: &str, window: &str) -> Result<Value, String> {
     let next = Authorization::parse(revision, policy, scope, window)?;
-    app.state::<NativeUpdater>().authorize(next)?;
+    let updater = app.state::<NativeUpdater>();
+    if !updater.authorize(next.clone())? {
+        let current = updater.authorization();
+        if current.revision == next.revision && current != next {
+            return Err("update_authorization_changed".into());
+        }
+    }
     Ok(snapshot(app))
 }
 
@@ -769,13 +1048,15 @@ pub async fn check(app: tauri::AppHandle, download: bool) -> Result<Value, Strin
 async fn transfer(updater: &NativeUpdater, update: &tauri_plugin_updater::Update, part: &Path,
                   mut offset: u64, total: &mut Option<u64>, version: &str, notes: &str) -> Result<u64, String> {
     let client = reqwest::Client::builder()
+        .https_only(true)
+        .redirect(update_redirect_policy())
         .connect_timeout(UPDATE_CONNECT_TIMEOUT)
         .build()
         .map_err(|_| "update_check_failed")?;
     let started = Instant::now();
-    let mut attempt = 0u8;
+    let mut restarted = false;
+    let announced = *total;
     loop {
-        attempt += 1;
         if updater.cancel.load(Ordering::SeqCst) { return Err("update_cancelled".into()); }
         let request_started = Instant::now();
         let mut request = client.get(update.download_url.clone()).headers(update.headers.clone());
@@ -804,15 +1085,16 @@ async fn transfer(updater: &NativeUpdater, update: &tauri_plugin_updater::Update
             // An unsatisfiable range with a non-zero offset usually means the
             // persisted segment already holds the complete package. Verify it
             // before deciding to discard it.
-            if offset > 0 { return Ok(offset); }
+            if offset > 0 && total.is_none_or(|size| size == offset) { return Ok(offset); }
             discard_part(part);
             return Err("update_range_rejected".into());
         }
         if !(200..300).contains(&status) { return Err("update_download_or_signature_failed".into()); }
-        let content_range = response.headers().get(reqwest::header::CONTENT_RANGE)
+        let segment = response.headers().get(reqwest::header::CONTENT_RANGE)
             .and_then(|value| value.to_str().ok())
-            .and_then(parse_content_range);
-        match segment_action(offset, status, content_range.as_ref()) {
+            .and_then(parse_segment_range);
+        let content_range = segment.as_ref().map(|(range, _)| range);
+        match segment_action(offset, status, content_range) {
             SegmentAction::Rejected => {
                 // 416 is handled above; any other unexpected success status means
                 // the body cannot be trusted as a segment for this package.
@@ -822,23 +1104,30 @@ async fn transfer(updater: &NativeUpdater, update: &tauri_plugin_updater::Update
             SegmentAction::Restart if offset > 0 => {
                 // The server ignored our offset (200) or answered for another start.
                 discard_part(part);
+                if restarted { return Err("update_range_rejected".into()); }
+                restarted = true;
                 offset = 0;
-                if attempt < 2 { continue; }
-                // A second inconsistent answer is not written as if it were a
-                // full body; the segment is already gone and the caller retries.
-                return Err("update_download_or_signature_failed".into());
+                *total = announced;
+                continue;
             }
+            SegmentAction::Restart if status != 200 => return Err("update_range_rejected".into()),
             SegmentAction::Append | SegmentAction::Restart => {}
         }
-        let declared = content_range.as_ref().and_then(|range| range.total)
-            .or_else(|| response.content_length().map(|length| offset.saturating_add(length)));
-        if declared.is_some_and(|value| value > MAX_PACKAGE as u64) {
-            discard_part(part);
+        let (declared, segment_end) = if let Some((range, end)) = segment.filter(|_| status == 206) {
+            if response.content_length().is_some_and(|length| length != end - offset) {
+                return Err("update_range_rejected".into());
+            }
+            (range.total, Some(end))
+        } else {
+            (response.content_length(), response.content_length())
+        };
+        if [declared, segment_end].into_iter().flatten().any(|value| value > MAX_PACKAGE as u64) {
             return Err("update_size_limit".into());
         }
-        if declared.is_some_and(|value| value < offset) {
-            discard_part(part);
-            return Err("update_download_or_signature_failed".into());
+        if total.zip(declared).is_some_and(|(previous, current)| previous != current)
+            || total.zip(segment_end).is_some_and(|(total, end)| end > total)
+        {
+            return Err("update_range_rejected".into());
         }
         if let Some(value) = declared { *total = Some(value); }
         let mut file = open_part(part, offset)?;
@@ -866,6 +1155,9 @@ async fn transfer(updater: &NativeUpdater, update: &tauri_plugin_updater::Update
                 discard_part(part);
                 return Err("update_size_limit".into());
             }
+            if segment_end.or(*total).is_some_and(|end| next > end) {
+                return Err("update_range_rejected".into());
+            }
             file.write_all(&chunk).map_err(|_| "update_cache_unavailable")?;
             count = next;
             let now = Instant::now();
@@ -875,47 +1167,45 @@ async fn transfer(updater: &NativeUpdater, update: &tauri_plugin_updater::Update
             }
         }
         file.sync_all().map_err(|_| "update_cache_unavailable")?;
-        if total.is_some_and(|value| count < value) {
-            // A transient truncation gets one more range request from the
-            // current offset; a deterministic truncation discards the segment
-            // so the next attempt can restart instead of looping forever.
-            if attempt < 2 { offset = count; continue; }
-            discard_part(part);
+        if count == offset || segment_end.is_some_and(|end| count != end) {
             return Err("update_download_incomplete".into());
+        }
+        if total.is_some_and(|value| count < value) || (status == 206 && total.is_none()) {
+            offset = count;
+            continue;
         }
         return Ok(count);
     }
 }
 
-async fn download_package(updater: &NativeUpdater, update: &tauri_plugin_updater::Update,
+async fn download_package(app: &tauri::AppHandle, updater: &NativeUpdater, update: &tauri_plugin_updater::Update,
                           cache: &Path, version: &str, notes: &str) -> Result<(), String> {
     let cached = cached_path(cache);
     let part = part_path(cache);
     let meta = part_meta_path(cache);
     let announced = announced_size(&update.raw_json);
     let url = update.download_url.as_str();
-    let stored = std::fs::read_to_string(&meta).ok();
+    let stored = read_part_identity(&meta);
     if !identity_matches(stored.as_deref(), version, url) {
         // Never append a new release to a segment left by another artifact.
         discard_part(&part);
         write_part_identity(&meta, &part_identity(version, url))?;
     }
-    let offset = resume_offset(part_bytes(&part), (announced < MAX_PACKAGE as u64).then_some(announced));
+    if announced > MAX_PACKAGE as u64 { return Err("update_size_limit".into()); }
+    let mut total = update.raw_json.get("size").and_then(Value::as_u64).filter(|size| *size > 0);
+    let offset = resume_offset(part_bytes(&part), total);
     // The cache, application and extraction volumes all need room for the
     // complete package; checking only the remaining bytes under-reserved them.
-    preflight_space(cache, announced)?;
-    let mut total = (announced < MAX_PACKAGE as u64).then_some(announced);
-    let mut count = offset;
-    // A segment that already holds the announced size needs no request at all.
-    if announced == MAX_PACKAGE as u64 || offset < announced {
-        count = transfer(updater, update, &part, offset, &mut total, version, notes).await?;
-    }
-    updater.set(json!({"state":"verifying","stage":"verifying","version":version,"notes":notes,
-        "bytes":count,"total":total,"bytes_per_second":Value::Null}));
-    let verified = read_package(&part).and_then(|bytes| {
-        update.verify(&bytes).map_err(|_| "update_download_or_signature_failed".to_string())
-    });
-    if let Err(error) = verified {
+    preflight_space(app, cache, announced, true)?;
+    let result = async {
+        let count = if total == Some(offset) { offset } else {
+            transfer(updater, update, &part, offset, &mut total, version, notes).await?
+        };
+        updater.set(json!({"state":"verifying","stage":"verifying","version":version,"notes":notes,
+            "bytes":count,"total":total,"bytes_per_second":Value::Null}));
+        verify_cached_package(update, &part)
+    }.await;
+    if let Err(error) = result {
         if discards_segment(&error) { discard_part(&part); }
         return Err(error);
     }
@@ -954,16 +1244,15 @@ async fn check_in_operation(app: &tauri::AppHandle, download: bool) -> Result<Va
         std::fs::create_dir_all(&cache).map_err(|_| "update_cache_unavailable")?;
         let cached = cached_path(&cache);
         // A fresh feed and signature check are required even when using a persisted package.
-        if let Ok(bytes) = read_package(&cached) {
-            if update.verify(&bytes).is_ok() {
-                *updater.staged.lock().unwrap() = Some((update.clone(), cached));
-                updater.set(json!({"state":"ready","version":version,"notes":notes}));
-                return Ok(snapshot(&app));
-            }
+        if verify_cached_package(&update, &cached).is_ok() {
+            *updater.staged.lock().unwrap() = Some((update.clone(), cached));
+            updater.set(json!({"state":"ready","version":version,"notes":notes}));
+            return Ok(snapshot(&app));
         }
+        discard_part(&cached);
         *updater.staged.lock().unwrap() = None;
         if !download { return Ok(snapshot(&app)); }
-        download_package(&updater, &update, &cache, &version, &notes).await?;
+        download_package(&app, &updater, &update, &cache, &version, &notes).await?;
         *updater.staged.lock().unwrap() = Some((update, cached));
         updater.set(json!({"state":"ready","version":version,"notes":notes}));
         Ok(snapshot(&app))
@@ -1023,10 +1312,86 @@ pub async fn install(app: tauri::AppHandle, window: String, revision: u64, autom
     }).await.map_err(|_| "update_worker_failed".to_string())?
 }
 
+fn cancel_update_lease(lease: &Value, mut cancel: impl FnMut(Value) -> bool,
+                       mut pause: impl FnMut()) -> Result<(), String> {
+    // The engine expires the lease even if none of these attempts reaches it.
+    for attempt in 0..3 {
+        if cancel(json!({"action":"cancel","lease":lease})) { return Ok(()); }
+        if attempt < 2 { pause(); }
+    }
+    Err("update_barrier_release_failed".into())
+}
+
+fn release_update_barrier(runtime: &RuntimeState, lease: &Value) -> Result<(), String> {
+    cancel_update_lease(lease, |body| {
+        let connection = runtime.local.lock().unwrap().clone();
+        connection.as_ref().filter(|connection| connection.owned).is_some_and(|connection| {
+            call_with_session(connection, "desktop-update", Some(body), Some(Duration::from_secs(2)))
+                .is_ok_and(|(reply, _)| reply.status == 200)
+        })
+    }, || std::thread::sleep(Duration::from_millis(200)))
+}
+
+fn check_renewed_lease(lease: &mut Value, ready: &Value, version: &str) -> Result<(), String> {
+    let returned = &ready["barrier"]["lease"];
+    if returned == lease { return Ok(()); }
+    // prepare can acquire a fresh barrier after expiry. Cancel that lease on
+    // exit, while still requiring a new install attempt before any replacement.
+    if returned.as_str().is_some_and(|value| !value.is_empty())
+        && ready["barrier"]["version"] == version
+        && ready["barrier"]["phase"] == "draining"
+    {
+        *lease = returned.clone();
+    }
+    Err("update_lease_expired".into())
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    #[test]
+    fn renewed_update_lease_is_reclaimed_after_old_lease_expires() {
+        let mut lease = json!("previous-lease");
+        let foreign = json!({"barrier":{"lease":"foreign-lease","version":"2.0.0","phase":"draining"}});
+        assert_eq!(check_renewed_lease(&mut lease, &foreign, "1.2.3"), Err("update_lease_expired".into()));
+        assert_eq!(lease, "previous-lease");
+
+        let renewed = json!({"barrier":{"lease":"fresh-lease","version":"1.2.3","phase":"draining"}});
+        assert_eq!(check_renewed_lease(&mut lease, &renewed, "1.2.3"), Err("update_lease_expired".into()));
+        let mut attempts = 0;
+        let mut pauses = 0;
+        let result = cancel_update_lease(&lease, |body| {
+            assert_eq!(body, json!({"action":"cancel","lease":"fresh-lease"}));
+            attempts += 1;
+            attempts == 2
+        }, || pauses += 1);
+        assert_eq!((result, attempts, pauses), (Ok(()), 2, 1));
+    }
+
+    #[test]
+    fn persistent_update_cancel_failure_is_bounded() {
+        let mut attempts = 0;
+        let mut pauses = 0;
+        let result = cancel_update_lease(&json!("owned-lease"), |body| {
+            assert_eq!(body, json!({"action":"cancel","lease":"owned-lease"}));
+            attempts += 1;
+            false
+        }, || pauses += 1);
+        assert_eq!((result, attempts, pauses), (Err("update_barrier_release_failed".into()), 3, 2));
+    }
+}
+
 fn install_in_operation(app: tauri::AppHandle, permit: InstallPermit, automatic: bool, approved: Value,
                         current_version: String, target_version: String) -> Result<(), String> {
     let updater = app.state::<NativeUpdater>();
-    let local = app.state::<RuntimeState>().local.lock().unwrap().clone();
+    let runtime = app.state::<RuntimeState>();
+    // Keep the local engine stable from the drain snapshot through replacement and recovery.
+    let _local_start = runtime.local_start_gate.try_lock().map_err(|_| "update_busy")?;
+    if runtime.recovering.load(Ordering::SeqCst) {
+        return Err("update_runtime_recovery_failed".into());
+    }
+    let local = runtime.local.lock().unwrap().clone();
     let revision = permit.revision;
     let window = permit.window;
     let request = InstallRequest { revision: Some(revision), automatic, window: &window,
@@ -1041,49 +1406,80 @@ fn install_in_operation(app: tauri::AppHandle, permit: InstallPermit, automatic:
     let _waiting = updater.begin_waiting(revision);
     let mut lease = Value::Null;
     let mut engine_stopped = false;
+    let mut _replacement = None;
     let result: Result<(), String> = (|| {
         boundary()?;
-        let version = updater.staged.lock().unwrap().as_ref().map(|(update, _)| update.version.clone())
-            .ok_or("update_not_downloaded")?;
-        require_same_artifact(&approved, Some(&staged_artifact(&app)?))?;
+        let staged = updater.staged.lock().unwrap().clone().ok_or("update_not_downloaded")?;
+        require_same_artifact(&approved, Some(&artifact(&staged.0)))?;
+        let version = &staged.0.version;
+        let cache = staged.1.parent().ok_or("update_cache_unavailable")?;
+        let (file, size) = open_bounded_file(&staged.1, MAX_PACKAGE as u64)?;
+        preflight_space(&app, cache, size, true)?;
+        let snapshot = install_snapshot(file, size, cache)?;
+        let bytes = snapshot.as_ref();
+        let verified = staged.0.verify(bytes).is_ok();
+        let transaction = update_receipt::Transaction {
+            operation_id: update_receipt::operation_id(),
+            from_version: current_version.clone(),
+            to_version: version.clone(),
+            artifact_sha256: update_receipt::sha256_hex(bytes),
+            signature_sha256: update_receipt::sha256_hex(staged.0.signature.as_bytes()),
+            signature_verified: verified,
+            artifact_url: staged.0.download_url.as_str().to_string(),
+            authorization_revision: revision,
+            install_window: window.clone(),
+            platform: host_platform().into(),
+            arch: host_arch().into(),
+        };
+        if !verified {
+            *updater.staged.lock().unwrap() = None;
+            discard_part(&staged.1);
+            let receipt = update_receipt::prepare_app(&app)?;
+            update_receipt::begin_pending(&receipt, &transaction)?;
+            update_receipt::transition(&receipt, "failed", Some("update_download_or_signature_failed"), None)?;
+            return Err("update_download_or_signature_failed".into());
+        }
         let runtime = app.state::<RuntimeState>();
         let owned = local.as_ref().filter(|connection| connection.owned);
+        let enter_replacement = || -> Result<MutexGuard<'static, ()>, String> {
+            let gate = REPLACEMENT_GATE.try_lock().map_err(|_| "update_busy")?;
+            if QUITTING.load(Ordering::SeqCst) || updater.cancel.load(Ordering::SeqCst) {
+                return Err("update_wait_cancelled".into());
+            }
+            boundary()?;
+            Ok(gate)
+        };
         if let Some(connection) = owned {
             let reply = call(connection, "desktop-update", Some(json!({"action":"prepare","version":version})))?;
             if reply.status != 200 { return Err("update_drain_failed".into()); }
             let mut ready: Value = serde_json::from_str(&reply.body).map_err(|_| "update_drain_failed")?;
             lease = ready["barrier"]["lease"].clone();
+            if !lease.is_string() { return Err("update_drain_failed".into()); }
             let deadline = std::time::Instant::now() + Duration::from_secs(3600);
             while ready["ready"] != true {
-                // A policy/scope/window change revokes this waiting install; the
-                // barrier lease is released so the runtime keeps running normally.
-                if let Err(error) = boundary() {
-                    let _ = call(connection, "desktop-update", Some(json!({"action":"cancel","lease":lease})));
-                    return Err(error);
-                }
+                boundary()?;
                 updater.set(json!({"state":"waiting_idle","version":version,"reasons":ready["reasons"]}));
-                if updater.cancel.load(Ordering::SeqCst) || std::time::Instant::now() >= deadline {
-                    let _ = call(connection, "desktop-update", Some(json!({"action":"cancel","lease":lease})));
+                if QUITTING.load(Ordering::SeqCst) || updater.cancel.load(Ordering::SeqCst) || Instant::now() >= deadline {
                     return Err("update_wait_cancelled".into());
                 }
                 std::thread::sleep(Duration::from_secs(1));
                 let reply = call(connection, "desktop-update", Some(json!({"action":"prepare","version":version,"lease":lease})))?;
                 if reply.status != 200 { return Err("update_drain_failed".into()); }
                 ready = serde_json::from_str(&reply.body).map_err(|_| "update_drain_failed")?;
-                if ready["barrier"]["lease"] != lease { return Err("update_lease_expired".into()); }
+                check_renewed_lease(&mut lease, &ready, version)?;
             }
             boundary()?;
             revalidate(&app, &approved)?;
-            boundary()?;
+            _replacement = Some(enter_replacement()?);
             let reply = call(connection, "desktop-update", Some(json!({"action":"commit","lease":lease})))?;
             if reply.status != 200 { return Err("update_drain_failed".into()); }
+        } else {
+            revalidate(&app, &approved)?;
+            _replacement = Some(enter_replacement()?);
         }
         if updater.cancel.load(Ordering::SeqCst) { return Err("update_wait_cancelled".into()); }
         boundary()?;
-        if owned.is_none() { revalidate(&app, &approved)?; }
-        let cache = app.path().app_cache_dir().map_err(|_| "update_cache_unavailable")?;
-        preflight_space(&cache, announced_size(&approved))?;
-        if updater.cancel.load(Ordering::SeqCst) { return Err("update_wait_cancelled".into()); }
+        preflight_space(&app, cache, bytes.len() as u64, false)?;
         updater.set(json!({"state":"installing","stage":"installing","version":version}));
         // Replacement starts only after owned work has drained. Other services are not stopped.
         // A stop request is irreversible: never treat a child whose stdin was already
@@ -1101,84 +1497,67 @@ fn install_in_operation(app: tauri::AppHandle, permit: InstallPermit, automatic:
             }
         }
         boundary()?;
-        let staged = updater.staged.lock().unwrap().take().ok_or("update_not_downloaded")?;
-        let installation = read_package(&staged.1).and_then(|bytes| {
-            boundary()?;
+        let receipt = update_receipt::prepare_app(&app)?;
+        update_receipt::begin_pending(&receipt, &transaction)?;
+        let installation = (|| {
+            // Keep authorization stable from the final check through replacement.
+            let authorization = updater.authorization.lock().unwrap();
+            require_window(&window)?;
+            install_permit(&authorization, &request)?;
             if updater.cancel.load(Ordering::SeqCst) { return Err("update_wait_cancelled".into()); }
-            // Verify the exact bytes being installed so both the persisted receipt
-            // and the replacement decision come from a real signature check.
-            let verified = staged.0.verify(&bytes);
-            let receipt = update_receipt::prepare_app(&app)?;
-            update_receipt::begin_pending(&receipt, &update_receipt::Transaction {
-                operation_id: update_receipt::operation_id(),
-                from_version: app.package_info().version.to_string(),
-                to_version: staged.0.version.clone(),
-                artifact_sha256: update_receipt::sha256_hex(&bytes),
-                signature_sha256: update_receipt::sha256_hex(staged.0.signature.as_bytes()),
-                signature_verified: verified.is_ok(),
-                artifact_url: staged.0.download_url.as_str().to_string(),
-                authorization_revision: revision,
-                install_window: window.clone(),
-                platform: host_platform().into(),
-                arch: host_arch().into(),
-            })?;
-            if verified.is_err() {
-                // Keep the failed check as evidence; nothing was replaced.
-                let _ = update_receipt::transition(&receipt, "failed", Some("update_download_or_signature_failed"), None);
-                return Err("update_download_or_signature_failed".into());
-            }
-            if staged.0.install(&bytes).is_err() {
-                // Record the failed attempt, but keep the install error as the
-                // primary fact. If the record cannot be updated it stays pending
-                // and is settled by the next start; it is never read as applied.
-                let _ = update_receipt::transition(&receipt, "failed", Some("update_install_failed"), None);
-                return Err("update_install_failed".into());
-            }
-            Ok(())
-        });
-        if installation.is_err() {
-            *updater.staged.lock().unwrap() = Some(staged);
-            if let Some(connection) = owned {
-                let _ = call(connection, "desktop-update", Some(json!({"action":"cancel","lease":lease})));
-            }
-            return installation;
+            staged.0.install(bytes).map_err(|_| "update_install_failed".to_string())
+        })();
+        drop(snapshot);
+        if let Err(error) = installation {
+            let _ = update_receipt::transition(&receipt, "failed", Some(&error), None);
+            return Err(error);
         }
         app.restart();
     })();
-    if let Err(ref error) = result {
-        if engine_stopped { let _ = bootstrap(&app); }
+    if let Err(error) = result {
         let runtime_state = app.state::<RuntimeState>();
+        let error = if engine_stopped {
+            match bootstrap(&app) {
+                Ok(()) => error,
+                Err(reason) => {
+                    *runtime_state.error.lock().unwrap() = reason;
+                    "update_runtime_recovery_failed".into()
+                }
+            }
+        } else if !runtime_state.recovering.load(Ordering::SeqCst) && lease.is_string() {
+            release_update_barrier(&runtime_state, &lease).err().unwrap_or(error)
+        } else {
+            error
+        };
         if runtime_state.recovering.load(Ordering::SeqCst) {
             // The old service may still be exiting after the grace period. Watch for
             // its real exit, then restore a fresh owned runtime instead of exposing
             // a stale connection or reopening the update barrier.
             let handle = app.clone();
+            let generation = runtime_state.generation.load(Ordering::SeqCst);
             std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + Duration::from_secs(180);
-                loop {
-                    let state = handle.state::<RuntimeState>();
-                    let exited = {
-                        let mut guard = state.child.lock().unwrap();
-                        match guard.as_mut() {
-                            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
-                            None => true,
+                let state = handle.state::<RuntimeState>();
+                let deadline = Instant::now() + Duration::from_secs(180);
+                while Instant::now() < deadline && !QUITTING.load(Ordering::SeqCst) {
+                    if let Ok(_local_start) = state.local_start_gate.try_lock() {
+                        if !state.recovering.load(Ordering::SeqCst)
+                            || state.generation.load(Ordering::SeqCst) != generation
+                        {
+                            return;
                         }
-                    };
-                    if exited {
-                        *state.child.lock().unwrap() = None;
-                        let _ = bootstrap(&handle);
-                        break;
+                        if let Ok(_replacement) = REPLACEMENT_GATE.try_lock() {
+                            if QUITTING.load(Ordering::SeqCst) { return; }
+                            if reap_update_runtime(&state) {
+                                match bootstrap(&handle) {
+                                    Ok(()) => return,
+                                    Err(error) => *state.error.lock().unwrap() = error,
+                                }
+                            }
+                        }
                     }
-                    if std::time::Instant::now() >= deadline { break; }
                     std::thread::sleep(Duration::from_millis(500));
                 }
             });
-        }
-        let recovery = app.state::<RuntimeState>().local.lock().unwrap().clone();
-        if let Some(connection) = recovery.as_ref().or(local.as_ref()).filter(|connection| connection.owned) {
-            if lease.is_string() {
-                let _ = call(connection, "desktop-update", Some(json!({"action":"cancel","lease":lease})));
-            }
         }
         let staged = updater.staged.lock().unwrap();
         if let Some((update, _)) = staged.as_ref() {
@@ -1186,8 +1565,9 @@ fn install_in_operation(app: tauri::AppHandle, permit: InstallPermit, automatic:
         } else {
             updater.set(json!({"state":"error","error_code":error}));
         }
+        return Err(error);
     }
-    result
+    Ok(())
 }
 
 #[cfg(test)]

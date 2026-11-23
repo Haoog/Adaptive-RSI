@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
-const {createInterface} = require('node:readline');
+const {fixtureReady, closeFixture} = require('./fixture_browser.cjs');
 const {chromium} = require('playwright');
 
 const reply = (route, data, status = 200) => route.fulfill({status, contentType: 'application/json', body: JSON.stringify(data)});
@@ -506,12 +506,15 @@ async function checkObsoleteActions(browser,url,errors) {
     const project=await page.locator('#project-select').inputValue();
     assert.equal((await (await page.request.get(new URL('/api/task?id='+task+'&project='+project,url).href)).json()).state,'queued');
     await page.getByRole('button',{name:'过时任务补充入口',exact:true}).click();
-    await page.getByRole('textbox', {name:'补充需求（保留在当前任务）',exact:true}).fill('补充过时任务的新验收要求');
+    const detail = page.locator('#detail-dialog[open]');
+    const editor = detail.locator('.task-supplement-editor');
+    await editor.locator('summary').click();
+    await editor.getByRole('textbox', {name:'补充需求（保留在当前任务）',exact:true}).fill('补充过时任务的新验收要求');
     const revised=page.waitForResponse(response=>new URL(response.url()).pathname==='/api/task/revise'&&response.request().method()==='POST');
-    await page.getByRole('button',{name:'保存补充并重新评估',exact:true}).click();
+    await editor.getByRole('button',{name:'保存补充并重新评估',exact:true}).click();
     assert.equal((await revised).status(),200);
-    await page.locator('#detail-body').filter({hasText:'补充过时任务的新验收要求'}).waitFor();
-    assert.equal(await page.locator('#detail-body .badge').first().innerText(),'排队中');
+    await detail.locator('#task-requirements').filter({hasText:'补充过时任务的新验收要求'}).waitFor();
+    await detail.locator('#detail-body .badge').filter({hasText:'排队中'}).first().waitFor();
     assert.equal(paid,0,'obsolete actions must not enable projects or start model tests');
     assert.deepEqual(errors,[]);
     console.log('Obsolete history retry and detail revision passed against real HTTP; project remains paused.');
@@ -519,25 +522,24 @@ async function checkObsoleteActions(browser,url,errors) {
 }
 
 async function main() {
+  const group = process.env.RSI_BROWSER_HARDENING_GROUP;
+  const env = {...process.env, PYTHONDONTWRITEBYTECODE: '1'};
+  if (group === 'obsolete') env.RSI_BROWSER_OBSOLETE_ONLY = '1';
   const server = spawn(process.env.PYTHON || 'python3', ['-m', 'tests.browser_fixture'], {
-    stdio: ['pipe', 'pipe', 'pipe'], env: {...process.env, PYTHONDONTWRITEBYTECODE: '1'}
+    stdio: ['pipe', 'pipe', 'pipe'], env
   });
   server.stderr.on('data', chunk => process.stderr.write(chunk));
-  let browser;
+  let browser, scenarioError;
   const errors = [];
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(Error('Console startup timed out')), 30000);
-      createInterface({input: server.stdout}).once('line', line => {clearTimeout(timeout); resolve(line);});
-      server.once('exit', code => {clearTimeout(timeout); reject(Error('Console exited: ' + code));});
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
-    const group=process.env.RSI_BROWSER_HARDENING_GROUP;
     if(group){
       const steps={core:[()=>checkReadiness(browser,url,false,errors),()=>checkReadiness(browser,url,true,errors),()=>checkReadinessInstallAction(browser,url,errors),()=>checkRunProgress(browser,url,errors),()=>checkModelForms(browser,url,errors)],
        providers:[()=>checkProviderSaveRace(browser,url,errors),()=>checkProviderSaveRace(browser,url,errors,true)],
        routes:[()=>checkRouteSaveRace(browser,url,errors)],updates:[()=>checkUpdatePending(browser,url,errors),()=>checkUpdateRateLimit(browser,url,errors)],
-       settings:[()=>checkPendingSettingsDraft(browser,url,errors)],recovery:[()=>checkDraftRecovery(browser,url,errors),()=>checkInvalidConfigRepair(browser,url,errors)]};
+       settings:[()=>checkPendingSettingsDraft(browser,url,errors)],recovery:[()=>checkDraftRecovery(browser,url,errors),()=>checkInvalidConfigRepair(browser,url,errors)],
+       obsolete:[()=>checkObsoleteActions(browser,url,errors)]};
       assert.ok(steps[group],'Unknown hardening test group');
       for(const [index,step] of steps[group].entries()){const began=Date.now();await step();console.log('Hardening '+group+' step '+(index+1)+': '+((Date.now()-began)/1000)+'s');}
       assert.deepEqual(errors,[]);return;
@@ -562,10 +564,11 @@ async function main() {
     await checkInvalidConfigRepair(browser,url,errors);
     assert.deepEqual(errors, []);
     console.log('Delayed readiness and model form checks passed.');
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    server.stdin.end('\n');
-    await new Promise(resolve => server.once('exit', resolve));
+    await closeFixture(server, browser, scenarioError);
   }
 }
 

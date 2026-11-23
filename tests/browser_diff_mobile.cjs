@@ -1,23 +1,19 @@
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
-const {createInterface} = require('node:readline');
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const {chromium} = require('playwright');
 
 (async () => {
   const server = spawn(process.env.PYTHON || 'python3', ['-m', 'tests.browser_fixture'],
     {stdio: ['pipe', 'pipe', 'pipe'], env: {...process.env, PYTHONDONTWRITEBYTECODE: '1'}});
-  let browser;
+  let browser, scenarioError;
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(Error('Fixture startup timed out')), 30000);
-      createInterface({input: server.stdout}).once('line', line => {clearTimeout(timer); resolve(line);});
-      server.once('exit', code => {clearTimeout(timer); reject(Error('Fixture exited: ' + code));});
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
     const page = await browser.newPage(), errors = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(url);
-    await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+    await waitForPausedProject(page);
     const patch = 'diff --git a/first.py b/first.py\n--- a/first.py\n+++ b/first.py\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/second.py b/second.py\n--- a/second.py\n+++ b/second.py\n@@ -1 +1 @@\n-other\n+UNIQUE-SECOND-MATCH';
     await page.route('**/api/patch?*', route=>route.fulfill({status:200,contentType:'text/plain',body:patch}));
     await page.route('**/api/diff-files?*', route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify([{path:'first.py',line:1,additions:1,deletions:1},{path:'second.py',line:7,additions:1,deletions:1}])}));
@@ -63,9 +59,10 @@ const {chromium} = require('playwright');
 
     assert.deepEqual(errors, []);
     console.log('Mobile diff folding, lazy files and wrapped large-text location passed.');
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    server.stdin.end();
-    await new Promise(resolve => {server.once('exit', resolve); setTimeout(()=>{server.kill('SIGKILL');resolve();},5000).unref();});
+    await closeFixture(server, browser, scenarioError);
   }
 })().catch(error => {console.error(error); process.exitCode = 1;});

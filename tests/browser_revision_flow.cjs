@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
-const { createInterface } = require("node:readline");
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const { chromium } = require("playwright");
 
 async function openDetail(page, title, filter) {
@@ -114,7 +114,7 @@ async function checkRevisionFlow(browser, url, errors) {
     page.on('pageerror', error => errors.push(name + ': ' + error.message));
     try {
       await page.goto(url);
-      await page.locator('#project-status').filter({ hasText: '已暂停' }).waitFor({ timeout: 15000 });
+      await waitForPausedProject(page);
       await page.locator('.task-row').first().waitFor({ timeout: 10000 });
       await checkOverflow(page, name, errors);
       if (name === 'mobile') await checkBackoffRetry(page, url, errors);
@@ -157,6 +157,7 @@ async function checkRevisionFlow(browser, url, errors) {
       await page.close();
     }
   }
+  assert.deepEqual(errors, [], 'no page errors through both revision scenarios');
   console.log('Revision flow browser passed: 390px and 1280px long text stay inside the dialog; backoff retry appears in list and detail and clears on retry; ordinary queued tasks have no retry.');
 }
 
@@ -166,18 +167,16 @@ async function checkRevisionFlow(browser, url, errors) {
     env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', RSI_BROWSER_REVISION_FLOW: '1' },
   });
   server.stderr.on('data', chunk => process.stderr.write(chunk));
-  let browser;
+  let browser, scenarioError;
   const errors = [];
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(Error('Console startup timed out')), 30000);
-      createInterface({ input: server.stdout }).once('line', line => { clearTimeout(timeout); resolve(line); });
-      server.once('exit', code => { clearTimeout(timeout); reject(Error('Console exited: ' + code)); });
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? { channel: process.env.RSI_BROWSER_CHANNEL } : {});
     await checkRevisionFlow(browser, url, errors);
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    server.kill();
+    await closeFixture(server, browser, scenarioError);
   }
 })();

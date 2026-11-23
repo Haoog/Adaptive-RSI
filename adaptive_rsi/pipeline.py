@@ -294,7 +294,8 @@ def _review_key(run, task, base, strategies, config, plan, evaluation, summary, 
                         "patch_hash": fingerprint(patch)})
 
 
-def _evaluation_source(config, base, checks, patch, environment_digest, acceptance, test_first, change_type):
+def _evaluation_source(config, base, checks, patch, environment_digest, acceptance, test_first, change_type,
+                       required_test_ids=None):
     """The exact trees and settings one evaluation result describes.
 
     The stage signature is computed before implementation and therefore cannot
@@ -304,6 +305,7 @@ def _evaluation_source(config, base, checks, patch, environment_digest, acceptan
     but live outside the stage-cache subset, so they are named here too.
     """
     return {"base": base, "checks": checks, "patch_hash": fingerprint(patch),
+            **({"required_test_ids": required_test_ids} if required_test_ids else {}),
             "environment": environment_digest, "validation": config.get("validation"),
             "detected_checks": config.get("detected_checks", True),
             "acceptance_hash": acceptance["hash"] if acceptance else None,
@@ -982,8 +984,9 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             # 实现与并发的验收基线都按 preparation 计时（与生产路径一致），
             # 不能提前切到 evaluation，否则实现越慢，留给评估的预算越少。
             runtime.begin_phase(run, "evaluation")
+        required_test_ids = contract.get("required_test_ids") if test_first else None
         evaluation_source = _evaluation_source(config, base, checks, patch, environment["sha256"],
-                                               acceptance, test_first, change_type)
+                                               acceptance, test_first, change_type, required_test_ids)
         # A resumed candidate replays exactly the saved patch, so a stored
         # verdict for the same tree and check settings replaces the full
         # evaluation run; anything missing, partial or differently sourced
@@ -1002,7 +1005,9 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                 lambda: runtime.is_cancelled(run), seeds=seeds, acceptance=acceptance,
                 acceptance_baseline=acceptance_baseline, cache_scope=project["id"], cache_base=base,
                 environment_digest=environment["sha256"], test_first=test_first,
-                test_first_kind=change_type, changed_files=files), "source": evaluation_source}
+                test_first_kind=change_type, changed_files=files,
+                **({"required_test_ids": required_test_ids} if required_test_ids else {})),
+                "source": evaluation_source}
     finally:
         if acceptance_executor is not None:
             acceptance_cancel.set()

@@ -279,6 +279,20 @@ class BackupPublicationTest(unittest.TestCase):
         self.assertEqual(list(self.folder.iterdir()), [existing])
         self.assertEqual(existing.read_bytes(), original)
 
+    @unittest.skipUnless(platform.system() in {"Darwin", "Linux"}, "requires exclusive rename")
+    def test_backup_on_volume_without_hard_links_preserves_existing_names(self):
+        from adaptive_rsi.storage_tools import backup, verify_backup
+        with patch("adaptive_rsi.storage_tools.os.link", side_effect=OSError(errno.ENOTSUP, "no hard links")):
+            saved = backup(self.store)
+            existing = self.folder / (saved["id"] + ".sqlite3")
+            self.assertEqual(verify_backup(existing)["bytes"], saved["bytes"])
+            original = existing.read_bytes()
+            with patch("adaptive_rsi.storage_tools.uid", return_value=saved["id"]):
+                with self.assertRaises(FileExistsError):
+                    backup(self.store)
+        self.assertEqual(list(self.folder.iterdir()), [existing])
+        self.assertEqual(existing.read_bytes(), original)
+
     def test_name_collision_never_overwrites_or_removes_valid_backup(self):
         from adaptive_rsi.storage_tools import backup
         saved = backup(self.store)
@@ -1146,7 +1160,13 @@ class ExperienceTest(unittest.TestCase):
         from adaptive_rsi.telemetry import workflow_metrics
         from adaptive_rsi.store import encode
         task = self.runtime.goal(self.project, "Fix addition")
-        passed = {"evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}
+        passed = {
+            "evaluation": {
+                "decision": "pass",
+                "checks": {"candidate": [{"name": "addition", "passed": True, "exit_code": 0}]},
+            },
+            "review": {"decision": "pass"},
+        }
         for index, (state, evidence) in enumerate([("assessed", {}), ("awaiting_approval", passed)]):
             self.store.execute("INSERT INTO runs(id,task,project,state,result,started,ended) VALUES (?,?,?,?,?,?,?)",
                 ("first-pass-" + str(index), task, self.project, state, encode(evidence), time.time() + index, time.time() + index + 1))

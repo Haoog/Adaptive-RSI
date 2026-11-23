@@ -7,7 +7,7 @@ import logging
 import re
 import time
 
-from .store import encode, issue_snapshot_pending, record_issue_sync_corrupt
+from .store import decode_object, encode, issue_snapshot_pending, record_issue_sync_corrupt
 
 
 ISSUE_COMMENT_TTL = 300
@@ -21,6 +21,7 @@ ISSUE_SYNC_SECONDS = 20
 # 必然再失败，超上限后移出 pending 并记 issue_sync_quarantined，不再让
 # failures 汇总把整个 sync（含 prs:/ci: 刷新与 summary 事件）永久 wedge。
 ISSUE_SYNC_PENDING_MAX_ATTEMPTS = 3
+ISSUE_SYNC_QUARANTINE_RETRY_LIMIT = 10
 # 只有这些状态的任务还会消费暂存的 Issue 快照；其余状态（已交付、评审中、
 # 已终止）写入 pending 只会让重放扫描永不收敛。
 HOLDABLE_STATES = ("queued", "planning", "executing", "evaluating", "awaiting_approval",
@@ -366,11 +367,24 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
     store = runtime.store
     key = "issue-sync:" + project["id"]
     progress = store.setting(key, {})
+    if not isinstance(progress, dict):
+        store.event("issue_sync_progress_repaired", "Issue sync progress was not an object; restarting scan",
+                    project["id"], run_id)
+        progress = {}
     from .config import fingerprint
     policy = fingerprint({"labels": config["github"]["labels"], "exclude": config["github"]["exclude_labels"]})
     if progress.get("repository") != repo or progress.get("policy") != policy:
-        retained = progress.get("pending", {}) if progress.get("repository") == repo else {}
-        progress = {"repository": repo, "policy": policy, "pending": retained}
+        same_repo = progress.get("repository") == repo
+        progress = {"repository": repo, "policy": policy,
+                    "pending": progress.get("pending", {}) if same_repo else {},
+                    "quarantined": progress.get("quarantined", {}) if same_repo else {}}
+    since, started_at, page = progress.get("since"), progress.get("started"), progress.get("page")
+    if (since is not None and not isinstance(since, str)) or (started_at and
+            (not isinstance(started_at, str) or type(page) is not int or page < 1)):
+        store.event("issue_sync_progress_repaired", "Issue sync cursor was invalid; restarting scan",
+                    project["id"], run_id)
+        for field in ("since", "started", "page"):
+            progress.pop(field, None)
     if not progress.get("started"):
         progress.update(started=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), page=1)
     changed, complete = 0, False
@@ -383,6 +397,9 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
                     "Issue sync progress held a malformed pending map; it was reset",
                     project["id"], run_id, data={"pending_type": type(pending).__name__})
         pending = {}
+    quarantined = progress.get("quarantined", {})
+    if not isinstance(quarantined, dict):
+        quarantined = {}
     prior_failures = progress.get("failures", 0)
     failures = []
     # 本轮为防止并发授权而预先密封的 Issue；它们不是上一周期遗留的快照，
@@ -400,6 +417,32 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
             logging.getLogger(__name__).exception("Failed to record issue sync failure for %s", number)
         failures.append(exc)
 
+    quarantine_rows = {}
+    newly_quarantined = set()
+
+    def revision(entry):
+        return entry.get("updated_at") if isinstance(entry, dict) else entry
+
+    def older_revision(updated, reference):
+        if not isinstance(updated, str) or not isinstance(reference, str):
+            return False
+        try:
+            updated, reference = (datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                                  for value in (updated, reference))
+            return updated < reference
+        except (TypeError, ValueError):
+            return False
+
+    def persist_replay(quarantine_event=None):
+        progress.update(pending=pending, quarantined=quarantined)
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(progress)))
+            if quarantine_event:
+                message, data = quarantine_event
+                db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                           (project["id"], run_id, "issue_sync_quarantined", message, encode(data), time.time()))
+
     def hold_failed(issue):
         """Stash a failed remote row in pending so the next cycle retries it."""
         try:
@@ -408,6 +451,14 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
             # 暂存只是重试优化；任何畸形行都不得中断整页同步。
             logging.getLogger(__name__).exception("Failed to hold a malformed Issue snapshot")
 
+    def snapshot_of(issue):
+        fields = ("number", "updated_at", "html_url", "state", "labels", "comments")
+        entry = {field: issue[field] for field in fields if field in issue}
+        for field, limit in (("title", 300), ("body", 30000)):
+            if field in issue:
+                entry[field] = str(issue[field] or "")[:limit]
+        return entry
+
     def _hold_failed(issue):
         if not isinstance(issue, dict):
             return
@@ -415,29 +466,32 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
             number = str(int(issue["number"]))
         except (TypeError, ValueError, KeyError):
             return
-        # 与 apply_existing 暂存活跃修订相同的裁剪形状。apply() 需要这些键：
-        # 结构不完整的行无法暂存重试，记录错误后等下一次远端刷新再读原文。
         required = ("number", "updated_at", "html_url", "state", "labels", "title", "body")
-        if any(key not in issue for key in required):
-            # 行本身不完整时仍要挡住旧候选：远端确实有更新，只是本地无法解析。
+        if number not in quarantined and any(field not in issue for field in required):
             seal(number, issue)
             return
-        entry = {key: issue[key] for key in ["number", "updated_at", "html_url", "state", "labels"]}
+        # Keep a replacement for a quarantined revision sealed even if it is
+        # incomplete. Falling back to the older snapshot would lose the update.
+        entry = snapshot_of(issue)
         # 远端每次刷新都会重投同一条失败行：保留既有 attempts，否则确定性坏行
         # 的计数永远被覆写回 0、到不了隔离上限，sync 仍会被永久 wedge。
         previous = pending.get(number)
         attempts = 0
-        if isinstance(previous, dict) and previous.get("updated_at") == issue["updated_at"]:
+        if isinstance(previous, dict) and previous.get("updated_at") == issue.get("updated_at"):
             existing = previous.get("attempts", 0)
             attempts = existing if isinstance(existing, int) and existing >= 0 else 0
-        entry.update(title=str(issue.get("title") or "")[:300],
-                     body=str(issue.get("body") or "")[:30000], attempts=attempts)
+        entry["attempts"] = attempts
         pending[number] = entry
+        # Publish a replacement and retire the older quarantine in the same write.
+        # A failed replacement must never permit the older snapshot to replay.
+        retired = quarantined.pop(number, None)
+        try:
+            persist_replay()
+        except Exception:
+            if retired is not None:
+                quarantined[number] = retired
+            raise
         sealed_now.add(number)
-        progress["pending"] = pending
-        with store.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(progress)))
         seal(number, issue)
 
     def seal(number, issue):
@@ -490,10 +544,10 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
             if existing:
                 prior = dict(existing)
                 if apply_existing(issue, existing, db):
-                    changed += 1
                     row = db.execute("SELECT id,title,body,evidence FROM tasks WHERE id=?",
                                      (existing["id"],)).fetchone()
                     _diff_audit(db, project["id"], run_id, existing["id"], prior, dict(row))
+                    changed += 1
                 progress["pending"] = pending
                 db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(progress)))
                 if str(number) in pending:
@@ -534,6 +588,8 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
             previous = []
         if not isinstance(previous, list) or not previous or not isinstance(previous[0], dict):
             previous = []
+        if previous and older_revision(issue.get("updated_at"), previous[0].get("updated")):
+            return False
         revised = not previous or previous[0].get("updated") != issue["updated_at"]
         exclusion = previous[0].get("sync_exclusion") if previous else None
         labels = label_names(issue)
@@ -577,8 +633,9 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
                 requirements = {**requirements, "upstream_body": (issue["body"] or "")[:30000]}
                 evidence[0]["requirements"] = requirements
                 body = issue_requirements_body(requirements)
-                db.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,updated=? WHERE id=?",
-                    (issue["title"][:300], body, encode(evidence), time.time(), existing["id"]))
+                db.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,"
+                           "attempts=0,infra_retries=0,budget_waits=0,updated=? WHERE id=?",
+                           (issue["title"][:300], body, encode(evidence), time.time(), existing["id"]))
                 db.execute("DELETE FROM settings WHERE key=?", ("task-schedule:" + existing["id"],))
                 return True
             if revised:
@@ -650,6 +707,56 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
                                 encode({"task": existing["id"], "updated": issue["updated_at"]}), time.time()))
         return False
 
+    quarantine_cursor = progress.get("quarantine_cursor", "")
+    if not isinstance(quarantine_cursor, str):
+        quarantine_cursor = ""
+
+    def recover_quarantined():
+        nonlocal quarantine_cursor
+        if not quarantined:
+            return
+        deadline = time.monotonic() + 5
+        # Finish reading the incremental scan before falling back to a stored
+        # snapshot, so a newer remote revision can replace it first.
+        numbers = sorted(quarantined, key=lambda number: (number <= quarantine_cursor, number))
+        for number in numbers[:ISSUE_SYNC_QUARANTINE_RETRY_LIMIT]:
+            if time.monotonic() >= deadline:
+                break
+            if cancel and cancel():
+                from .process import Cancelled
+                raise Cancelled("Issue sync cancelled; continuation retained")
+            quarantine_cursor = number
+            if number in newly_quarantined or number in pending:
+                continue
+            snapshot = quarantined[number]
+            issue = quarantine_rows.get(number, snapshot)
+            if not isinstance(issue, dict):
+                # Older releases stored only the timestamp. An incremental list
+                # can already have moved beyond it, so fetch that Issue directly.
+                try:
+                    remaining = max(1, deadline - time.monotonic())
+                    args = ["gh", "api", "--method", "GET", "repos/" + repo + "/issues/" + str(int(number))]
+                    issue = json.loads(checked(args, timeout=remaining))
+                    if str(int(issue["number"])) != number or "pull_request" in issue:
+                        continue
+                    if not isinstance(revision(issue), str) or not revision(issue):
+                        continue
+                except (RuntimeError, ValueError, TypeError, KeyError):
+                    continue
+            if older_revision(revision(issue), revision(snapshot)):
+                continue
+            if issue is not snapshot:
+                quarantined[number] = snapshot_of(issue)
+                persist_replay()
+            try:
+                apply(issue)
+            except Exception:
+                # Quarantine already records the failure. Leave the gate closed
+                # and the scan healthy while a later pass checks for recovery.
+                pending.pop(number, None)
+                continue
+            quarantined.pop(number)
+
     for pending_key, issue in list(pending.items()):
         try:
             issue_number = str(int(issue["number"])) if isinstance(issue, dict) else None
@@ -659,10 +766,13 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
             # 暂存条目缺 number 或不可转 int：handler 内 int() 会穿透出 sync()。
             # 记事件后把原键从 pending 摘除——只 continue 会让它每周期重复
             # 进入这个分支、无限追加 quarantine 事件。
-            store.event("issue_sync_quarantined",
-                        "Issue sync dropped a malformed pending snapshot",
-                        project["id"], run_id, data={"issue": issue if isinstance(issue, dict) else None})
             pending.pop(pending_key, None)
+            persist_replay(("Issue sync dropped a malformed pending snapshot",
+                            {"issue": issue if isinstance(issue, dict) else None}))
+            continue
+        if issue_number in quarantined and revision(quarantined[issue_number]) == revision(issue):
+            pending.pop(pending_key, None)
+            persist_replay()
             continue
         try:
             apply(issue)
@@ -677,14 +787,17 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
             attempts = issue.get("attempts", 0) + 1 if isinstance(issue.get("attempts", 0), int) else 1
             note_failure(issue, exc)
             if attempts >= ISSUE_SYNC_PENDING_MAX_ATTEMPTS:
-                store.event("issue_sync_quarantined",
-                            "Issue sync dropped a pending snapshot after %d failed replays: %s" % (
-                                attempts, str(exc)[:300]),
-                            project["id"], run_id, data={"issue": issue_number, "attempts": attempts})
+                updated = issue.get("updated_at")
+                quarantined[issue_number] = issue
+                newly_quarantined.add(issue_number)
+                pending.pop(pending_key, None)
                 pending.pop(issue_number, None)
+                persist_replay(("Issue sync quarantined a snapshot after %d failed replays: %s" % (
+                    attempts, str(exc)[:300]), {"issue": issue_number, "updated_at": updated, "attempts": attempts}))
                 continue
             issue["attempts"] = attempts
             pending[issue_number] = issue
+            persist_replay()
         else:
             # 新建任务成功后清除暂存；apply_existing 路径在函数内自行 pop，且
             # 活跃期间会重新写入新快照——只有仍是原对象的条目才移除。
@@ -712,27 +825,36 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
         if not isinstance(rows, list):
             raise RuntimeError("Unexpected GitHub Issue response")
         for issue in rows:
+            number, held = None, None
             try:
                 # Seal the observed revision before attempting its update. If the
                 # update rolls back, candidate authorization remains blocked.
                 if isinstance(issue, dict) and "pull_request" not in issue:
+                    number = str(int(issue["number"]))
+                    seen.add(int(number))
+                    if any(older_revision(revision(issue), revision(entries.get(number)))
+                           for entries in (pending, quarantined)):
+                        continue
+                    if number in quarantined:
+                        updated = revision(issue)
+                        if not isinstance(updated, str) or not updated:
+                            continue
+                        if revision(quarantined[number]) == updated:
+                            quarantine_rows[number] = issue
+                            continue
                     hold_failed(issue)
+                    held = pending.get(number)
                 apply(issue)
-            except IssueRequirementsTooLong as exc:
-                # apply_existing removes the in-memory entry before validation;
-                # preserve it after rollback so the final progress write cannot clear it.
-                pending[str(int(issue["number"]))] = issue
-                note_failure(issue, exc)
-                continue
             except Exception as exc:
-                # 单个坏 Issue 不杀掉整页：其任务/审计写入已随事务回滚，记录
-                # 证据并暂存 pending 供下周期重试；首个异常在本周期汇总后抛出。
-                hold_failed(issue)
+                # apply_existing removes pending in memory before validation.
+                # Restore the sealed entry and its retry count on rollback.
+                if held is not None:
+                    pending[number] = held
                 note_failure(issue, exc)
-                continue
         progress["page"] += 1
         pages_read += 1
         if len(rows) < size:
+            recover_quarantined()
             complete = True
             # Overlap catches updates made while this cycle was draining. A page
             # with skipped rows keeps the previous since watermark instead of
@@ -748,34 +870,18 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
             # 被跳过的行（updated_at 早于新水印）将永久漏读。complete 重建分支
             # 只保留本周期计数：旧失败已靠 since 水印获得重读机会。
             progress["failures"] = len(failures) or prior_failures
-        progress["pending"] = pending
-        # Publish the held snapshot and its active-run marker together. The
-        # dispatcher's replay handles a worker that ended before this transaction.
+        progress.update(pending=pending, quarantined=quarantined, quarantine_cursor=quarantine_cursor)
+        # Keep active-run markers aligned with the same gate that protects delivery.
         with store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(progress)))
-            held_ids = set()
-            for number, snapshot in pending.items():
-                if not isinstance(snapshot, dict):
-                    continue
-                try:
-                    task_key = "issue:" + repo.lower() + ":" + str(int(number))
-                except (TypeError, ValueError):
-                    continue
-                held_ids.add(task_key)
-                run = db.execute("SELECT r.id,t.id AS task FROM tasks t JOIN runs r ON r.task=t.id "
-                                 "WHERE t.project=? AND t.fingerprint=? AND r.ended IS NULL",
-                                 (project["id"], task_key)).fetchone()
-                if run:
-                    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
-                               ("issue-revision-pending:" + run["id"], encode({"task": run["task"]})))
-            # 政策收紧后又恢复、或更新已成功应用时，这块标记必须随之消失，
-            # 否则下一次状态转换会把任务永久置为 blocked 且无人重放。
-            for row in db.execute("SELECT r.id,t.fingerprint FROM runs r JOIN tasks t ON t.id=r.task "
+            for run in db.execute("SELECT r.id,r.task FROM runs r JOIN tasks t ON t.id=r.task "
                                   "WHERE r.project=? AND r.ended IS NULL AND t.source='issue'", (project["id"],)):
-                if row["fingerprint"] not in held_ids:
-                    db.execute("DELETE FROM settings WHERE key=?",
-                               ("issue-revision-pending:" + row["id"],))
+                marker = "issue-revision-pending:" + run["id"]
+                if issue_snapshot_pending(db, project["id"], run["task"], progress):
+                    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (marker, encode({"task": run["task"]})))
+                else:
+                    db.execute("DELETE FROM settings WHERE key=?", (marker,))
         if complete:
             break
     if failures:
@@ -812,6 +918,18 @@ def _number_tokens(title):
     return set(re.findall(r"\d+", title))
 
 
+def evidence_anchors(value):
+    try:
+        rows = json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def evidence_paths(values):
+    return [path for path in values if isinstance(path, str) and path] if isinstance(values, list) else []
+
+
 def related_task(backlog, finding):
     """Collapse exact or near-identical findings without merging variants.
 
@@ -824,10 +942,7 @@ def related_task(backlog, finding):
     for row in backlog:
         if not title:
             continue
-        try:
-            evidence = json.loads(row["evidence"] or "[]")
-        except (TypeError, ValueError):
-            evidence = []
+        evidence = evidence_anchors(row["evidence"])
         same_anchor = any(e.get("path") == finding["path"] and e.get("quote") == finding["quote"] for e in evidence)
         same_path = any(e.get("path") == finding["path"] for e in evidence)
         if title == problem_title(row["title"]) and same_anchor:
@@ -849,15 +964,14 @@ def related_task(backlog, finding):
 def related_work(store, project, task, limit=12):
     """Provide evidence of overlapping work without merging distinct reports."""
     from .context import terms
-    evidence = json.loads(task.get("evidence") or "[]")
-    paths = {item["path"] for item in evidence if item.get("path")}
+    paths = set(evidence_paths([item.get("path") for item in evidence_anchors(task.get("evidence"))]))
     words = terms(task["title"] + " " + task.get("body", ""))
     def ranked(rows):
         for row in rows:
-            result = json.loads(row["result"] or "{}")
-            anchors = json.loads(row["evidence"] or "[]")
-            other_paths = {item["path"] for item in anchors if item.get("path")}
-            other_paths.update(result.get("files", []))
+            result = decode_object(row["result"])
+            anchors = evidence_anchors(row["evidence"])
+            other_paths = set(evidence_paths([item.get("path") for item in anchors]))
+            other_paths.update(evidence_paths(result.get("files")))
             shared = sorted(paths & other_paths)
             overlap = len(words & terms(row["title"]))
             if not shared and (not words or overlap < 2):

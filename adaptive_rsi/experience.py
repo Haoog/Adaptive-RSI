@@ -4,6 +4,8 @@ import re
 import time
 from pathlib import PurePosixPath
 
+from .store import decode_evidence, decode_object
+
 
 def safe_excerpt(value, limit=1200):
     text = str(value or "")
@@ -30,12 +32,7 @@ def failure_excerpt(value, limit=1000):
 
 
 def retry_feedback(row, protected=()):
-    try:
-        result = json.loads(row["result"] or "{}")
-    except (TypeError, ValueError):
-        result = {}
-    if not isinstance(result, dict):
-        result = {}
+    result = decode_evidence(row["result"])
     feedback = {key: row.get(key) for key in ["id", "base", "state"]}
     variants = {variant for value in protected for variant in
                 (value, json.dumps(value, ensure_ascii=True)[1:-1], repr(value)[1:-1]) if variant}
@@ -82,14 +79,13 @@ def protected_feedback_values(store, task):
     values = set()
     rows = store.query("SELECT s.data FROM stages s JOIN runs r ON r.id=s.run WHERE r.task=? AND s.stage='acceptance' ORDER BY s.created DESC LIMIT 2", (task,))
     for row in rows:
-        try:
-            stage_data = json.loads(row["data"] or "{}")
-        except (TypeError, ValueError):
-            stage_data = {}
-        if not isinstance(stage_data, dict):
-            stage_data = {}
-        for item in stage_data.get("files", []):
-            content = item.get("content", "")
+        files = decode_object(row["data"]).get("files")
+        if not isinstance(files, list):
+            continue
+        for item in files:
+            content = item.get("content") if isinstance(item, dict) else None
+            if not isinstance(content, str):
+                continue
             values.update(line.strip() for line in content.splitlines() if len(line.strip()) >= 10)
             try:
                 for node in ast.walk(ast.parse(content)):

@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
-const { createInterface } = require("node:readline");
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const { chromium } = require("playwright");
 
 // 当前任务标题回归：运行中任务不在任务列表当前页（深队列第 2 页）或被分组
@@ -13,7 +13,7 @@ async function checkCurrentWork(browser, url, errors, server) {
   const pausedCopy = '暂停期间不会调用模型或修改代码';
   try {
     await page.goto(url);
-    await page.locator('#project-status').filter({ hasText: '已暂停' }).waitFor({ timeout: 15000 });
+    await waitForPausedProject(page);
     await page.locator('.task-row').first().waitFor({ timeout: 10000 });
 
     // 深队列：运行中任务在第 2 页，第一页 50 行里没有它。
@@ -44,7 +44,7 @@ async function checkCurrentWork(browser, url, errors, server) {
     const options = page.locator('#project-select option');
     const other = await options.filter({ hasText: '另一个独立项目' }).getAttribute('value');
     await page.locator('#project-select').selectOption(other);
-    await page.locator('#project-status').filter({ hasText: '已暂停' }).waitFor({ timeout: 15000 });
+    await waitForPausedProject(page);
     await page.locator('#current-work').filter({ hasText: pausedCopy }).waitFor({ timeout: 10000 });
     assert.ok(!(await page.locator('#current-work').textContent()).includes(title), 'no cross-project leak');
     await page.locator('#project-select').selectOption(project);
@@ -70,19 +70,17 @@ async function checkCurrentWork(browser, url, errors, server) {
     env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', RSI_BROWSER_CURRENT_WORK: '1' },
   });
   server.stderr.on('data', chunk => process.stderr.write(chunk));
-  let browser;
+  let browser, scenarioError;
   const errors = [];
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(Error('Console startup timed out')), 30000);
-      createInterface({ input: server.stdout }).once('line', line => { clearTimeout(timeout); resolve(line); });
-      server.once('exit', code => { clearTimeout(timeout); reject(Error('Console exited: ' + code)); });
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? { channel: process.env.RSI_BROWSER_CHANNEL } : {});
     await checkCurrentWork(browser, url, errors, server);
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    server.kill();
+    await closeFixture(server, browser, scenarioError);
   }
   assert.deepEqual(errors, []);
 })();

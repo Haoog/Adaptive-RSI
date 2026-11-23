@@ -9,6 +9,7 @@ on:
       - 'requirements-build.txt'
       - 'scripts/package.py'
       - 'scripts/package_desktop.py'
+      - 'scripts/sbom.py'
       - 'scripts/upgrade_harness.py'
       - 'scripts/test_updater_signing.py'
       - '.github/workflows/release.yml'

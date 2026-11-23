@@ -292,7 +292,8 @@ def scheduling_scope(config, acceptance, changed_files):
     """Conservative opt-in gate: scheduling needs config, graph and change evidence."""
     if not config.get("validation", {}).get("affected_check_scheduling"):
         return None
-    graph = acceptance.get("contract", {}).get("check_dependencies") if acceptance else None
+    contract = acceptance.get("contract") if isinstance(acceptance, dict) else None
+    graph = contract.get("check_dependencies") if isinstance(contract, dict) else None
     if not isinstance(graph, dict) or not graph or not isinstance(changed_files, list):
         return None
     return graph
@@ -1660,17 +1661,17 @@ class Evaluator:
 
     def evaluate(self, baseline, candidate, checks, directory, config, cancel=None, overlay=None, seeds=None,
                  acceptance=None, acceptance_baseline=None, cache_scope=None, cache_base=None,
-                 environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None):
+                 environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None, required_test_ids=None):
         from .resources import execution_resources
         exclusive = acceptance and acceptance.get("change_kind") == "performance"
         with execution_resources.acquire(exclusive=True, cancel=cancel, priority="benchmark") if exclusive else contextlib.nullcontext():
             return self._evaluate(baseline, candidate, checks, directory, config, cancel, overlay, seeds,
                                   acceptance, acceptance_baseline, cache_scope, cache_base,
-                                  environment_digest, test_first, test_first_kind, changed_files)
+                                  environment_digest, test_first, test_first_kind, changed_files, required_test_ids)
 
     def _evaluate(self, baseline, candidate, checks, directory, config, cancel=None, overlay=None, seeds=None,
                   acceptance=None, acceptance_baseline=None, cache_scope=None, cache_base=None,
-                  environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None):
+                  environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None, required_test_ids=None):
         """Persist one report for every exit path, then hand the decision back.
 
         Early refusals and stage-ledger failures used to return without writing
@@ -1681,7 +1682,7 @@ class Evaluator:
             data = self._evaluate_stages(baseline, candidate, checks, directory, config, cancel, overlay, seeds,
                                          acceptance, acceptance_baseline, cache_scope, cache_base,
                                          environment_digest, test_first, test_first_kind, changed_files,
-                                         report_state=report_state)
+                                         report_state=report_state, required_test_ids=required_test_ids)
         except Exception as exc:
             try:
                 write_evaluation_report(directory, {
@@ -1700,7 +1701,7 @@ class Evaluator:
     def _evaluate_stages(self, baseline, candidate, checks, directory, config, cancel=None, overlay=None, seeds=None,
                          acceptance=None, acceptance_baseline=None, cache_scope=None, cache_base=None,
                          environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None,
-                         report_state=None):
+                         report_state=None, required_test_ids=None):
         stage_stop = threading.Event()
         original_cancel = cancel
         cancel = lambda: stage_stop.is_set() or bool(original_cancel and original_cancel())
@@ -1773,14 +1774,7 @@ class Evaluator:
         additions = (full_checks if harness_differs else
                      [check for check in full_checks if check not in checks])
         if scheduled is not None:
-            # The candidate stage executes only graph-affected configured
-            # checks; the full candidate stage runs everything the candidate
-            # stage did not (unaffected configured checks and detected-only
-            # checks), so the executed surface stays complete.
-            additions = [check for check in full_checks
-                         if check not in scheduled or check not in checks]
-            if not additions:
-                additions = None
+            additions = [check for check in full_checks if check not in scheduled]
         if test_first and changed_harness:
             return _write_report(directory, {
                 "decision": "insufficient_evidence",
@@ -1842,8 +1836,9 @@ class Evaluator:
             stages["acceptance_baseline"] = lambda: self._acceptance_stage(
                 physical, baseline, baseline, acceptance, directory, execution_config, cancel, seeds, hidden)
         stages["candidate"] = lambda: self._standard_stage(
-            "candidate", candidate, baseline, candidate, checks, directory, execution_config, cancel, overlay,
-            seeds, hidden, added_tests if test_first else (), test_first_check, run_checks=scheduled)
+            "candidate", candidate, baseline, candidate, scheduled if scheduled is not None else checks,
+            directory, execution_config, cancel, overlay, seeds, hidden,
+            added_tests if test_first else (), test_first_check)
         if not reuse_full:
             stages["candidate_full"] = lambda: self._standard_stage(
                 "candidate_full", candidate, baseline, candidate, full_checks, directory, execution_config, cancel,
@@ -1931,10 +1926,11 @@ class Evaluator:
         if seeds:
             from .process import scrub_tree
             scrub_tree(seeds)
-        if acceptance and acceptance.get("contract", {}).get("check_dependencies"):
+        contract = acceptance.get("contract") if acceptance else None
+        graph = contract.get("check_dependencies") if isinstance(contract, dict) else None
+        if graph:
             data["check_dependency_analysis"] = {
-                "affected": [row["name"] for row in affected_checks(
-                    changed_files, checks, acceptance["contract"]["check_dependencies"])],
+                "affected": [row["name"] for row in affected_checks(changed_files, full_checks, graph)],
                 "scheduled": [row["name"] for row in scheduled] if scheduled is not None else None,
                 "execution": "full_checks_retained_until_graph_is_independently_validated"}
         if acceptance:
@@ -1946,14 +1942,6 @@ class Evaluator:
             data["criteria"] = acceptance["criteria"]
             data["coverage"] = [{"name": check["name"], "criteria": check["criteria"]} for check in acceptance["spec"]["checks"]]
             data["contract"] = acceptance.get("contract")
-            required = (acceptance.get("contract") or {}).get("required_test_ids")
-            if required:
-                # 具名测试可能是宿主验收里的新行为测试，也可能是普通回归里钉住旧
-                # 行为的既有测试；只查 acceptance_candidate 会把后者误判成没执行。
-                data["test_identity_verification"] = verify_test_identities(
-                    named_test_rows(results), required)
-                if not data["test_identity_verification"]["valid"]:
-                    data.update(decision="insufficient_evidence", reason="Required regression test IDs were not executed")
         elif test_first:
             from .workflow import improvement
             data["improvement"] = improvement(results, {
@@ -1962,6 +1950,11 @@ class Evaluator:
             if passing and data["improvement"]["decision"] != "pass":
                 data.update(decision="insufficient_evidence",
                             reason="Checks passed but the new regression test did not prove the planned change")
+        required = contract.get("required_test_ids") if isinstance(contract, dict) else required_test_ids
+        if required:
+            data["test_identity_verification"] = verify_test_identities(named_test_rows(results), required)
+            if not data["test_identity_verification"]["valid"]:
+                data.update(decision="insufficient_evidence", reason="Required regression test IDs were not executed")
         if unavailable:
             data["reason"] = "Required check executable is unavailable; candidate remains unverified"
         try:

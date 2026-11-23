@@ -1,13 +1,16 @@
 import hashlib
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
+from scripts.package import package_plugin
 from scripts.package_desktop import desktop_build_mode, package_desktop, smoke_bundled_engine, verify_macos_dmg
 from scripts.release import release_assets
 
@@ -160,6 +163,124 @@ class DesktopReleasePackageTest(unittest.TestCase):
             binary.chmod(0o700)
             self.assertEqual(smoke_bundled_engine(binary, timeout=5),
                              {"version": "Adaptive RSI 0.5.0", "startup": True, "owned": True})
+
+
+class DesktopBuildScriptTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("Node.js is required to exercise the desktop build entry point")
+
+    def run_build(self, platform, extra_env, mode="build"):
+        library = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "desktop/scripts/build.mjs"
+            script.parent.mkdir(parents=True)
+            shutil.copyfile(library / "desktop/scripts/build.mjs", script)
+            (root / "adaptive_rsi").mkdir()
+            (root / "adaptive_rsi/__init__.py").write_text('__version__ = "1.2.3"\n')
+            runner = root / "record.mjs"
+            runner.write_text('''
+import childProcess from 'node:child_process';
+import {syncBuiltinESMExports} from 'node:module';
+import {appendFileSync} from 'node:fs';
+Object.defineProperty(process, 'platform', {value: process.env.RSI_TEST_PLATFORM});
+childProcess.spawnSync = (command, args, {argv0, cwd, env}) => {
+  appendFileSync('children.jsonl', JSON.stringify({command, args, argv0, cwd, env}) + '\\n');
+  return {status: 0};
+};
+syncBuiltinESMExports();
+await import('./desktop/scripts/build.mjs');
+''', encoding="utf-8")
+            env = {"RSI_TEST_PLATFORM": platform, "PATH": os.defpath, "TEST_RETAINED": "yes", **extra_env}
+            result = subprocess.run([self.node, str(runner), mode], cwd=root, env=env,
+                                    capture_output=True, text=True, timeout=10)
+            trace = root / "children.jsonl"
+            children = [json.loads(line) for line in trace.read_text().splitlines()] if trace.exists() else []
+            config = root / "desktop/.generated/version.json"
+            return result, children, json.loads(config.read_text()) if config.exists() else None
+
+    def test_windows_uses_uv_and_node_without_shell_shims(self):
+        result, children, config = self.run_build("win32", {})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(config, {"version": "1.2.3"})
+        engine, icons, bundle = children
+        self.assertEqual(engine["command"], "uv")
+        self.assertEqual(len(engine["args"]), 7)
+        self.assertEqual(engine["args"][:-1], ["run", "--no-project", "--managed-python", "--python",
+                                               "3.12.13", "python"])
+        self.assertTrue(engine["args"][-1].endswith(str(Path("desktop/scripts/engine.py"))))
+        for call in (icons, bundle):
+            self.assertEqual(Path(call["command"]).resolve(), Path(self.node).resolve())
+            self.assertEqual(call["argv0"], "node")
+            self.assertEqual(call["args"][0], "-e")
+            self.assertTrue(call["args"][3].endswith(str(Path("node_modules/@tauri-apps/cli"))))
+        self.assertEqual(icons["args"][4:], ["icon", "app-icon.svg"])
+        self.assertEqual(bundle["args"][4:], ["build", "--config", ".generated/version.json"])
+
+    def test_signed_config_and_notarization_credentials_only_reach_bundle(self):
+        shared = {"RSI_UPDATER_PUBLIC_KEY": "public", "TAURI_SIGNING_PRIVATE_KEY": "private-test",
+                  "TAURI_SIGNING_PRIVATE_KEY_PASSWORD": "updater-pass-test",
+                  "APPLE_SIGNING_IDENTITY": "Developer ID Application: Fixture"}
+        for credentials in (
+            {"APPLE_ID": "test-user", "APPLE_PASSWORD": "test-pass", "APPLE_TEAM_ID": "test-team"},
+            {"APPLE_API_KEY": "test-key", "APPLE_API_ISSUER": "test-issuer", "APPLE_API_KEY_PATH": "test-path"},
+        ):
+            with self.subTest(credentials=sorted(credentials)):
+                env = {**shared, **credentials}
+                result, children, config = self.run_build("darwin", env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(config, {"version": "1.2.3", "bundle": {"createUpdaterArtifacts": True,
+                    "macOS": {"signingIdentity": env["APPLE_SIGNING_IDENTITY"], "hardenedRuntime": True}},
+                    "plugins": {"updater": {"pubkey": "public"}}})
+                self.assertEqual(len(children), 3)
+                for child in children[:2]:
+                    self.assertFalse(set(env).intersection(child["env"]))
+                    self.assertEqual(child["env"]["TEST_RETAINED"], "yes")
+                self.assertEqual({key: children[2]["env"][key] for key in env}, env)
+
+    def test_dev_and_unsigned_builds_do_not_receive_unused_signing_secrets(self):
+        secrets = {"TAURI_SIGNING_PRIVATE_KEY": "unused-private-test", "APPLE_PASSWORD": "unused-pass-test"}
+        for mode in ("dev", "build"):
+            with self.subTest(mode=mode):
+                result, children, config = self.run_build("darwin", secrets, mode=mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(config, {"version": "1.2.3"})
+                self.assertEqual(children[-1]["args"][4], mode)
+                for child in children:
+                    self.assertFalse(set(secrets).intersection(child["env"]))
+
+    def test_invalid_signing_configuration_stops_before_spawning_children(self):
+        for platform, env, detail in (
+            ("darwin", {"RSI_UPDATER_PUBLIC_KEY": "test"}, "TAURI_SIGNING_PRIVATE_KEY"),
+            ("darwin", {"APPLE_SIGNING_IDENTITY": "Developer ID", "APPLE_ID": "test"}, "notarization"),
+            ("win32", {"APPLE_SIGNING_IDENTITY": "Developer ID"}, "requires macOS"),
+        ):
+            with self.subTest(platform=platform, detail=detail):
+                result, children, config = self.run_build(platform, env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(detail, result.stderr)
+                self.assertEqual(children, [])
+                self.assertIsNone(config)
+
+
+class DesktopSourceArchiveTest(unittest.TestCase):
+    def test_plugin_zip_includes_desktop_rust_modules(self):
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = package_plugin(source, Path(directory))
+            digest, name = bundle.with_suffix(".zip.sha256").read_text().split()
+            self.assertEqual((digest, name), (hashlib.sha256(bundle.read_bytes()).hexdigest(), bundle.name))
+            with zipfile.ZipFile(bundle) as archive:
+                for name in ("main.rs", "update_receipt.rs", "update_check_race.rs", "update_boundary_tests.rs",
+                             "bin/verify_updater.rs"):
+                    path = "desktop/src-tauri/src/" + name
+                    self.assertEqual(archive.read("adaptive-rsi/" + path), (source / path).read_bytes())
+                desktop_parts = {part for name in archive.namelist() if name.startswith("adaptive-rsi/desktop/")
+                                 for part in Path(name).parts}
+                self.assertTrue(desktop_parts.isdisjoint({".generated", "node_modules", "target", "binaries"}))
 
 
 class DesktopReleaseAssetsTest(unittest.TestCase):

@@ -14,6 +14,18 @@ The desktop app uses Tauri 2 and a bundled Python runtime. No separate Python in
 
 State remains in `~/.local/share/adaptive-rsi`; `ADAPTIVE_RSI_HOME` selects a separate directory. Do not run different versions against the same directory simultaneously. Upgrade an older existing service first.
 
+## Connect to a server through an SSH tunnel
+
+If your server generates an authentication URL such as `http://127.0.0.1:6090/?token=…`, run the following command in Terminal on your Mac. Replace `user@server` with your SSH login:
+
+```sh
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:6090:127.0.0.1:6090 user@server
+```
+
+Keep the SSH session running in Terminal. Open the runtime-machine menu at the top right of the desktop app, change **Server connection method** from **HTTPS** to **SSH tunnel**, paste the full HTTP authentication URL, and click **Connect server**. This mode accepts HTTP only at the literal address `127.0.0.1` and uses the forwarding you have already set up.
+
+If the authentication URL uses a different port, replace both instances of `6090` with that port so the local listener matches the URL and forwards to the runtime's loopback port on the server. The authentication URL contains session credentials. Retrieve it privately from the server logs and share it only through a private channel.
+
 ## Records and Usage
 
 Real call records are grouped by task, including failures and retries. Filter by project, dates, model/task search, and inspect details. Background checks and connection tests are identified separately. Missing usage is unknown, not zero; missing historical input/output/cache fields cannot be reconstructed. Model time is summed call duration, not task wall time. Daily buckets and date ranges follow the browser timezone. Estimates prefer frozen input, output and cache prices, falling back to blended pricing when components are incomplete. Unpriced calls are disclosed; estimates do not represent bills or impose quotas.
@@ -30,7 +42,7 @@ npm run --prefix desktop build
 npm run --prefix desktop dev
 ```
 
-The build downloads Python 3.12, installs PyInstaller and packages a standalone engine. The app version comes from the Python package rather than a second release-version source. Bundles are under `desktop/src-tauri/target/release/bundle/`.
+`npm run` uses uv to obtain and run the pinned Python 3.12 release, so a system `python3` is optional. The build records the engine's Python dependencies before installing build tools such as PyInstaller, then packages the engine as a standalone process. The app version comes from the Python package. Bundles are under `desktop/src-tauri/target/release/bundle/`.
 
 Builds use local ad-hoc signatures unless Apple Developer ID signing and notarization credentials are configured; macOS may show a security warning for ad-hoc builds. Server source hot-updates are disabled for an app-owned engine to prevent UI/engine version mismatch. Replacing the app preserves its data directory.
 

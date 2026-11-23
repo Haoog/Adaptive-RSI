@@ -1,15 +1,15 @@
 const assert=require('node:assert/strict');
 const {spawn}=require('node:child_process');
-const {createInterface}=require('node:readline');
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const {chromium}=require('playwright');
 (async()=>{
  const server=spawn(process.env.PYTHON||'python3',['-m','tests.browser_fixture'],{stdio:['pipe','pipe','pipe']});server.stderr.on('data',chunk=>process.stderr.write(chunk));
- let browser;
+ let browser, scenarioError;
  try{
-  const url=await new Promise((resolve,reject)=>{const timeout=setTimeout(()=>reject(Error('Fixture timed out')),30000);createInterface({input:server.stdout}).once('line',line=>{clearTimeout(timeout);resolve(line);});});
+  const url = await fixtureReady(server);
   browser=await chromium.launch(process.env.RSI_BROWSER_CHANNEL?{channel:process.env.RSI_BROWSER_CHANNEL}:{});
   const page=await browser.newPage(),errors=[];page.on('pageerror',e=>errors.push(e.message));
-  await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+  await page.goto(url);await waitForPausedProject(page);
   await page.locator('[data-view="usage"]').click();await page.locator('#usage-totals strong').first().waitFor();
   await page.locator('#usage-period').selectOption('all');await page.locator('#usage-refresh').filter({hasNot:page.locator('[disabled]')});
   await page.waitForFunction(()=>!document.getElementById('usage-refresh').disabled);
@@ -43,7 +43,7 @@ const {chromium}=require('playwright');
   // 首次加载就失败、还没有旧报表时，也要有可重试的持久提示，而不是只有 toast。
   const emptyPage=await browser.newPage();emptyPage.on('pageerror',error=>errors.push(error.message));
   await emptyPage.route('**/api/usage?*',route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Isolated usage outage'})}));
-  await emptyPage.goto(url);await emptyPage.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+  await emptyPage.goto(url);await waitForPausedProject(emptyPage);
   await emptyPage.locator('[data-view="usage"]').click();
   const emptyStale=emptyPage.locator('#usage-stale');await emptyStale.waitFor();
   assert.match(await emptyStale.innerText(),/用量加载失败/,'first failure without data must explain the failure inline');
@@ -175,13 +175,14 @@ const {chromium}=require('playwright');
   await dialog.locator('.close-dialog').click();await page.locator('#toast .toast-close').click();await page.unroute('**/api/usage?*',paginationRoute);
   assert.deepEqual(errors,[]);
   const dstContext=await browser.newContext({timezoneId:'America/New_York'}),dstPage=await dstContext.newPage();const requests=[];
+  dstPage.on('pageerror', error => errors.push(error.message));
   await dstPage.route('**/api/usage?*',async route=>{
    requests.push(Object.fromEntries(new URL(route.request().url()).searchParams));
    await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({summary:{tokens:12,unknown_calls:0,tasks:1,model_seconds:1,cache_read_tokens:0,estimated_usd:null,unpriced_calls:1},daily:[],roles:[{role:'acceptance',tokens:12}],tasks:[],total:0})});
   });
   try{
    assert.equal(await dstPage.evaluate(()=>Intl.DateTimeFormat().resolvedOptions().timeZone),'America/New_York');
-   await dstPage.goto(url);await dstPage.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await dstPage.locator('[data-view="usage"]').click();
+   await dstPage.goto(url);await waitForPausedProject(dstPage);await dstPage.locator('[data-view="usage"]').click();
    await dstPage.locator('#usage-role-summary').filter({hasText:'验收设计'}).waitFor();
    await dstPage.locator('#usage-period').selectOption('custom');
    await dstPage.locator('#usage-start').fill('2026-11-01');
@@ -272,6 +273,13 @@ const {chromium}=require('playwright');
    await page.waitForFunction(()=>!document.querySelector('#usage-role-summary').textContent.includes('部分未知'));
    assert.deepEqual(await roleValues(),{'规划':'150 tokens','验收设计':'12 tokens'});
   }finally{await page.unroute('**/api/usage?*',roleRoute);}
+  await page.close();
+  assert.deepEqual(errors, []);
   console.log('Usage page: real API, empty/filter state, English, mobile and no JS errors passed.');
- }finally{if(browser)await browser.close();server.stdin.end('\n');await new Promise(resolve=>server.once('exit',resolve));}
+  } catch (error) {
+  scenarioError = error;
+  throw error;
+ } finally {
+  await closeFixture(server, browser, scenarioError);
+ }
 })().catch(e=>{console.error(e);process.exitCode=1;});

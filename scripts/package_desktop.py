@@ -336,8 +336,6 @@ def _package_updater(bundle_dir, output_dir, version, require_inventory=False):
     sys.path.insert(0, str(ROOT))
     from scripts.sbom import components
     inventory = components(ROOT, require_inventory=require_inventory)
-    if require_inventory and any(item["name"] == "engine-inventory-unavailable" for item in inventory):
-        raise ValueError("Formal releases require the actual engine dependency inventory")
     sbom = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.5",

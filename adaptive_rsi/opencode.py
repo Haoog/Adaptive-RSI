@@ -593,19 +593,22 @@ def parse_events(text, strict=True):
             continue
         if not isinstance(event, dict):
             continue
-        part = event.get("part", {})
+        part = event.get("part")
+        if not isinstance(part, dict):
+            part = {}
         if event.get("type") == "error":
             errors.append("OpenCode reported an execution error")
         if event.get("type") == "text" and isinstance(part.get("text"), str):
             final.append(part["text"])
-        if event.get("type") == "step_finish" and isinstance(part.get("tokens"), dict):
+        if event.get("type") == "step_finish":
             part_id = part.get("id")
-            if part_id:
+            if isinstance(part_id, (str, int)) and part_id:
                 if part_id in seen:
                     continue
                 seen.add(part_id)
             # 无 id 时无法证明事件重复；不同步骤可能恰好消耗相同 tokens，全部保留。
-            usage.append(part["tokens"])
+            # 保留没有上报计数的步骤，否则整个会话可能被当作完整用量计费。
+            usage.append(part.get("tokens"))
     if errors:
         if strict:
             raise RuntimeError(errors[-1])

@@ -1,4 +1,4 @@
-"""Generate an inventory from locked crates and the actual engine environment."""
+"""Generate an inventory from locked crates and the engine's runtime dependencies."""
 import hashlib
 import json
 from pathlib import Path
@@ -37,9 +37,14 @@ def components(root, require_inventory=False):
                        "licenses": [{"license": {"name": license_name}}] if license_name else [],
                        "properties": [{"name": "rsi:license-status", "value": "metadata" if license_name else "unavailable"}]})
     inventory = root / "desktop/.generated/engine-inventory.json"
-    if inventory.exists():
-        observed = json.loads(inventory.read_text())
-        result.extend(observed["components"])
+    if inventory.is_file():
+        observed = json.loads(inventory.read_text(encoding="utf-8"))
+        runtime = observed.get("components", [])
+        if require_inventory and (observed.get("scope") != "engine-runtime" or not runtime):
+            raise ValueError("Formal releases require a runtime-only engine dependency inventory")
+        result.extend(runtime)
+    elif require_inventory:
+        raise ValueError("Formal releases require the actual engine dependency inventory")
     else:
         # Local asset-format tests do not build an engine. Formal builds must supply it.
         result.append({"type": "application", "name": "engine-inventory-unavailable",
@@ -62,7 +67,8 @@ def engine_inventory(destination):
         item["properties"] = [{"name": "rsi:distribution-record-sha256",
                                "value": hashlib.sha256(record.encode()).hexdigest() if record else "unavailable"}]
         result.append(item)
-    Path(destination).write_text(json.dumps({"components": result}, sort_keys=True, indent=2) + "\n")
+    receipt = {"scope": "engine-runtime", "components": result}
+    Path(destination).write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

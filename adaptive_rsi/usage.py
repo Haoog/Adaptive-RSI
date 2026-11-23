@@ -79,42 +79,65 @@ def usage(input_tokens=0, output_tokens=0, cache_read=0, cache_write=0, total=No
     return {**values, "tokens": count(total) if total is not None else sum(values.values()), "usage_known": True}
 
 
+def _reported_usage(data, input_name, output_name, *, cache_read=0, cache_write=0,
+                    extra_output=0, total_name=None, input_includes_cache=False):
+    raw_total = data.get(total_name) if total_name else None
+    total = _tolerated(raw_total)
+    if raw_total is not None and total is None:
+        return None
+    # 有明确总量时兼容只报总量的供应商，缺少主计数时只保留总量。
+    default = 0 if total is not None else None
+    input_tokens = _tolerated(data.get(input_name, default))
+    output_tokens = _tolerated(data.get(output_name, default))
+    if None in (input_tokens, output_tokens, cache_read, cache_write, extra_output):
+        return None
+    if input_includes_cache and input_name in data:
+        if cache_read > input_tokens:
+            return None
+        input_tokens -= cache_read
+    output_tokens += extra_output
+    if total is not None:
+        if total < input_tokens + output_tokens + cache_read + cache_write:
+            return None
+        if input_name not in data or output_name not in data:
+            return usage(total=total)
+    return usage(input_tokens, output_tokens, cache_read, cache_write, total)
+
+
 def native_usage(protocol, response):
     if not isinstance(response, dict):
         return None
     data = response.get("usage")
     if protocol == "ollama":
-        if "eval_count" not in response:
-            return None
-        values = [_tolerated(response.get("prompt_eval_count", 0)), _tolerated(response.get("eval_count"))]
-        return usage(*values) if None not in values else None
+        return _reported_usage(response, "prompt_eval_count", "eval_count")
     if protocol == "gemini":
         data = response.get("usageMetadata")
-        if not isinstance(data, dict) or not data:
+        if not isinstance(data, dict):
             return None
-        fields = {key: _tolerated(data.get(key, 0)) for key in
-                  ["promptTokenCount", "candidatesTokenCount", "thoughtsTokenCount", "cachedContentTokenCount"]}
-        total = _tolerated(data.get("totalTokenCount")) if data.get("totalTokenCount") is not None else None
-        if None in fields.values() or total is None and data.get("totalTokenCount") is not None:
-            return None
-        return usage(max(0, fields["promptTokenCount"] - fields["cachedContentTokenCount"]),
-                     fields["candidatesTokenCount"] + fields["thoughtsTokenCount"],
-                     fields["cachedContentTokenCount"], total=total)
-    if not isinstance(data, dict) or not data:
+        return _reported_usage(data, "promptTokenCount", "candidatesTokenCount", total_name="totalTokenCount",
+                               extra_output=_tolerated(data.get("thoughtsTokenCount", 0)),
+                               cache_read=_tolerated(data.get("cachedContentTokenCount", 0)),
+                               input_includes_cache=True)
+    if not isinstance(data, dict):
         return None
     if protocol == "anthropic":
-        fields = {key: _tolerated(data.get(key, 0)) for key in
-                  ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]}
-        return usage(fields["input_tokens"], fields["output_tokens"],
-                     fields["cache_read_input_tokens"], fields["cache_creation_input_tokens"]) \
-            if None not in fields.values() else None
+        return _reported_usage(data, "input_tokens", "output_tokens",
+                               cache_read=_tolerated(data.get("cache_read_input_tokens", 0)),
+                               cache_write=_tolerated(data.get("cache_creation_input_tokens", 0)))
     input_name, output_name = ("prompt_tokens", "completion_tokens") if protocol == "chat_completions" else ("input_tokens", "output_tokens")
-    cached = _tolerated(data.get(input_name + "_details", {}).get("cached_tokens", 0)) if isinstance(data.get(input_name + "_details"), dict) else 0
-    input_tokens, output_tokens = _tolerated(data.get(input_name, 0)), _tolerated(data.get(output_name, 0))
-    total = _tolerated(data.get("total_tokens")) if data.get("total_tokens") is not None else None
-    if None in (input_tokens, output_tokens, cached) or total is None and data.get("total_tokens") is not None:
+    details = data.get(input_name + "_details")
+    if details is not None and not isinstance(details, dict):
         return None
-    return usage(max(0, input_tokens - cached), output_tokens, cached, total=total)
+    cached = _tolerated(details.get("cached_tokens", 0)) if details else 0
+    return _reported_usage(data, input_name, output_name, cache_read=cached, total_name="total_tokens",
+                           input_includes_cache=True)
+
+
+def codex_usage(data):
+    if not isinstance(data, dict):
+        return None
+    return _reported_usage(data, "input_tokens", "output_tokens",
+                           cache_read=_tolerated(data.get("cached_input_tokens", 0)), input_includes_cache=True)
 
 
 def opencode_usage(steps):
@@ -122,15 +145,16 @@ def opencode_usage(steps):
         return None
     result = usage()
     for step in steps:
+        if not isinstance(step, dict):
+            return None
         cache = step.get("cache", {})
         if not isinstance(cache, dict):
-            cache = {}
-        fields = [_tolerated(step.get("input", 0)), _tolerated(step.get("output", 0)),
-                  _tolerated(cache.get("read", 0)), _tolerated(cache.get("write", 0))]
-        total = _tolerated(step.get("total")) if step.get("total") is not None else None
-        if None in fields or total is None and step.get("total") is not None:
             return None
-        current = usage(fields[0], fields[1], fields[2], fields[3], total)
+        current = _reported_usage(step, "input", "output", total_name="total",
+                                  cache_read=_tolerated(cache.get("read", 0)),
+                                  cache_write=_tolerated(cache.get("write", 0)))
+        if current is None:
+            return None
         for key in ["tokens", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"]:
             result[key] += current[key]
     return result

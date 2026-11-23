@@ -109,17 +109,20 @@ def issue_snapshot_pending(db, project, task, progress=_LOAD_PROGRESS):
         return "corrupt"
     try:
         pending = progress.get("pending", {})
+        quarantined = progress.get("quarantined", {})
         repo = progress.get("repository", "")
         prefix = "issue:" + repo.lower() + ":"
-        if not isinstance(pending, dict):
-            return False
+
+        def held(number):
+            return any(isinstance(entries, dict) and number in entries for entries in (pending, quarantined))
+
         if row["fingerprint"].startswith(prefix):
-            return row["fingerprint"][len(prefix):] in pending
+            return held(row["fingerprint"][len(prefix):])
         if row["fingerprint"].startswith("issue:"):
             number = row["fingerprint"][len("issue:"):]
             evidence = db.execute("SELECT evidence FROM tasks WHERE id=?", (task,)).fetchone()
             data = json.loads(evidence["evidence"])
-            return (number in pending and data[0].get("number") == int(number) and
+            return (held(number) and data[0].get("number") == int(number) and
                     str(data[0].get("url", "")).lower().rstrip("/") ==
                     "https://github.com/" + repo.lower() + "/issues/" + number)
         return False
@@ -188,16 +191,14 @@ def decode_evidence(value):
         errors.append("case")
         result.pop("trials", None)
     checks = evaluation.get("checks", {})
-    empty_checks = isinstance(checks, list) and not checks
-    if empty_checks:
+    if isinstance(checks, list) and not checks:
         evaluation["checks"], checks = {}, {}
     if not isinstance(checks, dict) or any(not isinstance(rows, list) or
             any(not isinstance(row, dict) for row in rows) for rows in checks.values()):
         errors.append("checks")
         result.pop("evaluation", None)
-    elif empty_checks and evaluation.get("decision") == "pass":
-        # 空列表兼容只表示“没有可执行检查”，不构成验收证据；沿用 pass 会让
-        # 0 个检查的记录在质量/工作流读模型里被计成 passed/accepted。
+    elif evaluation.get("decision") == "pass" and not any(checks.values()):
+        # 没有检查结果时，历史记录中的 pass 不构成验收证据。
         evaluation["decision"] = "insufficient_evidence"
     if "merged_at" in result and (not isinstance(result["merged_at"], (int, float)) or
             not (0 <= result["merged_at"] < 2**63 - 1)):

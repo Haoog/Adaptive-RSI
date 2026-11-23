@@ -1063,6 +1063,8 @@ class AuthSessions:
         # 供 cancel() 拒绝并发取消，并让状态扫描不要把写入中的会话提前过期。
         self.credential_writes = set()
         self.api_key_writes = set()
+        self.api_key_commit = threading.Condition(self.lock)
+        self.api_key_committing = False
         self.discoveries = set()
         # (backend, provider) -> 该凭据正在被登出删除。登出在 self.lock 外做删除与
         # CLI 子进程，等 credential_lock 的 _save() 与 reserve() 据此放弃回装/登记。
@@ -2104,6 +2106,8 @@ class AuthSessions:
                     raise AuthError("auth_busy")
             worker = self.factory(backend)
             with self.lock:
+                if self.closed:
+                    raise AuthError("service_closed")
                 self.discoveries.add(worker)
             rows = worker.providers()
             if not any(row["id"] == provider and any(item["type"] == "api" and item.get("supported", True)
@@ -2116,28 +2120,32 @@ class AuthSessions:
                     raise AuthError("auth_busy")
                 self.api_key_writes.add(backend)
                 write_reserved = True
-            modern = bool(getattr(getattr(worker, "capabilities", None), "modern", False))
-            if modern and hasattr(worker, "set_api_key") and hasattr(worker, "export_credential"):
+            modern = (bool(getattr(getattr(worker, "capabilities", None), "modern", False))
+                      and hasattr(worker, "set_api_key") and hasattr(worker, "export_credential"))
+            if modern:
                 worker.set_api_key(provider, key.strip())
                 credentials = worker.export_credential(provider)
                 if not credentials:
                     raise AuthError("invalid_credentials")
-                with self.lock:
-                    if self.closed:
-                        raise AuthError("service_closed")
-                    if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
-                        raise AuthError("auth_busy")
-                # 安装可能起子进程；与 _save 一致移出会话锁，只在 AUTH_LOCK 下写凭据。
-                worker.install_credential(provider, credentials)
-            else:
-                with self.lock:
-                    if self.closed:
-                        raise AuthError("service_closed")
-                    if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
-                        raise AuthError("auth_busy")
-                data = _read_json_for_write(auth_path())
-                data[provider] = {"type": "api", "key": key.strip()}
-                _write_json(auth_path(), data)
+            with self.api_key_commit:
+                if self.closed:
+                    raise AuthError("service_closed")
+                if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
+                    raise AuthError("auth_busy")
+                self.api_key_committing = True
+            try:
+                # 宿主凭据写入可能起子进程；释放会话锁，关停仅等待本次提交结束。
+                if modern:
+                    worker.install_credential(provider, credentials)
+                else:
+                    path = auth_path()
+                    data = _read_json_for_write(path)
+                    data[provider] = {"type": "api", "key": key.strip()}
+                    _write_json(path, data)
+            finally:
+                with self.api_key_commit:
+                    self.api_key_committing = False
+                    self.api_key_commit.notify_all()
             with self.lock:
                 self._invalidate_caches(backend)
         finally:
@@ -2154,9 +2162,10 @@ class AuthSessions:
         return self.snapshot()
 
     def close(self):
-        with self.lock:
+        with self.api_key_commit:
             self.closed = True
             self.shutdown.set()
+            self.api_key_commit.wait_for(lambda: not self.api_key_committing)
             with self.cache_lock:
                 self.providers_cache.clear()
                 self.status_cache.clear()

@@ -21,16 +21,16 @@ function element(tag,text,cls){
 // Drives the real toolbar entry point so the regression covers the user path, not a private helper.
 function harness(api,{confirm=true}={}){
  const drafts=new Map(),calls=[],toasts=[],confirms=[],rows={};
- let panel=null;
+ let panel=null,dialog=null,requestNumber=0;
  const host=element('div');host.after=node=>{panel=node;};
- const context={window:{},Map,Set,JSON,crypto:{randomUUID:()=>'request-new'},console,projectId:'project',t:value=>value,
+ const context={window:{},Map,Set,JSON,crypto:{randomUUID:()=>++requestNumber===1?'request-new':'request-new-'+requestNumber},console,projectId:'project',navigationSequence:0,t:value=>value,
   statusNames:{queued:'排队'},reviewNames:{},el:element,
   toast:(message,error=false)=>toasts.push({message,error}),
   uiConfirm:async message=>{confirms.push(message);return confirm;},
   refresh:async()=>{},
   safe:async fn=>{await fn();},
   api:async(path,body)=>{calls.push({path,body});return api(path,body);},
-  document:{querySelector:selector=>selector==='.task-toolbar'?host:null,getElementById:id=>id==='batch-actions'?panel:null,body:{append(){}}}};
+  document:{querySelector:selector=>selector==='.task-toolbar'?host:null,getElementById:id=>id==='batch-actions'?panel:null,body:{append(node){dialog=node;}}}};
  context.window.RSIDraftStore={get:(kind,scope)=>drafts.get(kind+':'+scope)??null,set:(kind,scope,value)=>drafts.set(kind+':'+scope,value),remove:(kind,scope)=>drafts.delete(kind+':'+scope)};
  vm.createContext(context);
  vm.runInContext(fs.readFileSync('adaptive_rsi/web/batch.js','utf8'),context);
@@ -39,7 +39,7 @@ function harness(api,{confirm=true}={}){
  const render=tasks=>{const list=tasks.map(task=>typeof task==='string'?{id:task}:task);context.window.RSIBatch.toolbar(list);for(const task of list)rows[task.id]=context.window.RSIBatch.row({id:task.id,title:'任务 '+task.id,fingerprint:''});};
  // Mirror a real checkbox click: the browser toggles checked before dispatching click.
  const check=(id,shiftKey=false)=>{const box=rows[id];box.checked=!box.checked;box.dispatch('click',{shiftKey});};
- return {calls,toasts,confirms,drafts,rows,panel,batch:context.window.RSIBatch,button,render,check,count:()=>panel.children[0].textContent,
+ return {calls,toasts,confirms,drafts,rows,panel,dialog:()=>dialog,project(value){context.projectId=value;context.navigationSequence++;},batch:context.window.RSIBatch,button,render,check,count:()=>panel.children[0].textContent,
   buttonByText:text=>panel.children.find(node=>node.textContent===text),click:()=>button().click()};
 }
 function previewFor(ids){return {tasks:ids.map(id=>({id,title:'任务 '+id,state:'queued'})),conflicts:[],unknown_scope:[],originals:[],revision:'rev-1'};}
@@ -154,4 +154,42 @@ test('changing the filter or page drops selections that are no longer visible',a
  await fixture.click();
  const write=fixture.calls.find(call=>call.body&&!call.body.preview);
  assert.deepEqual(Array.from(write.body.tasks),['t1']);
+});
+
+test('later batch operations retain separate unresolved receipt IDs', async () => {
+ const fixture=harness(async (_path,body)=>{
+  if(!body)throw new TypeError('Receipt unavailable');
+  if(body.preview)return previewFor(body.tasks);
+  if(body.tasks[0]==='t1')throw new TypeError('Reply interrupted');
+  return {complete:body.tasks[0]==='t3',receipts:[]};
+ });
+ fixture.drafts.set('batch:project',draft());
+ fixture.render(['t1','t2','t3']);
+ fixture.check('t2');await fixture.click();
+ fixture.check('t3');await fixture.click();
+ assert.deepEqual(Array.from(fixture.drafts.get('batch:project'),entry=>entry.id),['request-1','request-new']);
+ fixture.check('t1');await fixture.click();
+ assert.equal(fixture.calls.filter(call=>call.body&&!call.body.preview).at(-1).body.request_id,'request-1');
+});
+
+test('batch history ignores a response after a round trip through another project', async () => {
+ let finish;
+ const fixture=harness(()=>new Promise(resolve=>{finish=resolve;}));
+ const pending=fixture.buttonByText('批次记录').onclick();
+ fixture.project('other');fixture.project('project');
+ finish({batches:[]});await pending;
+ assert.equal(fixture.dialog(),null);
+});
+
+test('same-name checks at different positions are not attributed to grouped requirements', async () => {
+ const check=(index,passed)=>({name:'shared name',run:'run',stage:'acceptance_candidate',index,passed});
+ const fixture=harness(async()=>({group_lineage:{acceptance_evidence:{all_passed:true,requirements:[
+  {task:'a',index:0,criterion:'Criterion A',state:'pass',checks:[check(0,true)]},
+  {task:'b',index:0,criterion:'Criterion B',state:'pass',checks:[check(1,true)]},
+ ]}}}));
+ await fixture.batch.evidence({id:'group'});
+ const [,,first,second]=fixture.dialog().children;
+ assert.equal(fixture.dialog().children[1].textContent,'覆盖记录未知');
+ assert.deepEqual(first.children.map(node=>node.textContent),['a · 1 · Criterion A','未知']);
+ assert.deepEqual(second.children.map(node=>node.textContent),['b · 1 · Criterion B','未知']);
 });

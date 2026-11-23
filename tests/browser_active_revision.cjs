@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
-const {createInterface} = require('node:readline');
+const {fixtureReady, closeFixture} = require('./fixture_browser.cjs');
 const {chromium} = require('playwright');
 
 (async () => {
@@ -9,13 +9,9 @@ const {chromium} = require('playwright');
     env: {...process.env, PYTHONDONTWRITEBYTECODE: '1', RSI_BROWSER_ACTIVE_REVISION: '1'},
   });
   server.stderr.on('data', chunk => process.stderr.write(chunk));
-  let browser;
+  let browser, scenarioError;
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(Error('Console startup timed out')), 30000);
-      createInterface({input: server.stdout}).once('line', line => {clearTimeout(timeout); resolve(line);});
-      server.once('exit', code => {clearTimeout(timeout); reject(Error('Console exited: ' + code));});
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
     const page = await browser.newPage({viewport: {width: 390, height: 844}, isMobile: true});
     const errors = [];
@@ -46,8 +42,10 @@ const {chromium} = require('playwright');
     assert.deepEqual(errors, []);
     await page.close();
     console.log('Active revision browser passed: saved and acknowledged without a model call.');
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    server.kill();
+    await closeFixture(server, browser, scenarioError);
   }
 })();

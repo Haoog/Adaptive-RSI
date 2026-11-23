@@ -1,13 +1,14 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs');
 
-function fixture({cancelError,authorizeError,wait=false,deferRevision=0,nativeRevision=0}={}){
+function fixture({cancelError,authorizeError,wait=false,deferRevision=0,deferredResult,storePreference=()=>{},nativeRevision=0}={}){
  let panel,finish,release;const calls=[];let stored=nativeRevision;
  const el=(tag,text,className)=>({tag,className,textContent:text||'',children:[],append(...nodes){this.children.push(...nodes);},setAttribute(){},after(node){panel=node;}});
  const invoke=async(_,args)=>{
   calls.push(args);
   if(args.action==='authorize'){
-   if(authorizeError)throw Error(authorizeError);
+   const error=typeof authorizeError==='function'?authorizeError(args):authorizeError;
+   if(error)throw Error(error);
    // The native process keeps its counter across a webview reload and refuses a
    // revision that is not strictly newer, replying with the one it still holds.
    if(args.revision<=stored)return{state:'waiting_idle',authorization_revision:stored};
@@ -15,7 +16,7 @@ function fixture({cancelError,authorizeError,wait=false,deferRevision=0,nativeRe
    const reply={state:'waiting_idle',authorization_revision:args.revision};
    if(args.revision!==deferRevision)return reply;
    // Simulate an out-of-order reply from an older revision.
-   return new Promise(resolve=>{release=()=>resolve(reply);});
+   return new Promise((resolve,reject)=>{release=()=>deferredResult instanceof Error?reject(deferredResult):resolve(deferredResult||reply);});
   }
   if(args.action==='cancel'){
    if(cancelError)throw Error(cancelError);
@@ -32,13 +33,13 @@ function fixture({cancelError,authorizeError,wait=false,deferRevision=0,nativeRe
  const context={window:{RSIDesktop:{invoke,ready:Promise.resolve({kind:'local',owned:true})}},
   document:{activeElement:null,addEventListener(){},documentElement:{lang:'zh-CN'}},
   el,$:()=>el('anchor'),t:x=>x,localRead:key=>key==='rsi-native-update-policy'?'automatic':null,
-  localStorage:{setItem(){}},safe:fn=>fn(),setTimeout(){},setInterval(){},Date,Math,Number,String,Error,JSON};
+  localStorage:{setItem:storePreference},safe:fn=>fn(),setTimeout(){},setInterval(){},Date,Math,Number,String,Error,JSON};
  vm.runInNewContext(fs.readFileSync('adaptive_rsi/web/native-update.js','utf8'),context);
  const api=context.window.RSINativeUpdate;api.render();
  const all=node=>[node,...node.children.flatMap(all)];
  const policy=()=>all(panel).find(node=>node.tag==='label').children.find(node=>node.tag==='select');
  const text=()=>all(panel).map(node=>node.textContent).join(' ');
- return{api,calls,policy,text,selects:()=>all(panel).filter(node=>node.tag==='select'),
+ return{api,calls,policy,text,storageWarning:()=>all(panel).find(node=>node.textContent.includes('偏好未保存')),selects:()=>all(panel).filter(node=>node.tag==='select'),
   nativeRevision:()=>stored,resolve:value=>finish(value),release:()=>release()};
 }
 
@@ -140,4 +141,27 @@ test('an install after a reload carries the revision the native side still holds
  const install=f.calls.find(args=>args.action==='install');
  assert.equal(install.revision,3);
  assert.equal(f.api.errorCode(),'');
+});
+
+for(const failure of [false,true])test(`an older ${failure?'rejected':'successful'} authorization leaves the latest result visible`,async()=>{
+ const f=fixture({deferRevision:1,deferredResult:failure?Error('stale authorization'):undefined,
+  authorizeError:args=>!failure&&args.revision===2?'update_authorization_invalid':null});
+ const older=f.api.syncAuthorization();
+ await f.api.syncAuthorization();
+ f.release();await older;
+ assert.equal(f.api.errorCode(),failure?'':'update_authorization_invalid');
+});
+
+test('a successful preference save retries a previously failed write and clears the warning', async () => {
+ const saved=new Map();let writable=false;
+ const f=fixture({storePreference(key,value){if(!writable)throw Error('temporary storage failure');saved.set(key,value);}});
+ const [,scope,window]=f.selects();
+ scope.value='minor';scope.onchange();
+ await new Promise(setImmediate);
+ assert.equal(f.storageWarning().hidden,false);
+ writable=true;window.value='night';window.onchange();
+ await new Promise(setImmediate);
+ assert.equal(f.storageWarning().hidden,true);
+ assert.equal(saved.get('rsi-native-update-scope'),'minor');
+ assert.equal(saved.get('rsi-native-update-window'),'night');
 });

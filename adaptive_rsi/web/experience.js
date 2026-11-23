@@ -226,6 +226,9 @@ window.RSIExperience = (() => {
                 safe(() => openTask(task));
                 notification.close();
               };
+            } else {
+              displayFailed = true;
+              displayFailures++;
             }
           } catch {
             // 单条显示失败只跳过该条，同批其余提醒继续；不写入 seen，下一轮重试，
@@ -280,25 +283,30 @@ window.RSIExperience = (() => {
     const checks = result.evaluation?.checks || {},
       before = checks.acceptance_baseline || [],
       after = checks.acceptance_candidate || [];
-    if (before.length || after.length) {
+    if ((Array.isArray(before) && before.length) || (Array.isArray(after) && after.length)) {
+      const checksByName = rows => {
+        const byName = new Map();
+        for (const check of Array.isArray(rows) ? rows : []) {
+          if (typeof check?.name !== "string" || !check.name) continue;
+          const group = byName.get(check.name) || [];
+          group.push(check);
+          byName.set(check.name, group);
+        }
+        return byName;
+      };
+      const baseline = checksByName(before), candidate = checksByName(after);
+      const status = rows => {
+        if (rows?.length !== 1) return t("未知");
+        return t(rows[0].passed === true ? "通过" : rows[0].passed === false ? "未通过" : "未知");
+      };
       const table = el("table", undefined, "evidence-table"),
         head = el("tr");
       for (const label of ["独立验收", "修改前", "修改后"])
         head.append(el("th", t(label)));
       table.append(head);
-      for (let i = 0; i < Math.max(before.length, after.length); i++) {
+      for (const name of new Set([...baseline.keys(), ...candidate.keys()])) {
         const row = el("tr");
-        row.append(
-          el("td", after[i]?.name || before[i]?.name || String(i + 1)),
-          el(
-            "td",
-            t(before[i] ? (before[i].passed ? "通过" : "未通过") : "未知"),
-          ),
-          el(
-            "td",
-            t(after[i] ? (after[i].passed ? "通过" : "未通过") : "未知"),
-          ),
-        );
+        row.append(el("td", name), el("td", status(baseline.get(name))), el("td", status(candidate.get(name))));
         table.append(row);
       }
       outcome.append(table);
@@ -1393,35 +1401,29 @@ window.RSIExperience = (() => {
   }
   let shutdownOverlay = null;
   async function showShutdownProgress() {
-    if (shutdownOverlay) return;
+    const desktop = window.RSIDesktop;
+    if (!desktop || shutdownOverlay) return;
     const overlay = el("div", undefined, "shutdown-overlay");
     overlay.setAttribute("role", "status");
     const title = el("h2", t("正在安全关闭本机服务"));
     const status = el("p", t("正在准备关闭…"));
     overlay.append(title, status);
     document.body.append(overlay);
-    shutdownOverlay = { overlay, status };
-    const phases = {
-      stopping: "正在停止接收新任务",
-      authentication: "正在结束登录会话",
-      operations: "正在结束后台操作",
-      scheduler: "正在停止调度",
-      workers: "正在等待运行中的任务结束",
-      maintenance: "正在结束维护任务",
-      storage: "正在保存并关闭数据库",
-      completed: "本机服务已安全停止",
-      failed: "关闭过程中出现问题",
-    };
+    shutdownOverlay = overlay;
     for (;;) {
       try {
-        const data = await api("shutdown-status");
-        status.textContent = t(phases[data.phase] || "正在关闭本机服务") + " · " +
-          t("剩余任务") + " " + (data.remaining_workers || 0) + " · " +
-          t("后台操作") + " " + (data.remaining_operations || 0);
-        if (data.phase === "completed" || data.phase === "failed") break;
+        const progress = await desktop.invoke("quit_progress");
+        if (progress === "stopped") {
+          status.textContent = t("本机服务已停止，正在退出应用。");
+          return;
+        }
+        if (progress === "failed") {
+          status.textContent = t("关闭过程中出现问题");
+          return;
+        }
+        if (progress === "stopping") status.textContent = t("正在关闭本机服务");
       } catch {
-        status.textContent = t("本机服务已停止，正在退出应用。");
-        break;
+        // Keep the last confirmed status until the native bridge responds again.
       }
       await new Promise(resolve => setTimeout(resolve, 350));
     }
@@ -1528,7 +1530,7 @@ window.RSIProduct = (() => {
       ['本次交付设置',deliveryMode(frozen)],
       ['当前交付授权',deliveryMode(live?.config)],
       ['项目运行状态',t(live?.paused?'已暂停':'运行中')],
-      ['运行检查',t(result.evaluation?.decision==='pass'?'通过':'尚未通过')],
+      ['运行检查',t(statusNames[evaluationDecision(result.evaluation)]||'尚未通过')],
       ['代码评审',t(result.review?.decision==='pass'?'通过':'尚未通过')],
       ['问题解决证据',t(result.evaluation?.improvement?.decision==='pass'?'通过':'未提供通过证据')],
     ])list.append(el('dt',t(label)),el('dd',value));

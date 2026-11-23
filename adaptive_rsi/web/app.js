@@ -1,6 +1,10 @@
 'use strict';
 function preferenceKey(key){return ['rsi-project','rsi-navigation'].includes(key)&&window.__RSI_MACHINE_KEY__?key+':'+window.__RSI_MACHINE_KEY__:key;}
 function localRead(key){try{return localStorage.getItem(preferenceKey(key));}catch{return null;}}
+function runtimeConnectionError(){
+ if(window.RSIDesktop?.isSshTunnel?.())return t('SSH 隧道暂时不可用。请恢复终端中的转发，或打开运行机器重新连接。');
+ return t('无法连接本地服务。输入已保留，请确认服务仍在运行后重试。');
+}
 function localWrite(key,value){try{localStorage.setItem(preferenceKey(key),value);}catch{}}
 function localRemove(key){try{localStorage.removeItem(preferenceKey(key));}catch{}}
 let state, projectId = localRead('rsi-project') || '', view = 'overview', settingsBaseline, toastTimer;
@@ -213,7 +217,7 @@ document.addEventListener('close',event=>{if(event.target.tagName==='DIALOG')rev
 function unchangedForm(form,{projectSensitive=true}={}){const revision=formRevisions.get(form)||0,project=projectId;return ()=>(formRevisions.get(form)||0)===revision&&(!projectSensitive||projectId===project);}
 function el(tag, text, cls){ const node=document.createElement(tag); if(text!==undefined)node.textContent=text; if(cls)node.className=cls; return node; }
 function lazyEvidence(label,produce){
- const box=el('details'),summary=el('summary',t(label));box.append(summary);let loaded=false,text='',offset=0,anchorOffset=0,searchTicket=0;
+ const box=el('details'),summary=el('summary',t(label));box.append(summary);let loaded=false,text='',offset=0,anchorOffset=-1,searchTicket=0;
  box.addEventListener('toggle',()=>{
   if(!box.open||loaded)return;loaded=true;text=String(produce()??'');
   const controls=el('div',undefined,'task-actions'),search=el('input'),raw=el('pre'),status=el('span');search.type='search';search.placeholder=t('搜索日志');search.setAttribute('aria-label',t('搜索日志'));status.dataset.logStatus='';status.setAttribute('role','status');
@@ -221,12 +225,12 @@ function lazyEvidence(label,produce){
   const lineStarts=[0];for(let cursor=0;cursor<text.length;cursor++)if(text.charCodeAt(cursor)===10)lineStarts.push(cursor+1);
   function lineAt(position){let low=0,high=lineStarts.length;while(low+1<high){const middle=(low+high)>>1;if(lineStarts[middle]<=position)low=middle;else high=middle;}return low+1;}
   function paint(){raw.textContent=text.slice(offset,offset+size);status.textContent=t('原文位置')+' '+(offset+1)+'–'+Math.min(offset+size,text.length)+' / '+text.length+' · '+t('行')+' '+lineAt(offset);previous.disabled=offset===0;next.disabled=offset+size>=text.length;}
-  async function find(anchor=false){const ticket=++searchTicket,needle=search.value;if(!anchor&&!needle){offset=0;paint();return;}const start=anchor?Math.max(offset,anchorOffset)+1:0;
+  async function find(anchor=false){const ticket=++searchTicket,needle=search.value;if(!anchor)anchorOffset=-1;if(!anchor&&!needle){offset=0;paint();return;}const start=anchor?Math.max(offset,anchorOffset+1):0;
    for(let cursor=start;cursor<text.length;cursor+=262144){if(ticket!==searchTicket||!box.isConnected)return;const chunk=text.slice(cursor,cursor+262144+(anchor?256:needle.length)),match=anchor?/(?:\b\d{4}-\d\d-\d\d[T ][\d:.+Z-]+|\[(?:planning|implementation|evaluation|review|delivery)\])/i.exec(chunk):null,index=anchor?(match?.index??-1):chunk.indexOf(needle);
     if(index>=0){anchorOffset=cursor+index;offset=Math.max(0,anchorOffset-200);paint();return;}await new Promise(resolve=>setTimeout(resolve,0));}
    if(ticket===searchTicket)status.textContent=t('未找到匹配内容');
   }
-  const previous=action(t('上一段'),()=>{searchTicket++;offset=Math.max(0,offset-size);paint();},'text-button'),next=action(t('下一段'),()=>{searchTicket++;offset=Math.min(Math.max(0,text.length-1),offset+size);paint();},'text-button');
+  const previous=action(t('上一段'),()=>{searchTicket++;anchorOffset=-1;offset=Math.max(0,offset-size);paint();},'text-button'),next=action(t('下一段'),()=>{searchTicket++;anchorOffset=-1;offset=Math.min(Math.max(0,text.length-1),offset+size);paint();},'text-button');
   const anchor=action(t('下一个时间或阶段'),()=>find(true),'text-button');search.addEventListener('input',()=>find());
   const download=action(t('导出完整原文'),()=>{const url=URL.createObjectURL(new Blob([text],{type:'text/plain;charset=utf-8'})),link=el('a');link.href=url;link.download='evidence.txt';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);},'text-button');
   controls.append(search,previous,next,anchor,download,status);box.append(controls,raw);paint();
@@ -264,7 +268,7 @@ async function sendApi(path,body,signal,{text=false}={}){
  const feature=featureForPath(path);
  // A failed probe returns null: let the real fetch surface the connectivity error
  // instead of misreporting it as an old service. Only a negotiated descriptor decides support.
- if(feature){const supported=await negotiateCapabilities();if(supported!==null&&!supported.has(feature)){const error=Error(t('当前服务不支持此功能，请升级服务后重试。'));error.code='unsupported_capability';error.feature=feature;throw error;}}
+ if(feature){const supported=await negotiateCapabilities();signal?.throwIfAborted();if(supported!==null&&!supported.has(feature)){const error=Error(t('当前服务不支持此功能，请升级服务后重试。'));error.code='unsupported_capability';error.feature=feature;throw error;}}
  const bootstrapRepair=body!==undefined&&!state&&path==='config/repair-global';
  if(body!==undefined&&!state&&!bootstrapRepair)throw Error(t('正在连接本地服务，请稍候再提交。'));
  const controller=new AbortController();
@@ -280,14 +284,16 @@ async function sendApi(path,body,signal,{text=false}={}){
   }catch{throw new TypeError(t('正在连接本地服务，请稍候再提交。'));}
  }
  let response;
- try{response=await fetch('/api/'+path,options);}catch(error){throw new TypeError(t('无法连接本地服务。输入已保留，请确认服务仍在运行后重试。'));}
+ try{response=await fetch('/api/'+path,options);}catch(error){if(signal?.aborted)throw signal.reason??error;throw new TypeError(runtimeConnectionError());}
+ signal?.throwIfAborted();
  const requestHeader=response.headers?.get?.('X-RSI-Request-ID');
  const requestId=typeof requestHeader==='string'&&/^[a-f0-9]{16}$/.test(requestHeader)?requestHeader:null;
  if(response.status===401){const error=Error(t('登录已失效，输入已保留。请从启动入口重新打开控制台，无需重启。'));error.code='session_required';error.status=401;error.requestId=requestId;throw error;}
  if(text&&response.ok)return await response.text();
  const invalidResponse=()=>{const invalid=Error(t('服务返回了无法识别的结果。输入已保留，请稍后重试。'));invalid.status=response.status;invalid.requestId=requestId;invalid.evidence={status:response.status,code:'invalid_response',request_id:requestId};return invalid;};
  let data;
- try{data=await response.json();}catch(error){throw invalidResponse();}
+ try{data=await response.json();}catch(error){signal?.throwIfAborted();throw invalidResponse();}
+ signal?.throwIfAborted();
  if(!response.ok&&(!data||typeof data!=='object'||Array.isArray(data)))throw invalidResponse();
  if(!response.ok){
   // 已知错误给中文指引；未知技术错误兜底为通用文案，原文留在控制台便于诊断。
@@ -306,14 +312,22 @@ async function sendApi(path,body,signal,{text=false}={}){
  }finally{if(timeout!==null)clearTimeout(timeout);}
 }
 async function api(path,body,{signal}={}){
+ signal?.throwIfAborted();
  const payload=body===undefined?undefined:structuredClone(body);
  try{return await sendApi(path,payload,signal);}catch(error){if(payload===undefined||error.code!=='update_in_progress')throw error;}
  toast(t('服务正在完成更新，表单已保留，恢复后自动提交。'));
  const deadline=Date.now()+120000;
  while(Date.now()<deadline){
-  await new Promise(resolve=>setTimeout(resolve,1000));
+  await new Promise((resolve,reject)=>{
+   const abort=()=>{clearTimeout(timer);reject(signal.reason);};
+   const timer=setTimeout(()=>{signal?.removeEventListener('abort',abort);resolve();},1000);
+   signal?.addEventListener('abort',abort,{once:true});
+   if(signal?.aborted)abort();
+  });
+  signal?.throwIfAborted();
   let next;
-  try{next=await sendApi('state',undefined,signal);}catch(error){if(error instanceof TypeError)continue;throw error;}
+  try{next=await sendApi('state',undefined,signal);}catch(error){if(!signal?.aborted&&error instanceof TypeError)continue;throw error;}
+  signal?.throwIfAborted();
   if(next.update?.busy??['downloading','restarting'].includes(next.update?.state))continue;
   state=next;
   // 只重试服务明确拒绝执行的请求；提交后断线时不重复操作。
@@ -463,7 +477,7 @@ async function refresh(options={}){
  if(sessionExpired)return;
  const force=!!options.force,requestedProject=projectId,requestedView=view,sections=requestedStateSections(force),taskView=['overview','tasks'].includes(view),filter=taskView?$('task-filter').value:'all',system=taskView?String($('show-system-tasks').checked):'true',offset=taskView?taskOffset:0;
  const key=JSON.stringify([requestedProject,view,offset,filter,system,sections]);
- if(refreshPromise){if(refreshKey===key)return refreshPromise;refreshQueued=true;refreshForce=refreshForce||force;refreshSequence++;refreshController?.abort();return new Promise((resolve,reject)=>refreshWaiters.push({resolve,reject}));}
+ if(refreshPromise){if(!force&&refreshKey===key&&!refreshController?.signal.aborted)return refreshPromise;refreshQueued=true;refreshForce=refreshForce||force;refreshSequence++;refreshController?.abort();return new Promise((resolve,reject)=>refreshWaiters.push({resolve,reject}));}
  const ticket=++refreshSequence;clearTimeout(refreshPollTimer);
  const controller=new AbortController(),query=new URLSearchParams({project:requestedProject,limit:'50',offset:String(offset),filter,system,sections:sections.join(',')});
  refreshController=controller;refreshProject=requestedProject;refreshKey=key;let timedOut=false;const timeout=setTimeout(()=>{timedOut=true;controller.abort();},15000);
@@ -480,7 +494,7 @@ async function refresh(options={}){
     taskOffset=0;
    }
    if(bootBuild&&next.build&&bootBuild!==next.build)$('reload-ui').hidden=false;if(state&&state.version!==next.version&&next.version!==lastUpdateToast){lastUpdateToast=next.version;toast(t('后台已更新，当前输入已保留。刷新页面可加载新版界面。'));}
-   const previousProject=state?.selected_project,returned=new Set(Array.isArray(next.sections)?next.sections:[]);
+   const firstState=!state,previousProject=state?.selected_project,returned=new Set(Array.isArray(next.sections)?next.sections:[]);
    if(!next.sections){if(Object.hasOwn(next,'candidates'))returned.add('candidates');if(['cases','quality','usage','model_usage'].every(key=>Object.hasOwn(next,key)))returned.add('analytics');}
    if(previousProject!==undefined&&previousProject!==next.selected_project){const merged={...(state||{}),...next};if(!returned.has('candidates'))delete merged.candidates;if(!returned.has('analytics'))for(const key of ['cases','quality','usage','model_usage'])delete merged[key];state=merged;}
    else state={...(state||{}),...next};
@@ -491,7 +505,7 @@ async function refresh(options={}){
    if(JSON.stringify([...select.options].map(x=>[x.value,x.text]))!==JSON.stringify(state.projects.map(p=>[p.id,projectLabel(p)]))){select.replaceChildren(...state.projects.map(p=>{const o=el('option',projectLabel(p));o.value=p.id;o.title=projectPath(p);return o;}));if(!state.projects.length){const o=el('option',t('尚未接入项目'));o.value='';select.append(o);}}
    if(projectId&&!scopeChosen&&!scopeInitialized){stashSettings();$('config-scope').value='project';settingsBaseline=null;scopeInitialized=true;}
    select.value=projectId;rememberNavigationHome();if(old!==projectId){stashSettings();closeTaskDetail();settingsBaseline=null;localWrite('rsi-project',projectId);goalDraftRestoredProject=projectId;}if(goalDraftRestoredProject!==projectId){restoreGoalDraft();goalDraftRestoredProject=projectId;}
-   render();window.RSIExperience?.refreshed();
+   render();if(firstState&&view==='usage')window.RSIUsage?.show();window.RSIExperience?.refreshed();
   }catch(error){if(controller.signal.aborted){if(timedOut&&requestedProject===projectId)$('connection').textContent=t('连接超时');return;}throw error;}
   finally{clearTimeout(timeout);}
  })();refreshPromise=operation;
@@ -657,7 +671,7 @@ function restoreRuntimeNavigation(){
  view=saved&&['overview','evolution','settings','models','usage'].includes(saved.view)?saved.view:'overview';
  if(saved&&['active','attention','history','all'].includes(saved.filter))$('task-filter').value=saved.filter;
  if(saved)$('show-system-tasks').checked=saved.system===true;
- if(window.__RSI_MACHINE_KEY__&&location.pathname!==undefined)history.replaceState(null,'',location.pathname+location.search);
+ readNavigationRoute();
 }
 function writeNavigation(name){
  localWrite('rsi-navigation',JSON.stringify({view:name,filter:$('task-filter').value,system:$('show-system-tasks').checked}));
@@ -675,14 +689,15 @@ function showView(name,recordHistory=true){
  if(name==='usage')window.RSIUsage?.show();
 
 }
-(function initialNavigation(){
+function readNavigationRoute(){
  const route=new URLSearchParams(location.href?String(location.hash||'').replace(/^#/,''):''),requestedView=route.get('view'),requestedProject=route.get('project');
  if(['global','project'].includes(route.get('scope'))){$('config-scope').value=route.get('scope');scopeChosen=true;}
  if(requestedProject){projectId=requestedProject;}
  if(requestedView&&['overview','tasks','evolution','settings','models','usage'].includes(requestedView)){
   view=requestedView==='tasks'?'overview':requestedView;
  }
-})();
+}
+readNavigationRoute();
 typeof window.addEventListener==='function'&&window.addEventListener('hashchange',()=>{
  if(!state)return;const route=new URLSearchParams(String(location.hash||'').replace(/^#/,'')),requested=route.get('view'),project=route.get('project')||history.state?.rsi_home_project||navigationHomeProject;
  const scope=route.get('scope'),projectChanged=!!(project&&state.projects.some(item=>item.id===project)&&project!==projectId),scopeChanged=['global','project'].includes(scope)&&scope!==$('config-scope').value;
@@ -857,7 +872,7 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
    for(const finding of review.findings||[]){const card=el('div',undefined,'provider-card');card.append(el('strong',t(reviewNames[finding.severity]||finding.severity)+' · '+finding.title),el('p',finding.path+':'+finding.line),el('p',finding.reason),el('p',t('修改建议')+t('：')+finding.suggestion));report.append(card);}
    section.append(report);
   }
-  if(data.result.evaluation){const report=el('details',undefined,'review-report');report.append(el('summary',t('运行与效果检查')),badge(data.result.evaluation.decision));for(const [label,rows] of Object.entries(data.result.evaluation.checks||{})){if(!Array.isArray(rows))continue;const detail=lazyEvidence(evaluationNames[label]||label,()=>JSON.stringify(rows,null,2));detail.querySelector('summary').append(' · '+rows.filter(r=>r.passed).length+'/'+rows.length);report.append(detail);}section.append(report);}
+  if(data.result.evaluation){const report=el('details',undefined,'review-report');report.append(el('summary',t('运行与效果检查')),badge(evaluationDecision(data.result.evaluation)));for(const [label,rows] of Object.entries(data.result.evaluation.checks||{})){if(!Array.isArray(rows))continue;const detail=lazyEvidence(evaluationNames[label]||label,()=>JSON.stringify(rows,null,2));detail.querySelector('summary').append(' · '+rows.filter(r=>r?.passed===true).length+'/'+rows.length);report.append(detail);}section.append(report);}
   if(data.result.delivery_status)section.append(el('p',t('交付状态')+' · '+t(deliveryNames[data.result.delivery_status]||data.result.delivery_status)));
   if(data.result.feedback){section.append(el('h3',t('合并后收益反馈')),badge(data.result.feedback.state),el('p',stamp(data.result.feedback.checked_at)+' · '+data.result.feedback.head));}
   const delivery=el('div',undefined,'task-actions');
@@ -992,7 +1007,20 @@ function renderEvolution(){const summary=$('suite-summary');summary.replaceChild
   list.append(card);}}
 function getPath(obj,path){return path.split('.').reduce((v,k)=>v?.[k],obj);}
 function setPath(obj,path,value){const keys=path.split('.');let node=obj;keys.slice(0,-1).forEach(k=>node=node[k]??={});node[keys.at(-1)]=value;}
-function deepMerge(a,b){for(const [key,value]of Object.entries(b)){if(value&&typeof value==='object'&&!Array.isArray(value))a[key]=deepMerge(a[key]||{},value);else a[key]=value;}return a;}
+function evaluationDecision(evaluation){
+ if(evaluation?.decision==='pass'&&!Object.values(evaluation.checks||{}).some(rows=>Array.isArray(rows)&&rows.some(row=>row&&typeof row==='object'&&Object.keys(row).length)))return 'insufficient_evidence';
+ return evaluation?.decision;
+}
+function deepMerge(target,source){
+ for(const [key,value] of Object.entries(source)){
+  if(['__proto__','constructor','prototype'].includes(key))throw Error(t('设置格式或字段无效，请检查配置后重试。'));
+  if(value&&typeof value==='object'&&!Array.isArray(value)){
+   const existing=Object.hasOwn(target,key)?target[key]:null;
+   target[key]=deepMerge(existing&&typeof existing==='object'&&!Array.isArray(existing)?existing:{},value);
+  }else target[key]=value;
+ }
+ return target;
+}
 function settingsKey(){return $('config-scope').value==='global'?'global':projectId;}
 function sensitiveField(node){return node.type==='password'||/(?:api.?key|oauth|secret|password|credential|authorization|token)/i.test([node.id,node.name,node.dataset.path,node.autocomplete].join(' '));}
 function settingsValues(){return [...$('settings-form').querySelectorAll('input,textarea,select')].filter(node=>!sensitiveField(node)&&!node.hasAttribute('data-unit-for')&&!node.hasAttribute('data-check-field')&&!node.hasAttribute('data-check-arg')).map(node=>({id:node.id,path:node.dataset.path,value:node.value,checked:node.checked,unit:node.dataset.duration?document.querySelector('[data-unit-for="'+node.dataset.duration+'"]').value:undefined}));}
@@ -1233,7 +1261,7 @@ $('attention-open').addEventListener('click',()=>{$('show-system-tasks').checked
 document.querySelectorAll('[data-unit-for]').forEach(unit=>unit.addEventListener('change',()=>{const node=document.querySelector('[data-path="'+unit.dataset.unitFor+'"]');const previous=Number(unit.dataset.previous||durationUnit(node));node.value=Number(node.value)*previous/Number(unit.value);unit.dataset.previous=unit.value;node.min=5/Number(unit.value);node.max=525600/Number(unit.value);}));
 $('delivery-choice').addEventListener('change',()=>{if($('delivery-choice').value==='custom')return;document.querySelector('[data-path="delivery.mode"]').value=$('delivery-choice').value==='local'?'local':'pr';document.querySelector('[data-path="delivery.auto_merge"]').checked=$('delivery-choice').value==='auto';syncDelivery();});
 $('goal-text').addEventListener('input',()=>{goalDraftRevisions.set(projectId,(goalDraftRevisions.get(projectId)||0)+1);stashGoalDraft();});
-$('project-select').addEventListener('change',()=>{stashSettings();stashGoalDraft();closeTaskDetail();projectId=$('project-select').value;restoreGoalDraft();goalDraftRestoredProject=projectId;localWrite('rsi-project',projectId);settingsBaseline=null;if(view==='models')window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null);taskOffset=0;writeNavigation(view);render();safe(refresh);});
+$('project-select').addEventListener('change',()=>{if(projectId!==$('project-select').value)navigationSequence++;stashSettings();stashGoalDraft();closeTaskDetail();projectId=$('project-select').value;restoreGoalDraft();goalDraftRestoredProject=projectId;localWrite('rsi-project',projectId);settingsBaseline=null;if(view==='models')window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null);taskOffset=0;writeNavigation(view);render();safe(refresh);});
 var offerGlobalConfigRepair=function(raw){
  const dialog=el('dialog','','confirm-dialog');dialog.setAttribute('aria-labelledby','global-config-repair-title');
  const title=el('h2',t('通用配置损坏'));title.id='global-config-repair-title';
@@ -1552,12 +1580,12 @@ $('language-select').addEventListener('change',()=>safe(async()=>{
  else $('connection').textContent=t(connectionStates.find(name=>[name,english[name]].includes($('connection').textContent))||'已连接');
  if(!projectId&&$('project-select').options.length)$('project-select').options[0].textContent=t('尚未接入项目');
  $('toast').hidden=true;
+ window.RSIDesktop?.translate?.();
  if(!state)return;
  render();if(settingsBaseline){syncDelivery();window.RSIProduct?.renderEditor();window.RSIProduct?.dirtyStatus();}
  window.RSIModelCenter?.translate();
  window.RSIUsage?.translate();
  window.RSIExperience?.translate?.();
- window.RSIDesktop?.translate?.();
  window.RSINativeUpdate?.render?.();
  if($('detail-dialog').open&&detailTask){
   // 语言切换会重建详情体：沿用 liveDetail 的做法，先记录展开状态与滚动位置再恢复。

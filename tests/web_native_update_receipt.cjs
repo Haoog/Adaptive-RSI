@@ -4,7 +4,7 @@ const test=require('node:test'),assert=require('node:assert/strict'),vm=require(
 const source=()=>fs.readFileSync('adaptive_rsi/web/native-update.js','utf8');
 
 function fixture({runtime, snapshot={state:'idle'}, stored, receiptError, cancelError, authorizeError}={}){
- let panel;const saved=new Map(),calls=[],blobs=[],downloads=[];
+ let panel;const saved=new Map(),calls=[],blobs=[],downloads=[],timers=[],revoked=[];
  const el=(tag,text,className)=>({tag,className,textContent:text||'',children:[],append(...nodes){this.children.push(...nodes);},setAttribute(){},after(node){panel=node;}});
  const invoke=async(_,args)=>{
   calls.push(args);
@@ -24,16 +24,16 @@ function fixture({runtime, snapshot={state:'idle'}, stored, receiptError, cancel
   document:{activeElement:null,addEventListener(){},documentElement:{lang:'zh-CN'},
    createElement:()=>({click(){downloads.push(this.download);},href:'',download:''})},
   Blob:class{constructor(parts,options){blobs.push({parts,type:options&&options.type});}},
-  URL:{createObjectURL:()=>'blob:receipt',revokeObjectURL(){}},
+  URL:{createObjectURL:()=>'blob:receipt',revokeObjectURL(url){revoked.push(url);}},
   el,$:()=>el('anchor'),t:x=>x,localRead:key=>saved.get(key),
   localStorage:{setItem(key,value){saved.set(key,value);}},
-  safe:fn=>fn(),setTimeout(){},setInterval(){},Date,Math,Number,String,Error,JSON,
+  safe:fn=>fn(),setTimeout(fn,delay){timers.push({fn,delay});},setInterval(){},Date,Math,Number,String,Error,JSON,
  };
  vm.runInNewContext(source(),context);
  const api=context.window.RSINativeUpdate;
  const all=node=>[node,...node.children.flatMap(all)];
  const text=()=>all(panel).map(node=>node.textContent).join(' ');
- return{api,calls,saved,blobs,downloads,nodes:()=>all(panel),text,panel:()=>panel,
+ return{api,calls,saved,blobs,downloads,timers,revoked,nodes:()=>all(panel),text,panel:()=>panel,
   selects:()=>all(panel).filter(node=>node.tag==='select')};
 }
 
@@ -52,6 +52,10 @@ test('exporting a receipt reads the persisted transaction instead of panel state
  assert.equal(receipt.authorization_revision,4);
  assert.equal(receipt.transaction_error,null);
  assert.deepEqual(f.downloads,['adaptive-rsi-update-receipt.json']);
+ assert.deepEqual(f.revoked,[]);
+ const cleanup=f.timers.find(timer=>timer.delay===1000);
+ assert.ok(cleanup);cleanup.fn();
+ assert.deepEqual(f.revoked,['blob:receipt']);
  assert.equal(f.blobs[0].type,'application/json');
  const text=f.blobs[0].parts[0];
  assert.ok(!/token|cookie|password|secret/i.test(text),text);

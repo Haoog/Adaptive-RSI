@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
-const { createInterface } = require("node:readline");
+const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const { chromium } = require("playwright");
 
 async function openDetail(page, title, filter) {
@@ -77,7 +77,7 @@ async function checkTaskDetail(browser, url, errors) {
       await route.fulfill({response, json: data});
     });
     await page.goto(url);
-    await page.locator('#project-status').filter({ hasText: '已暂停' }).waitFor({ timeout: 15000 });
+    await waitForPausedProject(page);
     await page.locator('.task-row').first().waitFor({ timeout: 10000 });
     const qualityCard = label => page.locator('#quality-summary > div').filter({hasText: label});
     await page.locator('#runtime-evidence').evaluate(node => node.open = true);
@@ -405,18 +405,16 @@ async function checkTaskDetail(browser, url, errors) {
     env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', RSI_BROWSER_TASK_DETAIL: '1' },
   });
   server.stderr.on('data', chunk => process.stderr.write(chunk));
-  let browser;
+  let browser, scenarioError;
   const errors = [];
   try {
-    const url = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(Error('Console startup timed out')), 30000);
-      createInterface({ input: server.stdout }).once('line', line => { clearTimeout(timeout); resolve(line); });
-      server.once('exit', code => { clearTimeout(timeout); reject(Error('Console exited: ' + code)); });
-    });
+    const url = await fixtureReady(server);
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? { channel: process.env.RSI_BROWSER_CHANNEL } : {});
     await checkTaskDetail(browser, url, errors);
+  } catch (error) {
+    scenarioError = error;
+    throw error;
   } finally {
-    if (browser) await browser.close();
-    server.kill();
+    await closeFixture(server, browser, scenarioError);
   }
 })();

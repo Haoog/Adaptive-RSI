@@ -42,6 +42,41 @@ class DockerCheckCommandTest(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 self.box.command(args, self.workspace)
 
+    def test_missing_writable_target_without_approved_parent_fails_closed(self):
+        missing = self.workspace / "new-output"
+        with self.assertRaisesRegex(ValueError, "no approved writable directory: new-output"):
+            self.box.command(["true"], self.workspace, writable=[missing])
+        self.assertFalse(missing.exists())
+
+    def test_approved_file_does_not_grant_writes_to_a_missing_sibling(self):
+        approved = self.workspace / "approved.txt"
+        approved.write_text("existing", encoding="utf-8")
+        missing = self.workspace / "new-output.txt"
+        with self.assertRaisesRegex(ValueError, "no approved writable directory: new-output.txt"):
+            self.box.command(["true"], self.workspace, writable=[approved, missing])
+        self.assertEqual(list(self.workspace.iterdir()), [approved])
+
+    def test_missing_writable_target_under_approved_directory_needs_no_bind_mount(self):
+        parent = self.workspace / "output"
+        parent.mkdir()
+        missing = parent / "new-output"
+        command, _ = self.box.command(["true"], self.workspace, writable=[missing, parent])
+        mounts = [command[index + 1] for index, arg in enumerate(command) if arg == "--mount"]
+        self.assertEqual(mounts, [
+            f"type=bind,src={self.workspace},dst=/workspace,readonly",
+            f"type=bind,src={parent},dst=/workspace/output",
+        ])
+        self.assertFalse(missing.exists())
+
+    def test_missing_writable_target_under_protected_directory_fails_closed(self):
+        parent = self.workspace / "output"
+        protected = parent / "protected"
+        protected.mkdir(parents=True)
+        missing = protected / "new-output"
+        with self.assertRaisesRegex(ValueError, "no approved writable directory: output/protected/new-output"):
+            self.box.command(["true"], self.workspace, protected=[protected], writable=[parent, missing])
+        self.assertFalse(missing.exists())
+
     def test_exit_and_missing_init_failure_are_reported(self):
         check = {"name": "check", "argv": ["cargo", "test"]}
         for code, stderr in ((0, ""), (23, "check failed"), (125, "docker-init not found")):

@@ -171,6 +171,13 @@ class AuditRound6Test(unittest.TestCase):
         self.assertEqual(change_kind({"title": "优化按钮文字", "body": ""}, {"change_kind": "ui"}), "ui")
         self.assertEqual(change_kind({"title": "降低延迟", "body": ""}, {"change_kind": "ui"}), "performance")
 
+    def test_bug_fix_overrides_documentation_and_ui_declarations(self):
+        for declared in ("documentation", "ui", "configuration"):
+            for title, body in (("优化错误输出", ""), ("Update interface", "Fix invalid results")):
+                with self.subTest(declared=declared, title=title):
+                    self.assertEqual(change_kind({"title": title, "body": body}, {"change_kind": declared}),
+                                     "behavior")
+
     def test_contract_validates_tail_and_numeric_bounds(self):
         schema = {"type": "array", "items": {"type": "integer", "minimum": 0}}
         self.assertTrue(check_keys([1, "bad"], schema, schema))
