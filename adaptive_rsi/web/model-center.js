@@ -110,9 +110,13 @@ window.RSIModelCenter = (() => {
       else if(JSON.stringify(safeRoute(previous[role]))!==JSON.stringify(safeRoute(data.models[role]))){draft[role]=structuredClone(data.models[role]);conflicts=true;}
     }
     baselines.set(key,structuredClone(data.models));
-    if(!selected())active=data.providers[0].id;
+    if(!selected())selectProvider(data.providers[0].id);
     render();if(conflicts)setStatus(t('服务器模型设置已变化，冲突分工未从旧草稿恢复。'),true);
   }
+  let diagnosisSequence=0;
+  function invalidateDiagnosis(){diagnosisSequence++;}
+  function selectProvider(next){if(active!==next)invalidateDiagnosis();active=next;}
+  function selectTab(next){if(tab!==next)invalidateDiagnosis();tab=next;}
   function render(){
     if(!data||loading||data.project!==scope)return;
     $('view-models').dataset.scope=scopeKey();
@@ -128,7 +132,7 @@ window.RSIModelCenter = (() => {
   function renderProviders(){
     const list=$('mc-provider-list');list.replaceChildren();
     for(const provider of data.providers){
-      const button=action('',()=>{active=provider.id;modelPage=0;$('mc-search').value='';setStatus('');render();},'mc-provider');
+      const button=action('',()=>{selectProvider(provider.id);modelPage=0;$('mc-search').value='';setStatus('');render();},'mc-provider');
       button.setAttribute('aria-pressed',String(provider.id===active));button.setAttribute('aria-label',provider.name);
       const symbol=el('span',provider.name.slice(0,1).toUpperCase(),'mc-provider-symbol'),copy=el('span',undefined,'mc-provider-copy');
       copy.append(el('strong',provider.id==='openai'?t('Codex 登录'):provider.name));
@@ -170,13 +174,19 @@ window.RSIModelCenter = (() => {
     $('mc-resume').hidden=!provider.health.paused;$('mc-resume').disabled=false;
     let diagnostics=$('mc-diagnostics');
     if(!diagnostics){diagnostics=el('button',t('只读诊断'),'mc-text-button');diagnostics.id='mc-diagnostics';diagnostics.type='button';$('mc-health').after(diagnostics);}
-    diagnostics.onclick=()=>safe(async()=>{
+    diagnostics.onclick=async()=>{
       const model=provider.catalog.models.find(item=>item.enabled)?.id||provider.catalog.models[0]?.id;
-      if(!model)return;
-      const result=await api('model-center/diagnose',{provider:provider.id,model,project:scope});
-      const box=diagnosticDialog(t('模型路由诊断')),body=el('pre',JSON.stringify(result,null,2));
-      box.append(el('p',t('本次只读取本地状态，不发送模型请求，也不产生费用。'),'muted'),body);
-    });
+      if(!model||data?.project!==scope||active!==provider.id||tab!=='providers'||$('view-models').hidden)return;
+      const ticket=++diagnosisSequence;
+      try{
+        const result=await api('model-center/diagnose',{provider:provider.id,model,project:scope});
+        if(ticket!==diagnosisSequence)return;
+        const box=diagnosticDialog(t('模型路由诊断')),body=el('pre',JSON.stringify(result,null,2));
+        box.append(el('p',t('本次只读取本地状态，不发送模型请求，也不产生费用。'),'muted'),body);
+      }catch(error){
+        if(ticket===diagnosisSequence)await safe(()=>{throw error;});
+      }
+    };
     const authProvider=provider.id,authScope=scope;window.RSIAuth?.show(authProvider,()=>fetchProvider(authProvider,authScope,true));
     renderModels();
   }
@@ -459,7 +469,7 @@ window.RSIModelCenter = (() => {
     const dialog=$('mc-probe-dialog');if(dialog.open)dialog.close();
     $('mc-probe-result').textContent='';$('mc-probe-start').disabled=true;
   }
-  function changeScope(next){if(scope!==next)invalidateProbe();scope=next;}
+  function changeScope(next){if(scope!==next){invalidateDiagnosis();invalidateProbe();}scope=next;}
   function openProbe(provider,model){
     abortProbe();
     probeSession={project:scope,provider:provider.id,model:model.id};
@@ -474,7 +484,7 @@ window.RSIModelCenter = (() => {
   }
   function init(){
     const tabs=[...document.querySelectorAll('[data-mc-tab]')];
-    tabs.forEach(button=>{button.tabIndex=button.dataset.mcTab===tab?0:-1;button.addEventListener('click',()=>{tab=button.dataset.mcTab;rememberTab();render();});});
+    tabs.forEach(button=>{button.tabIndex=button.dataset.mcTab===tab?0:-1;button.addEventListener('click',()=>{selectTab(button.dataset.mcTab);rememberTab();render();});});
     tabs[0].parentElement.addEventListener('keydown',event=>{
       if(event.key!=='ArrowLeft'&&event.key!=='ArrowRight')return;
       const current=tabs.indexOf(document.activeElement);
@@ -523,7 +533,7 @@ window.RSIModelCenter = (() => {
         connectionSaved=true;remaining=[...models];
         if(editorSession===session)editing={...provider,id:result.id};
         for(const id of models){await api('model-center/model',{project,provider:result.id,model:{id,manual:true}});remaining.shift();}
-        if(scope===project){await refresh();await load();if(editorSession===session&&$('mc-provider-dialog').open&&unchanged()&&scope===project){active=result.id;tab='providers';render();$('mc-provider-dialog').close();}setStatus(t('连接配置已保存。'));}
+        if(scope===project){await refresh();await load();if(editorSession===session&&$('mc-provider-dialog').open&&unchanged()&&scope===project){selectProvider(result.id);selectTab('providers');render();$('mc-provider-dialog').close();}setStatus(t('连接配置已保存。'));}
         await fetchProvider(result.id,project);
       }catch(error){if(editorSession===session){$('mc-provider-error').textContent=(connectionSaved?t('连接已保存；部分后续操作未完成。尚未添加的模型：')+' '+remaining.join(', ')+' · ':'')+message(error);if(connectionSaved&&unchanged())$('mc-input-models').value=remaining.join('\n');}}finally{if(editorSession===session)button.disabled=false;}
     });});
@@ -597,5 +607,5 @@ window.RSIModelCenter = (() => {
     const next=requested||null,changed=scope!==next;changeScope(next);
     if(loading&&!changed)return;
     if(!data||changed||data.project!==scope||reload)safe(()=>load());
-  },connections:(reset=true)=>{const requested=location.href?new URLSearchParams(String(location.hash||'').replace(/^#/, '')).get('modelTab'):null;tab=!reset&&['providers','roles'].includes(requested)?requested:'providers';if(data)render();},translate,load};
+  },connections:(reset=true)=>{const requested=location.href?new URLSearchParams(String(location.hash||'').replace(/^#/, '')).get('modelTab'):null;selectTab(!reset&&['providers','roles'].includes(requested)?requested:'providers');if(data)render();},leave:invalidateDiagnosis,translate,load};
 })();

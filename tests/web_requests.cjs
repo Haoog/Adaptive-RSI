@@ -3487,14 +3487,38 @@ test('an active run stopping error explains when retry and supplement become ava
   await assert.rejects(page.context.api('retry', {task: 'child'}), /任务仍在停止中，请等当前运行结束后再重试或补充需求。/);
 });
 
-function modelScopePage(savedDrafts = new Map()) {
-  const page=browser(),posts=[],globals={planning:{provider:'ollama',model:'scope-coder',effort:'medium',fallback:null}},overrides=new Map([['a',structuredClone(globals)],['b',{}]]);
+function modelScopePage(savedDrafts = new Map(), {connections=false} = {}) {
+  const page=browser(new Map(),connections?({document,window})=>{
+    window.scrollTo=()=>{};
+    const buttons=(attribute,values)=>values.map(value=>{
+      const button=document.getElementById('model-test-'+attribute+'-'+value);button.dataset[attribute]=value;return button;
+    });
+    const selectors={
+      '[data-view]':buttons('view',['models','overview']),
+      '[data-settings-scope]':buttons('settingsScope',['project','global']),
+      '.view':['models','overview'].map(value=>document.getElementById('view-'+value))
+    };
+    document.querySelectorAll=selector=>selectors[selector]||[];
+  }:null),posts=[],globals={planning:{provider:'ollama',model:'scope-coder',effort:'medium',fallback:null}},overrides=new Map([['a',structuredClone(globals)],['b',{}]]);
   let release,held=false,holdNext=false,probeFailure=false;
   const effective=project=>({...structuredClone(globals),...structuredClone(overrides.get(project)||{})});
-  const modelSnapshot=project=>({project,models:effective(project),global_models:structuredClone(globals),overrides:structuredClone(overrides.get(project)||{}),providers:[{id:'ollama',name:'Ollama',protocol:'ollama',catalog:{models:[{id:'scope-coder',name:'Scope coder'}]}}]});
+  const providers=[{id:'ollama',name:'Ollama',protocol:'ollama',health:{},catalog:{models:[{id:'scope-coder',name:'Scope coder'}]}}];
+  if(connections)providers.push({id:'openai',name:'OpenAI',health:{},catalog:{models:[{id:'other-coder',name:'Other coder'}]}});
+  const modelSnapshot=project=>({project,models:effective(project),global_models:structuredClone(globals),overrides:structuredClone(overrides.get(project)||{}),providers:structuredClone(providers)});
   page.context.english={};page.context.window.addEventListener=()=>{};
-  const tab=page.node('model-tab');tab.dataset.mcTab='roles';tab.parentElement=page.node('model-tabs');
-  page.document.querySelectorAll=selector=>selector==='[data-mc-tab]'?[tab]:[];
+  const tabs=(connections?['providers','roles']:['roles']).map(name=>{
+    const tab=page.node('model-tab-'+name);tab.dataset.mcTab=name;tab.parentElement=page.node('model-tabs');return tab;
+  });
+  const querySelectorAll=page.document.querySelectorAll;
+  page.document.querySelectorAll=selector=>selector==='[data-mc-tab]'?tabs:querySelectorAll(selector);
+  if(connections){
+    page.document.body=page.node('body');
+    page.node('config-scope').value='project';
+    page.node('mc-scope').querySelector=()=>page.node('model-test-project-option');
+    page.node('toast').hidden=true;
+    page.context.renderNavigation=()=>{};
+    page.context.safe=fn=>{page.context.lastAction=page.context.originalSafe(fn);return page.context.lastAction;};
+  }
   for(const id of ['view-models','mc-provider-list','mc-model-list','mc-role-list','mc-extra-role-list'])page.node(id).removeAttribute=()=>{};
   page.node('mc-probe-effort').querySelector=()=>page.node('mc-probe-effort').children[0];
   page.context.window.RSIDraftStore={get:(_type,key)=>structuredClone(savedDrafts.get(key)),set:(_type,key,value)=>savedDrafts.set(key,structuredClone(value)),remove:(_type,key)=>savedDrafts.delete(key)};
@@ -3511,8 +3535,8 @@ function modelScopePage(savedDrafts = new Map()) {
   };
   page.context.refresh=async()=>{};
   const modelSource=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/model-center.js'),'utf8');
-  // Keep production loading, saving, draft persistence and event handlers; omit unrelated catalog rendering.
-  const instrumented=modelSource.replace('  init();',`  render=renderRoles=()=>{updateDirty();persistRouteDraft();};
+  // Keep production loading, saving, draft persistence and event handlers.
+  const instrumented=modelSource.replace('  init();',`  ${connections?'':'render='}renderRoles=()=>{updateDirty();persistRouteDraft();};
   window.modelScopeTest={openProbe:()=>openProbe(data.providers[0],data.providers[0].catalog.models[0]),otherProbe:()=>openProbe({id:'ollama',name:'Ollama'},{id:'other-coder',name:'Other coder'}),edit:effort=>{routes().planning.effort=effort;renderRoles();},draft:()=>structuredClone(routes())};
   init();`);
   vm.runInContext(instrumented,page.context);
@@ -3526,6 +3550,85 @@ function modelScopePage(savedDrafts = new Map()) {
     hold(){holdNext=true;},failProbe(){probeFailure=true;},release(){assert(held);release();}
   };
 }
+
+async function diagnosisPage(){
+  const page=modelScopePage(new Map(),{connections:true}),requests=[];
+  const api=page.context.api;
+  page.context.api=(path,body,options)=>path==='model-center/diagnose'
+    ?new Promise((resolve,reject)=>requests.push({body:structuredClone(body),resolve,reject}))
+    :api(path,body,options);
+  const click=id=>page.node(id).handlers.click();
+  const provider=name=>page.node('mc-provider-list').children.find(button=>button.attributes['aria-label']===name).handlers.click();
+  const project=id=>{page.node('project-select').value=id;page.node('project-select').handlers.change();};
+  click('model-test-view-models');await page.context.lastAction;
+  assert.equal(page.node('toast').textContent,'');
+  await provider('Ollama');
+  return {...page,requests,click,provider,project,
+    diagnose:()=>page.node('mc-diagnostics').onclick(),
+    dialogs:()=>page.document.body.children.filter(node=>node.tagName==='DIALOG'&&node.open)
+  };
+}
+
+const diagnosisTransitions={
+  'scope switch while loading':page=>{
+    const api=page.context.api;
+    let release;
+    page.context.api=async(path,...args)=>{
+      if(path==='model-center')await new Promise(resolve=>{release=resolve;});
+      return api(path,...args);
+    };
+    page.click('model-test-settingsScope-global');
+    assert.equal(page.node('mc-provider-name').textContent,'正在读取配置…');
+    const loading=page.context.lastAction;
+    return async()=>{release();await loading;};
+  },
+  'project round trip':async page=>{page.project('b');page.project('a');await new Promise(setImmediate);},
+  'provider switch':page=>page.provider('OpenAI'),
+  'provider round trip':async page=>{await page.provider('OpenAI');await page.provider('Ollama');},
+  'connection tab switch':page=>page.click('model-tab-roles'),
+  'connection tab round trip':page=>{page.click('model-tab-roles');page.click('model-tab-providers');},
+  'leaving the page':page=>page.click('model-test-view-overview'),
+  'returning to the page':async page=>{page.click('model-test-view-overview');page.click('model-test-view-models');await page.context.lastAction;}
+};
+for(const [name,transition] of Object.entries(diagnosisTransitions))for(const failure of [false,true]){
+  test(`read-only diagnosis discards stale ${failure?'failure':'success'} after ${name}`,async()=>{
+    const page=await diagnosisPage(),pending=page.diagnose();
+    assert.deepEqual(page.requests.map(request=>request.body),[{provider:'ollama',model:'scope-coder',project:'a'}]);
+    const finishTransition=await transition(page);
+    if(failure)page.requests[0].reject(new Error('Old diagnosis error'));
+    else page.requests[0].resolve({result:'old'});
+    await pending;
+    await finishTransition?.();
+    assert.equal(page.dialogs().length,0);
+    assert.equal(page.node('toast').hidden,true);
+    assert.equal(page.requests.length,1);
+  });
+}
+
+for(const failure of [false,true])test(`read-only diagnosis keeps current ${failure?'failure':'success'} after a repeated click and refresh`,async()=>{
+  const page=await diagnosisPage(),old=page.diagnose(),current=page.diagnose();
+  await page.show('a');
+  assert.deepEqual(page.requests.map(request=>request.body),Array(2).fill({provider:'ollama',model:'scope-coder',project:'a'}));
+  if(failure)page.requests[1].reject(Object.assign(new Error('Current diagnosis error'),{requestId:'diag-current'}));
+  else page.requests[1].resolve({result:'current'});
+  await current;
+  const dialog=page.dialogs()[0];
+  if(failure){
+    assert.equal(page.dialogs().length,0);
+    assert.equal(page.node('toast').textContent,'Current diagnosis error');
+    assert.equal(page.node('toast').className,'error');
+    assert.equal(page.node('toast').children.at(-1).textContent,'复制诊断标识');
+    page.requests[0].resolve({result:'old'});
+  }else{
+    assert.equal(page.dialogs().length,1);
+    assert.deepEqual(JSON.parse(dialog.children.at(-1).textContent),{result:'current'});
+    page.requests[0].reject(new Error('Old diagnosis error'));
+  }
+  await old;
+  assert.equal(page.dialogs().length,failure?0:1);
+  assert.equal(page.node('toast').hidden,!failure);
+  assert.equal(page.node('toast').textContent,failure?'Current diagnosis error':'');
+});
 
 test('Magpie preset fills the local OpenAI-compatible gateway without a credential', async()=>{
   const page=modelScopePage();await page.show('a');
