@@ -1106,6 +1106,51 @@ test('list rows omit body and evidence so the open detail fetches them once', as
   assert.equal(paragraph(requirements()).textContent, '补取的正文', 'redrawing keeps 任务要求 text');
 });
 
+test('a late task requirements disconnect cannot show an error over a different task', async () => {
+  const page = browser();
+  page.node('task-filter').value = 'all';
+  const toast = page.node('toast');
+  toast.hidden = true;
+  page.context.language = 'zh-CN';
+  vm.runInContext(`safe=fn=>{lastAction=originalSafe(fn);return lastAction;};
+    view='tasks';state={...initialState,selected_project:'a',runs:[],tasks:[
+      {id:'old',project:'a',source:'goal',title:'Old task',state:'failed',updated:1},
+      {id:'new',project:'a',source:'goal',title:'New task',state:'completed',updated:1}
+    ]};renderTasks();`, page.context);
+  let disconnectOld, oldRequests = 0;
+  page.context.fetch = async url => {
+    if (url.startsWith('/api/task?id=old')) {
+      if (++oldRequests === 1) return new Promise((_, reject) => {
+        disconnectOld = () => reject(new TypeError('fake disconnect'));
+      });
+      throw new TypeError('fake disconnect');
+    }
+    if (url.startsWith('/api/task?id=new')) return response({id:'new',project:'a',title:'New task',state:'completed',body:'New requirements',evidence:'[]'});
+    if (url.startsWith('/api/task-runs?')) return response([]);
+    assert.fail(`unexpected request: ${url}`);
+  };
+  const open = id => {
+    const row = page.node('tasks-list').children.find(node => node.dataset.taskId === id);
+    descendants(row).find(node => node.textContent === '查看详情').handlers.click();
+    return page.context.lastAction;
+  };
+  await open('old');
+  assert.equal(typeof disconnectOld, 'function');
+  page.context.closeTaskDetail();
+  await open('new');
+  disconnectOld();
+  await new Promise(setImmediate);
+  assert.equal(page.node('detail-title').textContent, 'New task');
+  assert.equal(descendants(page.node('detail-body')).find(node => node.id === 'task-requirements').textContent, 'New requirements');
+  assert.equal(toast.hidden, true, `unexpected error over the newly opened task: ${toast.textContent}`);
+
+  page.context.closeTaskDetail();
+  await open('old');
+  await new Promise(setImmediate);
+  assert.equal(toast.hidden, false, 'an error for the current task must still be reported');
+  assert.match(toast.textContent, /无法连接本地服务/);
+});
+
 test('closing task details while a response waits keeps the dialog closed', async () => {
   const page = browser();
   page.context.initialState.runs = [{id: 'ra', task: 'a', project: 'a'}];

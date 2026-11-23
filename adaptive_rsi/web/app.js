@@ -835,7 +835,13 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
  const partial=task.body===undefined||task.evidence===undefined;
  const requirements=el('section',undefined,'task-requirements'),copy=el('p',task.body);copy.id='task-requirements';requirements.append(el('h3',t('任务要求')),copy);body.append(requirements);
  const evidence=lazyEvidence('来源与证据',()=>task.evidence||'');evidence.className='detail-section';evidence.hidden=partial;body.append(evidence);
- if(partial)safe(async()=>{const detail=await api('task?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));if(!stillCurrent())return;task=detail;detailTask=detail;copy.textContent=detail.body||'';evidence.hidden=false;});
+ if(partial)safe(async()=>{
+  let detail;
+  try{detail=await api('task?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));}
+  catch(error){if(stillCurrent()&&$('detail-dialog').open)throw error;return;}
+  if(!stillCurrent())return;
+  task=detail;detailTask=detail;copy.textContent=detail.body||'';evidence.hidden=false;
+ });
  // 首屏请求失败时，保留当前详情；重试只重取第一页，再继续本次渲染。
  let retrying=false,rendered=false;
  let firstPage;try{firstPage=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');}catch(error){if(!stillCurrent())return;
