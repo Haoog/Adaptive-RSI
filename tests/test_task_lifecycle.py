@@ -245,6 +245,7 @@ class TaskLifecycleTest(unittest.TestCase):
             db.execute('BEGIN IMMEDIATE')
             db.execute('DROP INDEX events_intervention_task')
             db.execute('DELETE FROM schema_migrations WHERE version>=8')
+            db.execute('ALTER TABLE calls DROP COLUMN usage_components_known')
         self.store.close()
         reopened = Store(self.store.root)
         try:

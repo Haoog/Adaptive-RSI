@@ -102,7 +102,8 @@ class DependencyDAGTest(unittest.TestCase):
             db.execute('INSERT INTO task_dependencies VALUES (?,?)', (self.tasks[0], self.tasks[1]))
             db.execute('CREATE INDEX task_dependencies_dependency ON task_dependencies(dependency)')
             db.execute('DELETE FROM schema_migrations WHERE version>=6')
-            for column in ('input_price', 'output_price', 'cache_read_price', 'cache_write_price', 'price_basis'):
+            for column in ('input_price', 'output_price', 'cache_read_price', 'cache_write_price', 'price_basis',
+                           'usage_components_known'):
                 db.execute('ALTER TABLE calls DROP COLUMN ' + column)
         self.store.close()
         reopened = Store(self.store.root)
@@ -121,7 +122,8 @@ class DependencyDAGTest(unittest.TestCase):
             db.execute('INSERT INTO task_dependencies VALUES (?,?)', (self.tasks[0], self.tasks[0]))
             db.execute('CREATE INDEX task_dependencies_dependency ON task_dependencies(dependency)')
             db.execute('DELETE FROM schema_migrations WHERE version>=6')
-            for column in ('input_price', 'output_price', 'cache_read_price', 'cache_write_price', 'price_basis'):
+            for column in ('input_price', 'output_price', 'cache_read_price', 'cache_write_price', 'price_basis',
+                           'usage_components_known'):
                 db.execute('ALTER TABLE calls DROP COLUMN ' + column)
         self.store.close()
         reopened = Store(self.store.root)
