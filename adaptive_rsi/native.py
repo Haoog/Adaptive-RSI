@@ -271,7 +271,8 @@ def tools_for(role):
              object_schema({"path": TEXT, "content": TEXT})),
             ("replace_text", "Replace one unique exact text match in a source file.", object_schema({"path": TEXT, "old": TEXT, "new": TEXT})),
             ("run_command", "Run a command in the network-disabled sandbox. No credentials or other projects are available. "
-             "On Docker, use write_file to create approved sources that do not yet have a writable mount.",
+             "On Docker, the host prepares explicitly approved directories before launch. "
+             "Use write_file for approved files that do not yet have a writable mount.",
              object_schema({"argv": {"type": "array", "items": TEXT}, "cwd": TEXT})),
         ]
     return tools + [("finish", "Submit the final structured result. Do not combine with other tool calls.", SCHEMAS[role])]
@@ -311,6 +312,7 @@ class WorkspaceTools:
         self.files_truncated = False
         self.index_source = "filesystem_fallback"
         self.scope = None
+        self.scope_directories = ()
         self.deadline = None
         self._artifact_spec = None
         self._artifact_store = None
@@ -363,6 +365,35 @@ class WorkspaceTools:
             yield fd, parts[-1]
         finally:
             os.close(fd)
+
+    def load_scope(self, record):
+        paths = record.get("paths") if isinstance(record, dict) else record
+        directories = record.get("directories") if isinstance(record, dict) else []
+        if not isinstance(paths, list) or not paths or not isinstance(directories, list):
+            raise RuntimeError("Approved native tool scope is invalid")
+        scope = [relative_path(value) for value in paths]
+        for value in directories:
+            if not Path(relative_path(value)).parts or value not in scope:
+                raise RuntimeError("Approved native tool directory is outside the scope")
+        self.scope, self.scope_directories = scope, directories
+
+    def prepare_scope_directories(self, writable):
+        directories = [self.workspace / scope for scope in self.scope_directories if scope in self.scope]
+        protected = [Path(path).resolve() for path in (*self.protected, self.state, self.workspace / ".git")]
+        for path in directories:
+            if path not in writable or path.resolve() != path or any(
+                    path == item or item in path.parents or path in item.parents for item in protected):
+                raise ValueError("Approved tool directory must be an unprotected workspace path")
+        for path in sorted(directories, key=lambda item: len(item.parts)):
+            self.check_cancelled()
+            # Only create the approved directory itself. Any missing parent must
+            # have its own explicit directory approval and be prepared first.
+            with self.parent_descriptor(path) as (parent, leaf):
+                try:
+                    os.mkdir(leaf, dir_fd=parent)
+                except FileExistsError:
+                    if not stat.S_ISDIR(os.stat(leaf, dir_fd=parent, follow_symlinks=False).st_mode):
+                        raise ValueError("Approved tool directory is not a directory") from None
 
     def read_source(self, path, maximum):
         with self.parent_descriptor(path) as (parent, leaf):
@@ -693,6 +724,11 @@ class WorkspaceTools:
             writable = None
             if self.scope is not None:
                 writable = [self.path(scope) for scope in self.scope]
+                if self.scope_directories and sandbox.backend() == "docker":
+                    if not args["argv"][0]:
+                        raise ValueError("Sandbox command requires a non-empty executable")
+                    (self.workspace / args["cwd"]).resolve().relative_to(self.workspace)
+                    self.prepare_scope_directories(writable)
                 writable += [self.workspace / ".rsi-home", self.workspace / ".rsi-tmp"]
                 for item in writable[-2:]:
                     item.mkdir(exist_ok=True)
@@ -1037,10 +1073,7 @@ class NativeAgent:
         if role == "implementation":
             plan_path = Path(workspace).resolve().parent / "tool-scope.json"
             if plan_path.is_file():
-                scope = json.loads(plan_path.read_text(encoding="utf-8"))
-                if not isinstance(scope, list) or not scope:
-                    raise RuntimeError("Approved native tool scope is invalid")
-                tools.scope = [relative_path(value) for value in scope]
+                tools.load_scope(json.loads(plan_path.read_text(encoding="utf-8")))
         from .store import credential_generation, provider_identity
         identity = provider_identity(provider, credential_generation(self.store.root, provider))
         directory, _ = self.store.catalog_entry(project, provider["id"], identity,

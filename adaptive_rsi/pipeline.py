@@ -779,7 +779,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     change_type = "preservation" if task["source"] == "rollback" else change_kind(task, plan)
     test_first_requested = _uses_test_first(change_type, plan["risk"])
     test_first = test_first_requested and supports_test_first(checks, workspace)
-    regression_test_scope = None
+    test_scope = regression_test_scope = None
     if test_first or change_type == "performance" or (plan["risk"] == "high" and change_type != "documentation"):
         test_scope = _regression_test_scope(workspace, plan["scope"], allow_colocated=test_first)
         covered = any(Path(workspace, path).is_dir() and
@@ -790,7 +790,9 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         elif not covered:
             plan["scope"].append(test_scope)
     tool_scope = _tool_scope(plan["scope"], regression_test_scope, original_scope)
-    (directory / "tool-scope.json").write_text(encode(tool_scope), encoding="utf-8")
+    tool_directories = [test_scope] if test_scope in tool_scope else []
+    (directory / "tool-scope.json").write_text(
+        encode({"paths": tool_scope, "directories": tool_directories}), encoding="utf-8")
     (directory / "plan.json").write_text(encode(plan), encoding="utf-8")
     if not experiment:
         save(runtime, run, "planning", plan, plan_key)

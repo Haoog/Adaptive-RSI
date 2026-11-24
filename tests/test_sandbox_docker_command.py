@@ -72,7 +72,7 @@ class DockerCheckCommandTest(unittest.TestCase):
     def test_native_write_file_prepares_missing_regression_directory_for_scoped_command(self):
         (self.workspace / ".git").mkdir()
         tools = WorkspaceTools(self.workspace, "implementation", self.workspace / "state", self.config, None, ())
-        tools.scope = ["tests"]
+        tools.load_scope(["tests"])
         args = {"argv": ["true"], "cwd": "."}
         with patch("adaptive_rsi.process.run_process") as run:
             with self.assertRaisesRegex(ValueError, "no approved writable directory: tests"):
@@ -94,6 +94,56 @@ class DockerCheckCommandTest(unittest.TestCase):
             f"type=bind,src={self.workspace / '.rsi-tmp'},dst=/workspace/.rsi-tmp",
             f"type=bind,src={self.workspace / '.git'},dst=/workspace/.git,readonly",
         ])
+
+    def test_native_command_prepares_explicit_directory_before_launch(self):
+        (self.workspace / ".git").mkdir()
+        (self.workspace / "app.py").write_text("value = 1\n")
+        tools = WorkspaceTools(self.workspace, "implementation", self.workspace / "state", self.config, None, ())
+        tools.load_scope({"paths": ["tests"], "directories": ["tests"]})
+        tests = self.workspace / "tests"
+        self.assertFalse(tests.exists())
+        argv = ["python3", "-c", "from pathlib import Path; Path('tests/test_example.py').touch()"]
+
+        def launch(command, *args):
+            self.assertTrue(tests.is_dir())
+            self.assertEqual(list(tests.iterdir()), [])
+            mounts = [command[index + 1] for index, arg in enumerate(command) if arg == "--mount"]
+            self.assertEqual(mounts, [
+                f"type=bind,src={self.workspace},dst=/workspace,readonly",
+                f"type=bind,src={tests},dst=/workspace/tests",
+                f"type=bind,src={self.workspace / '.rsi-home'},dst=/workspace/.rsi-home",
+                f"type=bind,src={self.workspace / '.rsi-tmp'},dst=/workspace/.rsi-tmp",
+                f"type=bind,src={self.workspace / '.git'},dst=/workspace/.git,readonly",
+            ])
+            self.assertEqual(command[-len(argv):], argv)
+            self.assertIn("--read-only", command)
+            return {"exit_code": 0, "error": None, "stdout": "", "stderr": ""}
+
+        with patch("adaptive_rsi.process.run_process", side_effect=launch) as run:
+            self.assertEqual(tools.execute("run_command", {"argv": argv, "cwd": "."})["exit_code"], 0)
+            run.assert_called_once()
+
+    def test_native_command_needs_exact_directory_approval(self):
+        tools = WorkspaceTools(self.workspace, "implementation", self.workspace / "state", self.config, None, ())
+        with self.assertRaisesRegex(RuntimeError, "directory is outside the scope"):
+            tools.load_scope({"paths": ["app.py"], "directories": ["tests"]})
+        tools.load_scope({"paths": ["new/tests"], "directories": ["new/tests"]})
+        with patch("adaptive_rsi.process.run_process") as run, self.assertRaises(FileNotFoundError):
+            tools.execute("run_command", {"argv": ["true"], "cwd": "."})
+            run.assert_not_called()
+        self.assertFalse((self.workspace / "new").exists())
+
+    def test_native_command_does_not_prepare_protected_directory(self):
+        protected = self.workspace / "protected"
+        protected.mkdir()
+        tools = WorkspaceTools(self.workspace, "implementation", self.workspace / "state",
+                               self.config, None, [protected])
+        tools.load_scope({"paths": ["protected/tests"], "directories": ["protected/tests"]})
+        with patch("adaptive_rsi.process.run_process") as run, self.assertRaisesRegex(
+                ValueError, "must be an unprotected workspace path"):
+            tools.execute("run_command", {"argv": ["true"], "cwd": "."})
+            run.assert_not_called()
+        self.assertFalse((protected / "tests").exists())
 
     def test_missing_writable_target_under_protected_directory_fails_closed(self):
         parent = self.workspace / "output"
