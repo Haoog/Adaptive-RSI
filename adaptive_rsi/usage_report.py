@@ -1,12 +1,15 @@
 """按真实调用记录归集任务用量，失败重试和未知用量均保留。"""
+from collections import Counter, defaultdict
 import datetime
 import functools
+from itertools import groupby
 import math
 import statistics
 import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .store import Store
+from .store import Store, decode_evidence
+from .usage import PRICE_FIELDS, estimate, unit_prices
 
 
 DAILY_MAX_DAYS = 93
@@ -319,3 +322,171 @@ def report(store, params):
                                       " ORDER BY c.created DESC,c.id LIMIT ? OFFSET ?", [*args, limit, offset])
         result["call_total"] = summary["calls"]
     return result
+
+
+_AUTOMATIC_FINAL_STATES = frozenset(('completed', 'merged', 'failed', 'cancelled', 'expired', 'obsolete',
+                                     'rejected', 'pr_closed', 'unverified_merge', 'reverted', 'superseded'))
+
+
+def _history_cost(row):
+    prices = unit_prices({key: row[key + '_price'] for key in PRICE_FIELDS})
+    unit = unit_prices({'input': row['unit_price']}).get('input')
+    # Keep malformed prices out of known-cost samples without treating an explicit zero as missing.
+    known_usage = row['usage_known'] == 1 and row['call_state'] in ('completed', 'failed')
+    cost, basis = estimate(row, prices, unit) if known_usage else (None, 'unknown')
+    route = (row['role'], row['provider'], row['model'], row['effort'], row['unit'],
+             (unit, *(prices.get(key) for key in PRICE_FIELDS)))
+    issue = None if cost is not None else 'unknown_price' if known_usage else 'unknown_usage'
+    return route, cost, basis, issue
+
+
+def _route_fields(route):
+    role, provider, model, effort, unit, prices = route
+    return dict(role=role, provider=provider, model=model, effort=effort, call_unit=unit,
+                prices_usd_per_million=dict(zip(('mixed', *PRICE_FIELDS), prices)))
+
+
+def _history_bucket():
+    return {'samples': 0, 'costs': [], 'unknown_usage': 0, 'unknown_price': 0, 'missing_calls': 0,
+            'basis': Counter()}
+
+
+def _add_sample(bucket, costs, bases, issues):
+    bucket['samples'] += 1
+    bucket['basis'].update(bases)
+    for issue in issues:
+        bucket[issue] += 1
+    if not issues:
+        bucket['costs'].append(math.fsum(costs))
+
+
+def _cost_summary(bucket, distinct_tasks=None):
+    interval = (_interval(bucket['costs'])
+                if distinct_tasks is None or distinct_tasks >= REFERENCE_MIN_SAMPLES else None)
+    return {'samples': bucket['samples'], 'known_cost_samples': len(bucket['costs']),
+            'unknown_usage_samples': bucket['unknown_usage'], 'unknown_price_samples': bucket['unknown_price'],
+            'samples_with_missing_calls': bucket['missing_calls'], 'priced_calls_by_basis': dict(bucket['basis']),
+            'cost_usd': interval, 'cost_status': 'historical_interval' if interval else 'insufficient_samples'}
+
+
+def policy_history(db, start, end, project=None):
+    """Observe run-stage cost/quality and whole-task automatic cost from a read-only snapshot."""
+    if not (math.isfinite(start) and math.isfinite(end) and 0 <= start < end <= 4102444800):
+        raise ValueError('Invalid history time range')
+    scope = ' AND p.project=?' if project else ''
+    args = [start, end, start, end, *([project] if project else [])]
+    rows = db.execute('WITH selected AS (SELECT DISTINCT p.task FROM runs p WHERE '
+                      '(p.ended>=? AND p.ended<? OR p.started>=? AND p.started<?)' + scope + ') '
+                      'SELECT t.id AS task,t.project,t.source,t.state AS task_state,t.created AS task_created,'
+                      't.updated AS task_updated,r.id AS run,r.started,r.ended,r.calls AS recorded_calls,r.result,'
+                      'c.id AS call,c.state AS call_state,c.created AS call_created,c.role,c.provider,c.model,c.effort,'
+                      'c.unit,c.usage_known,c.tokens,c.unit_price,' +
+                      ','.join('c.' + field + suffix for suffix in ('_price', '_tokens') for field in PRICE_FIELDS) +
+                      ' FROM selected s JOIN tasks t ON t.id=s.task JOIN runs r ON r.task=t.id '
+                      'LEFT JOIN calls c ON c.run=r.id ORDER BY t.id,r.id,c.id', args)
+    stages, automatic = defaultdict(_history_bucket), defaultdict(_history_bucket)
+    stage_quality, automatic_coverage = defaultdict(Counter), defaultdict(Counter)
+    stage_tasks = Counter()
+    observed_runs = ungrouped_runs = 0
+    for _, task_rows in groupby(rows, key=lambda row: row['task']):
+        task_stage_keys, priced_stage_keys, quality_stage_keys = set(), set(), set()
+        routes, task_costs, task_bases, task_issues = set(), [], [], set()
+        outside, ended_in_window = False, False
+        for _, run_rows in groupby(task_rows, key=lambda row: row['run']):
+            run = [dict(row) for row in run_rows]
+            first = run[0]
+            scope_key = (first['project'], first['source'])
+            ended = first['ended']
+            finished = ended is not None and start <= ended < end
+            ended_in_window |= finished
+            inside = finished and first['started'] is not None and start <= first['started'] <= ended
+            outside |= not inside
+            calls = [row for row in run if row['call'] is not None]
+            missing = not calls or (first['recorded_calls'] or 0) > len(calls)
+            if missing:
+                task_issues.add('missing_calls')
+            run_routes = defaultdict(list)
+            for row in calls:
+                at = row['call_created']
+                if at is None or not start <= at < end:
+                    outside = True
+                    missing = True
+                    continue
+                route, cost, basis, issue = _history_cost(row)
+                run_routes[route].append((cost, basis, issue))
+            if inside:
+                observed_runs += 1
+                ungrouped_runs += not run_routes
+            evidence = decode_evidence(first['result']) if inside else {}
+            decisions = [evidence.get(field, {}).get('decision') for field in ('evaluation', 'review')]
+            passed_checks = decisions == ['pass', 'pass']
+            observed_quality = passed_checks or 'fail' in decisions
+            for route, observations in run_routes.items():
+                costs = [cost for cost, _, _ in observations if cost is not None]
+                bases = [basis for cost, basis, _ in observations if cost is not None]
+                issues = {issue for _, _, issue in observations if issue}
+                if missing:
+                    issues.add('missing_calls')
+                routes.add(route)
+                task_costs.extend(costs)
+                task_bases.extend(bases)
+                task_issues.update(issues)
+                if inside:
+                    key = (*scope_key, route)
+                    _add_sample(stages[key], costs, bases, issues)
+                    task_stage_keys.add(key)
+                    if not issues:
+                        priced_stage_keys.add(key)
+                    if observed_quality:
+                        quality_stage_keys.add(key)
+                        stage_quality[key]['observed'] += 1
+                        stage_quality[key]['passed'] += passed_checks
+        for key in task_stage_keys:
+            stage_tasks[key] += 1
+        for key in priced_stage_keys:
+            stage_quality[key]['priced_tasks'] += 1
+        for key in quality_stage_keys:
+            stage_quality[key]['quality_tasks'] += 1
+        if not (first['source'] or '').startswith('system_') or not ended_in_window:
+            continue
+        coverage = automatic_coverage[scope_key]
+        coverage['tasks_with_ended_attempt'] += 1
+        if (outside or first['task_created'] is None or first['task_created'] < start or
+                first['task_updated'] is None or first['task_updated'] >= end or
+                first['task_state'] not in _AUTOMATIC_FINAL_STATES):
+            coverage['excluded_incomplete_or_window_boundary'] += 1
+            continue
+        key = (*scope_key, tuple(sorted(routes, key=repr)))
+        _add_sample(automatic[key], task_costs, task_bases, task_issues)
+        coverage['eligible_tasks'] += 1
+        coverage['unknown_cost_tasks'] += bool(task_issues)
+    stage_groups = []
+    for (project_id, source, route), bucket in sorted(stages.items(), key=lambda item: repr(item[0])):
+        evidence = stage_quality[(project_id, source, route)]
+        observed, passed = evidence['observed'], evidence['passed']
+        enough_quality = evidence['quality_tasks'] >= REFERENCE_MIN_SAMPLES
+        stage_groups.append(dict(project=project_id, source=source, **_route_fields(route),
+                                 **_cost_summary(bucket, evidence['priced_tasks']),
+                                 distinct_tasks=stage_tasks[(project_id, source, route)],
+                                 known_cost_distinct_tasks=evidence['priced_tasks'],
+                                 quality={'observed_runs': observed, 'passed_runs': passed,
+                                          'missing_runs': bucket['samples'] - observed,
+                                          'distinct_tasks': evidence['quality_tasks'],
+                                          'pass_fraction': passed / observed if enough_quality else None,
+                                          'status': 'observed' if enough_quality else 'insufficient_samples'}))
+    automatic_groups = [dict(project=project_id, source=source, routes=[_route_fields(route) for route in routes],
+                             **_cost_summary(bucket))
+                        for (project_id, source, routes), bucket in sorted(automatic.items(), key=lambda item: repr(item[0]))]
+    return {'format': 1, 'provenance': 'local_sqlite_snapshot',
+            'window': {'start': start, 'end': end, 'project': project}, 'min_samples': REFERENCE_MIN_SAMPLES,
+            'stage_history': {'unit': 'run_stage', 'status': 'observed' if any(
+                group['cost_usd'] or group['quality']['status'] == 'observed' for group in stage_groups)
+                else 'insufficient_samples', 'observed_runs': observed_runs,
+                'runs_without_grouped_calls': ungrouped_runs, 'groups': stage_groups},
+            'automatic_task_cost': {'unit': 'whole_task_all_attempts',
+                                    'status': 'historical_interval' if any(group['cost_usd'] for group in automatic_groups)
+                                    else 'insufficient_samples', 'groups': automatic_groups,
+                                    'coverage': [dict(project=key[0], source=key[1], **value)
+                                                 for key, value in sorted(automatic_coverage.items())]},
+            'interpretation': 'Descriptive observation. Quality is a run-level outcome and may repeat across cohorts. '
+                              'Intervals are historical quartiles of fully priced observations at recorded tariffs.'}

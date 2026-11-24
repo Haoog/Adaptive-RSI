@@ -1,0 +1,18 @@
+{
+  "format": 1,
+  "provenance": "fixed_fixture",
+  "projects": {"a": {"repo": "repo-a"}, "b": {"repo": "repo-b"}, "c": {"repo": "repo-c"}},
+  "mainline_changes": {"repo-a": [125], "repo-b": [], "repo-c": []},
+  "tasks": [
+    {"id": "writer", "project": "a", "source": "goal", "created": 90, "ready_at": 100, "plan_seconds": 0, "work_seconds": 100},
+    {"id": "stale", "project": "a", "source": "goal", "created": 90, "ready_at": 110, "priority": 80, "plan_seconds": 10, "work_seconds": 10},
+    {"id": "fresh", "project": "a", "source": "goal", "created": 90, "ready_at": 135, "priority": 90, "plan_seconds": 15, "work_seconds": 10},
+    {"id": "old", "project": "a", "source": "goal", "created": 80, "ready_at": 100, "eligible_windows": [[100, 150], [155, null]], "priority": 20, "plan_seconds": 0, "work_seconds": 10},
+    {"id": "new", "project": "a", "source": "goal", "created": 195, "ready_at": 195, "priority": 100, "plan_seconds": 0, "work_seconds": 10},
+    {"id": "ordinary", "project": "b", "source": "goal", "created": 100, "ready_at": 160, "plan_seconds": 0, "work_seconds": 10},
+    {"id": "system", "project": "b", "source": "system_issues", "created": 100, "ready_at": 225, "urgency": 1, "urgency_origin": "system", "plan_seconds": 0, "work_seconds": 10},
+    {"id": "user-one", "project": "c", "source": "goal", "created": 100, "ready_at": 150, "urgency": 1, "urgency_origin": "user", "plan_seconds": 0, "work_seconds": 10},
+    {"id": "user-two", "project": "c", "source": "goal", "created": 101, "ready_at": 151, "urgency": 1, "urgency_origin": "user", "plan_seconds": 0, "work_seconds": 10},
+    {"id": "unknown", "project": "c", "source": "goal", "created": 102, "ready_at": 152, "urgency": 1, "plan_seconds": 0, "work_seconds": 10}
+  ]
+}

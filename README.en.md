@@ -118,6 +118,9 @@ Long-term capability improvement still requires real tasks and sustained experim
 
 Task details collect changes, checks, usage, reused stages and the delivery commit, with optional Helpful, Unnecessary or False positive feedback. Ratings are observational and do not automatically change ranking or strategies; original-merge verification and later-mainline regressions are counted separately. Model pricing supports input, output and cache components with blended-price fallback; usage details provide historical ranges only when enough comparable samples exist. Missing usage and prices remain unknown. Failed usage or detail refreshes identify retained data and the last successful update. See the [reliable improvement loop](RELIABILITY.en.md) for execution and recovery rules.
 
+Use the [offline scheduling and cost evaluation](docs/policy-evaluation.en.md) to replay a redacted queue or report stage history and automatic task cost ranges from a local snapshot.
+
+
 ## Documentation
 
 | Topic | Guide |

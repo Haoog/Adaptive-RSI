@@ -1749,10 +1749,8 @@ class Runtime(Maintenance):
                 waiting.setdefault(key, now)
             def rank(pair):
                 key = pair[0]["id"]
-                age = max(0, now - waiting[key])
-                if age >= 3600:
-                    return (0, -age, services[key])
-                return (1, counts[key] / max(1, pair[1]["schedule"]["weight"]), services[key])
+                return self.store.project_claim_key(now, waiting[key], counts[key],
+                                                    pair[1]["schedule"]["weight"], services[key])
             project, config = min(ready, key=rank)
             previous_pressure = self.resource_pressure.projects.get(project['id'])
             pressure = self.resource_pressure.check(self.store.root, project, config)
