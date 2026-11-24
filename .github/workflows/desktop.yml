@@ -104,11 +104,80 @@ jobs:
       - name: 测试桌面构建配置
         if: needs.changes.outputs.mode == 'full'
         run: npm --prefix desktop test
-      - name: 构建应用和完整安装包
+      - name: 构建应用并运行 Rust 测试
         if: needs.changes.outputs.mode == 'full'
         run: |
           npm run --prefix desktop build
           cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
+      - name: 验证 FAT32 和 ExFAT 真卷备份
+        if: needs.changes.outputs.mode == 'full'
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          scratch=$(mktemp -d "$RUNNER_TEMP/rsi-backup-volumes.XXXXXX")
+          disk=
+          detach_volume() {
+            if [[ -n "$disk" ]]; then
+              hdiutil detach "$disk" || hdiutil detach -force "$disk" || return 1
+              disk=
+            fi
+          }
+          cleanup() {
+            local status=$?
+            if detach_volume; then
+              rm -rf -- "$scratch" || status=1
+            else
+              echo "::error::Could not detach the backup test image on $disk"
+              status=1
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          fixture="$scratch/backup.sqlite3"
+          sqlite3 -batch -bail "$fixture" <<'SQL'
+          CREATE TABLE backup_fixture (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+          INSERT INTO backup_fixture VALUES (1, 'synthetic backup data');
+          SQL
+          test "$(sqlite3 -batch -bail "$fixture" 'PRAGMA integrity_check;')" = ok
+
+          test_name=tests::backup_saves_on_real_volume_without_hard_links
+          result=0
+          for filesystem in FAT32 ExFAT; do
+            echo "Testing backup on $filesystem"
+            image="$scratch/$filesystem.img"
+            mkfile -n 512m "$image"
+            disk=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$image" |
+              awk '$1 ~ /^\/dev\/disk[0-9]+$/ {print $1}')
+            [[ "$disk" =~ ^/dev/disk[0-9]+$ ]]
+            # Explicitly format the raw image. eraseDisk also mounts the new partition.
+            diskutil eraseDisk "$filesystem" "RSI$filesystem" MBRFormat "$disk"
+            diskutil info -plist "${disk}s1" > "$scratch/volume.plist"
+            actual=$(plutil -extract FilesystemName raw "$scratch/volume.plist")
+            expected=$filesystem
+            if [[ "$filesystem" == FAT32 ]]; then
+              expected='MS-DOS FAT32'
+            fi
+            test "$actual" = "$expected"
+            mount_point=$(plutil -extract MountPoint raw "$scratch/volume.plist")
+            test -d "$mount_point" && test -w "$mount_point" || exit 1
+
+            if ! RSI_TEST_NO_HARDLINK_DIR="$mount_point" RSI_TEST_BACKUP_FIXTURE="$fixture" \
+              cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml \
+                --bin adaptive-rsi-desktop -- "$test_name" --ignored --exact --format pretty |
+                tee "$scratch/test.log" ||
+              ! grep -Fx "test $test_name ... ok" "$scratch/test.log"; then
+              echo "::error::Real-volume backup test did not pass on $filesystem"
+              result=1
+            fi
+            detach_volume
+          done
+          exit "$result"
+      - name: 验证应用并生成完整安装包
+        if: needs.changes.outputs.mode == 'full'
+        run: |
           python3 scripts/test_updater_signing.py
           python3 -B scripts/upgrade_harness.py --stage receipt authorization isolation --app "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app"
           codesign --verify --deep --strict "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app"
