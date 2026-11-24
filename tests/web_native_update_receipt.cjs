@@ -10,7 +10,8 @@ function fixture({runtime, snapshot={state:'idle'}, stored, receiptError, cancel
   calls.push(args);
   if(args.action==='authorize'){
    if(authorizeError)throw Error(authorizeError);
-   return Object.assign({state:'idle'},snapshot,{authorization_revision:args.revision});
+   return Object.assign({state:'idle'},snapshot,{authorization_revision:args.revision,
+    authorization:{policy:args.policy,scope:args.versionScope,window:args.installationWindow}});
   }
   if(args.action==='receipt'){
    if(receiptError)throw Error(receiptError);

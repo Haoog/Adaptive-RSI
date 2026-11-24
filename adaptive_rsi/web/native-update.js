@@ -19,7 +19,7 @@ window.RSINativeUpdate=(()=>{
  // revision it was approved under. The native side rejects a stale binding, and
  // its counter survives a webview reload, so it is adopted instead of restarted.
  let settingsAuthorization=null;
- let revision=0,authorizationError='',installPending=false,initialAuthorization=null;
+ let revision=0,appliedRevision=0,authorizationError='',installPending=false,initialAuthorization=null;
  let authorizationRetryAt=null,authorizationFailures=0;
  const enabled=()=>!!window.RSIDesktop;
  const preference=()=>policy;
@@ -90,9 +90,8 @@ window.RSINativeUpdate=(()=>{
  }
  function errorText(code){return t(errors[code]||'更新未完成，请重试或手动安装。');}
  function errorCode(){return authorizationError||snapshot.error_code||'';}
- // Settings are pushed to the native side under a fresh revision. The reply must
- // echo that exact revision; anything else means the native side still runs the
- // previous policy and no install may start on the strength of this change.
+ // An install needs confirmation that the native side applied this revision
+ // and its policy, version scope and installation window.
  async function syncAuthorization(){
   if(!enabled())return false;
   adoptRevision(snapshot);
@@ -110,10 +109,11 @@ window.RSINativeUpdate=(()=>{
     reported=Number(result&&result.authorization_revision);
    }
    if(pending!==revision)return true;
-   if(reported!==pending){
+   const applied=result&&result.authorization;
+   if(reported!==pending||!applied||applied.policy!==policy||applied.scope!==versionScope||applied.window!==installWindow){
     adoptRevision(result);authorizationError='update_authorization_failed';return false;
    }
-   authorizationError='';return true;
+   appliedRevision=pending;authorizationError='';return true;
   }catch(error){if(pending!==revision)return true;authorizationError=String(error&&error.message||error||'update_authorization_failed');return false;}
  }
  // A settings change revokes a waiting install (or the old manual-policy download
@@ -225,8 +225,8 @@ window.RSINativeUpdate=(()=>{
   ensurePanel();
   const n=nodes,phase=phaseOf(snapshot);
   observe(snapshot);
-  // Every native snapshot reports the revision it holds; adopt it so an install
-  // binds to the stored authorization instead of a number this document guessed.
+  // Polls advance the counter for the next settings request. Only an authorize
+  // reply can confirm the revision for an install.
   adoptRevision(snapshot);
   // Polling can call this every second; only changed text is written, so an
   // unchanged snapshot costs comparisons instead of a full panel rewrite.
@@ -299,16 +299,17 @@ window.RSINativeUpdate=(()=>{
   try{
    // A status tick can reveal a ready update before the delayed startup auth
    // sync. If the user installs in that window, authorize first with this action.
-   if(action==='install'&&['interactive','complete'].includes(document.readyState)){
-    if(!initialAuthorization){
+   if(action==='install'){
+    const observedRevision=Number(snapshot.authorization_revision);
+    if(!initialAuthorization||(observedRevision>appliedRevision&&observedRevision>=revision)){
      trackAuthorization(syncAuthorization());
     }
-    if(!await waitForAuthorization()||authorizationError){
+    if(!await waitForAuthorization()||authorizationError||appliedRevision!==revision){
      if(!authorizationError)authorizationError='update_authorization_failed';
      return;
     }
    }
-   snapshot=await window.RSIDesktop.invoke('native_update',{action,automatic,installationWindow:action==='install'?(automatic?installWindow:'any'):null,revision:action==='install'?revision:null});
+   snapshot=await window.RSIDesktop.invoke('native_update',{action,automatic,installationWindow:action==='install'?(automatic?installWindow:'any'):null,revision:action==='install'?appliedRevision:null});
    if(snapshot.state==='error')throw Error(snapshot.error_code||'update_check_failed');
    if(action==='install'){failureCounts.install=0;installRetryAt=0;}
    if(['check','download'].includes(action)){

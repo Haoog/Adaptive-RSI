@@ -12,7 +12,9 @@ const {chromium}=require('playwright');
   const page=await browser.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));
   await page.addInitScript(()=>{
    localStorage.setItem('rsi-native-update-policy','manual');
-   window.RSIDesktop={invoke:async(command,args)=>command==='native_update'?{state:'ready',version:'0.5.125',current_version:'0.5.124',notes:'Fixture release notes'}:{}};
+   window.RSIDesktop={invoke:async(command,args)=>command==='native_update'?{state:'ready',version:'0.5.125',current_version:'0.5.124',notes:'Fixture release notes',
+    ...(args.action==='authorize'?{authorization_revision:args.revision,
+     authorization:{policy:args.policy,scope:args.versionScope,window:args.installationWindow}}:{})}:{}};
   });
   await page.goto(url);await waitForPausedProject(page);
   await page.locator('#project-settings').click();await page.locator('#advanced-settings > summary').click();

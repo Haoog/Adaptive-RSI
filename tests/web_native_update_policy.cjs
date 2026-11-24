@@ -1,7 +1,7 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs');
 
-function fixture({cancelError,authorizeError,wait=false,deferRevision=0,deferredResult,storePreference=()=>{},nativeRevision=0}={}){
+function fixture({cancelError,authorizeError,appliedOverride,readyState,wait=false,deferRevision=0,deferredResult,storePreference=()=>{},nativeRevision=0}={}){
  let panel,finish,release;const calls=[];let stored=nativeRevision;
  const el=(tag,text,className)=>({tag,className,textContent:text||'',children:[],append(...nodes){this.children.push(...nodes);},setAttribute(){},after(node){panel=node;}});
  const invoke=async(_,args)=>{
@@ -13,7 +13,8 @@ function fixture({cancelError,authorizeError,wait=false,deferRevision=0,deferred
    // revision that is not strictly newer, replying with the one it still holds.
    if(args.revision<=stored)return{state:'waiting_idle',authorization_revision:stored};
    stored=args.revision;
-   const reply={state:'waiting_idle',authorization_revision:args.revision};
+   const reply={state:'waiting_idle',authorization_revision:args.revision,
+    authorization:{policy:args.policy,scope:args.versionScope,window:args.installationWindow,...appliedOverride}};
    if(args.revision!==deferRevision)return reply;
    // Simulate an out-of-order reply from an older revision.
    return new Promise((resolve,reject)=>{release=()=>deferredResult instanceof Error?reject(deferredResult):resolve(deferredResult||reply);});
@@ -31,7 +32,7 @@ function fixture({cancelError,authorizeError,wait=false,deferRevision=0,deferred
   return{state:'waiting_idle',authorization_revision:stored};
  };
  const context={window:{RSIDesktop:{invoke,ready:Promise.resolve({kind:'local',owned:true})}},
-  document:{activeElement:null,addEventListener(){},documentElement:{lang:'zh-CN'}},
+  document:{activeElement:null,readyState,addEventListener(){},documentElement:{lang:'zh-CN'}},
   el,$:()=>el('anchor'),t:x=>x,localRead:key=>key==='rsi-native-update-policy'?'automatic':null,
   localStorage:{setItem:storePreference},safe:fn=>fn(),setTimeout(){},setInterval(){},Date,Math,Number,String,Error,JSON};
  vm.runInNewContext(fs.readFileSync('adaptive_rsi/web/native-update.js','utf8'),context);
@@ -40,7 +41,7 @@ function fixture({cancelError,authorizeError,wait=false,deferRevision=0,deferred
  const policy=()=>all(panel).find(node=>node.tag==='label').children.find(node=>node.tag==='select');
  const text=()=>all(panel).map(node=>node.textContent).join(' ');
  return{api,calls,policy,text,storageWarning:()=>all(panel).find(node=>node.textContent.includes('偏好未保存')),selects:()=>all(panel).filter(node=>node.tag==='select'),
-  nativeRevision:()=>stored,resolve:value=>finish(value),release:()=>release()};
+  nativeRevision:()=>stored,advanceNativeRevision:value=>{stored=value;},resolve:value=>finish(value),release:()=>release()};
 }
 
 test('tightening automatic to download cancels an automatic install waiting to replace',async()=>{
@@ -53,7 +54,7 @@ test('tightening automatic to download cancels an automatic install waiting to r
  assert.ok(actions.includes('authorize'),actions.join(','));
  assert.ok(actions.includes('cancel'),actions.join(','));
  assert.ok(actions.indexOf('authorize')<actions.indexOf('cancel'),'the new revision is stored before the old install is revoked');
- assert.equal(f.calls.find(args=>args.action==='authorize').policy,'download');
+ assert.equal(f.calls.find(args=>args.action==='authorize'&&args.revision>1).policy,'download');
  f.resolve({state:'ready'});await pending;
 });
 
@@ -72,7 +73,7 @@ test('a failed cancel is surfaced instead of pretending the replacement stopped'
 });
 
 test('a rejected authorization still revokes the waiting install and is reported',async()=>{
- const f=fixture({authorizeError:'update_authorization_failed',wait:true});
+ const f=fixture({authorizeError:args=>args.revision>1?'update_authorization_failed':null,wait:true});
  const pending=f.api.run('install',true);await f.api.tick();
  const policy=f.policy();policy.value='download';policy.onchange();
  for(let i=0;i<20&&!f.calls.some(args=>args.action==='cancel');i++)await new Promise(resolve=>setImmediate(resolve));
@@ -139,7 +140,7 @@ test('an install after a reload carries the revision the native side still holds
  await f.api.tick();
  await f.api.run('install');
  const install=f.calls.find(args=>args.action==='install');
- assert.equal(install.revision,3);
+ assert.equal(install.revision,4);
  assert.equal(f.api.errorCode(),'');
 });
 
@@ -164,4 +165,23 @@ test('a successful preference save retries a previously failed write and clears 
  assert.equal(f.storageWarning().hidden,true);
  assert.equal(saved.get('rsi-native-update-scope'),'minor');
  assert.equal(saved.get('rsi-native-update-window'),'night');
+});
+
+for(const appliedOverride of [{policy:'download'},{scope:'stable'},{window:'night'}]){
+ test(`matching revision with different ${Object.keys(appliedOverride)[0]} cannot start an install`,async()=>{
+  const f=fixture({appliedOverride,readyState:'complete'});
+  await f.api.run('install');
+  assert.equal(f.api.errorCode(),'update_authorization_failed');
+  assert.equal(f.calls.some(args=>args.action==='install'),false);
+ });
+}
+
+test('install reauthorizes instead of borrowing a revision observed only by polling',async()=>{
+ const f=fixture();
+ await f.api.run('install');
+ f.advanceNativeRevision(4);
+ await f.api.tick();
+ await f.api.run('install');
+ assert.deepEqual(f.calls.filter(args=>args.action==='authorize').map(args=>args.revision),[1,5]);
+ assert.deepEqual(f.calls.filter(args=>args.action==='install').map(args=>args.revision),[1,5]);
 });

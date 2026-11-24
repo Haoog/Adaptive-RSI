@@ -1,6 +1,11 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs');
 
+function appliedAuthorization(args){
+ return {authorization_revision:args.revision,
+  authorization:{policy:args.policy,scope:args.versionScope,window:args.installationWindow}};
+}
+
 // Deterministic timers: the panel schedules itself with setTimeout, so every read
 // and every pending timer can be asserted instead of waited for.
 function fakeClock(start=1700000000000){
@@ -31,7 +36,7 @@ function fakeClock(start=1700000000000){
 function fixture({visibility='visible',readyState,policy,versionScope='patch',respond}={}){
  let panel;const saved=new Map(),calls=[],listeners={},writes={total:0,option:0};
  const clock=fakeClock();
- const reply=respond||(args=>args.action==='authorize'?{authorization_revision:args.revision}:{state:'latest'});
+ const reply=respond||(args=>args.action==='authorize'?appliedAuthorization(args):{state:'latest'});
  const counted=(node,kind)=>{
   let text='';
   Object.defineProperty(node,'textContent',{get(){return text;},set(value){text=String(value);writes.total++;if(kind)writes[kind]++;}});
@@ -46,7 +51,7 @@ function fixture({visibility='visible',readyState,policy,versionScope='patch',re
   addEventListener(type,handler){(listeners[type]||(listeners[type]=[])).push(handler);},
   createElement:()=>el('a')};
  const invoke=async(_,args)=>{
-  calls.push({action:args.action,at:clock.now()});
+  calls.push({...args,at:clock.now()});
   return reply(args);
  };
  const context={
@@ -117,7 +122,7 @@ test('a pending initial authorization does not block status polling or start aut
  assert.equal(f.button('取消').hidden,false);
  assert.equal(f.pendingTimers(),1);
  assert.equal(f.calls.filter(call=>['check','download','install'].includes(call.action)).length,0);
- authorize({authorization_revision:1});
+ authorize(appliedAuthorization(f.calls.find(call=>call.action==='authorize')));
  await f.flush();
  assert.equal(f.pendingTimers(),1,'authorization completion does not stack timers');
 });
@@ -133,7 +138,7 @@ test('automatic actions wait for the initial authorization and resume after it c
  f.boot();
  await f.advance(15000);
  assert.equal(f.calls.filter(call=>call.action==='download').length,0);
- authorize({authorization_revision:1});
+ authorize(appliedAuthorization(f.calls.find(call=>call.action==='authorize')));
  await f.flush();
  assert.equal(f.calls.filter(call=>call.action==='download').length,1,'the pending action resumes without another timer');
 });
@@ -236,7 +241,7 @@ test('a long automatic download keeps status reads, progress and cancel live',as
  const gate=new Promise(()=>{});
  let started=false,bytes=0;
  const f=fixture({respond:args=>{
-  if(args.action==='authorize')return {authorization_revision:args.revision};
+  if(args.action==='authorize')return appliedAuthorization(args);
   if(args.action==='download'){started=true;return gate;}
   return started?{state:'downloading',bytes:bytes+=1000,total:100000}:{state:'available',version:'1.2.4',current_version:'1.2.3'};
  }});
@@ -259,7 +264,7 @@ test('a user-started download replaces the pending idle timer',async()=>{
  const gate=new Promise(()=>{});
  let started=false;
  const f=fixture({respond:args=>{
-  if(args.action==='authorize')return {authorization_revision:args.revision};
+  if(args.action==='authorize')return appliedAuthorization(args);
   if(args.action==='download'){started=true;return gate;}
   return started?{state:'downloading',bytes:25000,total:100000}:{state:'latest',version:'1.2.3'};
  }});
@@ -279,7 +284,7 @@ test('a user-started download replaces the pending idle timer',async()=>{
 test('a failed status read retries after its backoff instead of waiting for the idle cadence',async()=>{
  let calls=0;
  const f=fixture({respond:args=>{
-  if(args.action==='authorize')return {authorization_revision:args.revision};
+  if(args.action==='authorize')return appliedAuthorization(args);
   calls++;
   if(calls===2)throw Error('temporary status failure');
   return {state:'latest'};
@@ -299,7 +304,7 @@ test('a failed status read retries after its backoff instead of waiting for the 
 
 test('a manual install before startup authorization sync authorizes before invoking install',async()=>{
  const f=fixture({readyState:'interactive',respond:args=>{
-  if(args.action==='authorize')return {authorization_revision:args.revision};
+  if(args.action==='authorize')return appliedAuthorization(args);
   return {state:'ready'};
  }});
  await f.api.run('install');
@@ -310,7 +315,7 @@ test('a manual install before startup authorization sync authorizes before invok
 test('a DOMContentLoaded startup tick cannot run an automatic action before authorization sync',async()=>{
  let authorized=false;
  const f=fixture({readyState:'interactive',policy:'automatic',versionScope:'stable',respond:args=>{
-  if(args.action==='authorize'){authorized=true;return {authorization_revision:args.revision};}
+  if(args.action==='authorize'){authorized=true;return appliedAuthorization(args);}
   if(args.action==='status')return {state:'ready',current_version:'1.2.3',version:'1.2.4'};
   if(args.action==='install'&&!authorized)return {state:'error',error_code:'update_authorization_invalid'};
   return {state:'restarting'};
@@ -334,7 +339,7 @@ test('automatic install resumes after startup authorization retries with backoff
   if(args.action==='authorize'){
    revisions.push(args.revision);
    if(revisions.length<3)throw Error('update_authorization_failed');
-   return {authorization_revision:args.revision};
+   return appliedAuthorization(args);
   }
   if(args.action==='install'){
    assert.equal(args.revision,revisions.at(-1));
@@ -364,7 +369,7 @@ test('a failed startup authorization can recover through changed settings and ma
  let authorizations=0;
  const f=fixture({readyState:'complete',respond:args=>{
   if(args.action==='authorize'&&++authorizations===1)throw Error('authorization unavailable');
-  if(args.action==='authorize')return {authorization_revision:args.revision};
+  if(args.action==='authorize')return appliedAuthorization(args);
   if(args.action==='status')return {state:'ready',current_version:'1.2.3',version:'1.2.4'};
   if(args.action==='install')return {state:'restarting'};
   return {state:'latest'};
@@ -405,7 +410,7 @@ test('manual install retries authorization after an earlier authorization failur
  let authorizations=0;
  const f=fixture({readyState:'complete',respond:args=>{
   if(args.action==='authorize'&&++authorizations===1)throw Error('authorization unavailable');
-  if(args.action==='authorize')return {authorization_revision:args.revision};
+  if(args.action==='authorize')return appliedAuthorization(args);
   if(args.action==='status')return {state:'ready',current_version:'1.2.3',version:'1.2.4'};
   if(args.action==='install')return {state:'restarting'};
   return {state:'latest'};
@@ -432,7 +437,7 @@ test('concurrent manual install clicks cannot bypass pending authorization',asyn
  await f.flush();
  assert.equal(f.calls.filter(call=>call.action==='authorize').length,1);
  assert.equal(f.calls.filter(call=>call.action==='install').length,0);
- authorize({authorization_revision:1});
+ authorize(appliedAuthorization(f.calls.find(call=>call.action==='authorize')));
  await Promise.all([first,second]);
  assert.equal(f.calls.filter(call=>call.action==='install').length,1,'concurrent clicks start only one install after authorization succeeds');
 });

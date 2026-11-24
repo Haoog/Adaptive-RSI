@@ -103,14 +103,26 @@ fn supported_remote_api(version: u64) -> bool {
     matches!(version, 1 | 2)
 }
 
+fn update_redirect_allowed(url: &reqwest::Url, hops: usize) -> bool {
+    url.scheme() == "https" && hops <= 5 && url.host_str().is_some_and(|host| {
+        let name = host.trim_end_matches('.');
+        if name == "localhost" || name.ends_with(".localhost") { return false; }
+        !host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok_and(|ip| {
+            let ip = match ip {
+                std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(ip.into(), Into::into),
+                ip => ip,
+            };
+            ip.is_loopback() || ip.is_unspecified()
+        })
+    })
+}
+
 fn update_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() > 5 {
-            attempt.error("too many redirects")
-        } else if attempt.url().scheme() == "https" {
+        if update_redirect_allowed(attempt.url(), attempt.previous().len()) {
             attempt.follow()
         } else {
-            attempt.error("updater redirects must use HTTPS")
+            attempt.error("updater redirect refused")
         }
     })
 }
