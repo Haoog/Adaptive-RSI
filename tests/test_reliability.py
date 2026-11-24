@@ -488,6 +488,11 @@ class ReliabilityTest(unittest.TestCase):
         self.assertIn("Saved implementation evidence changed", json.loads(row["result"])["reason"])
         self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 1)
         self.assertFalse((self.run_directory(second) / "resume.patch").exists())
+        from adaptive_rsi.recovery import task_recovery
+        events = task_recovery(self.store, {"id": task, "project": self.project})["events"]
+        implementation = [event for event in events if event["stage"] == "implementation"]
+        self.assertEqual(implementation, [{"stage": "implementation", "kind": "stage_invalidated",
+                                           "reason": "patch_hash_changed", "from_run": run["id"]}])
 
     def test_legacy_implementation_checkpoint_without_patch_is_reimplemented(self):
         """只有 hash 的旧记录不可重放：作废这一项后重新实现，而不是让重试崩掉。"""
@@ -2012,6 +2017,155 @@ class ReliabilityTest(unittest.TestCase):
         self.runtime.request(self.project, "light")
         self.runtime.process(self.store.claim(self.project, self.runtime.config(self.project)))
         self.assertEqual([role for role, _ in self.runtime.agent.roles].count("analysis"), 1)
+
+    def test_declared_module_paths_trigger_only_matching_inspection(self):
+        class SyntheticScan(FakeAgent):
+            malformed = False
+
+            def invoke(self, role, prompt, *args, **kwargs):
+                self.roles.append((role, json.loads(prompt.rsplit("\n", 1)[1])))
+                return {} if self.malformed else {"findings": []}
+
+        def commit_file(path):
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("# synthetic change\n")
+            git(self.repo, "add", path)
+            git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", path)
+
+        def scan(task, state="completed", origin="manual_scan"):
+            run = self.store.claim(self.project, self.runtime.config(self.project))
+            self.assertIsNotNone(run)
+            self.assertEqual(run["task"], task)
+            self.runtime.process(run)
+            row = self.store.one("SELECT state,origin,result FROM runs WHERE id=?", (run["id"],))
+            self.assertEqual(row["state"], state, row["result"])
+            self.assertEqual(row["origin"], origin)
+            return json.loads(row["result"])
+
+        def request():
+            return self.runtime.request(self.project, "light")
+
+        self.runtime.agent = SyntheticScan()
+        self.runtime.configure({"inspection": {"module_paths": [
+            {"cwd": "services/api", "paths": ["shared/schema", "package-lock.json"]}]}}, self.project)
+        module = {"cwd": "services/api", "language": "Python", "manifest": "services/api/pyproject.toml"}
+        with patch("adaptive_rsi.runtime.detect", return_value={"modules": [module], "checks": []}):
+            task = request()
+            self.assertEqual(request(), task)
+            scan(task)
+            self.assertIsNone(self.store.claim(self.project, self.runtime.config(self.project)))
+            scan(request())
+            commit_file("shared/schema-other/file.py")
+            scan(request())
+            self.assertEqual(len(self.runtime.agent.roles), 1)
+
+            commit_file("shared/schema/file.py")
+            self.runtime.agent.malformed = True
+            failed = scan(request(), state="blocked")
+            self.assertEqual(failed["failure"]["code"], "inspection_malformed")
+            self.runtime.agent.malformed = False
+            self.runtime.retry(task)
+            scan(task, origin="manual_retry")
+            scan(request())
+            self.assertEqual(len(self.runtime.agent.roles), 3)
+
+            commit_file("services/api/handler.py")
+            scan(request())
+            commit_file("package-lock.json")
+            scan(request())
+        payloads = [data for _, data in self.runtime.agent.roles]
+        self.assertEqual([data["changed_paths"] for data in payloads],
+                         [None, ["shared/schema/file.py"], ["shared/schema/file.py"],
+                          ["services/api/handler.py"], ["package-lock.json"]])
+        self.assertEqual(payloads[-1]["selected_module"]["dependency_paths"], ["package-lock.json", "shared/schema"])
+
+    def test_cited_file_is_read_before_the_context_budget_is_spent(self):
+        (self.repo / "aaa.py").write_text("# noise long enough to spend the content budget\n")
+        quote = "return a - b"
+        with patch("adaptive_rsi.context._INDEX_BYTES", 36):
+            mapping = code_map(self.repo, "noise", limit=1, evidence=[("calculator.py", quote)])
+        self.assertEqual(mapping["files"][0]["path"], "calculator.py")
+        self.assertIn({"line": 2, "declaration": "    " + quote}, mapping["files"][0]["anchors"])
+
+    def test_cooldown_only_waits_persist_and_stop_after_three_deferrals(self):
+        from adaptive_rsi.provider_health import ModelFailure, ProviderHealth
+        task, run = self.claim()
+        config = self.runtime.config(self.project)
+        provider = config["models"]["planning"]["provider"]
+        health = ProviderHealth(self.store)
+        rate_limit = ModelFailure("HTTP 429 from synthetic provider", "rate_limit")
+        rate_limit.retry_after = 3600
+        health.record(config, provider, self.project, rate_limit)
+        latest = health.status(config, provider, self.project)["retry_at"]
+
+        def admit(*_):
+            health.require(config, provider, self.project)
+            self.fail("local admission should stop the candidate")
+
+        with patch.object(self.runtime, "execute_candidate", side_effect=admit):
+            for attempt in range(4):
+                # A billing reservation alone does not prove a dispatched call.
+                self.store.reserve_call(self.project, run["id"], "planning", config["models"]["planning"], config)
+                self.runtime.process(run)
+                reopened = Store(self.store.root)
+                try:
+                    row = reopened.one("SELECT * FROM tasks WHERE id=?", (task,))
+                finally:
+                    reopened.close()
+                self.assertEqual((row["infra_retries"], row["cooldown_waits"], row["attempts"]),
+                                 (0, min(3, attempt + 1), 0))
+                problem = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])["failure"]
+                self.assertEqual(problem["remote_attempt"], False)
+                if attempt == 3:
+                    self.assertEqual(row["state"], "blocked")
+                    self.assertTrue(problem["auto_retry_exhausted"])
+                    break
+                self.assertEqual((row["state"], row["available"], problem["retry_kind"]),
+                                 ("queued", latest, "provider_cooldown"))
+                self.assertIsNone(self.store.claim(self.project, config))
+                # Simulate independent renewals of the shared account cooldown.
+                self.store.execute("UPDATE tasks SET available=0 WHERE id=?", (task,))
+                run = self.store.claim(self.project, config)
+        self.assertEqual(health.status(config, provider, self.project)["failures"], 1)
+        self.runtime.retry(task)
+        next_run = self.store.claim(self.project, config)
+        self.assertEqual(next_run["origin"], "manual_retry")
+        self.assertEqual(self.store.one("SELECT cooldown_waits FROM tasks WHERE id=?", (task,))["cooldown_waits"], 0)
+
+    def test_dispatched_call_with_later_cooldown_preserves_infra_retry_and_cancellation(self):
+        from adaptive_rsi.provider_health import ModelFailure, ProviderHealth
+        task, run = self.claim()
+        config = self.runtime.config(self.project)
+        route = config["models"]["planning"]
+        health = ProviderHealth(self.store)
+        rate_limit = ModelFailure("HTTP 429 from synthetic provider", "rate_limit")
+        rate_limit.retry_after = 3600
+        health.record(config, route["provider"], self.project, rate_limit)
+        cancelled = False
+
+        def invoke_then_require(active, *_):
+            call = self.store.reserve_call(self.project, active["id"], "planning", route, config)
+            self.store.execute("UPDATE calls SET remote_attempt=1 WHERE id=?", (call,))
+            if cancelled:
+                self.runtime.cancel_task(task)
+            health.require(config, route["provider"], self.project)
+
+        with patch.object(self.runtime, "execute_candidate", side_effect=invoke_then_require):
+            self.runtime.process(run)
+            row = self.store.one("SELECT state,available,infra_retries,cooldown_waits FROM tasks WHERE id=?", (task,))
+            self.assertEqual((row["state"], row["infra_retries"], row["cooldown_waits"]), ("queued", 1, 0))
+            self.assertEqual(row["available"], health.status(config, route["provider"], self.project)["retry_at"])
+            problem = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])["failure"]
+            self.assertTrue(problem["remote_attempt"])
+            self.assertEqual(problem["retry_kind"], "infrastructure_retry")
+            self.runtime.retry(task)
+            cancelled = True
+            run = self.store.claim(self.project, config)
+            self.runtime.process(run)
+        self.assertEqual(self.store.one("SELECT state,infra_retries,cooldown_waits FROM tasks WHERE id=?", (task,)),
+                         {"state": "cancelled", "infra_retries": 0, "cooldown_waits": 0})
+        self.assertIsNone(self.store.claim(self.project, config))
 
     def test_due_scan_yields_to_an_existing_repair_backlog(self):
         self.runtime.configure({"sources": {"inspection": True, "issues": False}}, self.project)

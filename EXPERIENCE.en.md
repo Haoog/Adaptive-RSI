@@ -40,6 +40,18 @@ Performance tasks freeze a metric, unit, target, tolerance and direction before 
 
 With automatic promotion off, verified candidates remain in a ready state and can be enabled manually after confirmation. Only ready candidates are accepted; enabling replaces the stable strategy of the same project and kind, starts limited monitoring, preserves the paired evidence and rolls back step by step through the immediately preceding verified strategy. The page shows used/limit exposure per split and separates independent-case counts from total paired runs. Exhausted exposure explains how to import new cases or raise `evolution.max_holdout_uses` instead of only reporting insufficient samples. Rollbacks, imports and promotions refresh candidates and statistics immediately; other polling keeps its cache interval.
 
+### Module inspection triggers
+
+For a multi-module repository, set `inspection.module_paths` in the project's advanced JSON settings. `cwd` identifies a detected module and `paths` lists repository-relative dependency files or shared directories. For example:
+
+```json
+{"inspection":{"module_paths":[{"cwd":"services/api","paths":["shared/contracts","package-lock.json"]}]}}
+```
+
+Nested modules keep their own directory in scope. For `cwd` set to `.`, `paths` defines the root module's explicit scope. Paths match at file or directory boundaries. Modules without a rule keep their detected scope. First scans, unavailable commit diffs, and independent signals such as CI can still trigger inspection. Inspection prioritizes shared code paths. Text matches serve as related-work hints. Distinct source quotes retain separate tasks.
+
+**Run source and stage recovery** in task details shows the latest run source, saved checkpoints from the latest two runs, confirmed stage reuse and its source, invalidation reasons, and the first execution point. A task waiting for its next run is marked for fresh verification. Historical runs with no source evidence are marked accordingly. Provider admission cooldown has a separate limit on deferrals. A run that already dispatched a provider call uses infrastructure backoff. The queue persists wait times and honors cancellation.
+
 ## Results and attention
 
 Task details load the latest run first and fetch historical runs on expansion. Current state updates periodically; task URLs support direct navigation. Saved checkpoints are distinguished from actual execution. No fabricated percentages or completion estimates are shown. Results include independent before/after acceptance, review findings and readable diffs; original evidence is preserved. Unbroken long text and long URLs in sources, evidence and revisions wrap inside the detail instead of scrolling horizontally.

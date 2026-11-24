@@ -91,6 +91,7 @@ Data and diagnostics shows recent backups and restore checks on the current mach
 ## Core Capabilities
 
 - **Continuous discovery:** hourly checks for bugs, feature gaps, performance, usability, and maintenance work, with rotating code modules. Sync GitHub Issues incrementally or add a goal at any time.
+- **Run recovery:** task details show the latest run source, stage checkpoints, and recorded reuse and invalidation. Project advanced settings support dependency files and shared directories for module inspection.
 - **Value gate:** assess current evidence, duplicates, expected benefit, cost, and the impact of doing nothing before implementation.
 - **Isolation and verification:** implementation and review use separate contexts. The host runs new behavior tests in isolation on the baseline and candidate, then runs frozen regression and full-candidate checks. Unsupported runners, high-risk, and performance tasks use independent acceptance; model claims do not establish success.
 - **Code review:** check correctness, security, maintainability, architecture, tests, and scope. Blocking findings or insufficient evidence stop delivery.

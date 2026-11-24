@@ -1333,18 +1333,24 @@ class Evaluator:
         data = {"build": BUILD_ID, "inputs": copy.deepcopy(inputs), "result": copy.deepcopy(result), "effect": effect}
         self.store.put_setting("sealed-read-checkpoint:" + name, {**data, "sha256": fingerprint(data)})
 
-    def reuse_checkpoint(self, name, inputs):
+    def reuse_checkpoint(self, name, inputs, on_invalidate=None):
         entry = self.store.setting("sealed-read-checkpoint:" + name)
-        if not isinstance(entry, dict):
+        if entry is None:
             return None
-        data = {key: value for key, value in entry.items() if key != "sha256"}
-        if (data.get("effect") != "read_only" or data.get("build") != BUILD_ID
-                or data.get("inputs") != inputs or fingerprint(data) != entry.get("sha256")):
-            return None
-        return copy.deepcopy(data["result"])
+        data = {key: value for key, value in entry.items() if key != "sha256"} if isinstance(entry, dict) else {}
+        if (data.get("effect") != "read_only" or "result" not in data or
+                fingerprint(data) != entry.get("sha256")):
+            reason = "reused_record_invalid"
+        elif data.get("build") != BUILD_ID or data.get("inputs") != inputs:
+            reason = "input_signature_changed"
+        else:
+            return copy.deepcopy(data["result"])
+        if on_invalidate is not None:
+            on_invalidate(name, reason)
+        return None
 
     def execute_stage(self, name, inputs, action, *, effect="read_only", enabled=False,
-                      accept=None, on_reuse=None, on_reject=None):
+                      accept=None, on_reuse=None, on_reject=None, on_invalidate=None):
         """Run one stage, reusing a sealed checkpoint only for explicitly enabled read-only work.
 
         Write and remote stages always execute: no checkpoint can replay them.
@@ -1357,7 +1363,7 @@ class Evaluator:
         """
         if effect != "read_only" or not enabled:
             return action()
-        reused = self.reuse_checkpoint(name, inputs)
+        reused = self.reuse_checkpoint(name, inputs, on_invalidate=on_invalidate)
         if reused is not None:
             try:
                 acceptable = accept is None or bool(accept(reused))

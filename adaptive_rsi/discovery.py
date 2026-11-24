@@ -907,17 +907,6 @@ def finding_identity(finding):
                         "title": problem_title(finding["title"])})
 
 
-def _problem_tokens(title):
-    from .context import terms
-    ignored = {"the", "and", "for", "with", "from", "into", "when", "this", "that", "修复", "改进", "问题"}
-    return terms(problem_title(title)) - ignored
-
-
-def _number_tokens(title):
-    import re
-    return set(re.findall(r"\d+", title))
-
-
 def evidence_anchors(value):
     try:
         rows = json.loads(value or "[]")
@@ -931,32 +920,14 @@ def evidence_paths(values):
 
 
 def related_task(backlog, finding):
-    """Collapse exact or near-identical findings without merging variants.
-
-    Different error numbers or distinct behavioral anchors can share nearly all
-    title words, so a token-overlap threshold is never sufficient by itself.
-    """
+    """Require an identical problem title and literal source anchor to suppress."""
     title = problem_title(finding["title"])
-    tokens = _problem_tokens(finding["title"])
-    numbers = _number_tokens(finding["title"])
+    if not title or not finding["quote"].strip():
+        return None
     for row in backlog:
-        if not title:
-            continue
-        evidence = evidence_anchors(row["evidence"])
-        same_anchor = any(e.get("path") == finding["path"] and e.get("quote") == finding["quote"] for e in evidence)
-        same_path = any(e.get("path") == finding["path"] for e in evidence)
-        if title == problem_title(row["title"]) and same_anchor:
-            return row["id"]
-        # A title repeated at a different source anchor can still describe a
-        # separate defect; leave that decision to the planner.
-        if title == problem_title(row["title"]):
-            continue
-        if not same_path or numbers != _number_tokens(row["title"]):
-            continue
-        other_tokens = _problem_tokens(row["title"])
-        union = tokens | other_tokens
-        overlap = len(tokens & other_tokens) / len(union) if union else 0
-        if overlap >= 0.8:
+        if title == problem_title(row["title"]) and any(
+                anchor.get("path") == finding["path"] and anchor.get("quote") == finding["quote"]
+                for anchor in evidence_anchors(row["evidence"])):
             return row["id"]
     return None
 
@@ -976,8 +947,9 @@ def related_work(store, project, task, limit=12):
             overlap = len(words & terms(row["title"]))
             if not shared and (not words or overlap < 2):
                 continue
-            yield (len(shared) * 10 + overlap, row["updated"] or 0,
+            yield (len(shared), overlap, row["updated"] or 0,
                    {"id": row["id"], "title": row["title"], "state": row["state"],
+                    "match": "shared_path" if shared else "text_hint",
                     "shared_paths": shared, "summary": str(result.get("summary", ""))[:1500],
                     "pr": result.get("pr"), "base": result.get("base")})
 
@@ -988,10 +960,10 @@ def related_work(store, project, task, limit=12):
                           "FROM tasks t WHERE project=? AND id<>? AND source NOT LIKE 'system_%' "
                           "AND state NOT IN ('rejected','obsolete','cancelled','superseded') ORDER BY updated DESC",
                           (project, task["id"]))
-        order = lambda item: (-item[0], -item[1])
+        order = lambda item: (-item[0], -item[1], -item[2])
         selected = (sorted(ranked(rows), key=order)[:limit] if limit < 0 else
                     heapq.nsmallest(limit, ranked(rows), key=order))
-    return [item[2] for item in selected]
+    return [item[3] for item in selected]
 
 
 def value_priority(value, risk):

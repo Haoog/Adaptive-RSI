@@ -216,7 +216,7 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
                 now = time.time()
                 db.execute("UPDATE tasks SET state='cancelled',updated=? WHERE id=?", (now, current["id"]))
                 for original in verified["originals"]:
-                    db.execute("UPDATE tasks SET state='queued',attempts=0,infra_retries=0,budget_waits=0,updated=? "
+                    db.execute("UPDATE tasks SET state='queued',attempts=0,infra_retries=0,cooldown_waits=0,budget_waits=0,updated=? "
                                "WHERE id=? AND project=? AND state='superseded'", (now, original["id"], project))
                 db.execute("UPDATE task_group_members SET restored=? WHERE group_task=?", (now, current["id"]))
                 report.update(complete=True, receipts=[{"id": row["id"], "state": "restored", "from_group": current["id"],
