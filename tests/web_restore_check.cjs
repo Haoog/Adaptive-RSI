@@ -7,12 +7,12 @@ function fixture(api, fetch) {
   const source = fs.readFileSync('adaptive_rsi/web/experience.js', 'utf8');
   const state = source.indexOf('  const restoreChecks = new Map();');
   const start = source.lastIndexOf('      let status;', source.indexOf('      const checkButton = action(t("验证恢复点")'));
-  const end = source.indexOf('      box.append(checkButton);', start);
+  const end = source.indexOf('        summary.append(checkButton);', start);
   assert.ok(state >= 0 && start > state && end > start);
   let button, status, deadline;
   const toasts = [];
   const context = vm.createContext({
-    api, AbortController, Date, saved: {id:'backup'}, restoreCheckTimeout: 600000,
+    api, AbortController, Date, machine:'fixture', session:'fixture', visible: () => true, loadOperations() {}, saved: {id:'backup'}, restoreCheckTimeout: 600000,
     t: text => text,
     el: () => (status = {setAttribute() {}}),
     action: (_, handler) => (button = {handler, after() {}, disabled:false}),
@@ -55,6 +55,7 @@ function backupFixture(api) {
   const buttons = [], elements = [], clearedTimers = [];
   const context = {
     api,
+    visible: () => true, loadOperations() {}, loadSummary() {},
     box: {append(...nodes) { elements.push(...nodes); }},
     t: text => text,
     el: (tag, textContent) => ({tag, textContent, setAttribute() {}}),
@@ -108,7 +109,7 @@ test('backup submission errors still reach the shared action handler', async () 
   const [start] = f.buttons;
   await assert.rejects(start.handler(), failure => failure === error);
   assert.equal(start.disabled, false);
-  assert.deepEqual(f.elements, []);
+  assert.equal(f.elements[0].textContent, '若未收到回执，请先查看近期操作。');
 });
 
 test('backup cancellation shows sending and waiting despite progress and sends only one request', async () => {
@@ -288,7 +289,7 @@ test('restore verification shows status while creating and blocks repeated click
   assert.equal(calls, 1);
   reject(Error('offline'));
   await assert.rejects(first, /offline/);
-  assert.equal(originalStatus.textContent, '验证未完成，请重试。');
+  assert.equal(originalStatus.textContent, '若未收到回执，请先查看近期操作。');
   assert.equal(originalButton.disabled, false);
 });
 
@@ -363,7 +364,7 @@ test('only the explicit missing-operation response allows a fresh restore-check 
   const f = fixture(undefined, async (path, options) => {
     calls.push([options.method ?? 'GET', path]);
     if (options.method === 'POST') {
-      assert.deepEqual(JSON.parse(options.body), {kind:'restore-check', parameters:{id:'backup'}});
+      assert.deepEqual(JSON.parse(options.body), {kind:'restore-check', parameters:{id:'backup'}, reuse_active:true});
     }
     const [status, payload] = responses.shift();
     return {ok:status === 200, status, json:async () => payload};
@@ -381,4 +382,117 @@ test('only the explicit missing-operation response allows a fresh restore-check 
     ['GET', '/api/operation?id=old%2Fop'], ['GET', '/api/operation?id=old%2Fop'],
     ['POST', '/api/operations'], ['GET', '/api/operation?id=new-op'],
   ]);
+});
+
+function storageFixture(api) {
+  const source = fs.readFileSync('adaptive_rsi/web/experience.js', 'utf8');
+  const start = source.indexOf('  const restoreChecks = new Map();');
+  const end = source.indexOf('  function desktopDownload', start);
+  const dialogs = [], downloads = [];
+  function el(tag, textContent) {
+    const listeners = {};
+    return {
+      tag, textContent, open:false, checked:false, disabled:false, children:[],
+      classList:{add() {}}, setAttribute() {},
+      append(...nodes) { this.children.push(...nodes); },
+      replaceChildren() { this.children.length = 0; },
+      addEventListener(event, handler) { (listeners[event] ||= []).push(handler); },
+      emit(event) { for (const handler of listeners[event] || []) handler(); },
+      click() { if (tag === 'a') downloads.push(this); },
+      close() { this.open = false; this.emit('close'); },
+    };
+  }
+  const context = vm.createContext({
+    api, el, AbortController, Blob, state:{csrf:'current'}, window:{__RSI_MACHINE_KEY__:'first'},
+    document:{createTextNode: text => text}, t: text => text, stamp: at => `stamp-${at}`,
+    URL:{createObjectURL: blob => blob, revokeObjectURL() {}}, toast() {}, desktopDownload() {},
+    setTimeout() { return 1; }, clearTimeout() {},
+    dialog: title => {
+      const box = el('dialog', title);
+      box.open = true;
+      dialogs.push(box);
+      return box;
+    },
+    action: (text, handler) => Object.assign(el('button', text), {handler}),
+  });
+  vm.runInContext(source.slice(start, end), context);
+  const find = (node, predicate) => predicate(node) ? node : node.children?.map(child =>
+    typeof child === 'object' ? find(child, predicate) : null).find(Boolean);
+  return {open: () => vm.runInContext('storage()', context), context, dialogs, downloads, find};
+}
+
+test('data panel opens before usage, restores recent operations, and ignores late results after navigation', async () => {
+  const requests = [];
+  const f = storageFixture((path, body, {signal}) => {
+    const response = deferred();
+    requests.push({path, signal, ...response});
+    return response.promise;
+  });
+  await f.open();
+  const first = f.dialogs[0];
+  const findText = (box, text) => f.find(box, node => node.textContent?.includes(text));
+  assert.ok(findText(first, '创建一致性备份'));
+  assert.ok(findText(first, '恢复命令'));
+  assert.deepEqual(requests.map(row => row.path), ['storage?summary=true', 'operations', 'storage?usage=true']);
+  requests[0].resolve({backups:[], expiring_count:2});
+  requests[1].resolve({operations:[{kind:'restore-check', state:'completed', id:'lost-receipt', created:2, ended:3}]});
+  await new Promise(setImmediate);
+  assert.ok(findText(first, 'lost-receipt'));
+  assert.ok(findText(first, '正在统计存储占用'));
+  requests[2].resolve({scanned_at:10, bytes:{runs:1048576}});
+  await new Promise(setImmediate);
+  assert.ok(findText(first, 'stamp-10'));
+  first.close();
+  await f.open();
+  const reopened = f.dialogs[1];
+  assert.ok(findText(reopened, 'stamp-10'));
+  requests[5].reject(Error('offline'));
+  await new Promise(setImmediate);
+  assert.ok(findText(reopened, '统计未完成'));
+  assert.ok(findText(reopened, 'stamp-10'));
+  reopened.close();
+  assert.equal(requests[4].signal.aborted, true);
+  f.context.window.__RSI_MACHINE_KEY__ = 'second';
+  await f.open();
+  const second = f.dialogs[2];
+  requests[4].resolve({operations:[{kind:'backup', state:'completed', id:'old-machine', created:4, ended:5}]});
+  await new Promise(setImmediate);
+  assert.equal(findText(second, 'stamp-10'), undefined);
+  assert.equal(findText(reopened, 'old-machine'), undefined);
+  second.close();
+});
+
+test('data panel downloads exactly the consented preview and clears consent when regenerated', async () => {
+  const calls = [], snapshot = {snapshot:'id', body:'{\n  "format": 1\n}'};
+  const f = storageFixture(async (path, body) => {
+    calls.push([path, body]);
+    if (path === 'storage?summary=true') return {backups:[]};
+    if (path === 'storage?usage=true') return {bytes:{}, scanned_at:1};
+    if (path === 'operations') return {operations:[]};
+    if (path.startsWith('diagnostics/preview')) return snapshot;
+    if (path === 'diagnostics/export') return {body:snapshot.body};
+    throw Error(path);
+  });
+  await f.open();
+  const box = f.dialogs[0];
+  const preview = f.find(box, node => node.tag === 'details');
+  const consent = f.find(preview, node => node.tag === 'input');
+  const download = f.find(preview, node => node.textContent === '导出诊断包');
+  preview.open = true;
+  preview.emit('toggle');
+  await new Promise(setImmediate);
+  assert.equal(f.find(preview, node => node.tag === 'pre').textContent, snapshot.body);
+  await download.handler();
+  assert.equal(f.downloads.length, 0);
+  consent.checked = true;
+  consent.onchange();
+  await download.handler();
+  const exportCall = calls.at(-1);
+  assert.equal(exportCall[0], 'diagnostics/export');
+  assert.equal(JSON.stringify(exportCall[1]), '{"consent":true,"snapshot":"id"}');
+  assert.equal(await f.downloads[0].href.text(), snapshot.body);
+  await f.find(preview, node => node.textContent === '重新生成诊断预览').handler();
+  assert.equal(consent.checked, false);
+  assert.equal(download.disabled, true);
+  box.close();
 });

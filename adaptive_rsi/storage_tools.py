@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import math
 import os
+import re
 import sqlite3
 import stat
 import sys
@@ -231,6 +232,7 @@ def backup(store, cancel=None, progress=None, timeout=300, reserve_bytes=16 * 10
         # Publish only the closed snapshot; a name collision must preserve the old backup.
         _publish_snapshot(staging, path)
         store._storage_snapshot = None
+        store._storage_usage = None
         return {"id": path.stem, "bytes": path.stat().st_size, "created": time.time()}
     finally:
         for suffix in ("", "-wal", "-shm", "-journal"):
@@ -441,6 +443,9 @@ def restore(source, destination):
                                (json.dumps(result), row["id"]))
                 # Only the database was copied. Never retain access to the source state's files.
                 db.execute("UPDATE runs SET path=NULL")
+                # These receipts describe the source machine's local backup files and checks.
+                if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operations'").fetchone():
+                    db.execute("DELETE FROM operations WHERE kind IN ('backup','restore-check')")
                 for case in db.execute("SELECT id,spec FROM cases").fetchall():
                     try:
                         spec = json.loads(case["spec"])
@@ -790,12 +795,20 @@ def _cached_digests(store, entries, refresh, budget=None):
     return digests, hashed, pending
 
 
-def overview(store, refresh=False):
-    cached = getattr(store, "_storage_snapshot", None)
-    if not refresh and cached and time.monotonic() - cached["clock"] < 10:
-        result = copy.deepcopy(cached["data"])
-        result["expiring"], result["delivering"], result["delivered"] = _approval_candidates(store)
-        return result
+def storage_summary(store):
+    paths = (p for p in (store.root / "backups").glob("*.sqlite3") if re.fullmatch(r"[a-f0-9]{16}", p.stem))
+    backups = sorted(_file_info(paths), key=lambda item: item[1].st_mtime, reverse=True)[:20]
+    pending, delivering, delivered = _approval_candidates(store)
+    return {"backups": [{"id": p.stem, "bytes": info.st_size, "created": info.st_mtime}
+                        for p, info in backups],
+            "expiring_count": len(pending), "delivering_count": len(delivering),
+            "delivered_count": len(delivered)}
+
+
+def storage_usage(store, refresh=False):
+    cached = getattr(store, "_storage_usage", None)
+    if not refresh and cached and time.monotonic() - cached[0] < 10:
+        return cached[1]
     categories = {}
     for label, directory in [("runs", store.root / "runs"), ("backups", store.root / "backups"),
                              ("suites", store.root / "suites"), ("archives", store.root / "archives"),
@@ -805,6 +818,18 @@ def overview(store, refresh=False):
             paths = (p for p in paths if not p.name.startswith(".backup-"))
         categories[label] = sum(info.st_size for _, info in _file_info(paths))
     categories["database"] = sum(info.st_size for _, info in _file_info(store.root.glob("state.sqlite3*"), True))
+    result = {"bytes": categories, "scanned_at": time.time(), "cache_seconds": 10}
+    store._storage_usage = (time.monotonic(), result)
+    return result
+
+
+def overview(store, refresh=False):
+    cached = getattr(store, "_storage_snapshot", None)
+    if not refresh and cached and time.monotonic() - cached["clock"] < 10:
+        result = copy.deepcopy(cached["data"])
+        result["expiring"], result["delivering"], result["delivered"] = _approval_candidates(store)
+        return result
+    usage = storage_usage(store, refresh=refresh)
     backups = sorted(_file_info((store.root / "backups").glob("*.sqlite3")),
                      key=lambda item: item[1].st_mtime, reverse=True)
     expiring, delivering, delivered = _approval_candidates(store)
@@ -817,12 +842,11 @@ def overview(store, refresh=False):
         if p in pending:
             entry["digest_pending"] = True
         manifest.append(entry)
-    result = {"bytes": categories, "backups": [{"id": p.stem, "bytes": info.st_size, "created": info.st_mtime}
+    result = {**usage, "backups": [{"id": p.stem, "bytes": info.st_size, "created": info.st_mtime}
             for p, info in selected], "backup_manifest": manifest,
             "expiring": expiring, "delivering": delivering, "delivered": delivered,
             "hashed_bytes": hashed_bytes, "digest_budget_bytes": DIGEST_REFRESH_BUDGET,
-            "digest_pending": bool(pending),
-            "scanned_at": time.time(), "cache_seconds": 10}
+            "digest_pending": bool(pending)}
     store._storage_snapshot = {"clock": time.monotonic(), "data": copy.deepcopy(result)}
     return result
 

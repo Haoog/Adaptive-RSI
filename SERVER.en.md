@@ -26,7 +26,9 @@ Alternatively, install directly from the verified release bundle without cloning
 curl -fsSL https://raw.githubusercontent.com/Haoog/Adaptive-RSI/main/scripts/remote-install.sh | bash
 ```
 
-By default the app listens only on the server's `127.0.0.1:6090`. On your personal computer:
+Both installers report the systemd user service state, a bounded health check, and the account's linger status. If the process has started but health is still unavailable, the installer exits with a nonzero status and leaves the service configuration in place. When persistent operation is needed and linger is disabled, follow the printed command to enable it.
+
+The service listens on loopback only. A source install defaults to port `6090`. For a release install, find the actual port in the service journal's authenticated URL. On your personal computer, substitute the actual port for `6090` below:
 
 ```sh
 ssh -N -L 6090:127.0.0.1:6090 user@server

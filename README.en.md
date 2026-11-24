@@ -84,6 +84,8 @@ python3 scripts/rsi doctor
 
 The launcher reuses an existing service. Task details offer paginated dependency selection; unsaved queue settings survive language changes and requirement supplements. Edits made while settings are saving survive project switches; usage searches invalidate old requests so late responses cannot replace newer queries. The dashboard persistently shows save status: saving scan timing reschedules scans, model assignments are saved separately for new tasks, active tasks retain their configuration, and delivery permissions are rechecked before execution. No restart is required. Edit fixed checks as structured fields and read check results and mobile approval summaries with expandable original evidence. Unconfirmed goals can restore their original text and reuse their request IDs. Pending-approval counts in Data and diagnostics exclude approved, delivering and cancelled candidates, and a failed restore leaves no half-created directory that blocks retry. Issue sync counts only newly added tasks or actual body and evidence changes; an unfinished scan says so and continues next cycle, and open task details update with the synced input while preserving unsaved drafts. See [workflow and mobile use](EXPERIENCE.en.md) for recovery controls and evidence boundaries after database restoration, and [server deployment](SERVER.en.md) for Linux and systemd setup.
 
+Data and diagnostics shows recent backups and restore checks on the current machine, and diagnostic downloads match the confirmed preview.
+
 ## Core Capabilities
 
 - **Continuous discovery:** hourly checks for bugs, feature gaps, performance, usability, and maintenance work, with rotating code modules. Sync GitHub Issues incrementally or add a goal at any time.

@@ -12,6 +12,7 @@ repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
 runtime_dir="${XDG_DATA_HOME:-$HOME/.local/share}/adaptive-rsi-runtime"
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/adaptive-rsi"
 unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+state="$HOME/.local/share/adaptive-rsi"
 docker info >/dev/null
 docker build -f "$repo_dir/deploy/Dockerfile.worker" -t adaptive-rsi-worker:local "$repo_dir"
 python3 -m venv "$runtime_dir"
@@ -47,8 +48,5 @@ UMask=0077
 [Install]
 WantedBy=default.target
 EOF
-systemctl --user daemon-reload
-systemctl --user enable --now adaptive-rsi.service
-echo '服务已启动。通过 journalctl --user -u adaptive-rsi 查看启动地址。'
-echo "若需退出 SSH 后及重启后继续运行，请执行：sudo loginctl enable-linger $(id -un)"
+bash "$repo_dir/scripts/remote-install.sh" --start-user-service "$state"
 echo '默认访问：ssh -N -L 6090:127.0.0.1:6090 用户@服务器，然后打开日志中的认证地址。'

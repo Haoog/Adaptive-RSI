@@ -9,6 +9,8 @@ import json
 import os
 import sqlite3
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -22,6 +24,116 @@ from adaptive_rsi.catalog import CatalogError
 from adaptive_rsi.operations import Operations
 from adaptive_rsi.server import CSRF_HEADER, Handler, Server
 from adaptive_rsi.store import MAX_CONNECTIONS, POOL_SIZE, Store
+
+
+class LinuxInstallerReportingTest(unittest.TestCase):
+    def test_both_linux_installer_entries_report_active_without_readiness(self):
+        repo = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = root / "tools"
+            tools.mkdir()
+
+            def shim(name, body):
+                path = tools / name
+                path.write_text("#!/usr/bin/env bash\nset -eu\n" + body + "\n")
+                path.chmod(0o755)
+
+            shim("uname", "echo Linux")
+            shim("systemctl", "exit 9")
+            shim("docker", "exit 0")
+            shim("gh", "exit 0")
+            shim("git", "exit 0")
+            shim("unzip", "exit 9")
+            shim("shasum", "exit 9")
+            shim("curl", "printf '%s' '{\"tag_name\":\"v1.2.3\"}'")
+            shim("python3", """case "$1" in
+              -m) mkdir -p "$3/bin"; ln -s /usr/bin/true "$3/bin/python" ;;
+              -c) exec "$TEST_PYTHON" "$@" ;;
+              -) exec "$TEST_PYTHON" "$TEST_PROBE" "$2" ;;
+              *) exit 9 ;;
+            esac""")
+            probe = root / "probe.py"
+            probe.write_text("""
+import http.client
+import io
+import os
+import subprocess
+import sys
+import time
+from unittest.mock import patch
+
+source = sys.stdin.read()
+now = 0.0
+
+def sleep(delay):
+    global now
+    now += delay
+
+def systemd(args, **kwargs):
+    if args[0] == 'loginctl':
+        return subprocess.CompletedProcess(args, 0, stdout=os.environ['TEST_LINGER'])
+    assert args[0] == 'systemctl', args
+    if 'show' in args:
+        return subprocess.CompletedProcess(args, 0, stdout='ActiveState=active\\nMainPID=0\\n')
+    assert 'daemon-reload' in args or ('enable' in args and '--no-block' in args), args
+    return subprocess.CompletedProcess(args, 0, stdout='')
+
+class Health:
+    def __init__(self, host, port, timeout):
+        assert (host, port) == ('127.0.0.1', 6123)
+        assert 0 < timeout <= 2
+
+    def request(self, method, path, headers):
+        assert (method, path, headers) == ('GET', '/api/health', {'Cookie':'fixture=private'})
+        if os.environ['TEST_HEALTH'] == 'unavailable':
+            raise ConnectionRefusedError()
+
+    def getresponse(self):
+        response = io.BytesIO(b'{"pid":42}')
+        response.status = 200
+        return response
+
+    def close(self):
+        pass
+
+with patch.object(subprocess, 'run', side_effect=systemd), patch.object(time, 'monotonic', lambda: now), \
+     patch.object(time, 'sleep', side_effect=sleep), patch.object(http.client, 'HTTPConnection', Health):
+    exec(compile(source, '<installer health probe>', 'exec'))
+""")
+            for entry in ("install-server.sh", "remote-install.sh"):
+                for health in ("unavailable", "ready"):
+                    with self.subTest(entry=entry, health=health):
+                        home = root / (entry + "-" + health)
+                        share = home / ".local/share"
+                        state = share / "adaptive-rsi"
+                        state.mkdir(parents=True)
+                        (state / "server.json").write_text(json.dumps({
+                            "local_origin": "http://127.0.0.1:6123", "pid": 42,
+                            "cookie": "fixture", "token": "private",
+                        }))
+                        (share / "adaptive-rsi-installations/1.2.3").mkdir(parents=True)
+                        linger = "no" if health == "unavailable" else "yes"
+                        env = {**os.environ, "PATH": str(tools) + ":/usr/bin:/bin", "HOME": str(home),
+                               "XDG_DATA_HOME": str(share), "XDG_CONFIG_HOME": str(home / ".config"),
+                               "LC_ALL": "C", "LC_MESSAGES": "C", "LANG": "en_US.UTF-8",
+                               "TEST_PROBE": str(probe), "TEST_PYTHON": sys.executable,
+                               "TEST_HEALTH": health, "TEST_LINGER": linger}
+                        if health == "ready":
+                            env["LC_ALL"] = "en_US.UTF-8"
+                        result = subprocess.run(["bash", str(repo / "scripts" / entry)], env=env,
+                                                capture_output=True, encoding="utf-8", errors="replace", timeout=10)
+                        self.assertNotIn("private", result.stdout + result.stderr)
+                        if health == "unavailable":
+                            self.assertEqual(result.returncode, 1, result.stderr)
+                            self.assertIn("systemd 用户服务状态：active", result.stdout)
+                            self.assertIn("健康检查未就绪", result.stdout)
+                            self.assertIn("linger：未启用", result.stdout)
+                        else:
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertIn("systemd user service state: active", result.stdout)
+                            self.assertIn("Health check ready", result.stdout)
+                            self.assertIn("linger: enabled", result.stdout)
 
 
 class ServerHardeningTest(unittest.TestCase):
@@ -139,6 +251,105 @@ class ServerHardeningTest(unittest.TestCase):
         body = json.loads(exported["body"])
         self.assertEqual(set(body), set(preview))
         self.assertNotIn(secret, exported["body"])
+
+    def test_reviewed_diagnostic_snapshot_survives_data_change_until_rotation(self):
+        route = "/api/diagnostics/preview?snapshot=true"
+        self.assertEqual(self.request(route, authenticated=False)[0], 401)
+        status, _, raw = self.request(route)
+        self.assertEqual(status, 200)
+        preview = json.loads(raw)
+        self.assertEqual(set(preview), {"snapshot", "body"})
+        self.store.execute("INSERT INTO runs(id,project,state,result) VALUES ('r','p','hidden-text','{}')")
+        request = {"consent": True, "snapshot": preview["snapshot"]}
+        status, _, raw = self.request("/api/diagnostics/export", "POST", request)
+        self.assertEqual(status, 200)
+        envelope = json.loads(raw)
+        self.assertEqual(envelope["body"], preview["body"])
+        self.assertEqual(envelope["bytes"], len(preview["body"].encode()))
+        self.assertNotIn("hidden-text", envelope["body"])
+        self.assertNotEqual(json.loads(json.loads(self.request(route)[2])["body"])["row_counts"],
+                            json.loads(envelope["body"])["row_counts"])
+        with patch("adaptive_rsi.server.time.monotonic", return_value=time.monotonic() + 601):
+            self.assertEqual(self.request("/api/diagnostics/export", "POST", request)[0], 409)
+        self.server.rotate_session()
+        status, _, raw = self.request("/api/diagnostics/export", "POST", request)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(raw)["error_code"], "diagnostic_preview_expired")
+
+    def test_recent_backup_operations_recovers_lost_submission_without_exposing_other_results(self):
+        self.runtime.stop, self.runtime.wake = threading.Event(), threading.Event()
+        started, release = threading.Event(), threading.Event()
+        def execute(*args):
+            started.set()
+            if not release.wait(3):
+                raise RuntimeError("test deadline")
+            return {"private": "hidden receipt text"}
+        self.runtime.operations._execute = execute
+        self.addCleanup(release.set)
+        self.assertEqual(self.request("/api/operations", authenticated=False)[0], 401)
+        request = {"kind": "restore-check", "parameters": {"id": self.identifier}, "reuse_active": True}
+        try:
+            self.assertEqual(self.request("/api/operations", "POST", request)[0], 200)
+            self.assertTrue(started.wait(2))
+            # Ignore the creation response, as if the UI never received it.
+            rows = json.loads(self.request("/api/operations")[2])["operations"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["backup_id"], self.identifier)
+            self.assertEqual(json.loads(self.request("/api/operations", "POST", request)[2])["id"], rows[0]["id"])
+            self.store.execute("INSERT INTO operations VALUES ('other','diagnostics','completed','{}',1,2)")
+            with tempfile.TemporaryDirectory() as other:
+                isolated = Store(Path(other))
+                try:
+                    independent = Operations(SimpleNamespace(store=isolated))
+                    self.assertEqual(independent.recent_backups(), [])
+                    independent.close()
+                finally:
+                    isolated.close()
+        finally:
+            release.set()
+            self.runtime.operations.close()
+        recovered = Operations(self.runtime)
+        try:
+            recovered.recover()
+            recent = recovered.recent_backups()
+            self.assertEqual([(row["id"], row["state"], row["backup_id"]) for row in recent],
+                             [(rows[0]["id"], "completed", self.identifier)])
+            self.assertNotIn("hidden receipt text", json.dumps(recent))
+        finally:
+            recovered.close()
+
+    def test_recent_backup_operations_stay_with_the_source_after_database_restore(self):
+        from adaptive_rsi.storage_tools import backup, restore
+        self.store.execute("INSERT INTO operations VALUES (?,'restore-check','completed','{}',1,2)",
+                           (self.identifier,))
+        self.store.execute("INSERT INTO operation_backup_targets VALUES (?,?)", (self.identifier, self.identifier))
+        saved = backup(self.store)
+        destination = self.root / "restored"
+        restore(self.backups / (saved["id"] + ".sqlite3"), destination)
+        restored = Store(destination)
+        try:
+            self.assertIsNone(restored.one("SELECT id FROM operations WHERE id=?", (self.identifier,)))
+            self.assertIsNone(restored.one("SELECT operation FROM operation_backup_targets"))
+            self.assertEqual(self.runtime.operations.recent_backups()[0]["id"], self.identifier)
+        finally:
+            restored.close()
+
+    def test_storage_summary_and_usage_have_independent_cost_and_timestamp(self):
+        self.backup.write_bytes(b"fixture")
+        with patch("adaptive_rsi.storage_tools._cached_digests", side_effect=AssertionError("hashing")), \
+                patch("adaptive_rsi.storage_tools.storage_usage", side_effect=AssertionError("storage scan")):
+            status, _, raw = self.request("/api/storage?summary=true")
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(raw)["backups"][0]["id"], self.identifier)
+        with patch("adaptive_rsi.storage_tools._cached_digests", side_effect=AssertionError("hashing")):
+            status, _, raw = self.request("/api/storage?usage=true")
+            self.assertEqual(status, 200)
+            usage = json.loads(raw)
+            self.assertGreater(usage["scanned_at"], 0)
+            self.assertEqual(usage["bytes"]["backups"], 7)
+            self.assertEqual(json.loads(self.request("/api/storage?usage=true")[2]), usage)
+            with self.server._storage_usage_gate:
+                self.assertEqual(self.request("/api/storage?usage=true")[0], 503)
 
     def test_shutdown_status_exposes_phase_and_remaining_work(self):
         self.runtime.shutdown_status = lambda: {"phase": "workers", "started": 1.0, "ended": None,

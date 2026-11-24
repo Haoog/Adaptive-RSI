@@ -26,7 +26,9 @@ sudo loginctl enable-linger "$(id -un)"
 curl -fsSL https://raw.githubusercontent.com/Haoog/Adaptive-RSI/main/scripts/remote-install.sh | bash
 ```
 
-默认仅监听服务器的 `127.0.0.1:6090`。在个人电脑执行：
+两种安装器分别报告 systemd 用户服务状态、限时健康检查和当前用户的 linger 状态。进程已经启动但健康检查未就绪时，安装命令以非零状态退出，保留已写入的服务配置。需要常驻且 linger 未启用时，按提示手动启用。
+
+服务仅监听回环地址。源码安装默认端口为 `6090`，免 clone 安装请从服务日志中的认证地址读取实际端口。在个人电脑执行以下命令，并按实际端口替换示例中的 `6090`：
 
 ```sh
 ssh -N -L 6090:127.0.0.1:6090 用户@服务器
