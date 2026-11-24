@@ -372,6 +372,28 @@ class ExperienceTest(unittest.TestCase):
         self.assertIn("Handle negative input", json.dumps(feedback))
         self.assertNotIn("SEALED_SECRET", json.dumps(feedback))
 
+    def test_retry_feedback_ignores_invalid_containers_and_keeps_valid_siblings(self):
+        from adaptive_rsi.experience import retry_feedback
+
+        row = {"id": "run-1", "base": "sha", "state": "failed"}
+        result = {"review": [], "failure": [], "evaluation": [], "summary": "x" * 1000}
+        feedback = retry_feedback({**row, "result": json.dumps(result)})
+        self.assertEqual(feedback, {**row, "summary": "x" * 700, "review_findings": [],
+                                    "failed_regression_checks": []})
+
+        result = {"review": {"findings": [None] * 8 + [{"path": "src.py", "title": "Fix parsing"},
+                                                        {"path": ".rsi-acceptance/test.py"}]},
+                  "evaluation": {"checks": {"baseline": False,
+                                            "candidate": [None, {"name": "unit", "passed": False,
+                                                                  "exit_code": 1}, "invalid"],
+                                            "candidate_full": [{"name": "full", "passed": False,
+                                                                "exit_code": {"invalid": True}}],
+                                            "acceptance_candidate": [{"name": "sealed", "passed": False}]}}}
+        feedback = retry_feedback({**row, "result": json.dumps(result)})
+        self.assertEqual([finding["title"] for finding in feedback["review_findings"]], ["Fix parsing"])
+        self.assertEqual([(check["name"], check["exit_code"]) for check in feedback["failed_regression_checks"]],
+                         [("unit", 1), ("full", None)])
+
     def test_transient_failure_schedules_fresh_run_without_using_code_retry(self):
         task = self.runtime.goal(self.project, "Fix addition")
         self.runtime.pause(self.project, False)
