@@ -8,7 +8,7 @@ if(window.__TAURI_INTERNALS__){
   remoteRuntime=info.kind==='remote';
   sshTunnelConnected=remoteRuntime&&/^(?:ssh:|http:\/\/127\.0\.0\.1(?::|$))/.test(info.scope||'');
   return info;
- }).catch(error=>{console.warn(error);return null;});
+ }).catch(()=>null);
  let switching=false,switched=false,remoteSessionExpired=false;
  let stateRequest=0,lastSessionReply=0,clearConnectionExpiry;
  const sessionExpiredMessage='远端登录已失效。请生成新的认证地址并重新连接。';
@@ -31,7 +31,7 @@ if(window.__TAURI_INTERNALS__){
  }
  function reloadRuntime(info,next){
   switching=switched=true;
-  if(next?.scope&&next.scope!==info.scope)history.replaceState(null,'',location.pathname+location.search);
+  if(!info||(next?.scope&&next.scope!==info.scope))history.replaceState(null,'',location.pathname+location.search);
   location.reload();
  }
  window.fetch=async(input,options={})=>{
@@ -66,8 +66,7 @@ if(window.__TAURI_INTERNALS__){
  };
  document.addEventListener('DOMContentLoaded',async()=>{
   const info=await ready,tools=document.querySelector('.project-tools');
-  if(!info)return;
-  const machine=document.createElement('button');machine.className='text-button';machine.textContent=info.name||'连接运行机器';tools.prepend(machine);
+  const machine=document.createElement('button');machine.className='text-button';tools.prepend(machine);
   const dialog=document.createElement('dialog'),form=document.createElement('form');
   const title=document.createElement('h2');title.textContent=t('运行机器');
   const modeLabel=document.createElement('label'),modeText=document.createElement('span');
@@ -78,7 +77,7 @@ if(window.__TAURI_INTERNALS__){
   mode.value=sshTunnelConnected?'ssh':'https';
   modeLabel.append(modeText,mode);
   const hint=document.createElement('p');hint.id='desktop-connect-hint';
-  const ownership=document.createElement('p');ownership.className='muted';ownership.hidden=info.kind!=='local'||info.owned;
+  const ownership=document.createElement('p');ownership.className='muted';ownership.hidden=info?.kind!=='local'||info.owned;
   const compatibility=document.createElement('p');compatibility.className='muted';compatibility.hidden=true;
   const input=document.createElement('input');input.type='password';input.required=true;input.autocomplete='off';input.setAttribute('aria-describedby',hint.id);
   const error=document.createElement('p');error.className='form-error';error.setAttribute('role','alert');error.hidden=true;
@@ -127,7 +126,7 @@ if(window.__TAURI_INTERNALS__){
       :'未能通过 SSH 隧道连接。请检查终端中的转发仍在运行，并核对本机端口后重试。',
       /^(?:Error: )?Server connection failed$/.test(message)?'Server connection failed':'');
     }else if(args.url===null){
-     showConnectionError(message);
+     showConnectionError(info?message:'未能连接本机运行服务，请稍后重试。');
     }else if(checkRejected){
      showConnectionError('HTTPS 认证被拒绝。请生成新的认证地址后重试。');
     }else if(/^(?:Error: )?(?:Server connection failed|Cannot connect to the selected runtime)$/.test(message)){
@@ -163,13 +162,17 @@ if(window.__TAURI_INTERNALS__){
    event.stopImmediatePropagation();
    openMachine();
   },true);
-  if(info.kind==='remote'&&info.api_version===1){compatibility.hidden=false;compatibility.textContent=t('远端服务为旧版 API。基础功能可继续使用；不支持的操作会提示升级服务。');}
+  if(info?.kind==='remote'&&info.api_version===1){compatibility.hidden=false;compatibility.textContent=t('远端服务为旧版 API。基础功能可继续使用；不支持的操作会提示升级服务。');}
   dialog.addEventListener('close',()=>{if(!dialog.open)input.value='';});
-  if(!info.connected){showConnectionError(info.error||'连接运行机器');dialog.showModal();}
+  if(!info?.connected){
+   showConnectionError(info?info.error||'连接运行机器':'无法读取当前运行机器。请连接服务器或使用本机。');
+   dialog.showModal();
+  }
   const folder=document.createElement('button');folder.type='button';folder.className='button';folder.textContent=t('选择文件夹');
   const projectDialog=document.getElementById('project-dialog'),projectForm=document.getElementById('project-form');
   const projectSource=document.getElementById('project-source'),projectPath=document.getElementById('project-path');
-  const canChooseFolder=()=>!switched&&projectDialog.open&&projectSource.value==='local';
+  folder.hidden=!info;
+  const canChooseFolder=()=>info&&!switched&&projectDialog.open&&projectSource.value==='local';
   folder.onclick=()=>safe(async()=>{
    if(folder.disabled||!canChooseFolder())return;
    if(info.kind!=='local')throw Error(t('远端项目请填写服务器上的路径。'));
@@ -185,7 +188,7 @@ if(window.__TAURI_INTERNALS__){
   });
   document.getElementById('local-project-fields').append(folder);
   window.RSIDesktop.translate=()=>{
-   machine.textContent=t(info.name||'连接运行机器');machine.title=t('运行机器');title.textContent=t('运行机器');
+   machine.textContent=t(info?.name||'连接运行机器');machine.title=t('运行机器');title.textContent=t('运行机器');
    modeText.textContent=t('服务器连接方式');httpsOption.textContent='HTTPS';sshOption.textContent=t('SSH 隧道');
    updateConnectionMode();showConnectionError(connectionError,connectionDetail);
    ownership.textContent=t('当前连接已有本机服务，退出软件不会停止它。');

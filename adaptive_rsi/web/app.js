@@ -7,7 +7,7 @@ function runtimeConnectionError(){
 }
 function localWrite(key,value){try{localStorage.setItem(preferenceKey(key),value);}catch{}}
 function localRemove(key){try{localStorage.removeItem(preferenceKey(key));}catch{}}
-let state, projectId = localRead('rsi-project') || '', view = 'overview', settingsBaseline, toastTimer;
+let state, projectId = window.RSIDesktop ? '' : localRead('rsi-project') || '', view = 'overview', settingsBaseline, toastTimer;
 const $ = id => document.getElementById(id);
 const evaluationNames={baseline:'修改前的版本',candidate:'原有功能检查',candidate_full:'修改后的完整测试',acceptance_baseline:'修改前的独立检查',acceptance_candidate:'修改后的独立检查'};
 const deliveryNames={waiting:'等待可合并状态',waiting_review:'等待必需评审',waiting_ci:'等待 CI',ci_failed:'线上检查未通过',stale:'基线或待验证改动已变化',feedback_replan:'按评审或 CI 反馈重排',issue_changed:'Issue 已变化，等待同步后重评',merged:'已合并',merge_sha_pending:'已合并，等待合并提交回执',merge_submitted:'已提交合并',closed:'已关闭',unverified_merge:'外部合并包含未经验证的改动',ready:'可合并'};
@@ -741,7 +741,7 @@ function readNavigationRoute(){
   view=requestedView==='tasks'?'overview':requestedView;
  }
 }
-readNavigationRoute();
+if(!window.RSIDesktop)readNavigationRoute();
 typeof window.addEventListener==='function'&&window.addEventListener('hashchange',()=>{
  if(!state)return;const route=new URLSearchParams(String(location.hash||'').replace(/^#/,'')),requested=route.get('view'),project=route.get('project')||history.state?.rsi_home_project||navigationHomeProject;
  const scope=route.get('scope'),projectChanged=!!(project&&state.projects.some(item=>item.id===project)&&project!==projectId),scopeChanged=['global','project'].includes(scope)&&scope!==$('config-scope').value;
@@ -1782,7 +1782,17 @@ function renderUpdate(){if(!state)return;const update=state.update||{state:'unch
  renderUpdateExtras(update);}
 $('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop&&window.RSINativeUpdate){await window.RSINativeUpdate.run('check');return;}if(window.RSIDesktop){await checkDesktopUpdate(true);if(desktopCheckError){toast(t('检查更新失败，请稍后重试。'),true);return;}if(!desktopUpdate)toast(t('已是最新稳定版'));return;}const result=await api('updates/check',{});if(result.update){state.update=result.update;renderUpdate();}else await refresh();if(result.started)toast(t('已开始检查更新'));}));
 $('apply-update').addEventListener('click',()=>safe(async()=>{if(!(await uiConfirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？'))))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));
-safe(async()=>{if(window.RSIDesktop){await window.RSIDesktop.ready;restoreRuntimeNavigation();if(window.RSIDesktop.invoke)window.RSIDesktop.invoke('set_native_language',{language}).catch(()=>{});}await refresh();});
+if(window.RSIDesktop)$('connection').textContent=t('正在连接服务…');
+safe(async()=>{
+ if(window.RSIDesktop){
+  const info=await window.RSIDesktop.ready;
+  if(window.RSIDesktop.invoke)window.RSIDesktop.invoke('set_native_language',{language}).catch(()=>{});
+  if(info===null||info?.connected===false)$('connection').textContent=t('连接中断');
+  if(info===null)return;
+  restoreRuntimeNavigation();
+ }
+ await refresh();
+});
 // native-update.js 在本脚本之后加载，启动检查要等到 DOMContentLoaded 才会走带节流的 tick()；
 // 直接在这里调用会落到旧的 check_desktop_update 命令，每次刷新都请求远端发布源。
 if(window.RSIDesktop)document.addEventListener('DOMContentLoaded',()=>safe(checkDesktopUpdate));
@@ -1791,7 +1801,7 @@ $('language-select').addEventListener('change',()=>safe(async()=>{
  localWrite('rsi-language',language);
  if(window.RSIDesktop?.invoke)window.RSIDesktop.invoke('set_native_language',{language}).catch(()=>{});
  translateStatic();
- const connectionStates=['已连接','连接中断','连接超时','需要重新登录'];
+ const connectionStates=['已连接','正在连接服务…','连接中断','连接超时','需要重新登录'];
  if(sessionExpired)expireSessionCopy();
  else $('connection').textContent=t(connectionStates.find(name=>[name,english[name]].includes($('connection').textContent))||'已连接');
  if(!projectId&&$('project-select').options.length)$('project-select').options[0].textContent=t('尚未接入项目');

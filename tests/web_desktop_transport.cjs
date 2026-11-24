@@ -222,8 +222,8 @@ const sessionError='远端登录已失效。请生成新的认证地址并重新
 const sessionButton='登录已失效，重新打开控制台';
 const refreshButton='界面有更新，保存输入后刷新';
 const stateReply=(build='running')=>({status:200,body:JSON.stringify({projects:[],build,version:'test'})});
-async function sessionPage(kind,scope){
- const handlers={},nodes=new Map(),dialogs=[],pending=[],cancelled=[];
+async function runtimePage({invoke,fetch=async()=>assert.fail('unexpected network request')}){
+ const handlers={},nodes=new Map(),dialogs=[],storageReads=[],warnings=[],routes=[];
  const element=()=>({textContent:'',value:'',open:false,hidden:false,options:[],dataset:{},children:[],listeners:{},
   classList:{add(){},remove(){},toggle(){}},style:{},setAttribute(){},focus(){},querySelector(){return null},querySelectorAll(){return[]},remove(){},
   append(...children){this.children.push(...children);},prepend(child){this.children.unshift(child);},replaceChildren(...children){this.children=children;},
@@ -231,39 +231,177 @@ async function sessionPage(kind,scope){
   showModal(){this.open=true;},close(){this.open=false;for(const {handler} of this.listeners.close??[])handler();}});
  const node=id=>{if(!nodes.has(id))nodes.set(id,element());return nodes.get(id);};
  const body=element(),tools=element(),document={body,documentElement:{dataset:{build:'loaded'}},visibilityState:'visible',getElementById:node,
-  querySelector:selector=>selector==='.project-tools'?tools:null,querySelectorAll:()=>[],createTextNode:text=>({textContent:text}),
+  querySelector:selector=>selector==='.project-tools'?tools:selector==='#language-select'?node('language-select'):null,
+  querySelectorAll:()=>[],createTextNode:text=>({textContent:text}),
   createElement(tag){const child=element();if(tag==='dialog')dialogs.push(child);return child;},
   addEventListener(name,handler){(handlers[name]??=[]).push(handler);}};
  let reloads=0,confirmations=0,timer=0;
- const window={fetch:async()=>{assert.fail('unexpected network request');},addEventListener(){},__TAURI_INTERNALS__:{invoke:async(command,args)=>{
+ const window={fetch,addEventListener(){}};
+ if(invoke)window.__TAURI_INTERNALS__={invoke};
+ const storage={getItem(key){storageReads.push(key);return null;},setItem(){},removeItem(){}};
+ const context=vm.createContext({window,document,localStorage:storage,sessionStorage:storage,structuredClone,URLSearchParams,AbortController,DOMException,queueMicrotask,
+  TextEncoder,TextDecoder,crypto:webcrypto,Response,console:{...console,warn(...args){warnings.push(args);}},
+  setTimeout:()=>++timer,clearTimeout(){},setInterval(){},clearInterval(){},NodeFilter:{SHOW_TEXT:4},
+  history:{replaceState(_state,_title,url){routes.push(url);}},location:{hash:'',pathname:'/index.html',search:'',reload(){reloads++;}},
+  navigator:{clipboard:{}},matchMedia:()=>({matches:false,addEventListener(){}})});
+ document.documentElement.style={};
+ document.createTreeWalker=()=>({nextNode:()=>false});
+ vm.runInContext(i18nSource,context);
+ vm.runInContext(desktopSource,context);
+ context.fetch=window.fetch;
+ const reload=node('reload-ui');reload.textContent=refreshButton;reload.hidden=true;
+ node('connection').textContent='已连接';
+ if(invoke)window.RSINativeUpdate={tick:async()=>{}};
+ vm.runInContext(appSource,context);
+ context.render=()=>{};
+ context.uiConfirm=async()=>{confirmations++;return true;};
+ await Promise.all((handlers.DOMContentLoaded??[]).map(handler=>handler()));
+ const tick=()=>new Promise(setImmediate);
+ const dialog=dialogs[0],form=dialog?.children[0];
+ return {window,context,dialog,form,machine:tools.children[0],node,tick,storageReads,warnings,routes,
+  reload,reloads:()=>reloads,confirmations:()=>confirmations};
+}
+async function sessionPage(kind,scope){
+ const pending=[],cancelled=[];
+ const page=await runtimePage({invoke:async(command,args)=>{
   if(command==='runtime_info')return {kind,scope,connected:true,connection_generation:7};
-  if(command==='request')return new Promise(resolve=>pending.push({args,resolve}));
+  if(command==='request'){
+   if(args.path==='sys-metrics')return {status:200,body:'{}'};
+   return new Promise(resolve=>pending.push({args,resolve}));
+  }
   if(command==='cancel_request'){cancelled.push(args.id);return;}
   if(command==='validate_connection_target')return false;
   if(command==='set_native_language')return;
   throw new Error(`Unexpected command: ${command}`);
- }}};
- const storage={getItem(){return null;},setItem(){},removeItem(){}};
- const context=vm.createContext({window,document,localStorage:storage,sessionStorage:storage,structuredClone,URLSearchParams,AbortController,DOMException,queueMicrotask,
-  TextEncoder,TextDecoder,crypto:webcrypto,Response,console,setTimeout:()=>++timer,clearTimeout(){},setInterval(){},clearInterval(){},
-  location:{hash:'',reload(){reloads++;}},navigator:{clipboard:{}},matchMedia:()=>({matches:false,addEventListener(){}}),language:'zh-CN',t:value=>value});
- vm.runInContext(desktopSource,context);
- context.fetch=window.fetch;
- const reload=node('reload-ui');reload.textContent=refreshButton;reload.hidden=true;
- vm.runInContext(appSource,context);
- context.render=()=>{};
- context.uiConfirm=async()=>{confirmations++;return true;};
- await handlers.DOMContentLoaded[0]();
- const tick=()=>new Promise(setImmediate);
+ }});
+ const {window,dialog,form,node,tick,reload}=page;
  const take=async()=>{await tick();const request=pending.shift();assert.ok(request,node('toast').textContent);assert.equal(request.args.connectionGeneration,7);return request;};
  const finish=async(promise,reply)=>{const request=await take();request.resolve(reply);return promise;};
  const initial=await take();assert.match(initial.args.path,/^state\?/);initial.resolve(stateReply());await tick();
  assert.equal(node('connection').textContent,'已连接');
- const dialog=dialogs[0],form=dialog.children[0],input=form.children[5],alert=form.children[6];
- return {context,dialog,alert,form,input,reload,cancelled,node,tick,take,finish,read:(path='/api/state?sections=core',options)=>window.fetch(path,options),
-  openMachine:()=>tools.children[0].onclick(),reloads:()=>reloads,confirmations:()=>confirmations,
+ const input=form.children[5],alert=form.children[6];
+ return {...page,alert,input,cancelled,take,finish,read:(path='/api/state?sections=core',options)=>window.fetch(path,options),
+  openMachine:()=>page.machine.onclick(),
   async clickReload(){let stopped=false;for(const {handler} of [...reload.listeners.click].sort((a,b)=>Number(b.capture)-Number(a.capture))){handler({stopImmediatePropagation(){stopped=true;}});if(stopped)break;}await tick();}};
 }
+const startupError='无法读取当前运行机器。请连接服务器或使用本机。';
+const startupErrorEnglish='Could not read the current runtime. Connect a server or use this computer.';
+const localRecoveryError='未能连接本机运行服务，请稍后重试。';
+const localRecoveryErrorEnglish='Could not connect to the local runtime. Try again.';
+for(const recovery of ['local','server']){
+ test(`desktop startup recovers from a rejected runtime snapshot through ${recovery}`,async()=>{
+  const calls=[];
+  const secret='https://user:fixture-password@rsi.example.test/?token=fixture-token';
+  const scope=recovery==='local'?'local':'https://rsi.example.test';
+  const url=recovery==='local'?null:'https://rsi.example.test/?token=fixture-token';
+  let finishConnect,snapshot;
+  const invoke=async(command,args)=>{
+   calls.push({command,args});
+   if(command==='runtime_info'){
+    if(!snapshot)throw new Error(`Bridge error: ${secret}`);
+    return snapshot;
+   }
+   if(command==='set_native_language'){
+    if(!snapshot)throw new Error(`Bridge error: ${secret}`);
+    return;
+   }
+   if(command==='validate_connection_target')return true;
+   if(command==='connect')return new Promise((resolve,reject)=>{finishConnect={resolve,reject};});
+   if(command==='request')return stateReply();
+   assert.fail(`Unexpected command: ${command}`);
+  };
+  const {window,context,machine,dialog,form,node,tick,warnings,storageReads,routes,reloads}=await runtimePage({invoke});
+  assert.equal(await window.RSIDesktop.ready,null);
+  assert.equal(machine?.textContent,'连接运行机器');
+  assert.equal(dialog.open,true);
+  const [input,alert,connect,local,close]=form.children.slice(5);
+  assert.equal(alert.textContent,startupError);
+  assert.equal(alert.hidden,false);
+  assert.equal(node('connection').textContent,'连接中断');
+  assert.equal(node('toast').textContent,'');
+  assert.equal(window.__RSI_MACHINE_KEY__,undefined);
+  assert.deepEqual(storageReads.filter(key=>/^rsi-(project|navigation)/.test(key)),[]);
+  assert.deepEqual(calls.map(({command})=>command),['runtime_info','set_native_language']);
+  const setLanguage=async value=>{const select=node('language-select');select.value=value;await select.listeners.change[0].handler();};
+  await setLanguage('en');
+  assert.equal(machine.textContent,'Connect a runtime');
+  assert.equal(alert.textContent,startupErrorEnglish);
+  assert.equal(node('connection').textContent,'Disconnected');
+  await setLanguage('zh-CN');
+  const submit=()=>{
+   if(url===null)return local.onclick();
+   input.value=url;
+   form.onsubmit({preventDefault(){}});
+  };
+  submit();await tick();
+  assert.equal(connect.disabled,true);
+  assert.equal(local.disabled,true);
+  assert.equal(close.disabled,true);
+  assert.equal(calls.at(-1).args.url,url);
+  await assert.rejects(window.fetch('/api/config',{method:'POST',body:'{}'}),{name:'AbortError'});
+  finishConnect.reject(`Native connect error: ${secret}`);await tick();
+  const expectedError=url===null?localRecoveryError:'未能完成 HTTPS 连接。请核对完整的认证地址，并确认远端服务正在运行后重试。';
+  assert.equal(alert.textContent,expectedError);
+  assert.equal(connect.disabled,false);
+  assert.equal(local.disabled,false);
+  assert.equal(close.disabled,false);
+  assert.equal(reloads(),0);
+  close.onclick();assert.equal(dialog.open,false);assert.equal(input.value,'');
+  machine.onclick();assert.equal(dialog.open,true);assert.equal(alert.textContent,expectedError);
+  await setLanguage('en');
+  assert.equal(alert.textContent,url===null?localRecoveryErrorEnglish:'Could not complete the HTTPS connection. Verify the full authentication URL and make sure the remote service is running, then try again.');
+  submit();await tick();
+  snapshot={kind:recovery==='local'?'local':'remote',name:'Recovered',scope,connected:true,connection_generation:8};
+  finishConnect.resolve(snapshot);await tick();
+  assert.equal(reloads(),1);
+  assert.deepEqual(routes,['/index.html']);
+  assert.equal(window.__RSI_MACHINE_KEY__,undefined);
+  await assert.rejects(window.fetch('/api/state'),{name:'AbortError'});
+  assert.deepEqual(calls.filter(({command})=>command==='request'),[]);
+  assert.deepEqual(calls.filter(({command})=>command==='connect').map(({args})=>args.url),[url,url]);
+  assert.deepEqual(calls.filter(({command})=>command==='validate_connection_target').map(({args})=>args.url),url===null?[]:[url,url]);
+  assert.doesNotMatch(JSON.stringify(warnings),/fixture-password|fixture-token/);
+  const reloaded=await runtimePage({invoke});await reloaded.tick();
+  assert.equal(reloaded.dialog.open,false);
+  assert.equal(reloaded.machine.textContent,'Recovered');
+  assert.equal(reloaded.node('connection').textContent,'已连接');
+  assert.equal(reloaded.window.__RSI_MACHINE_KEY__,scope);
+  assert.deepEqual(reloaded.storageReads.filter(key=>/^rsi-(project|navigation)/.test(key)),[`rsi-project:${scope}`,`rsi-navigation:${scope}`]);
+  const requests=calls.filter(({command})=>command==='request').map(({args})=>[args.path.split('?')[0],args.connectionGeneration]);
+  assert.deepEqual(requests,[['sys-metrics',8],['state',8]]);
+ });
+}
+
+test('desktop startup preserves the explicit disconnected snapshot and generation',async()=>{
+ const requests=[];
+ const snapshot={connected:false,connection_generation:7,error:'Local runtime exited'};
+ const page=await runtimePage({invoke:async(command,args)=>{
+  if(command==='runtime_info')return snapshot;
+  if(command==='set_native_language')return;
+  assert.equal(command,'request');requests.push(args);
+  throw 'Runtime is unavailable';
+ }});
+ await page.tick();
+ assert.equal(await page.window.RSIDesktop.ready,snapshot);
+ assert.equal(page.window.__RSI_MACHINE_KEY__,'disconnected');
+ assert.equal(page.dialog.open,true);
+ assert.equal(page.form.children[6].textContent,snapshot.error);
+ assert.equal(page.node('connection').textContent,'连接中断');
+ assert.deepEqual(requests.map(args=>args.connectionGeneration),[7,7]);
+});
+
+test('desktop startup leaves browser startup on its original fetch',async()=>{
+ const calls=[];
+ const fetch=async path=>{calls.push(path);const reply=stateReply();return new Response(reply.body,{status:reply.status});};
+ const page=await runtimePage({fetch});await page.tick();
+ assert.equal(page.window.fetch,fetch);
+ assert.equal(page.window.RSIDesktop,undefined);
+ assert.equal(page.machine,undefined);
+ assert.equal(page.dialog,undefined);
+ assert.equal(page.node('connection').textContent,'已连接');
+ assert.deepEqual(calls.map(path=>path.split('?')[0]),['/api/state','/api/sys-metrics']);
+});
+
 const unauthorized={status:401,body:'{}'};
 for(const [name,kind,scope] of [
  ['local','local','local'],['SSH tunnel','remote','http://127.0.0.1:43217'],['direct HTTPS','remote','https://rsi.example.test'],
