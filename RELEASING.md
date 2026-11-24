@@ -28,6 +28,8 @@ smoke 可使用可选的 `GH_TOKEN` 读取本仓库固定的官方 latest Releas
 
 `CI timing evidence` 在普通检查、Desktop、专用验证或发布结束后，使用默认分支的只读脚本采集各 attempt、job 和 step，生成 Actions summary 和 JSON artifact，不执行被测分支代码、不读取日志。发布内部还保留携带 `release_path` 与 `artifact_reuse_reason` 的报告，区分候选可复用、缺失、过期、不可信及查询错误，并记录实际 `reuse`/`build` 结果。等待指标区分依赖/调度与 runner 分配加启动估计；缺时间戳保持 `unknown`，跳过作业为 `not_requested`，分配失败仅按真实 annotation 标注，不依据约十五分钟的时长推断执行超时。报告采集故障不改变源工作流的验证结论。
 
+按历史时间窗汇总复用和回退，或按 run/attempt 复查指定验包样本，可用 `scripts/release_path_metrics.py`。用法、计时口径和已完成运行的样本见[发布复用路径实测](docs/validation/release-paths-20261123.md)。
+
 可在 Actions 手动运行 `ci-metrics.yml`，传入一个已存在的 `run_id`，进行不创建版本、不发布的受控采集。提速后的端到端耗时和产物复用成功率仍需下一次真实版本记录；不能把 DAG 并行或合成测试当作已测得的发布提速比例。
 
 GitHub 必须允许 Actions 创建 PR，并允许既定工作流申请对应仓库权限；禁用这些能力时流程会明确失败，不假设已配置额外 PAT。仓库管理员仍应维护必需检查与评审规则。标签和工作流文件应纳入规则保护。

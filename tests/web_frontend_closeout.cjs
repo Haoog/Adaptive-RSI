@@ -2,6 +2,28 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
 const source=name=>fs.readFileSync('adaptive_rsi/web/'+name+'.js','utf8');
 function node(tag,text){return {tag,textContent:text,children:[],dataset:{},append(...items){this.children.push(...items);},setAttribute(){},addEventListener(){},remove(){},focus(){},showModal(){this.open=true;},close(){this.open=false;this.onclose?.();}};}
+test('task outcome shows head-scoped CI attention and links only web URLs',()=>{
+ const app=source('app'),start=app.indexOf('function ciAttention('),end=app.indexOf('function taskOutcome(',start);
+ const context={el(tag,text){const element=node(tag,text);Object.defineProperty(element,'childElementCount',{
+  get:()=>element.children.length});return element;},t:text=>text,stamp:seconds=>`time ${seconds}`};
+ vm.runInNewContext(app.slice(start,end),context);
+ const url='https://github.com/example/project/actions/runs/123/job/456';
+ const observation={head:'candidate-head',started_at:1000,reasons:['CANCELLED'],needs_attention:true,
+  checks:[{name:'verify',state:'CANCELLED',url},{name:'other',state:'STALE',url:'javascript:void(0)'}]};
+ const result={delivery_status:'waiting_ci',delivery_ci_inconclusive:observation};
+ const panel=context.ciAttention({state:'pr_open',result});
+ assert.equal(panel.children[0].textContent,'需要人工查看 CI');
+ assert.match(panel.children[1].textContent,/time 1000 · candidate-head/);
+ assert.match(panel.children[2].textContent,/CANCELLED/);
+ const [verify,other]=panel.children[3].children;
+ assert.equal(verify.children[0].href,url);
+ assert.equal(other.children.length,0);
+ assert.equal(other.textContent,'other · STALE');
+ assert.equal(context.ciAttention({state:'superseded',result}),null);
+ observation.needs_attention=false;
+ assert.equal(context.ciAttention({state:'pr_open',result}),null);
+});
+
 function diagnostics(scope){
  const text=source('model-center'),start=text.indexOf('    diagnostics.onclick='),end=text.indexOf('    const authProvider=',start),calls=[];
  const context={diagnostics:{},scope,provider:{id:'local',catalog:{models:[{id:'model',enabled:true}]}},api:async(path,body)=>{calls.push(body);return{scope:body.project};},safe:fn=>fn(),el:node,t:x=>x,document:{body:node('body')},JSON};

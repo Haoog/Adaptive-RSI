@@ -589,10 +589,67 @@ print('BOUNDARIES_OK')
         row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
         saved = json.loads(row["result"])
         self.assertEqual(row["state"], "pr_open")
-        self.assertEqual(saved["ci_inconclusive_ticks"], 10)
-        self.assertTrue(saved["ci_inconclusive_reported"])
+        self.assertEqual(saved["delivery_ci_inconclusive"], {
+            "head": "head", "started_at": 1000, "reasons": ["CANCELLED"],
+            "checks": [{"name": "verify", "state": "CANCELLED", "url": None}],
+            "observations": 10, "needs_attention": True,
+        })
+        event = self.store.one("SELECT data FROM events WHERE kind='delivery_ci_inconclusive'")
+        self.assertEqual(json.loads(event["data"]), saved["delivery_ci_inconclusive"])
         self.assertFalse([call for call in remote.call_args_list
-                          if call.args and call.args[0][:3] == ["gh", "pr", "close"]])
+                          if call.args and call.args[0][:3] in (["gh", "pr", "close"], ["gh", "pr", "merge"],
+                                                               ["gh", "run", "rerun"])])
+
+    def test_inconclusive_observation_restarts_only_when_evidence_changes_scope(self):
+        run = self.tracked_pr()
+        pr = self.pr_row("https://github.com/example/project/pull/1", "head")
+        check_url = "https://github.com/example/project/actions/runs/123/job/456"
+        pr["statusCheckRollup"] = [{"context": "verify", "state": "STALE", "targetUrl": check_url}]
+
+        def result():
+            return json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+
+        legacy = {**result(), "delivery_status": "waiting_ci", "ci_inconclusive_ticks": 10,
+                  "ci_inconclusive_reported": True}
+        self.store.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps(legacy), run["id"]))
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr) as view:
+            tick(self.runtime, 1000)
+            saved = result()
+            self.assertNotIn("ci_inconclusive_reported", saved)
+            observation = saved["delivery_ci_inconclusive"]
+            self.assertEqual(observation["observations"], 1)
+            self.assertFalse(observation["needs_attention"])
+            self.assertEqual(observation["checks"], [{"name": "verify", "state": "STALE", "url": check_url}])
+            view.side_effect = RuntimeError("GitHub temporarily unavailable")
+            tick(self.runtime, 1061)
+            self.assertEqual(result()["delivery_ci_inconclusive"], observation)
+            view.side_effect = None
+            pr["statusCheckRollup"] = [{"name": "verify", "conclusion": "STARTUP_FAILURE",
+                                         "detailsUrl": check_url}]
+            tick(self.runtime, 1122)
+            observation = result()["delivery_ci_inconclusive"]
+            self.assertEqual((observation["started_at"], observation["observations"]), (1000, 2))
+            self.assertEqual(observation["reasons"], ["STARTUP_FAILURE"])
+
+            # A newly sealed head has independent observations even if its conclusion is identical.
+            self.store.put_setting("delivery:" + run["id"], {"head": "next", "base": "base", "branch": "main"})
+            pr["headRefOid"] = "next"
+            tick(self.runtime, 1183)
+            next_head = result()["delivery_ci_inconclusive"]
+            self.assertEqual((next_head["head"], next_head["started_at"], next_head["observations"]),
+                             ("next", 1183, 1))
+
+            pr["statusCheckRollup"] = [{"name": "verify", "status": "IN_PROGRESS"}]
+            tick(self.runtime, 1244)
+            self.assertNotIn("delivery_ci_inconclusive", result())
+            self.assertEqual(result()["delivery_status"], "waiting_ci")
+            pr["statusCheckRollup"] = [{"name": "verify", "conclusion": "CANCELLED"}]
+            tick(self.runtime, 1305)
+            self.assertEqual(result()["delivery_ci_inconclusive"]["started_at"], 1305)
+            pr["statusCheckRollup"] = [{"name": "verify", "conclusion": "SUCCESS"}]
+            tick(self.runtime, 1366)
+            self.assertNotIn("delivery_ci_inconclusive", result())
+            self.assertEqual(result()["delivery_status"], "waiting_review")
 
     def test_inconclusive_check_conclusions_are_context_not_replan_evidence(self):
         from adaptive_rsi.delivery import pr_feedback_context, record_pr_feedback
