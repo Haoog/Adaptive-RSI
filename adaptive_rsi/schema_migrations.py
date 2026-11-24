@@ -315,20 +315,24 @@ def apply(db):
             LOGGER.info("Migration %d was applied by another opener while waiting for the write lock; "
                         "skipping its body", version)
             continue
-        if version == 6:
-            # 006 以文件 sha256 记账，不能在 SQL 里加过滤；预清理与迁移共用同一事务，
-            # 006 失败时隔离记录一并回滚，坏库不会留下半个状态。
-            _quarantine_unsafe_dependencies(db)
-        # executescript commits implicitly; execute complete statements within the
-        # same transaction as the ledger row so interrupted migrations roll back.
-        statement = ""
-        for line in content.decode("utf-8").splitlines(keepends=True):
-            statement += line
-            if sqlite3.complete_statement(statement):
-                db.execute(statement)
-                statement = ""
-        if statement.strip():
-            raise RuntimeError("Incomplete database migration statement")
+        # An earlier missing schema effect can stop heal() before it reaches an
+        # already-applied later migration. Recheck non-idempotent migration 11
+        # after applying earlier versions, under the same lock as the ledger write.
+        recovery_schema_exists = version == 11 and _effect_visible(db, version, _tables(db), _indexes(db))
+        if not recovery_schema_exists:
+            if version == 6:
+                # 清理与迁移共用同一事务，失败时隔离记录一并回滚。
+                _quarantine_unsafe_dependencies(db)
+            # executescript commits implicitly. Run complete statements in the
+            # same transaction as the ledger row so interrupted migrations roll back.
+            statement = ""
+            for line in content.decode("utf-8").splitlines(keepends=True):
+                statement += line
+                if sqlite3.complete_statement(statement):
+                    db.execute(statement)
+                    statement = ""
+            if statement.strip():
+                raise RuntimeError("Incomplete database migration statement")
         try:
             recorded = db.execute("INSERT OR IGNORE INTO schema_migrations VALUES (?,?,?)",
                                   (version, hashlib.sha256(content).hexdigest(), time.time())).rowcount
