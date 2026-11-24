@@ -319,7 +319,7 @@ function productionSettingsPage(scope) {
   // Keep production renderSettings, refresh, draft restoration and dirty status.
   // Isolate only unrelated panels and their background requests.
   vm.runInContext(`view='settings';renderCapabilities=async()=>{};loadReleaseWorkflows=async()=>{};
-    renderUpdateExtras=()=>{};renderNavigation=()=>{};window.RSIExperience.refreshed=()=>{};
+    renderNavigation=()=>{};window.RSIExperience.refreshed=()=>{};
     render=()=>{if(!settingsBaseline)renderSettings();};`, page.context);
   page.node('config-scope').value = scope; page.context.renderSettings();
   const server = structuredClone(page.context.initialState), posts = [];
@@ -463,7 +463,7 @@ for (const outcome of ['failure', 'network', 'timeout']) {
 
 test('update check acknowledgment replaces stale failure and disables only update controls', async () => {
   const page=browser();
-  vm.runInContext('state.update={state:"error",reason:"old-check-error",busy:false};renderUpdateExtras=()=>{};renderUpdate()',page.context);
+  vm.runInContext('state.update={state:"error",reason:"old-check-error",busy:false};renderUpdate()',page.context);
   assert.match(page.node('update-status').textContent,/old-check-error/);
   page.context.fetch=async()=>response({started:true,update:{state:'checking',busy:false}});
   page.node('check-update').handlers.click();await page.context.lastAction;
@@ -478,7 +478,7 @@ test('update check acknowledgment replaces stale failure and disables only updat
 });
 
 test('update check acknowledgment preserves a fast completed result', async () => {
-  const page=browser();vm.runInContext('renderUpdateExtras=()=>{}',page.context);
+  const page=browser();
   page.context.fetch=async()=>response({started:true,update:{state:'up_to_date',busy:false}});
   page.node('check-update').handlers.click();await page.context.lastAction;
   assert.match(page.node('update-status').textContent,/已是最新稳定版/);
@@ -493,7 +493,7 @@ test('primary rate limit shows retry time in both languages and enables checking
     const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
     // Load the real dictionary and translator without static DOM traversal.
     vm.runInContext(i18n.slice(0,i18n.indexOf('const staticText =')),page.context);
-    vm.runInContext(`language=${JSON.stringify(locale)};Date.now=()=>${(reset-1)*1000};state.update={state:'error',reason:'GitHub HTTP 403',reason_code:'github_primary_rate_limit',rate_limit_until:${reset},busy:false};renderUpdateExtras=()=>{};renderUpdate();`,page.context);
+    vm.runInContext(`language=${JSON.stringify(locale)};Date.now=()=>${(reset-1)*1000};state.update={state:'error',reason:'GitHub HTTP 403',reason_code:'github_primary_rate_limit',rate_limit_until:${reset},busy:false};renderUpdate();`,page.context);
     const expectedTime=vm.runInContext(`new Date(${reset}*1000).toLocaleString(language)`,page.context);
     assert.ok(page.node('update-status').textContent.includes(expectedTime));
     assert.match(page.node('update-status').textContent,locale==='en'?/anonymous API quota is exhausted/:/匿名 API 额度已用尽/);
@@ -566,7 +566,7 @@ test('update reasons show Chinese guidance in Chinese and the original text in E
   for (const locale of ['zh-CN', 'en']) for (const [update, zhHint] of cases) {
     const page = browser();
     vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')), page.context);
-    vm.runInContext(`language=${JSON.stringify(locale)};state.update=${JSON.stringify({...update, busy: false})};renderUpdateExtras=()=>{};renderUpdate();`, page.context);
+    vm.runInContext(`language=${JSON.stringify(locale)};state.update=${JSON.stringify({...update, busy: false})};renderUpdate();`, page.context);
     const text = page.node('update-status').textContent;
     if (locale === 'zh-CN') {
       assert.ok(text.includes(zhHint), 'Chinese UI should guide on: ' + update.reason + ' — got: ' + text);
@@ -605,6 +605,615 @@ test('an ambiguous connection failure after a write is never replayed', async ()
   page.context.fetch = async () => { calls++; throw new TypeError('connection lost'); };
   await assert.rejects(page.context.api('projects/import', {url: 'https://github.com/example/project'}), /无法连接本地服务/);
   assert.equal(calls, 1);
+});
+
+function projectAddPage(source = 'github') {
+  const page = browser(new Map(), context => {
+    const document = context.document, dialog = document.getElementById('project-dialog');
+    const close = document.getElementById('close-project-dialog');
+    close.closest = () => dialog;
+    const scopes = ['project', 'global'].map(scope => {
+      const button = document.getElementById('scope-' + scope);
+      button.dataset.settingsScope = scope;
+      return button;
+    });
+    document.querySelectorAll = selector => {
+      if (selector === '.close-dialog') return [close];
+      if (selector === '[data-settings-scope]') return scopes;
+      return [];
+    };
+    context.Event = Event;
+  });
+  const {node, context} = page;
+  const form = node('project-form'), select = node('project-source');
+  form.reset = () => {
+    select.value = 'github';
+    for (const id of ['project-urls', 'project-directory', 'project-path', 'project-name']) node(id).value = '';
+    node('project-enabled').checked = false;
+  };
+  select.dispatchEvent = event => {
+    page.listeners.get(event.type)({target: select});
+    select.handlers[event.type]({target: select});
+  };
+  select.form = form;
+  select.value = source;
+  select.dispatchEvent(new Event('change'));
+  node('add-project').handlers.click();
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', context);
+  return page;
+}
+
+const githubProject = name => `https://github.com/example/${name}`;
+const projectList = (...ids) => ({...snapshot(), projects: [...snapshot().projects, ...ids.map(id => ({id, name: id, paused: true}))]});
+
+test('GitHub project form distinguishes refused and unconfirmed links and retries only retained links manually', async () => {
+  const page = projectAddPage(), {node, context} = page, posts = [];
+  const urls = ['first', 'refused', 'lost', 'missing-id', 'last'].map(githubProject);
+  let retrying = false;
+  node('project-urls').value = urls.join('\n');
+  node('project-directory').value = '/tmp/chosen';
+  node('project-name').value = 'untouched local name';
+  context.fetch = async (url, options) => {
+    if (url.startsWith('/api/state?')) return response(projectList('first', 'lost', 'last', ...(retrying ? ['refused', 'missing-id'] : [])));
+    assert.equal(url, '/api/projects/import');
+    const body = JSON.parse(options.body);
+    posts.push(body);
+    if (retrying) return response({id: body.url.split('/').pop()});
+    if (body.url === urls[1]) return response({error: 'Import directory already exists; register it as a local project instead', error_code: 'validation_error'}, 400);
+    if (body.url === urls[2]) throw new TypeError('receipt lost after registration');
+    if (body.url === urls[3]) return response({});
+    return response({id: body.url.split('/').pop()});
+  };
+  await page.submit('project-form');
+  assert.deepEqual(posts, urls.map(url => ({url, directory: '/tmp/chosen'})));
+  assert.equal(node('project-urls').value, urls.slice(1, 4).join('\n'));
+  const status = node('import-status').textContent;
+  assert.match(status, /已确认接入 2/);
+  assert.ok(status.includes(`服务已拒绝：${urls[1]}`));
+  assert.ok(status.includes(`导入结果未确认：${urls[2]}`));
+  assert.ok(status.includes(`导入结果未确认：${urls[3]}`));
+  assert.equal(node('project-directory').value, '/tmp/chosen');
+  assert.equal(node('project-name').value, 'untouched local name');
+  assert.equal(node('project-dialog').open, true);
+  assert.equal(node('project-submit').disabled, false);
+  assert.equal(vm.runInContext('projectId', context), 'a');
+  retrying = true;
+  await page.submit('project-form');
+  assert.deepEqual(posts.slice(urls.length), urls.slice(1, 4).map(url => ({url, directory: '/tmp/chosen'})));
+  assert.equal(vm.runInContext('projectId', context), 'missing-id');
+  assert.equal(node('project-dialog').open, false);
+});
+
+test('GitHub project form reports an update rejection and an ambiguous server error in English', async () => {
+  const page = projectAddPage(), {node, context} = page, posts = [];
+  const links = ['blocked-by-update', 'server-error'].map(githubProject);
+  const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')) + ';language="en";', context);
+  node('project-urls').value = links.join('\n');
+  context.fetch = async (url, options) => {
+    if (url.startsWith('/api/state')) return response(projectList());
+    const {url: link} = JSON.parse(options.body);
+    posts.push(link);
+    if (posts.length === 1) return response({error: 'Software update in progress', error_code: 'update_in_progress'}, 503);
+    if (link === links[0]) return response({id: 'unexpected-retry'});
+    return response({error: 'Request could not be completed', error_code: 'internal_error'}, 500);
+  };
+  const pending = page.submit('project-form');
+  await new Promise(setImmediate);
+  if (page.timers.some(timer => timer.active && timer.delay === 1000)) await page.resume();
+  await pending;
+  assert.deepEqual(posts, links);
+  assert.equal(node('project-urls').value, links.join('\n'));
+  assert.match(node('import-status').textContent, /Confirmed imports for 0 links/);
+  assert.ok(node('import-status').textContent.includes(`Rejected by the service: ${links[0]}`));
+  assert.ok(node('import-status').textContent.includes(`Import result unconfirmed: ${links[1]}`));
+});
+
+for (const partial of [false, true]) test(`GitHub project form keeps ${partial ? 'partial results' : 'confirmed selection'} when the list read fails`, async () => {
+  const page = projectAddPage(), {node, context} = page, calls = [];
+  const urls = ['first', 'last'].map(githubProject);
+  node('project-urls').value = urls.join('\n');
+  context.fetch = async (url, options) => {
+    if (url.startsWith('/api/state?')) {
+      calls.push('list');
+      throw new TypeError('list unavailable');
+    }
+    const {url: link} = JSON.parse(options.body);
+    calls.push(link);
+    if (partial && link === urls[1]) return response({error: 'Invalid request', error_code: 'invalid_request'}, 400);
+    return response({id: link.split('/').pop()});
+  };
+  await page.submit('project-form');
+  assert.deepEqual(calls, [...urls, 'list']);
+  assert.equal(node('connection').textContent, '连接中断');
+  assert.ok(!node('project-form').querySelector('[data-form-error]'));
+  assert.equal(node('project-dialog').open, partial);
+  assert.equal(vm.runInContext('projectId', context), partial ? 'a' : 'last');
+  assert.equal(node('project-urls').value, partial ? urls[1] : '');
+  if (partial) assert.match(node('import-status').textContent, /已确认接入 1/);
+  else assert.equal(node('toast').textContent, '项目已接入');
+});
+
+for (const change of ['edit', 'reopen', 'source', 'project', 'settings scope']) test(`GitHub project form leaves ${change} alone after the prior batch settles`, async () => {
+  const page = projectAddPage(), {node, context} = page, posts = [];
+  const urls = ['first', 'last'].map(githubProject);
+  const draft = githubProject('new-draft');
+  let finishFirst, finishLast;
+  const first = new Promise(resolve => {finishFirst = resolve;});
+  const last = new Promise(resolve => {finishLast = resolve;});
+  node('project-urls').value = urls.join('\n');
+  context.fetch = (url, options) => {
+    if (url.startsWith('/api/state?')) return Promise.resolve(response(projectList('first', 'last')));
+    const {url: link} = JSON.parse(options.body);
+    posts.push(link);
+    return link === urls[0] ? first : last;
+  };
+  const pending = page.submit('project-form');
+  assert.deepEqual(posts, urls.slice(0, 1));
+  assert.match(node('import-status').textContent, /1 \/ 2/);
+  if (change === 'reopen') {
+    node('close-project-dialog').handlers.click();
+    node('onboard-add').handlers.click();
+  }
+  if (change === 'source') {
+    node('project-source').value = 'local';
+    node('project-source').dispatchEvent(new Event('change'));
+    node('project-path').value = '/draft/local';
+  }
+  if (change === 'project') {
+    node('project-select').value = 'b';
+    node('project-select').handlers.change();
+  }
+  if (change === 'settings scope') {
+    vm.runInContext('renderSettings=()=>{};renderNavigation=()=>{};', context);
+    node('scope-global').handlers.click();
+    node('scope-project').handlers.click();
+  }
+  if (change === 'edit' || change === 'reopen') {
+    node('project-urls').value = draft;
+    if (change === 'edit') page.input('project-urls', 'project-form');
+  }
+  const progress = node('import-status').textContent;
+  node('toast').textContent = 'newer feedback';
+  finishFirst(response({id: 'first'}));
+  await new Promise(setImmediate);
+  assert.deepEqual(posts, urls);
+  assert.equal(node('import-status').textContent, progress);
+  finishLast(change === 'project' ? response({error: 'Invalid request'}, 400) : response({id: 'last'}));
+  await pending;
+  assert.equal(node('import-status').textContent, '');
+  assert.equal(node('toast').textContent, 'newer feedback');
+  assert.equal(node('project-dialog').open, true);
+  assert.equal(node('project-urls').value, change === 'edit' || change === 'reopen' ? draft : urls.join('\n'));
+  assert.equal(node('project-path').value, change === 'source' ? '/draft/local' : '');
+  assert.equal(vm.runInContext('projectId', context), change === 'project' ? 'b' : 'a');
+});
+
+test('GitHub project form preserves a reopened draft while the successful batch list refresh finishes', async () => {
+  const page = projectAddPage(), {node, context} = page;
+  let finishList;
+  const list = new Promise(resolve => {finishList = resolve;});
+  node('project-urls').value = githubProject('added');
+  context.fetch = async url => url.startsWith('/api/state?') ? list : response({id: 'added'});
+  const pending = page.submit('project-form');
+  await new Promise(setImmediate);
+  const feedbackBeforeRefresh = node('toast').textContent;
+  node('onboard-add').handlers.click();
+  node('project-urls').value = githubProject('new-draft');
+  page.input('project-urls', 'project-form');
+  node('toast').textContent = 'newer feedback';
+  finishList(response(projectList('added')));
+  await pending;
+  assert.equal(node('toast').textContent, 'newer feedback');
+  assert.equal(feedbackBeforeRefresh, '项目已接入');
+  assert.equal(node('project-dialog').open, true);
+  assert.equal(node('project-urls').value, githubProject('new-draft'));
+  assert.equal(node('project-submit').disabled, false);
+  assert.equal(vm.runInContext('projectId', context), 'added');
+});
+
+test('local project form keeps the confirmed existing-project feedback when the list read fails', async () => {
+  const page = projectAddPage('local'), {node, context} = page, calls = [];
+  node('project-path').value = '/existing/project';
+  node('project-name').value = 'unsaved rename';
+  node('project-enabled').checked = true;
+  context.fetch = async (url, options) => {
+    if (url.startsWith('/api/state?')) {
+      calls.push('list');
+      throw new TypeError('list unavailable');
+    }
+    assert.equal(url, '/api/projects');
+    calls.push(JSON.parse(options.body));
+    return response({id: 'b', existing: true, name: 'B', paused: true});
+  };
+  await page.submit('project-form');
+  assert.deepEqual(calls, [{path: '/existing/project', name: 'unsaved rename', enabled: true}, 'list']);
+  assert.equal(node('project-dialog').open, false);
+  assert.equal(vm.runInContext('projectId', context), 'b');
+  assert.match(node('toast').textContent, /该路径已接入.*B.*已暂停.*未修改名称或启用状态/);
+  assert.equal(node('connection').textContent, '连接中断');
+});
+
+function pathRestorePage() {
+  const page = projectAddPage('local'), {node, context, document} = page;
+  const posts = [], reads = [], path = '/archived/project';
+  const receipt = {project: 'restored', archived: false, paused: true, name: 'Restored project'};
+  let restore = () => response(receipt), read = () => response(projectList('restored'));
+  document.body = node('body');
+  context.window.scrollTo = () => {};
+  context.window.__RSI_MACHINE_KEY__ = 'local';
+  const draft = () => {
+    node('project-source').value = 'local';
+    node('project-path').value = path;
+    node('project-name').value = 'draft name';
+    node('project-enabled').checked = true;
+  };
+  draft();
+  context.fetch = async (url, options) => {
+    if (/^\/api\/state(?:\?|$)/.test(url)) {
+      assert.equal(options.method, undefined);
+      reads.push(url);
+      return read(url);
+    }
+    assert.equal(options.method, 'POST');
+    posts.push([url, JSON.parse(options.body)]);
+    if (url === '/api/projects') return response({id: receipt.project, existing: true, archived: true, paused: true, name: 'Old name'});
+    assert.equal(url, '/api/project/restore');
+    return restore();
+  };
+  const confirmations = () => document.body.children.filter(box => box.className === 'confirm-dialog' && box.open);
+  const start = async () => {
+    const pending = page.submit('project-form');
+    await waitFor(() => confirmations().length);
+    return {pending, click: yes => confirmations()[0].children.at(-1).children[Number(yes)].handlers.click()};
+  };
+  return {...page, posts, reads, receipt, path, draft, start,
+    onRestore(handler) { restore = handler; }, onRead(handler) { read = handler; },
+    restorePosts: () => posts.filter(([url]) => url === '/api/project/restore'),
+    move(view) { vm.runInContext(`showView(${JSON.stringify(view)})`, context); }};
+}
+
+for (const [reason, invalidate] of [
+  ['form edit', page => { page.node('project-path').value = '/new/draft'; page.input('project-path', 'project-form'); }],
+  ['dialog reopen', page => { page.node('close-project-dialog').handlers.click(); page.node('add-project').handlers.click(); }],
+  ['project switch', page => { page.node('project-select').value = 'b'; page.node('project-select').handlers.change(); }],
+  ['navigation round trip', page => { page.move('settings'); page.move('overview'); }],
+  ['runtime switch', page => { page.context.window.__RSI_MACHINE_KEY__ = 'remote'; }],
+]) {
+  test(`path restore ignores confirmation after ${reason}`, async t => {
+    const page = pathRestorePage(), {pending, click} = await page.start();
+    invalidate(page);
+    click(true);
+    await pending;
+    t.diagnostic(`restore POST ${page.restorePosts().length}`);
+    assert.equal(page.restorePosts().length, 0);
+    assert.equal(page.node('project-dialog').open, true);
+    assert.equal(page.node('project-name').value, 'draft name');
+  });
+}
+
+test('path restore cancellation leaves the local form intact', async () => {
+  const page = pathRestorePage(), {pending, click} = await page.start();
+  click(false);
+  await pending;
+  assert.equal(page.restorePosts().length, 0);
+  assert.equal(page.node('project-dialog').open, true);
+  assert.equal(page.node('project-path').value, page.path);
+});
+
+test('path restore update rejection requires a new manual confirmation', async t => {
+  const page = pathRestorePage();
+  page.onRestore(() => rejected());
+  const {pending, click} = await page.start();
+  click(true);
+  await new Promise(setImmediate);
+  const replayTimer = page.timers.some(timer => timer.active && timer.delay === 1000);
+  if (replayTimer) {
+    page.onRestore(() => response(page.receipt));
+    await page.resume();
+  }
+  await pending;
+  t.diagnostic(`restore POST ${page.restorePosts().length}, automatic wait ${replayTimer}`);
+  assert.equal(page.restorePosts().length, 1);
+  assert.equal(replayTimer, false);
+  assert.match(page.node('toast').textContent, /服务正在更新.*重试/);
+  assert.equal(page.node('project-path').value, page.path);
+  page.onRestore(() => response(page.receipt));
+  const retry = await page.start();
+  retry.click(true);
+  await retry.pending;
+  assert.deepEqual(page.restorePosts().map(([, body]) => body), Array(2).fill({project: 'restored', confirmation: 'restore-project'}));
+});
+
+for (const [reason, change] of [
+  ['wrong project', {project: 'b'}], ['missing archive flag', {archived: undefined}],
+  ['missing pause flag', {paused: undefined}], ['unpaused project', {paused: false}], ['missing name', {name: undefined}],
+]) {
+  test(`path restore rejects ${reason} in a successful HTTP response`, async t => {
+    const page = pathRestorePage();
+    page.onRestore(() => response({...page.receipt, ...change}));
+    const {pending, click} = await page.start();
+    click(true);
+    await pending;
+    t.diagnostic(`selected ${vm.runInContext('projectId', page.context)}, list GET ${page.reads.length}`);
+    assert.equal(page.restorePosts().length, 1);
+    assert.equal(vm.runInContext('projectId', page.context), 'a');
+    assert.equal(page.reads.length, 0);
+    assert.equal(page.node('project-dialog').open, true);
+    assert.equal(page.node('project-name').value, 'draft name');
+    assert.match(page.node('toast').textContent, /恢复结果未确认/);
+  });
+}
+
+test('path restore reports the confirmed paused receipt and keeps a failed list check read-only on retry', async t => {
+  const page = pathRestorePage();
+  page.onRead(() => { throw new TypeError('list unavailable'); });
+  const {pending, click} = await page.start();
+  click(true);
+  await pending;
+  t.diagnostic(`feedback: ${page.node('toast').textContent}`);
+  assert.match(page.node('toast').textContent, /已恢复.*保持暂停.*Restored project|Restored project.*已恢复.*保持暂停/);
+  assert.equal(page.node('connection').textContent, '连接中断');
+  assert.match(page.node('toast').textContent, /重新提交相同路径，仅刷新列表/);
+  page.node('add-project').handlers.click();
+  page.draft();
+  const writes = page.posts.length;
+  page.onRead(() => response(projectList('restored')));
+  await page.submit('project-form');
+  assert.equal(page.posts.length, writes);
+  assert.equal(page.reads.length, 2);
+  assert.equal(page.node('project-dialog').open, false);
+  assert.equal(vm.runInContext('projectId', page.context), 'restored');
+});
+
+test('path restore keeps a late valid receipt for an explicit read without taking over the new project', async () => {
+  const page = pathRestorePage();
+  let finish;
+  page.onRestore(() => new Promise(resolve => { finish = () => resolve(response(page.receipt)); }));
+  const {pending, click} = await page.start();
+  click(true);
+  await waitFor(() => finish);
+  page.onRead(() => response(snapshot()));
+  page.node('project-select').value = 'b';
+  page.node('project-select').handlers.change();
+  await page.context.lastAction;
+  page.node('toast').textContent = 'new project feedback';
+  finish();
+  await pending;
+  assert.equal(vm.runInContext('projectId', page.context), 'b');
+  assert.equal(page.node('project-dialog').open, true);
+  assert.equal(page.node('project-name').value, 'draft name');
+  assert.equal(page.node('toast').textContent, 'new project feedback');
+  assert.equal(page.reads.length, 1);
+  page.onRead(() => response(projectList('restored')));
+  await page.submit('project-form');
+  assert.equal(page.posts.length, 2);
+  assert.equal(page.reads.length, 2);
+  assert.equal(vm.runInContext('projectId', page.context), 'restored');
+});
+
+test('path restore reports the receipt in English and preserves the outgoing goal draft', async () => {
+  const page = pathRestorePage();
+  const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')) + ';language="en"', page.context);
+  page.node('goal-text').value = 'outgoing goal';
+  vm.runInContext('goalDrafts.set("restored","restored goal")', page.context);
+  const {pending, click} = await page.start();
+  click(true);
+  await pending;
+  assert.equal(page.node('toast').textContent, 'Project restored and kept paused: Restored project');
+  assert.equal(page.node('goal-text').value, 'restored goal');
+  page.node('project-select').value = 'a';
+  page.node('project-select').handlers.change();
+  await page.context.lastAction;
+  assert.equal(page.node('goal-text').value, 'outgoing goal');
+});
+
+for (const outcome of ['failure', 'snapshot']) {
+  test(`path restore ignores late list ${outcome} after a navigation round trip and a reopened draft`, async t => {
+    const page = pathRestorePage();
+    vm.runInContext('view="settings"', page.context);
+    let finish;
+    page.onRead(() => new Promise((resolve, reject) => { finish = () => outcome === 'failure'
+      ? reject(new TypeError('late disconnect')) : resolve(response(snapshot())); }));
+    const {pending, click} = await page.start();
+    click(true);
+    await waitFor(() => finish);
+    page.move('models');
+    page.move('settings');
+    page.node('add-project').handlers.click();
+    page.node('project-path').value = '/current/draft';
+    page.input('project-path', 'project-form');
+    page.node('connection').textContent = 'new connection feedback';
+    page.node('toast').textContent = 'new form feedback';
+    finish();
+    await pending;
+    t.diagnostic(`selected ${vm.runInContext('projectId', page.context)}, connection ${page.node('connection').textContent}`);
+    assert.equal(vm.runInContext('projectId', page.context), 'restored');
+    assert.equal(page.node('connection').textContent, 'new connection feedback');
+    assert.equal(page.node('toast').textContent, 'new form feedback');
+    assert.equal(page.node('project-path').value, '/current/draft');
+    assert.equal(page.node('project-dialog').open, true);
+  });
+}
+
+function pausePage() {
+  const page = browser(), {context, node} = page;
+  const paused = {a: 0, b: 1}, posts = [], reads = [];
+  const stateFor = project => ({...snapshot(), selected_project: project, sections: ['core'],
+    projects: snapshot().projects.map(item => ({...item, paused: paused[item.id]})),
+    config: {sources: {}, github: {}, schedule: {light_minutes: 60, issues_minutes: 60}, delivery: {}},
+    tasks: [], runs: [], schedules: [], events: [], task_counts: [],
+  });
+  const reply = body => { paused[body.project] = Number(body.paused); return response({saved: true}); };
+  let post = reply, read = project => response(stateFor(project));
+  context.startState = stateFor('a');
+  context.fetch = async (url, options) => {
+    if (url === '/api/pause') {
+      assert.equal(options.method, 'POST');
+      const body = JSON.parse(options.body);
+      posts.push(body);
+      return post(body);
+    }
+    assert.match(url, /^\/api\/state(?:\?|$)/);
+    assert.equal(options.method, undefined);
+    const project = new URLSearchParams(url.split('?')[1]).get('project');
+    reads.push(project);
+    return read(project, options.signal);
+  };
+  vm.runInContext(`state=startState;language='zh-CN';view='settings';settingsBaseline={};
+    readinessCache.set('a',{items:[]});readinessCache.set('b',{items:[]});
+    renderSettings=()=>{};render=originalRender;
+    safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;};render()`, context);
+  const click = (includeDisabled = false, detail = 1) => {
+    if (node('pause-button').disabled && !includeDisabled) return;
+    node('pause-button').handlers.click({detail});
+    return context.lastAction;
+  };
+  const select = project => {
+    node('project-select').value = project;
+    node('project-select').handlers.change();
+    return context.lastAction;
+  };
+  return {...page, posts, reads, stateFor, reply, click, select,
+    onPost(handler) { post = handler; }, onRead(handler) { read = handler; }};
+}
+
+function pauseCounts(t, page) {
+  t.diagnostic(`POST ${page.posts.length}, GET ${page.reads.length}`);
+}
+
+test('pause button holds one write through redraw and project switch-back, then permits an explicit reversal', async t => {
+  const page = pausePage(), button = page.node('pause-button');
+  let finish;
+  const hold = new Promise(resolve => { finish = resolve; });
+  page.onPost(async body => { await hold; return page.reply(body); });
+  const first = page.click(), duplicate = page.click(true);
+  await page.context.refresh();
+  const afterRedraw = button.disabled;
+  await page.select('b');
+  const otherProject = button.disabled;
+  await page.select('a');
+  const afterReturn = button.disabled;
+  const afterSwitchClick = page.click(true);
+  finish();
+  // Release each old handler as well when running the regression against the parent.
+  await Promise.all([first, duplicate, afterSwitchClick].filter(Boolean));
+  page.onPost(page.reply);
+  await page.click();
+  pauseCounts(t, page);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}, {project:'a', paused:false}]);
+  assert.deepEqual([afterRedraw, otherProject, afterReturn], [true, false, true]);
+  assert.equal(button.textContent, '暂停运行');
+});
+
+for (const destination of ['b', 'a']) {
+  test(`pause button suppresses old rejection after switching ${destination === 'b' ? 'away' : 'away and back'}`, async t => {
+    const page = pausePage();
+    let reject;
+    page.onPost(() => new Promise(resolve => { reject = () => resolve(response({error_code:'invalid_request'}, 400)); }));
+    const first = page.click();
+    await page.select('b');
+    if (destination === 'a') await page.select('a');
+    vm.runInContext('toast("当前页面反馈")', page.context);
+    reject();
+    await first;
+    pauseCounts(t, page);
+    assert.deepEqual(page.posts, [{project:'a', paused:true}]);
+    assert.equal(page.node('toast').textContent, '当前页面反馈');
+    assert.equal(page.node('pause-button').disabled, false);
+  });
+}
+
+test('pause button keeps a saved receipt when the read fails and retries with GET before reversing', async t => {
+  const page = pausePage(), button = page.node('pause-button'), notice = page.node('toast');
+  page.onRead(() => { throw new TypeError('state unavailable'); });
+  await page.click();
+  const failedRead = {label: button.textContent, notice: notice.textContent};
+  const beforeRetry = page.posts.length;
+  await page.click();
+  const afterFailedRetry = page.posts.length;
+  page.onRead(project => response({...page.stateFor(project), runs: [{project:'a', task_title:'旧工作仍在收尾', started:1}]}));
+  await page.click();
+  const afterRead = {label: button.textContent, running: page.node('current-work').textContent, posts: page.posts.length};
+  await page.click();
+  pauseCounts(t, page);
+  assert.deepEqual([beforeRetry, afterFailedRetry, afterRead.posts], [1, 1, 1]);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}, {project:'a', paused:false}]);
+  assert.deepEqual(page.reads, ['a', 'a', 'a', 'a']);
+  assert.equal(failedRead.label, '刷新运行状态');
+  assert.match(failedRead.notice, /调度暂停请求已保存.*运行状态暂未刷新/);
+  assert.deepEqual([afterRead.label, afterRead.running], ['开始运行', '旧工作仍在收尾']);
+});
+
+test('pause button clears its old failure on retry and requires saved true before reporting success', async t => {
+  const page = pausePage(), notice = page.node('toast');
+  page.onPost(() => response({error_code:'invalid_request'}, 400));
+  await page.click();
+  const visibleFailure = !notice.hidden && notice.className === 'error';
+  let finish;
+  page.onPost(() => new Promise(resolve => { finish = () => resolve(response({saved:false})); }));
+  const retry = page.click();
+  const hidOldFailure = notice.hidden;
+  finish();
+  await retry;
+  const unconfirmed = {label:page.node('pause-button').textContent, notice:notice.textContent};
+  page.onPost(page.reply);
+  await page.click();
+  pauseCounts(t, page);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}, {project:'a', paused:true}]);
+  assert.deepEqual(page.reads, ['a']);
+  assert.deepEqual([visibleFailure, hidOldFailure], [true, true]);
+  assert.deepEqual(unconfirmed, {label:'刷新运行状态', notice:'运行状态变更结果未确认，请先刷新运行状态。'});
+  assert.equal(notice.hidden, true);
+  assert.equal(page.node('pause-button').textContent, '暂停运行');
+});
+
+test('pause button ignores the second click of a double click even after a fast refresh', async t => {
+  const page = pausePage();
+  await page.click();
+  await page.click(false, 2);
+  const countAfterDoubleClick = page.posts.length;
+  await page.click();
+  pauseCounts(t, page);
+  assert.equal(countAfterDoubleClick, 1);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}, {project:'a', paused:false}]);
+});
+
+test('pause button never treats a pre-write snapshot as the confirmed state', async t => {
+  const page = pausePage();
+  let finishOld;
+  page.onRead((project, signal) => {
+    if (page.reads.length > 1) return response(page.stateFor(project));
+    const old = page.stateFor(project);
+    return new Promise(resolve => {
+      finishOld = () => resolve(response(old));
+      signal.addEventListener('abort', finishOld, {once:true});
+    });
+  });
+  const old = page.context.refresh();
+  const write = page.click();
+  await new Promise(setImmediate);
+  finishOld();
+  await Promise.all([old, write]);
+  pauseCounts(t, page);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}]);
+  assert.deepEqual(page.reads, ['a', 'a']);
+  assert.equal(page.node('pause-button').textContent, '开始运行');
+});
+
+test('pause button does not replay an update rejection after the user changes projects', async t => {
+  const page = pausePage();
+  page.onPost(body => page.posts.length === 1 ? rejected() : page.reply(body));
+  const pending = page.click();
+  await new Promise(setImmediate);
+  await page.select('b');
+  if (page.timers.some(timer => timer.active && timer.delay === 1000)) await page.resume();
+  await pending;
+  pauseCounts(t, page);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}]);
+  assert.deepEqual(page.reads, ['b']);
+  assert.equal(page.node('pause-button').textContent, '开始运行');
 });
 
 test('a failed capability probe reports the connection error rather than an upgrade hint', async () => {
@@ -907,7 +1516,7 @@ test('inspection entry points follow project, configuration and repository avail
   });
   page.document.querySelectorAll = selector => selector === '[data-inspect]' ? buttons : [];
   page.node('config-scope').value = 'project';
-  vm.runInContext('language="zh-CN";view="settings";settingsBaseline={};readinessCache.set("a",{ready:true,items:[]});renderUpdateExtras=()=>{};originalRender()', page.context);
+  vm.runInContext('language="zh-CN";view="settings";settingsBaseline={};readinessCache.set("a",{ready:true,items:[]});originalRender()', page.context);
   assert.equal(buttons[0].disabled, false, 'manual check stays available when its source is disabled');
   assert.equal(buttons[1].disabled, true, 'missing repository cannot schedule Issue sync');
   page.context.initialState.projects[0].config.sources = {inspection: true, issues: true};
@@ -2118,6 +2727,125 @@ test('an import form remains unchanged when polling auto-selects a newly importe
   assert.equal(vm.runInContext('importInputUnchanged()',page.context),true);
   page.input('project-urls','project-form');
   assert.equal(vm.runInContext('importInputUnchanged()',page.context),false);
+});
+
+async function desktopProjectFolder(kind='local') {
+  const page=browser(new Map(),({document})=>{
+    const close=document.getElementById('project-close');
+    close.closest=()=>document.getElementById('project-dialog');
+    document.querySelectorAll=selector=>selector==='.close-dialog'?[close]:[];
+  });
+  const {node,document,context,listeners}=page;
+  const choices=[],posts=[],closeEvents=[];
+  let reloads=0;
+  const dialog=node('project-dialog'),form=node('project-form'),field=node('project-path'),source=node('project-source');
+  source.form=field.form=form;
+  source.dispatchEvent=event=>{listeners.get(event.type)({target:source});source.handlers[event.type]({target:source});};
+  context.Event=Event;
+  dialog.tagName='DIALOG';
+  dialog.querySelector=selector=>selector==='form'?form:null;
+  dialog.close=()=>{dialog.open=false;closeEvents.push(()=>listeners.get('close')({target:dialog}));};
+  form.reset=()=>{listeners.get('reset')({target:form});source.value='github';field.value='';};
+  const close=node('project-close');
+  node('project-enabled').checked=false;
+  document.querySelector=()=>node('project-tools');
+  document.body=node('body');
+  node('toast').hidden=true;
+  context.safe=(fn,owner)=>{context.lastAction=context.originalSafe(fn,owner);return context.lastAction;};
+  context.refresh=async()=>{};
+  context.fetch=async(url,options)=>{posts.push([url,JSON.parse(options.body)]);return response({id:'added'});};
+  context.history={replaceState(){}};
+  context.location={reload(){reloads++;}};
+  context.window.fetch=async()=>{};
+  context.window.__TAURI_INTERNALS__={invoke:async(command)=>{
+    if(command==='runtime_info')return {kind,connected:true,scope:kind,connection_generation:1};
+    if(command==='choose_folder')return new Promise((resolve,reject)=>choices.push({resolve,reject}));
+    if(command==='validate_connection_target')return true;
+    if(command==='connect')return {scope:'remote',connection_generation:2};
+    assert.fail('Unexpected native command: '+command);
+  }};
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/desktop.js'),'utf8'),context);
+  await listeners.get('DOMContentLoaded')();
+  const folder=node('local-project-fields').children.find(button=>button.textContent==='选择文件夹');
+  const select=value=>{source.value=value;source.dispatchEvent(new Event('change'));};
+  node('add-project').handlers.click();select('local');
+  return {
+    ...page,dialog,field,choices,posts,select,pick:()=>folder.onclick(),
+    close:()=>close.handlers.click(),reopen:()=>node('onboard-add').handlers.click(),
+    flushClose:()=>closeEvents.shift()(),
+    edit(value){field.value=value;page.input('project-path','project-form');},
+    async switchRuntime(){
+      node('project-tools').children[0].onclick();
+      const connection=document.body.children[0].children[0];
+      connection.children.find(child=>child.type==='password').value='https://rsi.example.test/?token=fixture';
+      connection.onsubmit({preventDefault(){}});
+      await new Promise(setImmediate);
+      assert.equal(reloads,1);
+    }
+  };
+}
+
+for(const [name,move] of [
+  ['reopened dialog before its queued close event',page=>{page.close();page.reopen();}],
+  ['source toggled away and back',page=>{page.select('github');page.select('local');}],
+  ['manually edited path',page=>page.edit('/manual')],
+  ['manual edit back to the original text',page=>{page.edit('/manual');page.edit('/original');}],
+  ['switched runtime',page=>page.switchRuntime()],
+]){
+  for(const outcome of ['path','error']){
+    test(`desktop project folder ignores stale ${outcome}: ${name}`,async()=>{
+      const page=await desktopProjectFolder();
+      page.edit('/original');
+      const picking=page.pick();
+      assert.equal(page.choices.length,1);
+      await move(page);
+      const expected=page.field.value;
+      if(outcome==='path')page.choices[0].resolve('/late');
+      else page.choices[0].reject('Folder selection interrupted');
+      await picking;
+      assert.equal(page.field.value,expected);
+      assert.equal(page.node('toast').hidden,true);
+    });
+  }
+}
+
+test('desktop project folder coalesces repeated clicks and permits reselection after cancellation',async()=>{
+  const page=await desktopProjectFolder();
+  page.edit('/manual');
+  const first=page.pick(),duplicate=page.pick();
+  const calls=page.choices.length;
+  for(const choice of page.choices)choice.resolve(null);
+  await Promise.all([first,duplicate]);
+  assert.equal(calls,1);
+  assert.equal(page.field.value,'/manual');
+  assert.equal(page.node('toast').hidden,true);
+  const second=page.pick();page.choices.at(-1).resolve('/chosen');await second;
+  assert.equal(page.field.value,'/chosen');
+});
+
+test('desktop project folder preserves selection and ordinary project submission',async()=>{
+  const page=await desktopProjectFolder();
+  const first=page.pick();page.choices.at(-1).resolve('/chosen');await first;
+  assert.equal(page.field.value,'/chosen');
+  page.close();page.reopen();
+  const second=page.pick();page.flushClose();page.choices.at(-1).resolve('/new-choice');await second;
+  assert.equal(page.field.value,'/new-choice');
+  await page.submit('project-form');
+  assert.deepEqual(page.posts,[['/api/projects',{path:'/new-choice',name:null,enabled:false}]]);
+  assert.equal(page.dialog.open,false);
+  assert.equal(page.field.value,'');
+  assert.equal(page.node('project-source').value,'github');
+  assert.equal(page.node('toast').textContent,'项目已接入');
+});
+
+test('desktop project folder on remote runtime keeps manual paths and skips the native chooser',async()=>{
+  const page=await desktopProjectFolder('remote');
+  page.edit('/srv/projects/example');await page.pick();
+  assert.equal(page.choices.length,0);
+  assert.equal(page.node('toast').textContent,'远端项目请填写服务器上的路径。');
+  await page.submit('project-form');
+  assert.deepEqual(page.posts,[['/api/projects',{path:'/srv/projects/example',name:null,enabled:false}]]);
+  assert.equal(page.dialog.open,false);
 });
 
 test('goal drafts stay with their project and submit only to that project', async () => {
@@ -7419,7 +8147,7 @@ function desktopPage() {
   page.context.clearInterval = id => { if (id === intervalId) poll = null; };
   page.context.uiConfirm = async () => true;
   page.context.window.RSIDesktop = desktop;
-  for (const id of ['update-status', 'update-notes', 'apply-update', 'desktop-update'])
+  for (const id of ['update-status', 'update-notes', 'apply-update', 'desktop-update', 'check-legacy-desktop-update'])
     Object.assign(page.node(id), {after(...children) { this.children.push(...children); }, remove() { this.removed = true; }});
   page.desktop = desktop;
   page.tick = async () => {
@@ -7481,7 +8209,8 @@ test('repeated update checks during a download keep one poller and the reported 
   await vm.runInContext('checkDesktopUpdate(true)', page.context);
   assert.equal(vm.runInContext('desktopUpdateTimer', page.context), first, 'a repeated check never starts a second poller');
   assert.equal(vm.runInContext('desktopUpdate.percent', page.context), 40, 'a repeated check keeps the reported progress');
-  assert.equal(page.desktop.checks, 2);
+  assert.equal(page.desktop.checks, 1, 'the disabled check neither calls the native command nor disturbs polling');
+  assert.equal(page.node('check-legacy-desktop-update').disabled, true);
   assert.match(String(page.node('desktop-update').children[0]), /40%/);
 });
 
@@ -7517,7 +8246,7 @@ function desktopBootPage({lastChecked = Date.now() - 60000, failCheck = false} =
   });
   page.context.fetch = async () => response(snapshot());
   page.context.localStorage.setItem('rsi-native-update-checked', String(lastChecked));
-  Object.assign(page.node('update-status'), {after(...children) { this.children.push(...children); }});
+  Object.assign(page.node('legacy-desktop-update'), {after(...children) { this.children.push(...children); }});
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/native-update.js'), 'utf8'), page.context);
   page.calls = calls;
   page.checkCalls = () => calls.filter(action => action === 'check').length;
@@ -7553,12 +8282,96 @@ test('opening the desktop console respects an active check backoff', async () =>
   assert.equal(page.checkCalls(), 1, 'the retry waits for the existing backoff');
 });
 
-test('the check-update button still forces an immediate check', async () => {
+test('desktop client and backend service keep separate check actions, results and busy states', async () => {
   const page = desktopBootPage();
+  const requests=[];
+  let reply;
+  page.context.fetch=(url, options)=>{
+    if(url==='/api/sys-metrics')return Promise.resolve(response({}));
+    requests.push([url,options.method]);
+    return new Promise(resolve=>{reply=resolve;});
+  };
   await page.fireReady();
-  assert.equal(page.checkCalls(), 0);
-  await page.node('check-update').handlers.click();
-  assert.equal(page.checkCalls(), 1, 'an explicit click bypasses the six-hour window');
+  assert.equal(page.checkCalls(),0);
+  const panel=page.node('legacy-desktop-update').children[0];
+  const clientCheck=panel.children.find(node=>node.textContent==='检查桌面客户端更新');
+  const clientStatus=panel.children.find(node=>node.attributes.role==='status');
+  const serviceCheck=page.node('check-update');
+  vm.runInContext('state.update={state:"unchecked",channel:"managed"};renderUpdate()',page.context);
+  const serviceAction=serviceCheck.handlers.click();
+  await new Promise(setImmediate);
+  assert.equal(serviceCheck.disabled,true);
+  assert.equal(clientCheck.disabled,false);
+  assert.match(page.node('update-status').textContent,/正在检查更新/);
+  await clientCheck.onclick();
+  assert.equal(page.checkCalls(),1,'the explicit client check bypasses the six-hour window');
+  assert.match(clientStatus.textContent,/已是最新稳定版/);
+  assert.equal(serviceCheck.disabled,true);
+  reply(response({started:true,update:{state:'available',version:'9.0.0',channel:'managed'}}));
+  await serviceAction;
+  assert.match(page.node('update-status').textContent,/9\.0\.0/);
+  assert.doesNotMatch(clientStatus.textContent,/9\.0\.0/);
+  assert.deepEqual(requests,[['/api/updates/check','POST']]);
+  assert.deepEqual(page.calls.filter(action=>['check','download','install'].includes(action)),['check']);
+  vm.runInContext('state.update={state:"unchecked",channel:"desktop",desktop_managed:true};renderUpdate()',page.context);
+  assert.match(page.node('update-status').textContent,/随桌面客户端更新/);
+  assert.equal(serviceCheck.disabled,true);
+  assert.equal(page.node('apply-update').disabled,true);
+  assert.equal(clientCheck.disabled,false);
+  await serviceCheck.handlers.click();
+  assert.equal(requests.length,1);
+  vm.runInContext('state.update={state:"available",version:"9.0.0",channel:"managed"};renderUpdate()',page.context);
+  assert.equal(serviceCheck.disabled,false);
+  page.context.window.RSIDesktop.isLocalDisconnected=()=>true;
+  vm.runInContext('renderUpdate()',page.context);
+  assert.equal(serviceCheck.disabled,true);
+  assert.equal(page.node('apply-update').disabled,true);
+  assert.equal(clientCheck.disabled,false);
+});
+
+test('operations confirmation names the action and restores focus after dismissal', async () => {
+  const page=browser();
+  const opener=page.node('apply-update');
+  page.document.activeElement=opener;
+  opener.focus=()=>{page.document.activeElement=opener;};
+  page.document.body=page.node('body');
+  const create=page.document.createElement;
+  page.document.createElement=tag=>{
+    const node=create(tag);node.focus=()=>{page.document.activeElement=node;};return node;
+  };
+  const result=page.context.uiConfirm('确认后台服务更新？');
+  const dialog=page.document.body.children.at(-1),cancel=dialog.children.at(-1).children[0];
+  assert.equal(dialog.attributes['aria-label'],'确认后台服务更新？');
+  assert.equal(page.document.activeElement,cancel);
+  dialog.close();
+  assert.equal(await result,false);
+  assert.equal(page.document.activeElement,opener);
+  assert.equal(dialog.isConnected,false);
+});
+
+test('global configuration repair keeps failure inside its named dialog and restores focus on close',async()=>{
+  const page=browser(),opener=page.node('settings-save');
+  page.document.activeElement=opener;
+  opener.focus=()=>{page.document.activeElement=opener;};
+  page.document.body=page.node('body');
+  const create=page.document.createElement;
+  page.document.createElement=tag=>{
+    const node=create(tag);node.focus=()=>{page.document.activeElement=node;};return node;
+  };
+  page.context.api=async route=>{
+    assert.equal(route,'config/repair-global');
+    throw Error('fixture repair failure');
+  };
+  page.context.offerGlobalConfigRepair({});
+  const dialog=page.document.body.children.at(-1),[title,,alert,actions]=dialog.children;
+  const [cancel,repair]=actions.children;
+  assert.equal(dialog.attributes['aria-labelledby'],title.id);
+  assert.equal(page.document.activeElement,cancel);
+  await repair.onclick();
+  assert.equal(dialog.open,true);
+  assert.equal(alert.attributes.role,'alert');assert.equal(alert.textContent,'fixture repair failure');
+  assert.equal(repair.disabled,false);
+  cancel.onclick();assert.equal(page.document.activeElement,opener);
 });
 
 test('multiple predecessors survive language rebuild and save as one dependency set', async () => {
