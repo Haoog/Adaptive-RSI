@@ -63,18 +63,24 @@ if(window.__TAURI_INTERNALS__){
    if(ticket)observeRemoteSession(ticket,reply);
    return response;
   },async error=>{
-   if(error==='Runtime connection changed'){
-    // Native recovery can change the connection outside the dialog. Reload
-    // only once a replacement is available, without retrying the old request.
-    const wasLocal=info.kind==='local'&&info.connected;
+   const wasLocal=info.kind==='local'&&info.connected;
+   const localUnavailable=wasLocal&&error==='Runtime unavailable';
+   if(error==='Runtime connection changed'||localUnavailable){
+    // Reload only once a replacement is available, without retrying the old request.
+    if(localUnavailable&&options.signal?.aborted)throw aborted();
     let obsolete=switching||changing;
     if(!obsolete){
      const probe=++runtimeProbe;
      const next=await invoke('runtime_info').catch(()=>null);
+     if(localUnavailable&&options.signal?.aborted)throw aborted();
      obsolete=switching||changing||probe<=lastRuntimeReply;
-     if(!obsolete&&typeof next?.connected==='boolean'){
+     const generation=next?.connection_generation;
+     // An ordinary owned child exit clears the target without changing the generation.
+     const confirmed=localUnavailable?Number.isSafeInteger(generation)&&(
+      next.connected===false&&next.error==='Local runtime exited'&&generation===info.connection_generation||
+      next.connected===true&&generation>info.connection_generation):typeof next?.connected==='boolean';
+     if(!obsolete&&confirmed){
       lastRuntimeReply=probe;
-      const generation=next.connection_generation;
       if(next.connected&&generation!==info.connection_generation&&
        (!isLocalDisconnected()||generation>disconnectedGeneration))reloadRuntime(info,next);
       if(wasLocal&&!next.connected&&Number.isSafeInteger(generation)){
@@ -84,9 +90,11 @@ if(window.__TAURI_INTERNALS__){
       }
      }
     }
-    const error=aborted();
-    if(wasLocal&&(obsolete||isLocalDisconnected()||switched))error.runtimeConnectionChanged=true;
-    throw error;
+    const handled=wasLocal&&(obsolete||isLocalDisconnected()||switched);
+    if(localUnavailable&&!handled)throw error;
+    const failure=aborted();
+    if(handled)failure.runtimeConnectionChanged=true;
+    throw failure;
    }
    if(switched||error==='Request cancelled')throw aborted();
    throw error;

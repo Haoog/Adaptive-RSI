@@ -272,22 +272,22 @@ async function runtimePage({invoke,fetch=async()=>assert.fail('unexpected networ
 }
 const reconnectMachine='重新连接运行机器';
 const reconnectLocal='本机服务连接已中断。请选择“使用本机”重连，或连接服务器。';
-async function exitedLocalPage(){
+async function exitedLocalPage({requestError='Runtime connection changed',kind='local',scope='http://127.0.0.1:6090'}={}){
  const calls=[],probes=[],connections=[],validations=[],writes=[];
  let initialState=true;
- const scope='http://127.0.0.1:6090';
  const page=await runtimePage({invoke:async(command,args)=>{
   calls.push({command,args});
   if(command==='runtime_info'){
-   if(calls.length===1)return {kind:'local',name:'本机',scope,connected:true,owned:true,connection_generation:7};
+   if(calls.length===1)return {kind,name:kind==='local'?'本机':'Fixture',scope,connected:true,owned:kind==='local',connection_generation:7};
    return new Promise(resolve=>probes.push(resolve));
   }
   if(command==='request'){
    if(args.path==='sys-metrics')return {status:200,body:'{}'};
    if(args.path==='config')return new Promise(resolve=>writes.push(resolve));
    if(args.path.startsWith('state?')&&initialState){initialState=false;return stateReply();}
-   throw 'Runtime connection changed';
+   throw requestError;
   }
+  if(command==='cancel_request')return;
   if(command==='validate_connection_target')return new Promise(resolve=>validations.push(resolve));
   if(command==='connect')return new Promise((resolve,reject)=>connections.push({resolve,reject}));
   if(command==='set_native_language')return;
@@ -301,6 +301,111 @@ async function exitedLocalPage(){
  return {...page,scope,calls,probes,connections,validations,writes,clickInspect,alert:page.form.children[6],local:page.form.children[8]};
 }
 const disconnectedLocal={connected:false,connection_generation:8,error:'Local runtime exited'};
+const exitedAtPageGeneration={...disconnectedLocal,connection_generation:7};
+test('desktop ordinary local process exit offers manual reconnection from the inspect button',async()=>{
+ const page=await exitedLocalPage({requestError:'Runtime unavailable'});
+ const draft=page.node('goal-text');draft.value='待编辑内容';
+ const count=command=>page.calls.filter(call=>call.command===command).length;
+ const click=page.clickInspect();await page.tick();
+ page.probes.shift()?.(exitedAtPageGeneration);
+ await click;
+ assert.deepEqual({snapshots:count('runtime_info'),machine:page.machine.textContent,status:page.node('connection').textContent,
+  toast:page.node('toast').textContent,connects:count('connect'),reloads:page.reloads()},
+ {snapshots:2,machine:reconnectMachine,status:'连接中断',toast:'',connects:0,reloads:0});
+ assert.equal(draft.value,'待编辑内容');
+ page.machine.onclick();
+ assert.equal(page.alert.textContent,reconnectLocal);
+ const reconnect=page.local.onclick();await page.tick();
+ assert.equal(count('connect'),1);
+ assert.equal(page.calls.find(call=>call.command==='connect').args.url,null);
+ // Native connect bootstraps without selecting, then publishes a replacement at generation + 1.
+ page.connections.shift().resolve({kind:'local',scope:page.scope,connected:true,connection_generation:8});
+ await reconnect;
+ assert.equal(page.reloads(),1);
+ assert.equal(page.routes.length,0);
+ assert.deepEqual(page.calls.filter(call=>call.command==='request'&&call.args.body!==null)
+  .map(({args})=>[args.path,args.connectionGeneration]),[['request',7]]);
+});
+test('desktop ordinary local process exit lets polling discover recovery and discards late replies',async()=>{
+ const page=await exitedLocalPage({requestError:'Runtime unavailable'});
+ const write=assert.rejects(page.window.fetch('/api/config',{method:'POST',body:'{}'}),{name:'AbortError'});
+ const older=page.clickInspect(),newer=page.clickInspect();
+ const unknown=assert.rejects(page.window.fetch('/api/state'),error=>error==='Runtime unavailable');
+ await page.tick();
+ assert.equal(page.probes.length,3);
+ const [oldSnapshot,newSnapshot,unknownSnapshot]=page.probes.splice(0);
+ unknownSnapshot(Promise.reject(new Error('snapshot unavailable')));await unknown;
+ newSnapshot(exitedAtPageGeneration);await newer;
+ oldSnapshot({kind:'local',scope:page.scope,connected:true,connection_generation:8});await older;
+ assert.equal(page.machine.textContent,reconnectMachine);
+ assert.equal(page.reloads(),0);
+
+ page.advance(15000);await page.tick();
+ const late=page.clickInspect();await page.tick();
+ assert.equal(page.probes.length,2);
+ page.probes.shift()({kind:'local',scope:page.scope,connected:true,connection_generation:8});await page.tick();
+ page.probes.shift()(exitedAtPageGeneration);await late;
+ page.writes.shift()({status:200,body:'{"saved":true}'});await write;
+ assert.equal(page.reloads(),1);
+ assert.equal(page.dialog.open,false);
+ assert.equal(page.node('toast').textContent,'');
+ assert.equal(page.calls.filter(call=>call.command==='connect').length,0);
+ assert.deepEqual(page.calls.filter(call=>call.command==='request'&&call.args.body!==null)
+  .map(({args})=>[args.path,args.connectionGeneration]),[['config',7],['request',7],['request',7],['request',7]]);
+});
+
+test('desktop ordinary local process exit ignores cancelled probes and defers to a manual choice',async()=>{
+ const page=await exitedLocalPage({requestError:'Runtime unavailable'});
+ const controller=new AbortController();
+ const cancelled=assert.rejects(page.window.fetch('/api/state',{signal:controller.signal}),{name:'AbortError'});
+ await page.tick();
+ assert.equal(page.probes.length,1);
+ controller.abort();await cancelled;
+ page.probes.shift()(exitedAtPageGeneration);await page.tick();
+ assert.equal(page.machine.textContent,'本机');
+ const cancel=page.calls.find(call=>call.command==='cancel_request');
+ const request=page.calls.find(call=>call.command==='request'&&call.args.path==='state');
+ assert.equal(cancel.args.id,request.args.requestId);
+
+ const click=page.clickInspect();await page.tick();
+ assert.equal(page.probes.length,1);
+ page.machine.onclick();
+ const reconnect=page.local.onclick();await page.tick();
+ page.connections.shift().reject('private native error');await reconnect;
+ const manualError=page.alert.textContent;
+ assert.ok(manualError);
+ page.probes.shift()(exitedAtPageGeneration);await click;
+ assert.equal(page.alert.textContent,manualError);
+ assert.equal(page.machine.textContent,'本机');
+ assert.equal(page.node('connection').textContent,'已连接');
+ assert.equal(page.node('toast').textContent,'');
+ assert.equal(page.reloads(),0);
+});
+
+for(const [name,options,snapshot] of [
+ ['generic bridge failure',{requestError:'Server connection failed'}],
+ ['native cancellation',{requestError:'Request cancelled'}],
+ ['HTTPS outage',{requestError:'Runtime unavailable',kind:'remote',scope:'https://fixture.example.test'}],
+ ['SSH outage',{requestError:'Runtime unavailable',kind:'remote',scope:'ssh:fixture'}],
+ ['unknown snapshot',{requestError:'Runtime unavailable'},{}],
+ ['unrelated disconnect',{requestError:'Runtime unavailable'},{...exitedAtPageGeneration,error:'Runtime startup interrupted'}],
+ ['disconnect at a different generation',{requestError:'Runtime unavailable'},disconnectedLocal],
+ ['still connected at the original generation',{requestError:'Runtime unavailable'},{connected:true,connection_generation:7}],
+]){
+ test(`desktop ordinary local process exit ignores ${name}`,async()=>{
+  const page=await exitedLocalPage(options);
+  const label=page.machine.textContent;
+  const click=page.clickInspect();await page.tick();
+  assert.equal(page.probes.length,snapshot?1:0);
+  if(snapshot)page.probes.shift()(snapshot);
+  await click;
+  assert.equal(page.machine.textContent,label);
+  assert.equal(page.node('connection').textContent,'已连接');
+  assert.match(page.node('toast').textContent,options.scope?.startsWith('ssh:')?/SSH 隧道暂时不可用/:/无法连接本地服务/);
+  assert.equal(page.reloads(),0);
+ });
+}
+
 test('desktop running local disconnect offers manual recovery after the inspect button aborts',async()=>{
  const page=await exitedLocalPage();
  const draft=page.node('goal-text');draft.value='待编辑内容';
