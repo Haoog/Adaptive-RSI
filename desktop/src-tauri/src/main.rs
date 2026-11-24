@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     fs::{self, File},
-    io::{self, BufRead, IsTerminal, Read, Write},
+    io::{self, BufRead, IsTerminal, Read, Seek, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -21,6 +21,7 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 
+mod legacy_dmg_download;
 mod native_update;
 mod update_receipt;
 mod updater_signature;
@@ -85,6 +86,7 @@ impl DesktopUpdate {
 }
 
 const UPDATE_REPO: &str = "Haoog/Adaptive-RSI";
+const LEGACY_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
 // 进程级下载闸门：由下载线程持有直到结束。双下载防护因此不依赖
 // DesktopUpdate.downloading 这个可被并发状态替换清零的标志。
@@ -134,7 +136,7 @@ fn update_client() -> Result<Client, String> {
         .no_proxy()
         .https_only(true)
         .redirect(update_redirect_policy())
-        .timeout(Duration::from_secs(600))
+        .timeout(LEGACY_DOWNLOAD_TIMEOUT)
         .build()
         .map_err(|_| "Cannot create updater connection".into())
 }
@@ -339,41 +341,33 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
             .map(|h| std::path::PathBuf::from(h).join("Downloads"))
             .unwrap_or_else(std::env::temp_dir);
         let path = download_dir.join(format!("adaptive-rsi-{}-macos-{}-adhoc.dmg", version, arch));
-        let download = |staged: &mut File| -> Result<(), &'static str> {
-            let mut response = client.get(&url)
-                .header("User-Agent", "Adaptive-RSI-updater")
-                .send().map_err(|_| "Download failed")?;
-            if response.status() != reqwest::StatusCode::OK {
-                return Err("Download failed");
-            }
-            let total = response.content_length().unwrap_or(0);
-            if total > native_update::MAX_PACKAGE as u64 { return Err("Download exceeds size limit"); }
-            let mut downloaded = 0u64;
-            let mut buffer = [0u8; 65536];
-            loop {
-                let read = response
-                    .read(&mut buffer)
-                    .map_err(|_| "Download interrupted")?;
-                if read == 0 {
-                    break;
+        let cache = app.path().app_cache_dir().ok();
+        let download = |staged: &mut File| {
+            let started = std::time::Instant::now();
+            legacy_dmg_download::download(staged, cache.as_deref(), &expected, |range| {
+                let timeout = LEGACY_DOWNLOAD_TIMEOUT.saturating_sub(started.elapsed());
+                if timeout.is_zero() {
+                    return Err("Download interrupted");
                 }
-                if downloaded.saturating_add(read as u64) > native_update::MAX_PACKAGE as u64 {
-                    return Err("Download exceeds size limit");
+                let mut request = client.get(&url)
+                    .timeout(timeout)
+                    .header("User-Agent", "Adaptive-RSI-updater")
+                    .header(reqwest::header::ACCEPT_ENCODING, "identity");
+                if let Some(range) = range {
+                    request = request.header(reqwest::header::RANGE, range);
                 }
-                staged.write_all(&buffer[..read])
-                    .map_err(|_| "Cannot write download")?;
-                downloaded += read as u64;
-                if total > 0 {
-                    let state = app.state::<RuntimeState>();
-                    let guard = state.update.lock().unwrap();
-                    if let Some(update) = guard.as_ref() {
-                        update
-                            .percent
-                            .store(downloaded * 10000 / total, Ordering::Relaxed);
-                    }
+                let response = request.send().map_err(|_| "Download failed")?;
+                Ok(legacy_dmg_download::DownloadResponse {
+                    status: response.status(),
+                    headers: response.headers().clone(),
+                    length: response.content_length(),
+                    body: response,
+                })
+            }, |downloaded, total| {
+                if let Some(update) = state.update.lock().unwrap().as_ref() {
+                    update.percent.store(downloaded * 10000 / total, Ordering::Relaxed);
                 }
-            }
-            Ok(())
+            })
         };
         let result = stage_legacy_dmg(&path, &expected, download, attach_legacy_dmg);
         complete_desktop_download(&state, result);
@@ -423,9 +417,14 @@ fn stage_legacy_dmg(
     };
     let already_published = existing.is_some();
     let download_dir = path.parent().ok_or((CANNOT_WRITE, ""))?;
-    let staging = tempfile::Builder::new()
-        .prefix(".adaptive-rsi-")
-        .tempdir_in(download_dir)
+    let mut staging = tempfile::Builder::new();
+    staging.prefix(".adaptive-rsi-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        staging.permissions(fs::Permissions::from_mode(0o700));
+    }
+    let staging = staging.tempdir_in(download_dir)
         .map_err(|_| (CANNOT_WRITE, ""))?;
     let mut staged = tempfile::Builder::new()
         .suffix(".dmg")
@@ -440,11 +439,13 @@ fn stage_legacy_dmg(
         download(staged.as_file_mut()).map_err(|message| (message, ""))?;
     }
     staged.flush().map_err(|_| (CANNOT_WRITE, ""))?;
-
+    let file = staged.as_file();
+    let mut input = file.try_clone().map_err(|_| (CANNOT_READ, ""))?;
+    input.rewind().map_err(|_| (CANNOT_READ, ""))?;
     let digest = Command::new("/usr/bin/shasum")
         .arg("-a")
         .arg("256")
-        .arg(staged.path())
+        .stdin(Stdio::from(input))
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -454,10 +455,23 @@ fn stage_legacy_dmg(
     if digest != expected {
         return Err(("Checksum verification failed", "checksum"));
     }
+    let verified = file.metadata().map_err(|_| (CANNOT_READ, ""))?;
+    let require_verified_path = || {
+        let named = staged.path().symlink_metadata().map_err(|_| (CANNOT_READ, ""))?;
+        if !named.is_file() || !native_update::single_link(&named)
+            || !native_update::same_identity(&named, &verified)
+            || named.len() != verified.len()
+        {
+            return Err((CANNOT_READ, ""));
+        }
+        Ok(())
+    };
+    require_verified_path()?;
     if !attach(staged.path()) {
         return Err(("Cannot open installer", ""));
     }
     if !already_published {
+        require_verified_path()?;
         staged.persist_noclobber(path).map_err(|error| {
             if error.error.kind() == io::ErrorKind::AlreadyExists {
                 (EXISTS, "")

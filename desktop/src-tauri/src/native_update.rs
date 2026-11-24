@@ -237,7 +237,7 @@ pub(super) fn parse_content_range(value: &str) -> Option<ContentRange> {
     parse_segment_range(value).map(|(range, _)| range)
 }
 
-fn parse_segment_range(value: &str) -> Option<(ContentRange, u64)> {
+pub(super) fn parse_segment_range(value: &str) -> Option<(ContentRange, u64)> {
     let (range, total) = value.trim().strip_prefix("bytes ")?.split_once('/')?;
     let (start, end) = range.split_once('-')?;
     let start = start.parse::<u64>().ok()?;
