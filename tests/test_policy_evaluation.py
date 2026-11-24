@@ -8,6 +8,7 @@ import unittest
 
 from adaptive_rsi.queue_replay import evaluate
 from adaptive_rsi.store import Store, encode
+from adaptive_rsi.usage_report import policy_history
 from scripts.benchmark_history import main, read_policy_history
 
 
@@ -124,6 +125,43 @@ class PolicyEvaluationTest(unittest.TestCase):
         self.assertIsNone(free['cost_usd'])
         self.assertIsNone(next(row for row in groups if not row['routes'])['cost_usd'])
         self.assertEqual(automatic['coverage'][0]['excluded_incomplete_or_window_boundary'], 1)
+
+    def test_automatic_cost_includes_inconclusive_tasks_and_excludes_unfinished_tasks(self):
+        # An inconclusive evolution task can follow an earlier failed, paid attempt.
+        tasks = ([('completed', [('completed', 'completed', 1000)])] * 5 +
+                 [('insufficient_evidence', [('failed', 'failed', 2000),
+                                             ('insufficient_evidence', 'completed', 3000)])] * 3 +
+                 [(state, [(run_state, 'completed', 100000)]) for state, run_state in
+                  [('queued', 'failed'), ('waiting_budget', 'waiting_budget'), ('interrupted', 'interrupted')]])
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory))
+            try:
+                with store.connect() as db:
+                    db.execute("INSERT INTO projects VALUES ('p','Fixture','fixture','{}',1,90)")
+                    for index, (state, attempts) in enumerate(tasks):
+                        task = str(index)
+                        db.execute("INSERT INTO tasks(id,project,source,state,created,updated) "
+                                   "VALUES (?,'p','system_evolve',?,100,160)", (task, state))
+                        for attempt, (run_state, call_state, tokens) in enumerate(attempts):
+                            run = f'{task}-{attempt}'
+                            start = 110 + 30 * attempt
+                            db.execute("INSERT INTO runs(id,task,project,state,started,ended,calls) "
+                                       "VALUES (?,?,'p',?,?,?,1)", (run, task, run_state, start, start + 20))
+                            db.execute("INSERT INTO calls(id,run,project,state,created,role,provider,model,effort,"
+                                       "unit,tokens,usage_known,unit_price) VALUES (?,?,'p',?,?,'planner','mock',"
+                                       "'fixture','low','http_request',?,1,2)", (run, run, call_state, start + 10, tokens))
+                    automatic = policy_history(db, 90, 200)['automatic_task_cost']
+            finally:
+                store.close()
+        self.assertEqual(automatic['coverage'], [{
+            'project': 'p', 'source': 'system_evolve', 'tasks_with_ended_attempt': 11,
+            'eligible_tasks': 8, 'excluded_incomplete_or_window_boundary': 3, 'unknown_cost_tasks': 0,
+        }])
+        group, = automatic['groups']
+        self.assertEqual(group['samples'], 8)
+        self.assertEqual(group['known_cost_samples'], 8)
+        self.assertEqual(group['priced_calls_by_basis'], {'mixed': 11})
+        self.assertEqual(group['cost_usd'], {'p25': 0.002, 'median': 0.002, 'p75': 0.01, 'samples': 8})
 
     @staticmethod
     def _seed_history(db):

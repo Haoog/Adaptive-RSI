@@ -325,7 +325,8 @@ def report(store, params):
 
 
 _AUTOMATIC_FINAL_STATES = frozenset(('completed', 'merged', 'failed', 'cancelled', 'expired', 'obsolete',
-                                     'rejected', 'pr_closed', 'unverified_merge', 'reverted', 'superseded'))
+                                     'rejected', 'pr_closed', 'unverified_merge', 'reverted', 'superseded',
+                                     'insufficient_evidence'))
 
 
 def _history_cost(row):
