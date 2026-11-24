@@ -327,6 +327,21 @@ window.RSIExperience = (() => {
       );
       outcome.append(card);
     }
+    if (data.risk_review_evidence_requests?.length) {
+      const evidenceRequests = el("details");
+      evidenceRequests.open = true;
+      evidenceRequests.append(el("summary", t("高风险复审补证")));
+      for (const request of data.risk_review_evidence_requests) {
+        const card = el("div", undefined, "provider-card");
+        if (request.area) card.append(el("strong", t(request.area)));
+        if (request.title) card.append(el("p", request.title));
+        if (request.path) card.append(el("p", request.path + (request.line ? ":" + request.line : "")));
+        card.append(el("p", request.reason));
+        if (request.suggestion) card.append(el("p", request.suggestion));
+        evidenceRequests.append(card);
+      }
+      outcome.append(evidenceRequests);
+    }
     if (data.phases?.length) {
       const timeline = el("details");
       timeline.append(el("summary", t("阶段耗时")));
@@ -1606,11 +1621,29 @@ window.RSIExperience = (() => {
   async function metrics() {
     const data = await api("workflow-metrics?project=" + projectId),
       box = dialog("流程质量与耗时");
+    const appendAverage = (label, seconds, samples) => {
+      const duration = samples ? Math.round(seconds / samples) + " " + t("秒") : t("未知");
+      box.append(el("p", t(label) + " · " + duration + " · n=" + samples));
+    };
+    box.append(el("h3", t("最近 30 天的验收与交付")));
+    for (const [key, label] of [
+      ["accepted", "首次验收与评审通过"],
+      ["delivered", "首次确认合并"],
+      ["first_pass", "首次代码尝试通过"],
+    ]) box.append(el("p", t(label) + " · " + data[key]));
+    appendAverage("从入队到首次验收通过的平均耗时", data.elapsed_seconds, data.elapsed_samples);
+    appendAverage("到 PR 的平均耗时", data.to_pr_seconds, data.to_pr_samples);
+    appendAverage("到合并的平均耗时", data.to_merge_seconds, data.to_merge_samples);
+    box.append(el("p", t("每个验收通过任务的已记录 tokens") + " · " + (data.accepted ? Math.round(data.accepted_tokens / data.accepted) : t("未知")) + " · " + data.accepted_unknown_calls + " " + t("次调用用量未知")));
+    box.append(el("p", t("每个已合并任务的已记录 tokens") + " · " + (data.delivered ? Math.round(data.delivered_tokens / data.delivered) : t("未知")) + " · " + data.delivered_unknown_calls + " " + t("次调用用量未知")));
+    for (const [reason, seconds] of Object.entries(data.remote_wait_seconds)) {
+      const samples = data.remote_wait_samples_by_reason?.[reason] || 0;
+      appendAverage(deliveryNames[reason] || reason, seconds, samples);
+    }
+    box.append(el("h3", t("最近 30 天创建的任务")));
+    appendAverage("首次启动前的平均等待", data.queue_seconds, data.queue_samples || 0);
     for (const [key, label] of [
       ["tasks", "任务数"],
-      ["accepted", "验收与评审通过"],
-      ["delivered", "已合并"],
-      ["first_pass", "首次代码尝试通过"],
       ["infrastructure_failures", "连接与环境故障"],
       ["repeated_failures", "反复失败任务"],
       ["requirements_revised", "补充需求任务"],
@@ -1626,32 +1659,6 @@ window.RSIExperience = (() => {
       for(const [key,label] of [['helpful','有帮助'],['unnecessary','没必要'],['false_positive','误报']])box.append(el('p',t(label)+' · '+data.value_feedback[key]));
       box.append(el('p',t('未评价的运行')+' · '+data.unrated_runs+' · '+t('未评价不代表没有价值。'),'muted'));
     }
-    box.append(
-      el(
-        "p",
-        t("从入队到首次验收通过的平均耗时") +
-          " · " +
-          (data.elapsed_samples
-            ? Math.round(data.elapsed_seconds / data.elapsed_samples) +
-              " " +
-              t("秒")
-            : t("未知")) +
-          " · n=" +
-          data.elapsed_samples,
-      ),
-      el(
-        "p",
-        t("每个验收通过任务的已记录 tokens") +
-          " · " +
-          (data.accepted
-            ? Math.round(data.accepted_tokens / data.accepted)
-            : t("未知")) +
-          " · " +
-          data.accepted_unknown_calls +
-          " " +
-          t("次调用用量未知"),
-      ),
-    );
     for (const [phase, seconds] of Object.entries(data.phase_seconds))
       box.append(
         el(
@@ -1663,19 +1670,12 @@ window.RSIExperience = (() => {
             t("秒"),
         ),
       );
-    for (const [key, label] of [["to_pr", "到 PR 的平均耗时"], ["to_merge", "到合并的平均耗时"]]) {
-      box.append(el("p", t(label) + " · " + (data[key + "_samples"] ? Math.round(data[key + "_seconds"] / data[key + "_samples"]) + " " + t("秒") : t("未知")) + " · n=" + data[key + "_samples"]));
-    }
-    box.append(el("p", t("每个已合并任务的已记录 tokens") + " · " + (data.delivered ? Math.round(data.delivered_tokens / data.delivered) : t("未知")) + " · " + data.delivered_unknown_calls + " " + t("次调用用量未知")));
-    for (const [reason, seconds] of Object.entries(data.remote_wait_seconds)) {
-      box.append(el("p", t(deliveryNames[reason] || reason) + " · " + Math.round(seconds) + " " + t("秒")));
-    }
     box.append(el("p", t("缓存与重评失效记录") + " · " + Object.entries(data.invalidations).map(([key, value]) => t(({stage_invalidated: "阶段输入变化", requirements_revised: "需求修订", triage_recheck: "暂缓唤醒", issue_revision: "Issue 更新"})[key]) + ": " + value).join(" / ")));
     box.append(
       el(
         "p",
         t(
-          "最近 30 天创建的逻辑任务。阶段时间为各运行累计，含并行任务，不代表总体墙钟时间；未知用量不按零计算。",
+          "验收、PR 和合并按首次确认时间统计。远端等待按结束时间入窗。阶段时间累计各次运行，含并行阶段。",
         ),
         "muted",
       ),

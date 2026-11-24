@@ -1152,6 +1152,7 @@ function experimentEvidence(card,c){
    if(!detail.isConnected)return;
    const report=data.comparison, cohorts=el('div');
    for(const row of report.cohorts){const source={real:t('真实任务'),synthetic:t('合成任务')}[row.source]||t('未知'),split={validation:t('验证集'),holdout:t('最终评估集'),development:t('开发集')}[row.split]||t('未知'),size={small:t('短任务'),medium:t('中等任务'),large:t('长任务')}[row.size]||t('未知');cohorts.append(el('p',source+' · '+split+' · '+size+' / '+t('独立用例')+': '+row.families+' / '+t('胜 / 负 / 平')+': '+row.wins+' / '+row.losses+' / '+row.ties));}
+   if(report.incomplete_trials>0)cohorts.append(el('p',t('未计入胜负的配对试验')+' · '+report.incomplete_trials,'muted'));
    cohorts.append(el('p',t('分组结果仅描述已观察样本，不代表对其他任务的收益。')));
    detail.append(cohorts);
    const evidence=el('details'),raw=el('pre');evidence.append(el('summary',t('封存计划与输入清单')),raw);

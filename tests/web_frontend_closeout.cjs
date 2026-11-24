@@ -116,3 +116,38 @@ test('install status is retranslated after a language change', async () => {
  element('language-select').onchange({target:{value:'zh-CN'}});
  assert.equal(element('install-status').textContent,'zh-CN 已安装，可以从主屏幕打开。');
 });
+
+
+test('workflow metrics shows separate completion and creation cohorts with wait samples', async () => {
+ const text = source('experience');
+ const metrics = text.slice(text.indexOf('  async function metrics()'), text.indexOf('  let shutdownOverlay'));
+ const box = node('dialog');
+ const context = {projectId: 'fixture', dialog: () => box, el: node, t: key => key,
+  deliveryNames: {waiting_ci: '等待 CI'},
+  api: async () => ({tasks: 2, accepted: 1, delivered: 3, first_pass: 1,
+   elapsed_samples: 1, elapsed_seconds: 100, queue_samples: 1, queue_seconds: 10,
+   to_pr_samples: 0, to_merge_samples: 3, to_merge_seconds: 120,
+   phase_seconds: {}, remote_wait_seconds: {waiting_ci: 30}, remote_wait_samples_by_reason: {waiting_ci: 2}, invalidations: {}})};
+ await vm.runInNewContext(metrics + '\nmetrics()', context);
+ const rows = box.children.map(item => item.textContent);
+ assert.ok(rows.indexOf('首次确认合并 · 3') < rows.indexOf('最近 30 天创建的任务'));
+ assert.ok(rows.indexOf('任务数 · 2') > rows.indexOf('最近 30 天创建的任务'));
+ assert.ok(rows.includes('首次启动前的平均等待 · 10 秒 · n=1'));
+ assert.ok(rows.includes('等待 CI · 15 秒 · n=2'));
+ assert.ok(rows.includes('到 PR 的平均耗时 · 未知 · n=0'));
+});
+
+
+test('run detail displays additional review evidence and concrete suggestions', () => {
+ const text = source('experience');
+ const evidence = text.slice(text.indexOf('    if (data.risk_review_evidence_requests'), text.indexOf('    if (data.phases?.length)'));
+ const outcome = node('section');
+ const data = {risk_review_evidence_requests: [{area: 'security', path: 'app.py', line: 8,
+  reason: 'Missing denial evidence', suggestion: 'Check that unauthorized writes leave state unchanged'}]};
+ vm.runInNewContext(evidence, {outcome, data, el: node, t: key => key});
+ const panel = outcome.children[0];
+ assert.equal(panel.open, true);
+ assert.equal(panel.children[0].textContent, '高风险复审补证');
+ assert.deepEqual(panel.children[1].children.map(item => item.textContent),
+  ['security', 'app.py:8', 'Missing denial evidence', 'Check that unauthorized writes leave state unchanged']);
+});

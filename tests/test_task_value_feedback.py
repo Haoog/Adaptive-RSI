@@ -85,6 +85,11 @@ class TaskValueFeedbackTest(unittest.TestCase):
     def test_http_feedback_reads_back_exact_target_and_summary(self):
         from types import SimpleNamespace
         from adaptive_rsi.server import Server
+        row = self.store.one("SELECT result FROM runs WHERE id=?", (self.record["id"],))
+        saved = json.loads(row["result"])
+        saved["risk_review"] = {"decision": "insufficient_evidence", "assessments": [
+            {"area": "security", "decision": "insufficient_evidence", "reason": "Verify the denied-write path"}]}
+        self.store.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps(saved), self.record["id"]))
         runtime = SimpleNamespace(store=self.store, dispatch_lock=threading.RLock(),
                                   updates=SimpleNamespace(require_ready=lambda: None))
         server = Server(runtime)
@@ -105,6 +110,8 @@ class TaskValueFeedbackTest(unittest.TestCase):
             with opener.open(request, timeout=5) as response:
                 result = json.load(response)
             self.assertEqual(result["evidence_summary"]["value_feedback"]["note"], "Real HTTP")
+            self.assertEqual(result["risk_review_evidence_requests"],
+                             [{"area": "security", "reason": "Verify the denied-write path"}])
         finally:
             server.shutdown()
             server.server_close()
@@ -279,6 +286,50 @@ class TaskValueFeedbackTest(unittest.TestCase):
         self.assertEqual(measure({"merged_sha": "a" * 40, "feedback": {"state": "regressed", "head": "b" * 40}}),
                          ((0, 0, 1), (0, 0, 1)))
 
+    def test_workflow_metrics_uses_first_completion_events_and_creation_queue_separately(self):
+        from adaptive_rsi.telemetry import workflow_metrics
+        now = 1_800_000_000
+        day = 86400
+        cutoff = now - 30 * day
+        evidence = {"evaluation": {"decision": "pass", "checks": {"candidate": [{"passed": True}]}},
+                    "review": {"decision": "pass"}}
+        def add_task(name, created, source="goal"):
+            with patch("adaptive_rsi.store.time.time", return_value=created):
+                return self.store.add_task("p", source, name, name)
+
+        def run(task, name, started, ended, state, result, accepted=None):
+            self.store.execute("INSERT INTO runs(id,task,project,state,started,ended,result) VALUES (?,?,?,?,?,?,?)",
+                               (name, task, "p", state, started, ended, json.dumps(result)))
+            if accepted is not None:
+                with patch("adaptive_rsi.store.time.time", return_value=accepted):
+                    self.store.event("awaiting_approval", "Passed", "p", name, evidence)
+
+        old = add_task("old finish", cutoff - day)
+        split = add_task("old accept recent merge", cutoff - 2 * day)
+        recent = add_task("queued then started", now - 100)
+        add_task("not yet started", now - 50)
+        system = add_task("system", now - 100, "system_track")
+        run(old, "first", cutoff - 100, now - 60, "superseded", {}, now - 200)
+        run(old, "retry", now - 55, now - 45, "merged", {**evidence, "merged_at": now - 40}, now - 45)
+        run(old, "duplicate", now - 30, now - 25, "merged", {**evidence, "merged_at": now - 20}, now - 25)
+        run(split, "previous", cutoff - 200, cutoff - 100, "merged", {**evidence, "merged_at": now - 30})
+        run(split, "next", now - 25, now - 15, "awaiting_approval", evidence, now - 15)
+        run(recent, "queue", now - 90, now - 80, "blocked", evidence)
+        run(system, "tracker", now - 60, now - 40, "merged", {**evidence, "merged_at": now - 40}, now - 50)
+        for name, started, ended in [("first", cutoff - 10, cutoff + 5), ("previous", cutoff - 20, cutoff),
+                                     ("retry", now - 15, None), ("tracker", now - 70, now - 30)]:
+            self.store.execute("INSERT INTO remote_waits(run,reason,started,ended) VALUES (?,'waiting_ci',?,?)",
+                               (name, started, ended))
+        with patch("adaptive_rsi.telemetry.time.time", return_value=now):
+            result = workflow_metrics(self.store, "p")
+        self.assertEqual((result["tasks"], result["queue_samples"], result["queue_seconds"]), (2, 1, 10))
+        self.assertEqual((result["accepted"], result["elapsed_samples"], result["first_pass"]), (1, 1, 1))
+        self.assertEqual(result["elapsed_seconds"], now - 200 - (cutoff - day))
+        self.assertEqual((result["delivered"], result["to_merge_samples"]), (2, 2))
+        self.assertEqual(result["to_merge_seconds"], now - 40 - (cutoff - day) + now - 30 - (cutoff - 2 * day))
+        self.assertEqual(result["remote_wait_samples_by_reason"], {"waiting_ci": 1})
+        self.assertEqual(result["remote_wait_seconds"], {"waiting_ci": 15})
+
     def test_workflow_metrics_reports_one_committed_snapshot(self):
         # 在两次查询之间用独立事务原子写入任务与运行；响应必须对应某一已提交快照，
         # 不能出现“新运行 + 旧任务”的混合值。
@@ -299,7 +350,7 @@ class TaskValueFeedbackTest(unittest.TestCase):
                                "VALUES ('q-run',?,?,?,?,?,?)",
                                (task, "q", "merged", time.time(), time.time(), json.dumps({
                                    "evaluation": {"decision": "pass", "checks": {"candidate": [{"passed": True}]}},
-                                   "review": {"decision": "pass"}})))
+                                   "review": {"decision": "pass"}, "merged_at": time.time()})))
                 writes.append(True)
             return rows
 

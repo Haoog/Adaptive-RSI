@@ -238,6 +238,7 @@ jobs:
             tests.test_reliability.ReliabilityTest.test_changed_baseline_invalidates_recovery_cache \
             tests.test_reliability.ReliabilityTest.test_value_assessment_yields_and_reuses_plan_without_spending_retry \
             tests.test_reliability.ReliabilityTest.test_high_risk_requires_additional_review_and_preserves_blocking_result \
+            tests.test_reliability.ReliabilityTest.test_passing_high_risk_rereview_keeps_first_round_evidence_gap \
             tests.test_reliability.ReliabilityTest.test_ordinary_high_risk_does_not_force_a_second_review \
             tests.test_workflow_experience.ExperienceTest.test_review_rejection_reaches_next_implementation_without_sealed_source
 

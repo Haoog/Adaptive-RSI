@@ -2700,8 +2700,11 @@ class Runtime(Maintenance):
                                (encode(recorded_strategies), run["id"]))
             workspace = snapshot(source, directory / "workspace", base)
             if task["source"] in ["system_light", "system_deep"]:
-                self.inspect(project, workspace, task["source"].split("_")[1], run, strategies)
-                self.store.transition(run["id"], "completed", {"reason": "Inspection completed"}, True)
+                failure = self.inspect(project, workspace, task["source"].split("_")[1], run, strategies)
+                if failure:
+                    self.store.transition(run["id"], "blocked", {"reason": failure["detail"], "failure": failure}, True)
+                else:
+                    self.store.transition(run["id"], "completed", {"reason": "Inspection completed"}, True)
                 return
             if task["source"] == "system_evolve":
                 from .evolution import Evolution
@@ -2968,19 +2971,18 @@ class Runtime(Maintenance):
                                        "recent_failures": history, "open_prs": prs_context,
                                        "ci": ci, "postmerge_outcomes": module_outcomes,
                                        "stable_strategies": strategies}), workspace, run)
+        items = findings.get("findings") if isinstance(findings, dict) else None
+        if not isinstance(items, list):
+            detail = "Analysis output missing a findings array"
+            self.store.event("inspection_malformed", detail, project["id"], run["id"])
+            # Keep the last successful scan signature. Blocked system runs use
+            # the existing scheduler backoff and can be requested manually.
+            return {"code": "inspection_malformed", "action": "inspect_details", "detail": detail}
         candidates = []
         seen_keys = set()
         recurrences = 0
         rediscoveries = 0
         contents = {}
-        # analysis 输出契约依赖适配器自觉遵守；截断或越界的响应可能缺 findings
-        # 键或返回非 dict/非数组，不能让 KeyError/TypeError 把整个巡检 run 变成失败。
-        items = findings.get("findings") if isinstance(findings, dict) else None
-        if not isinstance(items, list):
-            self.store.event("inspection_malformed",
-                             "Analysis output missing a findings array; treating as no findings",
-                             project["id"], run["id"])
-            items = []
         skipped = 0
         for item in items:
             # 单条 finding 同样来自模型：非 dict、缺字段或字段类型不符时跳过该条，

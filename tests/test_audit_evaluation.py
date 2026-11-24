@@ -1182,7 +1182,7 @@ class AuditEvaluationTest(unittest.TestCase):
         return source, checks, acceptance
 
     def run_scheduled_evaluation(self, root, source, checks, acceptance, changed_files, scheduling=True,
-                                 detected=True, evaluation='evaluation'):
+                                 detected=True, evaluation='evaluation', failures=()):
         from adaptive_rsi.config import DEFAULTS, merge
         from adaptive_rsi.store import Store
         from unittest.mock import patch
@@ -1193,8 +1193,9 @@ class AuditEvaluationTest(unittest.TestCase):
                                          'exit_code': 0, 'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}]}
         calls = []
         def execute(_sandbox, check, workspace, *args, **kwargs):
-            calls.append((Path(workspace).name, check['name']))
-            return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0,
+            stage = Path(workspace).name
+            calls.append((stage, check['name']))
+            return {'name': check['name'], 'argv': check['argv'], 'exit_code': int((stage, check['name']) in failures),
                     'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}
         store = Store(root / ('state-' + evaluation))
         self.addCleanup(store.close)
@@ -1223,6 +1224,38 @@ class AuditEvaluationTest(unittest.TestCase):
         self.assertFalse(result['candidate_full_reused'])
         self.assertEqual(result['check_dependency_analysis']['scheduled'], ['check_a', 'check_b'])
         self.assertEqual(result['decision'], 'pass')
+
+    def test_scheduling_replay_reports_outside_failure_and_unknown_legacy_timing(self):
+        from unittest.mock import patch
+        from scripts.replay_check_scheduling import main, replay
+        graph = {'pa': {'paths': ['pkg_a/'], 'depends_on': [], 'checks': ['check_a']},
+                 'pb': {'paths': ['pkg_b/'], 'depends_on': ['pa'], 'checks': ['check_b']},
+                 'pc': {'paths': ['pkg_c/'], 'depends_on': [], 'checks': ['check_c']}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, checks, acceptance = self.scheduling_fixtures(root, graph)
+            result, _ = self.run_scheduled_evaluation(root, source, checks, acceptance, ['pkg_a/value.py'],
+                failures={('candidate_full', 'check_c')})
+            self.assertEqual(result['decision'], 'fail')
+            report = root / 'evaluation' / 'report.json'
+            saved = json.loads(report.read_text())
+            with patch('sys.argv', ['replay_check_scheduling.py', str(report)]), patch('builtins.print') as output:
+                main()
+            compared, = json.loads(output.call_args.args[0])
+        self.assertEqual(compared['gate_decision'], 'fail')
+        self.assertEqual(compared['priority']['checks'], 2)
+        self.assertEqual(compared['priority']['first_failure_timing'], 'no_failure')
+        self.assertEqual(compared['full']['checks'], 4)
+        self.assertEqual(compared['outside_priority']['failures'], [{'name': 'check_c', 'cwd': '.', 'full_index': 2}])
+        self.assertEqual(compared['full']['first_failure_timing'], 'observed')
+        self.assertGreaterEqual(compared['full']['first_failure_seconds'], 0)
+        self.assertEqual(compared['full']['first_failure_seconds'], compared['outside_priority']['first_failure_seconds'])
+        for row in saved['checks']['candidate_full']:
+            row.pop('verdict_available_seconds')
+        legacy = replay(saved)
+        self.assertIsNone(legacy['full']['first_failure_seconds'])
+        self.assertEqual(legacy['full']['first_failure_timing'], 'unknown')
+        self.assertEqual(legacy['outside_priority']['failures'], compared['outside_priority']['failures'])
 
     def test_affected_check_scheduling_runs_prerequisite_closure_in_candidate_stage(self):
         graph = {'pa': {'paths': ['pkg_a/'], 'depends_on': [], 'checks': ['check_a']},
@@ -1317,6 +1350,41 @@ class AuditEvaluationTest(unittest.TestCase):
         self.assertIn('uncertainty', result)
         result = workflow.improvement({'acceptance_baseline': [row([10])], 'acceptance_candidate': [row([5])]}, {'change_kind': 'performance', 'contract': contract})
         self.assertEqual(result['decision'], 'insufficient_evidence')
+
+    def test_benchmark_contract_does_not_reuse_samples_across_duplicate_criteria(self):
+        task = {'source': 'goal', 'title': 'Reduce latency', 'body': ''}
+        threshold = {'metric': 'latency', 'unit': 'ms', 'direction': 'lower', 'target': 8, 'tolerance': 0}
+        guard = {**threshold, 'metric': 'memory', 'unit': 'MiB', 'target': 40}
+        plan = {'change_kind': 'performance', 'performance_threshold': threshold,
+                'load_conditions': ['idle', 'busy'], 'guardrails': [guard]}
+        contract = workflow.evidence_contract(task, plan)
+        self.assertEqual(contract['load_conditions'], ['idle', 'busy'])
+        for fields in ({'load_conditions': ['idle', 'idle']}, {'load_conditions': ['idle', ' idle ']},
+                       {'load_conditions': [' ']}, {'guardrails': [guard, {**guard, 'metric': ' memory '}]},
+                       {'guardrails': [{**guard, 'unit': '\t'}]}, {'guardrails': [threshold]}):
+            with self.subTest(fields=fields):
+                with self.assertRaises(ValueError):
+                    workflow.evidence_contract(task, {**plan, **fields})
+
+        def rows(latency, memory, memory_loads=('idle', 'busy')):
+            values = [('latency', 'ms', latency, ('idle', 'busy')), ('memory', 'MiB', memory, memory_loads)]
+            stdout = '\n'.join(json.dumps({'metric': metric, 'unit': unit, 'value': value, 'load': load})
+                               for metric, unit, value, loads in values for load in loads)
+            return [{'passed': True, 'exit_code': 0, 'stdout': stdout, 'performance_repetition': repetition}
+                    for repetition in range(1, 4)]
+
+        def check(contract, candidate):
+            return workflow.improvement({'acceptance_baseline': rows(10, 40), 'acceptance_candidate': candidate},
+                                        {'change_kind': 'performance', 'contract': contract})
+
+        candidate = rows(5, 40)
+        self.assertEqual(check(contract, candidate)['decision'], 'pass')
+        self.assertEqual(check(contract, rows(5, 40, ('idle',)))['decision'], 'insufficient_evidence')
+        self.assertEqual(check(contract, rows(5, 40, ('idle', 'idle', 'busy')))['decision'], 'insufficient_evidence')
+        self.assertEqual(check({**contract, 'load_conditions': ['idle', 'idle']}, candidate)['basis'],
+                         'invalid_measurement_plan')
+        self.assertEqual(check({**contract, 'guardrails': [guard, guard]}, candidate)['basis'],
+                         'duplicate_guardrail_metric')
 
     def test_baseline_cache_write_failure_keeps_evaluation_result(self):
         # 缓存写失败（满盘、连接容量耗尽、只读状态目录）不能让已跑完检查的

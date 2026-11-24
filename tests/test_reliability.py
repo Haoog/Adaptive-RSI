@@ -682,6 +682,38 @@ class ReliabilityTest(unittest.TestCase):
         self.assertFalse(self.store.query("SELECT * FROM stages WHERE run=? AND stage='validated_candidate'", (run["id"],)))
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
+    def test_passing_high_risk_rereview_keeps_first_round_evidence_gap(self):
+        from adaptive_rsi.review import risk_review_evidence_requests
+
+        class HighRisk(FakeAgent):
+            reviews = 0
+
+            def invoke(self, role, *args, **kwargs):
+                result = super().invoke(role, *args, **kwargs)
+                if role == "planning":
+                    result["risk"] = "high"
+                if role == "review":
+                    self.reviews += 1
+                    if self.reviews == 1:
+                        result["assessments"][1]["decision"] = "insufficient_evidence"
+                    else:
+                        result["findings"].append({"area": "security", "severity": "low", "path": "calculator.py",
+                            "line": 1, "title": "Boundary coverage", "reason": "An error path lacks a check",
+                            "suggestion": "Add a regression check asserting denial leaves state unchanged"})
+                return result
+
+        self.runtime.agent = HighRisk()
+        task, run = self.claim()
+        self.runtime.process(run)
+        result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+        self.assertEqual(self.runtime.agent.reviews, 2)
+        self.assertEqual(result["review"]["decision"], "insufficient_evidence")
+        self.assertEqual(result["risk_review"]["decision"], "pass")
+        self.assertEqual(risk_review_evidence_requests(result["risk_review"])[0]["suggestion"],
+                         "Add a regression check asserting denial leaves state unchanged")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "insufficient_evidence")
+
+    @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_ordinary_high_risk_does_not_force_a_second_review(self):
         class HighRisk(FakeAgent):
             def invoke(self, role, *args, **kwargs):
@@ -709,6 +741,24 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(code_map(self.repo, "calculator", limit=1)["files"][0]["path"], "calculator.py")
         self.assertEqual(_code_index.cache_info().misses, cached.misses + 1)
         self.assertEqual(_code_map_cached.cache_info().misses, mapping_cached.misses + 1)
+
+    def test_code_map_ranks_a_late_declaration_above_callers(self):
+        symbol = "locate_sealed_snapshot"
+        large = self.repo / "storage.py"
+        prefix = "def placeholder(): pass\n" * 10000
+        declaration = f"def {symbol}(workspace):"
+        large.write_text(prefix + declaration + "\n    return workspace\n")
+        for i in range(13):
+            (self.repo / f"caller_{i}.py").write_text(f"storage.{symbol}(workspace)\n")
+        result = code_map(self.repo, symbol, limit=12)
+        self.assertEqual(result["files"][0]["path"], "storage.py")
+        self.assertEqual(result["files"][0]["anchors"][0], {"line": 10001, "declaration": declaration})
+        explicit = code_map(self.repo, "unrelated", limit=1,
+                            evidence=(("caller_1.py", f"storage.{symbol}(workspace)"),))
+        self.assertEqual(explicit["files"][0], {"path": "caller_1.py", "anchors": [
+            {"line": 1, "declaration": f"storage.{symbol}(workspace)"}]})
+        large.write_text(prefix + "def updated_snapshot(): pass\n")
+        self.assertNotEqual(code_map(self.repo, symbol, limit=1)["files"][0]["path"], "storage.py")
 
     def test_evaluation_baseline_cache_is_project_and_config_scoped(self):
         base = git(self.repo, "rev-parse", "HEAD")
@@ -844,6 +894,61 @@ class ReliabilityTest(unittest.TestCase):
         # Default config keeps affected-check scheduling off, so the candidate
         # stage must never receive a scheduled check subset.
         self.assertEqual(stage_run_checks, [None, None])
+
+    def test_performance_pipeline_runs_each_sealed_repetition(self):
+        from adaptive_rsi.delivery_replay_checks import _acceptance
+
+        class BenchmarkAgent(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                if role == "acceptance":
+                    self.prompt = prompt
+                    return {"files": [{"path": ".rsi-acceptance/benchmark.py", "content": (
+                        "import json, secrets\n"
+                        "from calculator import add\n"
+                        "print(secrets.token_hex(16))\n"
+                        "for load in ('idle', 'busy'):\n"
+                        "    print(json.dumps(dict(metric='latency', unit='ms', load=load, "
+                        "value=4 if add(2, 3) == 5 else 10, repetition=99)))\n"
+                        "    print(json.dumps(dict(metric='memory', unit='MiB', load=load, value=1)))\n"
+                    )}], "checks": [{"name": "benchmark", "criteria": [0], "argv": [
+                        "python3", "-c", "exec(open('.rsi-acceptance/benchmark.py').read())"]}]}
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == "planning":
+                    result.update(change_kind="performance", repetitions=3, load_conditions=["idle", "busy"],
+                                  performance_threshold={"metric": "latency", "unit": "ms", "target": 5,
+                                                         "tolerance": 0, "direction": "lower"},
+                                  guardrails=[{"metric": "memory", "unit": "MiB", "target": 2,
+                                               "tolerance": 0, "direction": "lower"}])
+                return result
+
+        agent = BenchmarkAgent()
+        self.runtime.agent = agent
+        _, run = self.claim("Reduce addition latency")
+        self.runtime.process(run)
+        saved = self.store.one("SELECT state,result,path FROM runs WHERE id=?", (run["id"],))
+        outcome = json.loads(saved["result"])
+        self.assertEqual("awaiting_approval", saved["state"], outcome)
+        self.assertIn("the host reruns all sealed checks", agent.prompt)
+        directory = Path(saved["path"])
+        report = json.loads((directory / "evaluation/report.json").read_text())
+        receipt = json.loads(self.store.one("SELECT data FROM stages WHERE run=? AND stage='evaluation'",
+                                           (run["id"],))["data"])
+        self.assertEqual(receipt["contract"], _acceptance(directory, receipt, receipt["source"])["contract"])
+        tokens = set()
+        for label in ("acceptance_baseline", "acceptance_candidate"):
+            rows = report["checks"][label]
+            fields = ("performance_repetition", "argv", "stdout", "exit_code")
+            self.assertEqual([{key: row[key] for key in fields} for row in receipt["checks"][label]],
+                             [{key: row[key] for key in fields} for row in rows])
+            self.assertEqual([1, 2, 3], [row["performance_repetition"] for row in rows])
+            for row in rows:
+                token, *samples = row["stdout"].splitlines()
+                tokens.add(token)
+                self.assertEqual(4, len(samples))
+        self.assertEqual(6, len(tokens))
+        gate = report["improvement"]
+        self.assertEqual("pass", gate["decision"])
+        self.assertEqual([3, 3, 3, 3], [row["samples"] for row in gate["uncertainty"] + gate["guardrails"]])
 
     def test_baseline_cache_invalidates_when_same_tag_image_id_changes(self):
         base = git(self.repo, "rev-parse", "HEAD")

@@ -53,6 +53,35 @@ def risk_review_required(plan, review, files=(), patch=""):
     return any(SENSITIVE_PATCH.search(line) for line in changed)
 
 
+def risk_review_evidence_requests(review):
+    """Extract the additional review's gaps and concrete follow-up suggestions."""
+    if not isinstance(review, dict):
+        return []
+    requests = []
+    for key, fields in (("assessments", ("area", "reason")),
+                        ("findings", ("area", "title", "path", "line", "reason", "suggestion"))):
+        rows = review.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict) or row.get("area") not in REVIEW_AREAS:
+                continue
+            if key == "assessments" and row.get("decision") not in ("fail", "insufficient_evidence"):
+                continue
+            if not isinstance(row.get("reason"), str) or not row["reason"].strip():
+                continue
+            item = {field: row[field].strip()[:700] for field in fields if isinstance(row.get(field), str)}
+            if type(row.get("line")) is int and "path" in item:
+                item["line"] = row["line"]
+            if item not in requests:
+                requests.append(item)
+    if not requests and review.get("decision") == "insufficient_evidence":
+        reason = review.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            requests.append({"reason": reason.strip()[:700]})
+    return requests[:20]
+
+
 def enforce_review(review, config):
     validate_output(review, SCHEMAS["review"])
     assessments = review["assessments"]
