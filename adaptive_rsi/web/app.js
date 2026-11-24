@@ -21,6 +21,8 @@ let settingsContext='',settingsGeneration=0,goalDraftRestoredProject=null;
 let configurationRepairBusy=false;
 // null means a write is pending. A sequence means we need a state read started after it.
 const pauseRequests=new Map();
+const archiveRequests=new Map();
+function archiveRequestKey(id,runtime=window.__RSI_MACHINE_KEY__){return JSON.stringify([runtime,id]);}
 let pauseFeedback=null;
 let refreshSequence=0,refreshPromise=null,refreshController=null,refreshProject=null,refreshKey=null,refreshQueued=false,refreshForce=false,refreshWaiters=[],refreshPollTimer=null,lastUpdateToast='',sessionExpired=false,lastRefreshAt=0;
 let capabilitySequence=0,scopeChosen=false,scopeInitialized=false,taskOffset=0;
@@ -494,15 +496,16 @@ function requestedStateSections(force=false){
 async function refresh(options={}){
  // 会话失效后只保留现有画面，等待用户点击重新登录；任何新的轮询或页面请求都不再发出。
  if(sessionExpired)return;
+ const runtime=window.__RSI_MACHINE_KEY__;
  const force=!!options.force,requestedProject=projectId,requestedView=view,sections=requestedStateSections(force),taskView=['overview','tasks'].includes(view),filter=taskView?$('task-filter').value:'all',system=taskView?String($('show-system-tasks').checked):'true',offset=taskView?taskOffset:0;
- const key=JSON.stringify([requestedProject,view,offset,filter,system,sections]);
+ const key=JSON.stringify([runtime,requestedProject,view,offset,filter,system,sections]);
  if(refreshPromise){if(!force&&refreshKey===key&&!refreshController?.signal.aborted)return refreshPromise;refreshQueued=true;refreshForce=refreshForce||force;refreshSequence++;refreshController?.abort();return new Promise((resolve,reject)=>refreshWaiters.push({resolve,reject}));}
  const ticket=++refreshSequence;clearTimeout(refreshPollTimer);
  const controller=new AbortController(),query=new URLSearchParams({project:requestedProject,limit:'50',offset:String(offset),filter,system,sections:sections.join(',')});
  refreshController=controller;refreshProject=requestedProject;refreshKey=key;let timedOut=false;const timeout=setTimeout(()=>{timedOut=true;controller.abort();},15000);
  const operation=(async()=>{
   try{
-   const current=()=>!controller.signal.aborted&&ticket===refreshSequence&&requestedProject===projectId&&requestedView===view&&(!taskView||(taskOffset===offset&&$('task-filter').value===filter&&String($('show-system-tasks').checked)===system));
+   const current=()=>!controller.signal.aborted&&ticket===refreshSequence&&runtime===window.__RSI_MACHINE_KEY__&&requestedProject===projectId&&requestedView===view&&(!taskView||(taskOffset===offset&&$('task-filter').value===filter&&String($('show-system-tasks').checked)===system));
    let next=await api('state?'+query,undefined,{signal:controller.signal});if(!current())return;
    // A shrinking group can strand the last page. Retry its first page once, under the same cancellation guard.
    const correctPage=taskView&&next.selected_project===requestedProject&&offset>0&&next.pagination?.offset===offset&&offset>=next.pagination.total;
@@ -523,6 +526,9 @@ async function refresh(options={}){
     // SQLite supplies 0/1 in normal snapshots; configuration errors can supply a boolean.
     if([0,1,false,true].includes(paused))pauseRequests.delete(id);
    }
+   for(const [key,request] of archiveRequests){
+    if(request.runtime===runtime&&ticket>request.savedAfter)archiveRequests.delete(key);
+   }
    if(returned.has('analytics')){loadedStateSections.analyticsProject=next.selected_project??null;loadedStateSections.analyticsAt=Date.now();}
    if(returned.has('candidates')){loadedStateSections.candidatesProject=next.selected_project??null;loadedStateSections.candidatesAt=Date.now();}
    lastRefreshAt=Date.now();$('connection').textContent=t('已连接');$('version').textContent='Adaptive RSI '+state.version;
@@ -531,7 +537,7 @@ async function refresh(options={}){
    if(projectId&&!scopeChosen&&!scopeInitialized){stashSettings();$('config-scope').value='project';settingsBaseline=null;scopeInitialized=true;}
    select.value=projectId;rememberNavigationHome();if(old!==projectId){stashSettings();closeTaskDetail();settingsBaseline=null;localWrite('rsi-project',projectId);goalDraftRestoredProject=projectId;}if(goalDraftRestoredProject!==projectId){restoreGoalDraft();goalDraftRestoredProject=projectId;}
    render();if(firstState&&view==='usage')window.RSIUsage?.show();window.RSIExperience?.refreshed();
-  }catch(error){if(controller.signal.aborted){if(timedOut&&requestedProject===projectId)$('connection').textContent=t('连接超时');return;}throw error;}
+  }catch(error){if(runtime!==window.__RSI_MACHINE_KEY__)return;if(controller.signal.aborted){if(timedOut&&requestedProject===projectId)$('connection').textContent=t('连接超时');return;}throw error;}
   finally{clearTimeout(timeout);}
  })();refreshPromise=operation;
  try{return await operation;}catch(error){
@@ -611,7 +617,7 @@ function render(){
  $('workspace-path').textContent=project?projectPath(project):'';
  let archive=$('archive-project');
  if(!archive){archive=el('button',t('归档当前项目'),'text-button');archive.id='archive-project';archive.type='button';$('workspace-path').after(archive);}
- archive.textContent=t('归档当前项目');
+ renderArchiveButton(archive,project?.id);
  archive.hidden=!project;
  $('workspace-path').hidden=!project;
  $('workspace-path').title=project?projectPath(project):'';
@@ -1422,11 +1428,55 @@ $('pause-button').addEventListener('click',event=>{
  if(event.detail>1)return;
  safe(toggleProjectPause);
 });
-document.querySelector('#view-overview')?.addEventListener('click',event=>{if(event.target.id!=='archive-project')return;safe(async()=>{const project=currentProject();if(!project)return;
- if(!(await uiConfirm(t('归档会停止调度并隐藏此项目，但保留任务、运行记录和审计历史。确认归档？'))))return;
- await api('project/archive',{project:project.id,confirmation:'archive-project'});
- projectId='';localWrite('rsi-project','');settingsBaseline=null;closeTaskDetail();await refresh({force:true});toast(t('项目已归档；历史记录仍保留。'));
-})});
+function renderArchiveButton(button,id=projectId){
+ if(!button)return;
+ const request=archiveRequests.get(archiveRequestKey(id));
+ button.setAttribute('aria-busy',String(!!request?.busy));
+ button.textContent=t(request?.savedAfter===undefined?'归档当前项目':'刷新');
+}
+async function archiveCurrentProject(){
+ if(!state||sessionExpired||view!=='overview')return;
+ const id=currentProject()?.id,runtime=window.__RSI_MACHINE_KEY__,navigation=navigationSequence;
+ if(!id)return;
+ const sameRuntime=()=>runtime===window.__RSI_MACHINE_KEY__;
+ const current=()=>sameRuntime()&&projectId===id&&navigationSequence===navigation&&!sessionExpired;
+ const key=archiveRequestKey(id,runtime),request=archiveRequests.get(key)||{runtime};
+ if(request.busy)return;
+ request.busy=true;archiveRequests.set(key,request);renderArchiveButton($('archive-project'));
+ try{
+  if(request.savedAfter===undefined){
+   if(!(await uiConfirm(t('归档会停止调度并隐藏此项目，但保留任务、运行记录和审计历史。确认归档？')))||!current())return;
+   let receipt;
+   try{
+    // An explicit update refusal requires a fresh confirmation.
+    receipt=await sendApi('project/archive',{project:id,confirmation:'archive-project'});
+   }catch(error){
+    if(!current())return;
+    if(error.status!==503||error.code!=='update_in_progress')throw error;
+    toast(t('服务正在更新，请稍后重试。'),true);return;
+   }
+   if(!sameRuntime())return;
+   if(receipt?.archived!==true||receipt.project!==id){
+    if(current())toast(t('运行状态变更结果未确认，请先刷新运行状态。'),true);
+    return;
+   }
+   request.savedAfter=refreshSequence;
+   if(projectId===id&&!sessionExpired)toast(t('项目已归档；历史记录仍保留。'));
+  }
+  // Let the state read reconcile the selection and preserve the outgoing draft.
+  const refreshingProject=projectId,refreshNavigation=navigationSequence;
+  try{await refresh({force:true});}catch{
+   if(sameRuntime()&&refreshingProject===projectId&&refreshNavigation===navigationSequence&&!sessionExpired)$('connection').textContent=t('连接中断');
+  }
+ }finally{
+  request.busy=false;
+  if(request.savedAfter===undefined)archiveRequests.delete(key);
+  if(sameRuntime()&&projectId===id)renderArchiveButton($('archive-project'));
+ }
+}
+document.querySelector('#view-overview')?.addEventListener('click',event=>{
+ if(event.target.id==='archive-project'&&!(event.detail>1))safe(archiveCurrentProject);
+});
 $('goal-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const project=projectId,text=$('goal-text').value,draftRevision=goalDraftRevisions.get(project)||0;if(!text.trim()||text.length>30000)throw Error(t('目标不能为空，且不能超过 30000 个字符。'));const submission=await pendingGoalSubmission(project,text),created=await api('goal',{project,text,request_id:submission.id});goalReceipts.set(project,{id:created.id,text});saveGoalSubmissions(project,(await goalSubmissions(project)).filter(entry=>entry.id!==submission.id));await renderGoalRecovery();if((goalDraftRevisions.get(project)||0)===draftRevision){if(goalDrafts.get(project)===text)goalDrafts.delete(project);if(draftStore.get('goal',project)===text)draftStore.remove('goal',project);if(projectId===project&&$('goal-text').value===text)$('goal-text').value='';}if(projectId===project){$('task-filter').value='active';taskOffset=0;$('goal-panel').classList.remove('composing');}await refresh();renderGoalReceipt();toast(state.projects.find(p=>p.id===project)?.paused?t('目标已入队；启用项目后执行'):t('目标已加入任务列表'));},event.target);});
 document.querySelectorAll('[data-inspect]').forEach(button=>button.addEventListener('click',()=>safe(async()=>{await api('request',{project:projectId,kind:button.dataset.inspect});await refresh();toast(currentProject().paused?t('已加入队列；启用项目后执行'):t('已加入队列'));})));
 $('task-filter').addEventListener('change',()=>{taskOffset=0;safe(refresh);});$('config-scope').addEventListener('change',()=>changeSettingsScope($('config-scope').value));
