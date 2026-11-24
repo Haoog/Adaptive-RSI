@@ -16,8 +16,8 @@ from .config import fingerprint
 from .gitops import copy_source, git
 from .process import Cancelled, Sandbox, run_process
 from .store import encode
-from .workflow import (_go_test_options, environment_failure, node_test_options, npm_test_runner,
-                       unittest_discovery_options, pytest_options)
+from .workflow import (HOST_REPETITIONS, _go_test_options, environment_failure, node_test_options,
+                       npm_test_runner, unittest_discovery_options, pytest_options)
 
 MANIFESTS = {"package.json", "pyproject.toml", "setup.py", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py",
              "pom.xml", "build.gradle", "build.gradle.kts", "Makefile", "CMakeLists.txt", "Cargo.toml",
@@ -1592,13 +1592,24 @@ class Evaluator:
             result = sandbox.check(setup, target, cancel, protected, hidden)
             if result["exit_code"] or result["error"]:
                 return {"setup": result}
+        contract = acceptance.get("contract")
+        rounds = (None,)
+        if isinstance(contract, dict) and contract.get("measurement_mode") == HOST_REPETITIONS:
+            repeats = contract.get("repetitions")
+            if type(repeats) is not int or not 3 <= repeats <= 100:
+                return {"rows": []}
+            rounds = range(1, repeats + 1)
         rows = []
-        for check in acceptance["checks"]:
-            result = check_with_fresh_artifacts(sandbox, check, target, cancel, protected, hidden)
-            result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty_test_run(
-                result["stdout"] + result["stderr"])
-            result["test_identities"] = test_identities(result["stdout"] + result["stderr"])
-            rows.append(result)
+        for repetition in rounds:
+            for check in acceptance["checks"]:
+                result = check_with_fresh_artifacts(sandbox, check, target, cancel, protected, hidden)
+                if repetition is not None:
+                    # Attach provenance after the sandboxed command returns, outside its stdout.
+                    result["performance_repetition"] = repetition
+                text = result["stdout"] + result["stderr"]
+                result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty_test_run(text)
+                result["test_identities"] = test_identities(text)
+                rows.append(result)
         return {"rows": rows}
 
     @staticmethod

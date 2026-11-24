@@ -1366,20 +1366,21 @@ class AuditEvaluationTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     workflow.evidence_contract(task, {**plan, **fields})
 
-        def row(latency, memory, memory_loads=('idle', 'busy')):
+        def rows(latency, memory, memory_loads=('idle', 'busy')):
             values = [('latency', 'ms', latency, ('idle', 'busy')), ('memory', 'MiB', memory, memory_loads)]
-            return {'passed': True, 'stdout': '\n'.join(
-                json.dumps({'metric': metric, 'unit': unit, 'value': value, 'load': load})
-                for metric, unit, value, loads in values for load in loads for _ in range(3))}
+            stdout = '\n'.join(json.dumps({'metric': metric, 'unit': unit, 'value': value, 'load': load})
+                               for metric, unit, value, loads in values for load in loads)
+            return [{'passed': True, 'exit_code': 0, 'stdout': stdout, 'performance_repetition': repetition}
+                    for repetition in range(1, 4)]
 
         def check(contract, candidate):
-            return workflow.improvement({'acceptance_baseline': [row(10, 40)], 'acceptance_candidate': [candidate]},
+            return workflow.improvement({'acceptance_baseline': rows(10, 40), 'acceptance_candidate': candidate},
                                         {'change_kind': 'performance', 'contract': contract})
 
-        candidate = row(5, 40)
+        candidate = rows(5, 40)
         self.assertEqual(check(contract, candidate)['decision'], 'pass')
-        self.assertEqual(check(contract, row(5, 40, ('idle',)))['decision'], 'insufficient_evidence')
-        self.assertEqual(check(contract, row(5, 40, ('idle', 'idle', 'busy')))['decision'], 'insufficient_evidence')
+        self.assertEqual(check(contract, rows(5, 40, ('idle',)))['decision'], 'insufficient_evidence')
+        self.assertEqual(check(contract, rows(5, 40, ('idle', 'idle', 'busy')))['decision'], 'insufficient_evidence')
         self.assertEqual(check({**contract, 'load_conditions': ['idle', 'idle']}, candidate)['basis'],
                          'invalid_measurement_plan')
         self.assertEqual(check({**contract, 'guardrails': [guard, guard]}, candidate)['basis'],
