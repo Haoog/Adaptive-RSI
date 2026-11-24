@@ -28,6 +28,7 @@ from .config import BUILTIN_PROVIDERS
 from .contracts import API_VERSION, descriptor
 from .evolution import Evolution
 from .maintenance import MAINTENANCE_INTERVAL
+from .operations import OperationNotFound
 from .release import ReconciliationRejected
 from .updates import UpdateInProgress, atomic_json
 
@@ -788,7 +789,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond({"version": __version__, "build": BUILD_ID, "pid": os.getpid(),
                               **descriptor()})
             elif parsed.path == "/api/operation":
-                self.respond(runtime.operations.get(params.get("id", [""])[0]))
+                try:
+                    operation = runtime.operations.get(params.get("id", [""])[0])
+                except OperationNotFound:
+                    self.respond({"error": "Operation not found", "error_code": "operation_not_found"}, 404)
+                else:
+                    self.respond(operation)
             elif parsed.path == "/api/contract":
                 if params.get("format", [""])[0] == "openapi":
                     self.respond(openapi_document(self.server.origin, self.server.local_origin,

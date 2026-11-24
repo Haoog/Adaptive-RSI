@@ -1068,6 +1068,8 @@ window.RSIExperience = (() => {
       ),
     );
   }
+  // Closing and reopening the storage dialog must keep the last confirmed operation ID.
+  const restoreChecks = new Map();
   async function storage() {
     const data = await api("storage"),
       box = dialog("数据与诊断");
@@ -1199,7 +1201,7 @@ window.RSIExperience = (() => {
       }
     });
     box.append(rotateButton);
-    // 服务端校验没有截止时间；界面最多等待 10 分钟，超时后停止轮询并允许重试。
+    // 界面每次最多查询 10 分钟；停止轮询后仍可继续查看同一操作。
     const restoreCheckTimeout = 10 * 60 * 1000;
     for (const saved of data.backups) {
       const link = el(
@@ -1211,11 +1213,13 @@ window.RSIExperience = (() => {
       link.download = "adaptive-rsi-" + saved.id + ".sqlite3";
       desktopDownload(link, saved.id);
       box.append(link);
-      let checking = false, status, timer, deadlineTimer;
+      let status;
       const checkButton = action(t("验证恢复点"), async () => {
-        // 全库校验可能持续数十秒到数分钟：先禁用按钮，避免重复点击占满后台操作池。
-        if (checking) return;
-        checking = true;
+        const check = restoreChecks.get(saved.id) ?? {id:null, checking:false};
+        // 即使弹窗已重新打开，同一备份也只允许一个查询或创建请求进行中。
+        if (check.checking) return;
+        check.checking = true;
+        restoreChecks.set(saved.id, check);
         checkButton.disabled = true;
         if (!status) {
           status = el("p", undefined, "muted");
@@ -1224,27 +1228,36 @@ window.RSIExperience = (() => {
         }
         status.textContent = t("正在验证恢复点…");
         const controller = new AbortController();
-        let timedOut = false;
+        let timer, deadlineTimer;
         try {
-          const operation = await api("operations", {kind:"restore-check", parameters:{id:saved.id}}),
-            deadline = Date.now() + restoreCheckTimeout;
-          deadlineTimer = setTimeout(() => { timedOut = true; controller.abort(); }, restoreCheckTimeout);
+          if (!check.id) {
+            const operation = await api("operations", {kind:"restore-check", parameters:{id:saved.id}});
+            check.id = operation.id;
+          }
+          const deadline = Date.now() + restoreCheckTimeout;
+          deadlineTimer = setTimeout(() => controller.abort(), restoreCheckTimeout);
           let current;
           do {
             await new Promise(resolve => { timer = setTimeout(resolve, 300); });
-            current = await api("operation?id=" + encodeURIComponent(operation.id), undefined, {signal:controller.signal});
+            current = await api("operation?id=" + encodeURIComponent(check.id), undefined, {signal:controller.signal});
           } while (!current.ended && Date.now() < deadline);
-          if (!current.ended) {
-            status.textContent = t("验证未完成，请重试。");
+          if (current.ended) {
+            check.id = null;
+            status.textContent = t(current.state === "completed" ? "恢复点验证通过。" : "恢复点验证未通过。");
+            toast(status.textContent, current.state !== "completed");
+          } else {
+            status.textContent = t("无法获取验证状态。再次点击可继续查看原验证。");
+            toast(status.textContent, true);
+          }
+        } catch (error) {
+          if (check.id && error.status === 404 && error.code === "operation_not_found") {
+            check.id = null;
+            status.textContent = t("原验证已不存在。再次点击可开始新的验证。");
             toast(status.textContent, true);
             return;
           }
-          status.textContent = t(current.state === "completed" ? "恢复点验证通过。" : "恢复点验证未通过。");
-          toast(status.textContent, current.state !== "completed");
-        } catch (error) {
-          // 轮询中断时保留错误提示，同时把状态行改成可重试，避免停在“正在验证”。
-          if (status) status.textContent = t("验证未完成，请重试。");
-          if (timedOut) {
+          status.textContent = t(check.id ? "无法获取验证状态。再次点击可继续查看原验证。" : "验证未完成，请重试。");
+          if (controller.signal.aborted) {
             toast(status.textContent, true);
             return;
           }
@@ -1252,7 +1265,8 @@ window.RSIExperience = (() => {
         } finally {
           clearTimeout(timer);
           clearTimeout(deadlineTimer);
-          checking = false;
+          check.checking = false;
+          if (!check.id) restoreChecks.delete(saved.id);
           checkButton.disabled = false;
         }
       }, "text-button");

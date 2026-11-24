@@ -349,6 +349,8 @@ const english = {
  "恢复点验证未通过。": "Restore point verification failed.",
  "正在验证恢复点…": "Verifying restore point…",
  "验证未完成，请重试。": "Verification did not finish. Please retry.",
+ "无法获取验证状态。再次点击可继续查看原验证。": "Unable to check verification status. Click again to check the same verification.",
+ "原验证已不存在。再次点击可开始新的验证。": "The previous verification no longer exists. Click again to start a new one.",
  "验证备份并生成清单": "Verify backup and create manifest",
  "备份清单生成失败": "Could not create the backup manifest",
  "下载备份清单": "Download backup manifest",
