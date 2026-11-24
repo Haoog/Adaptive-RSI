@@ -6,6 +6,8 @@ use tauri_plugin_updater::UpdaterExt;
 const FEED: &str = "https://github.com/Haoog/Adaptive-RSI/releases/latest/download/desktop-latest.json";
 pub(super) static REPLACEMENT_GATE: Mutex<()> = Mutex::new(());
 pub(super) const MAX_PACKAGE: usize = 512 * 1024 * 1024;
+#[cfg(unix)]
+const EXTRACTION_SPACE_MULTIPLIER: u64 = 2;
 
 /// Persisted download segment. Resuming reads its length; a completed package is
 /// renamed to `CACHED_NAME` only after the signature has been verified.
@@ -44,16 +46,34 @@ where F: FnMut(&Path) -> std::io::Result<u64> {
     Ok(())
 }
 
-fn cache_space_required(package: u64, snapshot_pending: bool) -> u64 {
-    let copies = if cfg!(unix) && snapshot_pending { 4 } else { 3 };
-    package.saturating_mul(copies)
+#[cfg(unix)]
+fn space_after_snapshot(
+    cache: &Path, snapshot_bytes: u64, extraction: &Path,
+    available: impl FnOnce(&Path) -> std::io::Result<u64>,
+) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    let free = available(extraction)?;
+    if snapshot_bytes > 0 && cache.metadata()?.dev() == extraction.metadata()?.dev() {
+        return Ok(free.saturating_sub(snapshot_bytes));
+    }
+    Ok(free)
 }
 
-fn preflight_space(app: &tauri::AppHandle, cache: &Path, package: u64, snapshot_pending: bool) -> Result<(), String> {
-    let required = package.saturating_mul(3);
-    // This also covers extraction on the cache volume. Once the snapshot exists,
-    // its allocation is already reflected in the available space.
-    require_space(&[cache], cache_space_required(package, snapshot_pending), |path| available_space(path))?;
+fn preflight_install_space(app: &tauri::AppHandle, cache: &Path, package: u64, snapshot_pending: bool) -> Result<(), String> {
+    // The staged package and current installation already occupy disk space.
+    // Tauri renames the Unix backup on the same filesystem. The new extraction
+    // may be larger than the archive, so keep two package lengths of headroom.
+    #[cfg(unix)]
+    let (extraction_bytes, available) = {
+        let snapshot_bytes = if snapshot_pending { package } else { 0 };
+        if snapshot_bytes > 0 {
+            require_space(&[cache], snapshot_bytes, |path| available_space(path))?;
+        }
+        (package.saturating_mul(EXTRACTION_SPACE_MULTIPLIER), |path: &Path| {
+            space_after_snapshot(cache, snapshot_bytes, path, |path| available_space(path))
+        })
+    };
     let temporary = std::env::temp_dir();
     #[cfg(target_os = "linux")]
     {
@@ -70,17 +90,24 @@ fn preflight_space(app: &tauri::AppHandle, cache: &Path, package: u64, snapshot_
         let package_manager = matches!(bundle_type(), Some(BundleType::Deb | BundleType::Rpm));
         // deb/rpm fall back when writing the package fails. AppImage selects
         // the first usable same-device directory before writing the new image.
-        let extraction_bytes = if package_manager { package } else { required };
-        linux_extraction_space(&executable, candidates, package_manager, extraction_bytes,
-            |path| available_space(path))
+        let extraction_bytes = if package_manager { package } else { extraction_bytes };
+        linux_extraction_space(&executable, candidates, package_manager, extraction_bytes, available)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         let _ = app;
         let executable = std::env::current_exe().map_err(|_| "update_disk_unavailable")?;
         let extraction = extraction_root(&executable, &temporary)?;
-        require_space(&[executable.parent().ok_or("update_disk_unavailable")?, &extraction],
-                      required, |path| available_space(path))
+        require_space(&[&extraction], extraction_bytes, available)
+    }
+    #[cfg(not(unix))]
+    {
+        // The in-memory snapshot uses no cache space. The external installer
+        // manages its own extraction and rollback, so keep its existing margin.
+        let _ = (app, cache, snapshot_pending);
+        let executable = std::env::current_exe().map_err(|_| "update_disk_unavailable")?;
+        require_space(&[executable.parent().ok_or("update_disk_unavailable")?, &temporary],
+                      package.saturating_mul(3), |path| available_space(path))
     }
 }
 
@@ -500,11 +527,6 @@ pub(super) fn extraction_root(executable: &Path, temporary: &Path) -> Result<Pat
     [Some(temporary), bundle.parent()].into_iter().flatten()
         .find(|path| path.metadata().is_ok_and(|metadata| metadata.dev() == device))
         .map(Path::to_path_buf).ok_or_else(|| "update_disk_unavailable".into())
-}
-
-#[cfg(not(unix))]
-fn extraction_root(_executable: &Path, temporary: &Path) -> Result<PathBuf, String> {
-    Ok(temporary.to_path_buf())
 }
 
 /// Only a feed transport or parse failure counts as being offline. Cancellations
@@ -1032,21 +1054,25 @@ mod cache_tests {
         assert!(cache.path().read_dir().unwrap().next().is_none());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn cache_preflight_charges_only_the_pending_unix_snapshot() {
-        let cache = Path::new("/cache");
+    fn preflight_charges_staged_size_on_the_shared_volume() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = cached_path(folder.path());
         let package = 1024 * 1024;
-        let before_snapshot = cache_space_required(package, true);
-        let after_snapshot = cache_space_required(package, false);
-        assert_eq!(before_snapshot, if cfg!(unix) { 4 * package } else { 3 * package });
-        assert_eq!(after_snapshot, 3 * package);
-        assert_eq!(require_space(&[cache], before_snapshot, |_| Ok(before_snapshot - 1)), Err("update_disk_space".into()));
-        assert!(require_space(&[cache], before_snapshot, |_| Ok(before_snapshot)).is_ok());
-        let just_over_three_copies = 3 * package + 1;
-        #[cfg(unix)]
-        assert_eq!(require_space(&[cache], before_snapshot, |_| Ok(just_over_three_copies)),
-            Err("update_disk_space".into()));
-        assert!(require_space(&[cache], after_snapshot, |_| Ok(just_over_three_copies)).is_ok());
+        File::create(&path).unwrap().set_len(package).unwrap();
+        let (_, staged_size) = open_bounded_file(&path, MAX_PACKAGE as u64).unwrap();
+        let extraction = folder.path().join("extract");
+        std::fs::create_dir(&extraction).unwrap();
+        let check = |free, snapshot_bytes| {
+            require_space(&[&extraction], staged_size * EXTRACTION_SPACE_MULTIPLIER, |path| {
+                space_after_snapshot(folder.path(), snapshot_bytes, path, |_| Ok(free))
+            })
+        };
+        assert!(check(3 * package + 1, staged_size).is_ok());
+        assert_eq!(check(3 * package - 1, staged_size), Err("update_disk_space".into()));
+        assert!(check(2 * package + 1, 0).is_ok());
+        assert_eq!(check(2 * package - 1, 0), Err("update_disk_space".into()));
     }
 }
 
@@ -1160,6 +1186,8 @@ async fn transfer(updater: &NativeUpdater, update: &tauri_plugin_updater::Update
                 restarted = true;
                 offset = 0;
                 *total = announced;
+                let cache = part.parent().ok_or("update_cache_unavailable")?;
+                require_space(&[cache], announced.unwrap_or(MAX_PACKAGE as u64), |path| available_space(path))?;
                 continue;
             }
             SegmentAction::Restart if status != 200 => return Err("update_range_rejected".into()),
@@ -1230,7 +1258,7 @@ async fn transfer(updater: &NativeUpdater, update: &tauri_plugin_updater::Update
     }
 }
 
-async fn download_package(app: &tauri::AppHandle, updater: &NativeUpdater, update: &tauri_plugin_updater::Update,
+async fn download_package(updater: &NativeUpdater, update: &tauri_plugin_updater::Update,
                           cache: &Path, version: &str, notes: &str) -> Result<(), String> {
     let cached = cached_path(cache);
     let part = part_path(cache);
@@ -1245,10 +1273,14 @@ async fn download_package(app: &tauri::AppHandle, updater: &NativeUpdater, updat
     }
     if announced > MAX_PACKAGE as u64 { return Err("update_size_limit".into()); }
     let mut total = update.raw_json.get("size").and_then(Value::as_u64).filter(|size| *size > 0);
-    let offset = resume_offset(part_bytes(&part), total);
-    // The cache, application and extraction volumes all need room for the
-    // complete package; checking only the remaining bytes under-reserved them.
-    preflight_space(app, cache, announced, true)?;
+    let persisted = part_bytes(&part);
+    let offset = resume_offset(persisted, total);
+    if offset == 0 && persisted > 0 {
+        discard_part(&part);
+    }
+    // Reserve the remaining download on this volume. Installation checks its
+    // own volumes against the verified staged file's length.
+    require_space(&[cache], announced - offset, |path| available_space(path))?;
     let result = async {
         let count = if total == Some(offset) { offset } else {
             transfer(updater, update, &part, offset, &mut total, version, notes).await?
@@ -1304,7 +1336,7 @@ async fn check_in_operation(app: &tauri::AppHandle, download: bool) -> Result<Va
         discard_part(&cached);
         *updater.staged.lock().unwrap() = None;
         if !download { return Ok(snapshot(&app)); }
-        download_package(&app, &updater, &update, &cache, &version, &notes).await?;
+        download_package(&updater, &update, &cache, &version, &notes).await?;
         *updater.staged.lock().unwrap() = Some((update, cached));
         updater.set(json!({"state":"ready","version":version,"notes":notes}));
         Ok(snapshot(&app))
@@ -1506,7 +1538,7 @@ fn install_in_operation(app: tauri::AppHandle, permit: InstallPermit, automatic:
         let version = &staged.0.version;
         let cache = staged.1.parent().ok_or("update_cache_unavailable")?;
         let (file, size) = open_bounded_file(&staged.1, MAX_PACKAGE as u64)?;
-        preflight_space(&app, cache, size, true)?;
+        preflight_install_space(&app, cache, size, true)?;
         let snapshot = install_snapshot(file, size, cache)?;
         let bytes = snapshot.as_ref();
         let verified = staged.0.verify(bytes).is_ok();
@@ -1571,7 +1603,7 @@ fn install_in_operation(app: tauri::AppHandle, permit: InstallPermit, automatic:
         }
         if updater.cancel.load(Ordering::SeqCst) { return Err("update_wait_cancelled".into()); }
         boundary()?;
-        preflight_space(&app, cache, bytes.len() as u64, false)?;
+        preflight_install_space(&app, cache, size, false)?;
         updater.set(json!({"state":"installing","stage":"installing","version":version}));
         // Replacement starts only after owned work has drained. Other services are not stopped.
         // A stop request is irreversible: never treat a child whose stdin was already
