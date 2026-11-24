@@ -91,7 +91,7 @@ if(window.__TAURI_INTERNALS__){
       if(wasLocal&&!next.connected&&Number.isSafeInteger(generation)){
        const first=!isLocalDisconnected();
        disconnectedGeneration=first?generation:Math.max(disconnectedGeneration,generation);
-       if(first)renderRuntimeConnection?.();
+       if(first){renderRuntimeConnection?.();window.RSIDesktop.onLocalRuntimeDisconnected?.();}
       }
      }
     }
@@ -111,7 +111,8 @@ if(window.__TAURI_INTERNALS__){
   const info=await ready,tools=document.querySelector('.project-tools');
   const machine=document.createElement('button');machine.className='text-button';tools.prepend(machine);
   const dialog=document.createElement('dialog'),form=document.createElement('form');
-  const title=document.createElement('h2');title.textContent=t('运行机器');
+  const title=document.createElement('h2');title.id='desktop-connect-title';title.textContent=t('运行机器');
+  dialog.setAttribute('aria-labelledby',title.id);
   const modeLabel=document.createElement('label'),modeText=document.createElement('span');
   const mode=document.createElement('select');
   const httpsOption=document.createElement('option'),sshOption=document.createElement('option');
@@ -123,16 +124,28 @@ if(window.__TAURI_INTERNALS__){
   const ownership=document.createElement('p');ownership.className='muted';
   const compatibility=document.createElement('p');compatibility.className='muted';compatibility.hidden=true;
   const input=document.createElement('input');input.type='password';input.required=true;input.autocomplete='off';input.setAttribute('aria-describedby',hint.id);
-  const error=document.createElement('p');error.className='form-error';error.setAttribute('role','alert');error.hidden=true;
+  const error=document.createElement('p');error.className='form-error';error.setAttribute('role','alert');
   const connect=document.createElement('button');connect.type='submit';connect.className='button primary';connect.textContent=t('连接服务器');
   const local=document.createElement('button');local.type='button';local.className='button';local.textContent=t('使用本机');
-  const close=document.createElement('button');close.type='button';close.className='text-button';close.textContent=t('关闭');close.onclick=()=>dialog.close();
-  form.append(title,modeLabel,hint,ownership,compatibility,input,error,connect,local,close);dialog.append(form);document.body.append(dialog);
-  let connectionError='',connectionDetail='';
+  const close=document.createElement('button');close.type='button';close.className='text-button';close.textContent=t('关闭');close.onclick=()=>{if(!close.disabled)dialog.close();};
+  const progress=document.createElement('p');progress.className='desktop-connection-progress';progress.setAttribute('role','status');
+  const logs=document.createElement('button');logs.type='button';logs.className='button';
+  const logError=document.createElement('p');logError.className='form-error';logError.setAttribute('role','alert');
+  form.append(title,modeLabel,hint,ownership,compatibility,input,error,connect,local,close,progress,logs,logError);dialog.append(form);document.body.append(dialog);
+  let connectionError='',connectionDetail='',connectionProgress='',returnFocus=machine,logFailed=false;
+  function showProgress(message){connectionProgress=message;const text=t(message);if(progress.textContent!==text)progress.textContent=text;}
+  function renderLogError(){logError.textContent=logFailed?t('无法打开本机日志目录，请稍后重试。'):'';}
+  logs.onclick=async()=>{
+   if(logs.disabled||logs.hidden)return;
+   logs.disabled=true;logFailed=false;renderLogError();
+   try{await invoke('open_runtime_log_directory');}
+   catch{if(dialog.open){logFailed=true;renderLogError();}}
+   finally{logs.disabled=false;}
+  };
   function showConnectionError(message,detail=''){
    connectionError=message;connectionDetail=detail;
-   error.textContent=t(message)+(detail?' ('+detail+')':'');
-   error.hidden=!message;
+   const text=t(message)+(detail?' ('+detail+')':'');
+   if(error.textContent!==text)error.textContent=text;
   }
   function updateConnectionMode(){
    const sshTunnel=mode.value==='ssh';
@@ -141,14 +154,15 @@ if(window.__TAURI_INTERNALS__){
     :t('连接服务器时粘贴 HTTPS 认证地址。账号和项目保留在运行机器，关闭客户端不会停止服务器任务。');
    input.placeholder=sshTunnel?'http://127.0.0.1:6090/?token=…':'https://rsi.example.com/?token=…';
   }
-  mode.onchange=()=>{input.value='';showConnectionError('');updateConnectionMode();};
+  mode.onchange=()=>{if(mode.disabled)return;input.value='';showConnectionError('');updateConnectionMode();};
   async function change(args){
    if(connect.disabled)return;
    changing=true;
    // A new choice supersedes probes that started before its preflight.
    lastRuntimeReply=runtimeProbe;
-   mode.disabled=connect.disabled=local.disabled=close.disabled=true;
+   mode.disabled=connect.disabled=local.disabled=close.disabled=input.readOnly=true;
    showConnectionError('');
+   showProgress(args.url===null?'正在连接本机服务…':'正在核对认证地址…');
    try{
     // Preflight uses the same parser as connect and leaves the current page's requests running.
     if(args.url!==null&&!await invoke('validate_connection_target',args)){
@@ -158,6 +172,7 @@ if(window.__TAURI_INTERNALS__){
     if(switched)return;
     // Pause new requests while native validates the candidate. Old replies can still complete.
     switching=true;
+    if(args.url!==null)showProgress(args.sshTunnel?'正在通过 SSH 隧道连接…':'正在连接 HTTPS 服务…');
     const next=await invoke('connect',args);
     input.value='';
     reloadRuntime(info,next);
@@ -185,7 +200,11 @@ if(window.__TAURI_INTERNALS__){
     }
    }finally{
     changing=false;
-    if(!switching)mode.disabled=connect.disabled=local.disabled=close.disabled=false;
+    if(!switching){
+     mode.disabled=connect.disabled=local.disabled=close.disabled=input.readOnly=false;
+     showProgress('');
+     if(dialog.open)(args.url===null?local:input).focus();
+    }
    }
   }
   dialog.addEventListener('cancel',event=>{if(connect.disabled)event.preventDefault();});
@@ -202,30 +221,37 @@ if(window.__TAURI_INTERNALS__){
    const disconnected=isLocalDisconnected();
    machine.textContent=t(disconnected?'重新连接运行机器':info?.name||'连接运行机器');
    ownership.hidden=disconnected||info?.kind!=='local'||info.owned;
+   logs.hidden=!!info?.connected&&!disconnected;
    if(disconnected){
     document.getElementById('connection').textContent=t('连接中断');
     if(dialog.open&&!connectionError)showConnectionError(localDisconnectedMessage);
    }
   };
-  function openMachine(){
+  function openMachine(opener){
    if(dialog.open)return;
+   returnFocus=opener;
    if(!connectionError){
     if(isLocalDisconnected())showConnectionError(localDisconnectedMessage);
     else if(remoteSessionExpired)showConnectionError(sessionExpiredMessage);
    }
    dialog.showModal();
+   mode.focus();
   }
-  machine.onclick=openMachine;
+  machine.onclick=()=>openMachine(machine);
   document.getElementById('reload-ui').addEventListener('click',event=>{
    if(!remoteSessionExpired)return;
    event.stopImmediatePropagation();
-   openMachine();
+   openMachine(event.currentTarget||document.getElementById('reload-ui'));
   },true);
   if(info?.kind==='remote'&&info.api_version===1){compatibility.hidden=false;compatibility.textContent=t('远端服务为旧版 API。基础功能可继续使用；不支持的操作会提示升级服务。');}
-  dialog.addEventListener('close',()=>{if(!dialog.open)input.value='';});
+  dialog.addEventListener('close',()=>{
+   if(dialog.open)return;
+   input.value='';logFailed=false;renderLogError();
+   (returnFocus?.isConnected===false||returnFocus?.hidden||returnFocus?.disabled?machine:returnFocus)?.focus();
+  });
   if(!info?.connected){
    showConnectionError(info?info.error||'连接运行机器':'无法读取当前运行机器。请连接服务器或使用本机。');
-   dialog.showModal();
+   openMachine(machine);
   }
   const folder=document.createElement('button');folder.type='button';folder.className='button';folder.textContent=t('选择文件夹');
   const projectDialog=document.getElementById('project-dialog'),projectForm=document.getElementById('project-form');
@@ -249,7 +275,8 @@ if(window.__TAURI_INTERNALS__){
   window.RSIDesktop.translate=()=>{
    renderRuntimeConnection();machine.title=t('运行机器');title.textContent=t('运行机器');
    modeText.textContent=t('服务器连接方式');httpsOption.textContent='HTTPS';sshOption.textContent=t('SSH 隧道');
-   updateConnectionMode();showConnectionError(connectionError,connectionDetail);
+   updateConnectionMode();showConnectionError(connectionError,connectionDetail);showProgress(connectionProgress);renderLogError();
+   logs.textContent=t('打开本机日志目录');
    ownership.textContent=t('当前连接已有本机服务，退出软件不会停止它。');
    compatibility.textContent=t('远端服务为旧版 API。基础功能可继续使用；不支持的操作会提示升级服务。');
    input.setAttribute('aria-label',t('服务器认证地址'));connect.textContent=t('连接服务器');local.textContent=t('使用本机');close.textContent=t('关闭');folder.textContent=t('选择文件夹');

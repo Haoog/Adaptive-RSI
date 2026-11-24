@@ -26,6 +26,8 @@ Keep the SSH session running in Terminal. Open the runtime-machine menu at the t
 
 If the authentication URL uses a different port, replace both instances of `6090` with that port so the local listener matches the URL and forwards to the runtime's loopback port on the server. The authentication URL contains session credentials. Retrieve it privately from the server logs and share it only through a private channel.
 
+The connection dialog shows address validation and connection progress. The address is read-only while the request is pending and remains available to edit after failure. If the local service fails to start or disconnects, choose **Open local log directory** in the recovery dialog. The directory keeps `runtime.log` and the previous run’s `runtime.log.1`.
+
 ## Records and Usage
 
 Real call records are grouped by task, including failures and retries. Filter by project, dates, model/task search, and inspect details. Background checks and connection tests are identified separately. Missing usage is unknown, not zero; missing historical input/output/cache fields cannot be reconstructed. Model time is summed call duration, not task wall time. Daily buckets and date ranges follow the browser timezone. Estimates prefer frozen input, output and cache prices, falling back to blended pricing when components are incomplete. Unpriced calls are disclosed; estimates do not represent bills or impose quotas.
@@ -47,6 +49,8 @@ npm run --prefix desktop dev
 Builds use local ad-hoc signatures unless Apple Developer ID signing and notarization credentials are configured; macOS may show a security warning for ad-hoc builds. Server source hot-updates are disabled for an app-owned engine to prevent UI/engine version mismatch. Replacing the app preserves its data directory.
 
 ## Software updates
+
+**Local desktop client** and **Backend service in the current runtime** have separate check controls and results. Independently running local or remote backends use the service check. The bundled backend updates with the desktop client, so its separate check and install controls are disabled.
 
 Desktop builds configured with an updater public key can check and download signed updates in the app. Choose “Restart and update” or enable automatic installation when tasks are idle. An owned runtime stops admitting new tasks and drains active work; the new app checks its bundled engine version before resuming. Download, wait, and installation errors are displayed alongside a manual installer link.
 

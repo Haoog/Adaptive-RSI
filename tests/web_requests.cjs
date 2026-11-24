@@ -319,7 +319,7 @@ function productionSettingsPage(scope) {
   // Keep production renderSettings, refresh, draft restoration and dirty status.
   // Isolate only unrelated panels and their background requests.
   vm.runInContext(`view='settings';renderCapabilities=async()=>{};loadReleaseWorkflows=async()=>{};
-    renderUpdateExtras=()=>{};renderNavigation=()=>{};window.RSIExperience.refreshed=()=>{};
+    renderNavigation=()=>{};window.RSIExperience.refreshed=()=>{};
     render=()=>{if(!settingsBaseline)renderSettings();};`, page.context);
   page.node('config-scope').value = scope; page.context.renderSettings();
   const server = structuredClone(page.context.initialState), posts = [];
@@ -463,7 +463,7 @@ for (const outcome of ['failure', 'network', 'timeout']) {
 
 test('update check acknowledgment replaces stale failure and disables only update controls', async () => {
   const page=browser();
-  vm.runInContext('state.update={state:"error",reason:"old-check-error",busy:false};renderUpdateExtras=()=>{};renderUpdate()',page.context);
+  vm.runInContext('state.update={state:"error",reason:"old-check-error",busy:false};renderUpdate()',page.context);
   assert.match(page.node('update-status').textContent,/old-check-error/);
   page.context.fetch=async()=>response({started:true,update:{state:'checking',busy:false}});
   page.node('check-update').handlers.click();await page.context.lastAction;
@@ -478,7 +478,7 @@ test('update check acknowledgment replaces stale failure and disables only updat
 });
 
 test('update check acknowledgment preserves a fast completed result', async () => {
-  const page=browser();vm.runInContext('renderUpdateExtras=()=>{}',page.context);
+  const page=browser();
   page.context.fetch=async()=>response({started:true,update:{state:'up_to_date',busy:false}});
   page.node('check-update').handlers.click();await page.context.lastAction;
   assert.match(page.node('update-status').textContent,/已是最新稳定版/);
@@ -493,7 +493,7 @@ test('primary rate limit shows retry time in both languages and enables checking
     const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
     // Load the real dictionary and translator without static DOM traversal.
     vm.runInContext(i18n.slice(0,i18n.indexOf('const staticText =')),page.context);
-    vm.runInContext(`language=${JSON.stringify(locale)};Date.now=()=>${(reset-1)*1000};state.update={state:'error',reason:'GitHub HTTP 403',reason_code:'github_primary_rate_limit',rate_limit_until:${reset},busy:false};renderUpdateExtras=()=>{};renderUpdate();`,page.context);
+    vm.runInContext(`language=${JSON.stringify(locale)};Date.now=()=>${(reset-1)*1000};state.update={state:'error',reason:'GitHub HTTP 403',reason_code:'github_primary_rate_limit',rate_limit_until:${reset},busy:false};renderUpdate();`,page.context);
     const expectedTime=vm.runInContext(`new Date(${reset}*1000).toLocaleString(language)`,page.context);
     assert.ok(page.node('update-status').textContent.includes(expectedTime));
     assert.match(page.node('update-status').textContent,locale==='en'?/anonymous API quota is exhausted/:/匿名 API 额度已用尽/);
@@ -566,7 +566,7 @@ test('update reasons show Chinese guidance in Chinese and the original text in E
   for (const locale of ['zh-CN', 'en']) for (const [update, zhHint] of cases) {
     const page = browser();
     vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')), page.context);
-    vm.runInContext(`language=${JSON.stringify(locale)};state.update=${JSON.stringify({...update, busy: false})};renderUpdateExtras=()=>{};renderUpdate();`, page.context);
+    vm.runInContext(`language=${JSON.stringify(locale)};state.update=${JSON.stringify({...update, busy: false})};renderUpdate();`, page.context);
     const text = page.node('update-status').textContent;
     if (locale === 'zh-CN') {
       assert.ok(text.includes(zhHint), 'Chinese UI should guide on: ' + update.reason + ' — got: ' + text);
@@ -1063,7 +1063,7 @@ function pausePage() {
   };
   vm.runInContext(`state=startState;language='zh-CN';view='settings';settingsBaseline={};
     readinessCache.set('a',{items:[]});readinessCache.set('b',{items:[]});
-    renderUpdateExtras=()=>{};renderSettings=()=>{};render=originalRender;
+    renderSettings=()=>{};render=originalRender;
     safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;};render()`, context);
   const click = (includeDisabled = false, detail = 1) => {
     if (node('pause-button').disabled && !includeDisabled) return;
@@ -1516,7 +1516,7 @@ test('inspection entry points follow project, configuration and repository avail
   });
   page.document.querySelectorAll = selector => selector === '[data-inspect]' ? buttons : [];
   page.node('config-scope').value = 'project';
-  vm.runInContext('language="zh-CN";view="settings";settingsBaseline={};readinessCache.set("a",{ready:true,items:[]});renderUpdateExtras=()=>{};originalRender()', page.context);
+  vm.runInContext('language="zh-CN";view="settings";settingsBaseline={};readinessCache.set("a",{ready:true,items:[]});originalRender()', page.context);
   assert.equal(buttons[0].disabled, false, 'manual check stays available when its source is disabled');
   assert.equal(buttons[1].disabled, true, 'missing repository cannot schedule Issue sync');
   page.context.initialState.projects[0].config.sources = {inspection: true, issues: true};
@@ -5364,7 +5364,7 @@ function desktopPage() {
   page.context.clearInterval = id => { if (id === intervalId) poll = null; };
   page.context.uiConfirm = async () => true;
   page.context.window.RSIDesktop = desktop;
-  for (const id of ['update-status', 'update-notes', 'apply-update', 'desktop-update'])
+  for (const id of ['update-status', 'update-notes', 'apply-update', 'desktop-update', 'check-legacy-desktop-update'])
     Object.assign(page.node(id), {after(...children) { this.children.push(...children); }, remove() { this.removed = true; }});
   page.desktop = desktop;
   page.tick = async () => {
@@ -5426,7 +5426,8 @@ test('repeated update checks during a download keep one poller and the reported 
   await vm.runInContext('checkDesktopUpdate(true)', page.context);
   assert.equal(vm.runInContext('desktopUpdateTimer', page.context), first, 'a repeated check never starts a second poller');
   assert.equal(vm.runInContext('desktopUpdate.percent', page.context), 40, 'a repeated check keeps the reported progress');
-  assert.equal(page.desktop.checks, 2);
+  assert.equal(page.desktop.checks, 1, 'the disabled check neither calls the native command nor disturbs polling');
+  assert.equal(page.node('check-legacy-desktop-update').disabled, true);
   assert.match(String(page.node('desktop-update').children[0]), /40%/);
 });
 
@@ -5462,7 +5463,7 @@ function desktopBootPage({lastChecked = Date.now() - 60000, failCheck = false} =
   });
   page.context.fetch = async () => response(snapshot());
   page.context.localStorage.setItem('rsi-native-update-checked', String(lastChecked));
-  Object.assign(page.node('update-status'), {after(...children) { this.children.push(...children); }});
+  Object.assign(page.node('legacy-desktop-update'), {after(...children) { this.children.push(...children); }});
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/native-update.js'), 'utf8'), page.context);
   page.calls = calls;
   page.checkCalls = () => calls.filter(action => action === 'check').length;
@@ -5498,12 +5499,96 @@ test('opening the desktop console respects an active check backoff', async () =>
   assert.equal(page.checkCalls(), 1, 'the retry waits for the existing backoff');
 });
 
-test('the check-update button still forces an immediate check', async () => {
+test('desktop client and backend service keep separate check actions, results and busy states', async () => {
   const page = desktopBootPage();
+  const requests=[];
+  let reply;
+  page.context.fetch=(url, options)=>{
+    if(url==='/api/sys-metrics')return Promise.resolve(response({}));
+    requests.push([url,options.method]);
+    return new Promise(resolve=>{reply=resolve;});
+  };
   await page.fireReady();
-  assert.equal(page.checkCalls(), 0);
-  await page.node('check-update').handlers.click();
-  assert.equal(page.checkCalls(), 1, 'an explicit click bypasses the six-hour window');
+  assert.equal(page.checkCalls(),0);
+  const panel=page.node('legacy-desktop-update').children[0];
+  const clientCheck=panel.children.find(node=>node.textContent==='检查桌面客户端更新');
+  const clientStatus=panel.children.find(node=>node.attributes.role==='status');
+  const serviceCheck=page.node('check-update');
+  vm.runInContext('state.update={state:"unchecked",channel:"managed"};renderUpdate()',page.context);
+  const serviceAction=serviceCheck.handlers.click();
+  await new Promise(setImmediate);
+  assert.equal(serviceCheck.disabled,true);
+  assert.equal(clientCheck.disabled,false);
+  assert.match(page.node('update-status').textContent,/正在检查更新/);
+  await clientCheck.onclick();
+  assert.equal(page.checkCalls(),1,'the explicit client check bypasses the six-hour window');
+  assert.match(clientStatus.textContent,/已是最新稳定版/);
+  assert.equal(serviceCheck.disabled,true);
+  reply(response({started:true,update:{state:'available',version:'9.0.0',channel:'managed'}}));
+  await serviceAction;
+  assert.match(page.node('update-status').textContent,/9\.0\.0/);
+  assert.doesNotMatch(clientStatus.textContent,/9\.0\.0/);
+  assert.deepEqual(requests,[['/api/updates/check','POST']]);
+  assert.deepEqual(page.calls.filter(action=>['check','download','install'].includes(action)),['check']);
+  vm.runInContext('state.update={state:"unchecked",channel:"desktop",desktop_managed:true};renderUpdate()',page.context);
+  assert.match(page.node('update-status').textContent,/随桌面客户端更新/);
+  assert.equal(serviceCheck.disabled,true);
+  assert.equal(page.node('apply-update').disabled,true);
+  assert.equal(clientCheck.disabled,false);
+  await serviceCheck.handlers.click();
+  assert.equal(requests.length,1);
+  vm.runInContext('state.update={state:"available",version:"9.0.0",channel:"managed"};renderUpdate()',page.context);
+  assert.equal(serviceCheck.disabled,false);
+  page.context.window.RSIDesktop.isLocalDisconnected=()=>true;
+  vm.runInContext('renderUpdate()',page.context);
+  assert.equal(serviceCheck.disabled,true);
+  assert.equal(page.node('apply-update').disabled,true);
+  assert.equal(clientCheck.disabled,false);
+});
+
+test('operations confirmation names the action and restores focus after dismissal', async () => {
+  const page=browser();
+  const opener=page.node('apply-update');
+  page.document.activeElement=opener;
+  opener.focus=()=>{page.document.activeElement=opener;};
+  page.document.body=page.node('body');
+  const create=page.document.createElement;
+  page.document.createElement=tag=>{
+    const node=create(tag);node.focus=()=>{page.document.activeElement=node;};return node;
+  };
+  const result=page.context.uiConfirm('确认后台服务更新？');
+  const dialog=page.document.body.children.at(-1),cancel=dialog.children.at(-1).children[0];
+  assert.equal(dialog.attributes['aria-label'],'确认后台服务更新？');
+  assert.equal(page.document.activeElement,cancel);
+  dialog.close();
+  assert.equal(await result,false);
+  assert.equal(page.document.activeElement,opener);
+  assert.equal(dialog.isConnected,false);
+});
+
+test('global configuration repair keeps failure inside its named dialog and restores focus on close',async()=>{
+  const page=browser(),opener=page.node('settings-save');
+  page.document.activeElement=opener;
+  opener.focus=()=>{page.document.activeElement=opener;};
+  page.document.body=page.node('body');
+  const create=page.document.createElement;
+  page.document.createElement=tag=>{
+    const node=create(tag);node.focus=()=>{page.document.activeElement=node;};return node;
+  };
+  page.context.api=async route=>{
+    assert.equal(route,'config/repair-global');
+    throw Error('fixture repair failure');
+  };
+  page.context.offerGlobalConfigRepair({});
+  const dialog=page.document.body.children.at(-1),[title,,alert,actions]=dialog.children;
+  const [cancel,repair]=actions.children;
+  assert.equal(dialog.attributes['aria-labelledby'],title.id);
+  assert.equal(page.document.activeElement,cancel);
+  await repair.onclick();
+  assert.equal(dialog.open,true);
+  assert.equal(alert.attributes.role,'alert');assert.equal(alert.textContent,'fixture repair failure');
+  assert.equal(repair.disabled,false);
+  cancel.onclick();assert.equal(page.document.activeElement,opener);
 });
 
 test('multiple predecessors survive language rebuild and save as one dependency set', async () => {

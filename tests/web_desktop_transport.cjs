@@ -142,7 +142,7 @@ function testConnectionRejection(name,{mode,rejection,expected,english}){
   const handlers={},elements={},calls=[];
   let finishRequest,failConnect;
   const makeElement=()=>({textContent:'',append(...children){this.children=children;},prepend(){},addEventListener(){},
-   setAttribute(name,value){if(name==='role'&&value==='alert')elements.alert=this;}});
+   setAttribute(name,value){if(name==='role'&&value==='alert'&&!elements.alert)elements.alert=this;}});
   const oldReply={status:200,body:'{"runtime":"old"}'};
   const scope=mode==='ssh'?'local':'https://old.example.test';
   const window={fetch:async()=>{},__TAURI_INTERNALS__:{invoke:async(command,args)=>{
@@ -180,7 +180,7 @@ function testConnectionRejection(name,{mode,rejection,expected,english}){
   if(mode!=='local'&&rejection!==null)expectedCalls.push(['connect',url,sshTunnel]);
   assert.deepEqual(calls.slice(2).map(({command,args})=>[command,args.url,args.sshTunnel]),expectedCalls);
   if(rejection!==null){failConnect(rejection);await new Promise(setImmediate);}
-  assert.equal(elements.alert.hidden,false);
+  assert.notEqual(elements.alert.textContent,'');
   assert.equal(elements.alert.textContent,expected);
   if(english){
    vm.runInContext('language="en";window.RSIDesktop.translate()',context);
@@ -226,7 +226,7 @@ const stateReply=(build='running')=>({status:200,body:JSON.stringify({projects:[
 async function runtimePage({invoke,fetch=async()=>assert.fail('unexpected network request'),beforeStartup}){
  const handlers={},nodes=new Map(),dialogs=[],storageReads=[],warnings=[],routes=[];
  const element=()=>({textContent:'',value:'',open:false,hidden:false,options:[],dataset:{},children:[],listeners:{},
-  classList:{add(){},remove(){},toggle(){}},style:{},setAttribute(){},focus(){},querySelector(){return null},querySelectorAll(){return[]},remove(){},
+  classList:{add(){},remove(){},toggle(){}},style:{},attributes:{},setAttribute(name,value){this.attributes[name]=value;},focus(){document.activeElement=this;},querySelector(){return null},querySelectorAll(){return[]},remove(){},
   append(...children){this.children.push(...children);},prepend(child){this.children.unshift(child);},replaceChildren(...children){this.children=children;},
   addEventListener(name,handler,capture=false){(this.listeners[name]??=[]).push({handler,capture});},
   showModal(){this.open=true;},close(){this.open=false;for(const {handler} of this.listeners.close??[])handler();}});
@@ -267,9 +267,77 @@ async function runtimePage({invoke,fetch=async()=>assert.fail('unexpected networ
  if(beforeStartup)await beforeStartup({window,node,tools,dialogs,tick,advance,timers});
  await startup;
  const dialog=dialogs[0],form=dialog?.children[0];
- return {window,context,dialog,form,machine:tools.children[0],node,tick,storageReads,warnings,routes,
+ return {window,context,document,dialog,form,machine:tools.children[0],node,tick,storageReads,warnings,routes,
   advance,reload,reloads:()=>reloads,confirmations:()=>confirmations};
 }
+for(const [mode,url,progress] of [
+ ['ssh','http://127.0.0.1:6090/?token=fixture','正在通过 SSH 隧道连接…'],
+ ['https','https://rsi.example.test/?token=fixture','正在连接 HTTPS 服务…'],
+]){
+ test(`desktop ${mode} connection announces both waits, retains a failed draft, and keeps a successful switch locked`,async()=>{
+  const calls=[],validations=[],connections=[];
+  const page=await runtimePage({invoke:async(command,args)=>{
+   if(command==='runtime_info')return {connected:true,kind:'local',scope:'local',connection_generation:7};
+   if(command==='set_native_language')return;
+   if(command==='request')return {status:200,body:'{}'};
+   calls.push({command,args});
+   if(command==='validate_connection_target')return new Promise(resolve=>validations.push(resolve));
+   if(command==='connect')return new Promise((resolve,reject)=>connections.push({resolve,reject}));
+   assert.fail('unexpected native command '+command);
+  }});
+  page.machine.onclick();
+  const [title,modeLabel,,,,input,error,connect,local,close,status]=page.form.children;
+  const select=modeLabel.children[1],submit=()=>page.form.onsubmit({preventDefault(){}});
+  assert.equal(page.dialog.attributes['aria-labelledby'],title.id);
+  assert.equal(page.document.activeElement,select);
+  assert.equal(status.attributes.role,'status');
+  assert.equal(error.attributes.role,'alert');
+  select.value=mode;select.onchange();input.value=url;
+  submit();submit();local.onclick();close.onclick();
+  let escapeBlocked=false;
+  page.dialog.listeners.cancel[0].handler({preventDefault(){escapeBlocked=true;}});
+  assert.equal(escapeBlocked,true);assert.equal(page.dialog.open,true);
+  assert.equal(input.readOnly,true);assert.equal(connect.disabled,true);
+  assert.equal(status.textContent,'正在核对认证地址…');
+  assert.equal(validations.length,1);
+  validations.shift()(false);await page.tick();
+  assert.equal(input.value,url);assert.equal(input.readOnly,false);assert.equal(status.textContent,'');
+  assert.notEqual(error.textContent,'');assert.equal(connections.length,0);
+  submit();validations.shift()(true);await page.tick();
+  assert.equal(status.textContent,progress);assert.equal(input.readOnly,true);
+  connections.shift().reject('Runtime health check failed (HTTP 401)');await page.tick();
+  assert.notEqual(error.textContent,'');assert.doesNotMatch(error.textContent,/fixture/);
+  assert.equal(input.value,url);assert.equal(input.readOnly,false);assert.equal(status.textContent,'');
+  assert.equal(page.document.activeElement,input);
+  close.onclick();assert.equal(page.document.activeElement,page.machine);assert.equal(input.value,'');
+  page.machine.onclick();input.value=url;submit();validations.shift()(true);await page.tick();
+  connections.shift().resolve({scope:'https://rsi.example.test',connected:true,connection_generation:8});await page.tick();
+  submit();local.onclick();assert.equal(input.readOnly,true);assert.equal(input.value,'');assert.equal(page.reloads(),1);
+  assert.deepEqual(calls.map(call=>call.command),['validate_connection_target','validate_connection_target','connect','validate_connection_target','connect']);
+ });
+}
+
+test('desktop recovery can open only the local log directory before a runtime exists',async()=>{
+ const calls=[];let fail=true;
+ const page=await runtimePage({invoke:async(command,args)=>{
+  if(command==='runtime_info')return {connected:false,error:'Bundled runtime is missing'};
+  if(command==='set_native_language')return;
+  if(command==='request')throw 'Runtime unavailable';
+  calls.push({command,args});
+  if(command!=='open_runtime_log_directory')assert.fail('unexpected command '+command);
+  if(fail)throw Error('private host path');
+ }});
+ const logs=page.form.children[11],feedback=page.form.children[12];
+ assert.equal(page.dialog.open,true);assert.equal(logs.hidden,false);
+ assert.equal(feedback.attributes.role,'alert');
+ await logs.onclick();assert.match(feedback.textContent,/无法打开本机日志目录/);
+ assert.doesNotMatch(feedback.textContent,/private host path/);
+ fail=false;await logs.onclick();assert.equal(feedback.textContent,'');
+ assert.deepEqual(calls.map(({command,args})=>[command,Object.keys(args??{})]),[
+  ['open_runtime_log_directory',[]],['open_runtime_log_directory',[]],
+ ]);
+});
+
 const reconnectMachine='重新连接运行机器';
 const reconnectLocal='本机服务连接已中断。请选择“使用本机”重连，或连接服务器。';
 async function exitedLocalPage({requestError='Runtime connection changed',kind='local',scope='http://127.0.0.1:6090'}={}){
@@ -610,7 +678,7 @@ for(const recovery of ['local','server']){
   assert.equal(dialog.open,true);
   const [input,alert,connect,local,close]=form.children.slice(5);
   assert.equal(alert.textContent,startupError);
-  assert.equal(alert.hidden,false);
+  assert.notEqual(alert.textContent,'');
   assert.equal(node('connection').textContent,'连接中断');
   assert.equal(node('toast').textContent,'');
   assert.equal(window.__RSI_MACHINE_KEY__,undefined);
@@ -812,7 +880,7 @@ for(const [name,kind,scope] of [
    return;
   }
   assert.equal(page.dialog.open,true);
-  assert.equal(page.alert.hidden,true);
+  assert.equal(page.alert.textContent,'');
   page.dialog.close();
   await page.clickReload();
   assert.equal(page.dialog.open,false);
@@ -847,7 +915,7 @@ test('desktop session recovery ignores a late refresh 401 after a newer valid st
  assert.equal(page.reload.textContent,refreshButton);
  assert.equal(page.node('connection').textContent,'已连接');
  assert.equal(page.node('toast').textContent,'');
- page.openMachine();assert.equal(page.alert.hidden,true);
+ page.openMachine();assert.equal(page.alert.textContent,'');
 });
 
 test('desktop session recovery preserves the current connection validation error',async()=>{
@@ -895,7 +963,7 @@ test('desktop session recovery orders valid state reads and ignores cancelled or
  await page.clickReload();
  assert.equal(page.dialog.open,false);
  assert.equal(page.reloads(),1);
- page.openMachine();assert.equal(page.alert.hidden,true);
+ page.openMachine();assert.equal(page.alert.textContent,'');
 });
 
 test('desktop download links are handled as downloads while ordinary external links use the native bridge', async () => {

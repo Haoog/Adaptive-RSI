@@ -73,6 +73,8 @@ Desktop builds configured with update signing can check and download updates in 
 
 Closing the window hides the app in the menu bar and active tasks continue. Choosing **Quit** from the menu bar stops the service started by the app. The current DMG uses a temporary signature and is not Apple-notarized.
 
+Settings show separate results for **Check for desktop client updates** and **Check for backend service updates**. The bundled backend updates with the client. If the local service fails to start, open its local log directory from the runtime-machine recovery dialog.
+
 ### Run from source
 
 Requires Python 3.9+ and Git; GitHub import and delivery also require authenticated `gh`:

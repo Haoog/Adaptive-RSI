@@ -2,8 +2,8 @@
 window.RSINativeUpdate=(()=>{
  const labels={checking:'正在检查更新',latest:'已是最新稳定版',available:'发现新版本',downloading:'正在下载新版本…',verifying:'正在校验签名',replacing:'正在替换应用',ready:'新版本已准备好',waiting_idle:'等待当前任务结束后更新',installing:'正在安装更新',restarting:'正在重启应用',error:'更新未完成'};
  const errors={update_target_changed:'更新目标已变化或撤回，请重新检查并确认。',update_window_closed:'安装窗口已结束，下一次允许的空闲窗口会重新尝试。',updater_key_missing:'当前安装包尚未配置更新签名，请手动安装支持自动更新的版本。',update_disk_space:'磁盘可用空间不足，请清理后重试。',update_download_or_signature_failed:'下载或签名验证失败，当前版本继续可用。',update_wait_cancelled:'已取消等待更新，当前任务继续运行。',update_install_failed:'安装未完成，请重试或手动安装。',update_incompatible_platform:'此更新包与当前系统或架构不兼容，当前版本继续可用。',update_connect_timeout:'连接更新服务器超时，当前版本继续可用。请检查网络后重试。',update_response_timeout:'更新服务器响应超时，当前版本继续可用。',update_download_timeout:'下载新版本超过总时限，已停止。当前版本继续可用。',update_transfer_stalled:'下载长时间没有数据，已停止。当前版本继续可用。',update_connection_failed:'无法连接更新服务器，当前版本继续可用。',update_download_incomplete:'更新包下载不完整，已重新开始；请重试。',update_range_rejected:'服务器拒绝续传分段，已删除分段；请重试重新下载。',update_cache_unavailable:'更新缓存不可用，请检查磁盘权限或空间后重试。',update_size_limit:'更新包超过允许的大小上限，已停止。当前版本继续可用。',update_unsupported_platform:'当前平台不支持应用内更新，请手动安装。',update_authorization_changed:'更新授权已变化，本次安装已撤销；请按当前设置重新确认。',update_authorization_invalid:'更新设置无效，请重新选择更新策略、版本范围与安装时间。',update_authorization_failed:'更新设置未能同步到本机，请重试。',update_cancel_failed:'未能确认本机已撤销安装，请查看更新状态后再操作。',update_receipt_missing:'本机还没有已持久化的升级回执。',update_receipt_unavailable:'升级回执无法写入本机，安装未开始。',update_version_mismatch:'重启后的版本与升级目标不一致，已记录为未生效。',update_health_failed:'升级后的本机服务未通过健康检查，已记录为升级失败。'};
- let snapshot={},busy=false,checking=false,nodes=null,failures=0,retryAt=0,statusRetryAt=0,polling=false,installRetryAt=0;
- let runtimeInfo=null,lastSample=null,currentSpeed=0;
+ let snapshot={},busy=false,checkPending=false,checking=false,nodes=null,failures=0,retryAt=0,statusRetryAt=0,polling=false,installRetryAt=0;
+ let runtimeInfo=null,lastSample=null,currentSpeed=0,completedActions=0;
  // A running download needs per-second progress; a settled client does not. The
  // panel used to run a 1s interval for the life of the page even when nothing
  // was happening, so idle machines paid 86k IPC round-trips and full DOM
@@ -79,7 +79,7 @@ window.RSINativeUpdate=(()=>{
    const count=reasonCount(snapshot.reasons);
    return count?t('等待 {count} 项本机任务结束后更新').replace('{count}',String(count)):t('等待当前任务结束后更新');
   }
-  return t(labels[phase]||'桌面应用');
+  return t(labels[phase]||'尚未检查更新');
  }
  function scopeText(info){
   const neutral='更新本机客户端；当前无法判断服务影响范围。';
@@ -173,7 +173,9 @@ window.RSINativeUpdate=(()=>{
  function ensurePanel(){
   if(nodes)return;
   const panel=el('section',undefined,'native-update-panel');panel.id='native-update-panel';
+  const title=el('h3');title.id='native-update-title';panel.setAttribute('aria-labelledby',title.id);
   const status=el('p'),progress=el('p'),error=el('p',undefined,'form-error'),details=el('details'),summary=el('summary'),notes=el('pre');
+  status.id='native-update-status';status.setAttribute('role','status');error.setAttribute('role','alert');
   details.append(summary,notes);
   const label=el('label'),labelText=el('span'),select=el('select'),options=[];
   for(const [value,text] of [['manual','手动检查'],['download','后台下载，确认后重启'],['automatic','任务空闲时自动安装']]){
@@ -189,17 +191,18 @@ window.RSINativeUpdate=(()=>{
   for(const [value,text] of [['any','任意空闲时间'],['night','本地夜间 22:00–06:00'],['weekend','本地周末']]){const option=el('option');option.value=value;windowSelect.append(option);windowOptions.push([option,text]);}
   windowSelect.value=installWindow;windowSelect.onchange=()=>{installWindow=windowSelect.value;persist('rsi-native-update-window',installWindow);safe(settingsChanged);};windowLabel.append(windowText,windowSelect);
   const buttons={};
-  for(const [action,text] of [['check','检查更新'],['download','下载新版本'],['install','重启并更新'],['cancel','取消']]){
+  for(const [action,text] of [['check','检查桌面客户端更新'],['download','下载新版本'],['install','重启并更新'],['cancel','取消']]){
    const button=el('button',undefined,'button');button.type='button';
+   if(action==='check')button.setAttribute('aria-describedby',status.id);
    button.onclick=()=>safe(()=>action==='cancel'?window.RSIDesktop.invoke('native_update',{action}):run(action));
    buttons[action]=[button,text];
   }
   const manual=el('a');manual.href='https://github.com/Haoog/Adaptive-RSI/releases/latest';manual.target='_blank';manual.rel='noreferrer';
   const receipt=el('button',undefined,'button');receipt.type='button';receipt.onclick=()=>safe(exportReceipt);
   const scope=el('p',undefined,'muted'),saved=el('p',undefined,'form-error');
-  panel.append(status,progress,error,details,label,scopeLabel,windowLabel,scope,...Object.values(buttons).map(row=>row[0]),manual,receipt,saved);
-  $('update-status').after(panel);
-  nodes={panel,status,progress,error,details,summary,notes,labelText,select,options,buttons,manual,receipt,scope,saved,scopeText,scopeSelect,scopeOptions,windowText,windowSelect,windowOptions};
+  panel.append(title,status,progress,error,details,label,scopeLabel,windowLabel,scope,...Object.values(buttons).map(row=>row[0]),manual,receipt,saved);
+  $('legacy-desktop-update').after(panel);
+  nodes={panel,title,status,progress,error,details,summary,notes,labelText,select,options,buttons,manual,receipt,scope,saved,scopeText,scopeSelect,scopeOptions,windowText,windowSelect,windowOptions};
   bindRuntime();
  }
  function bindRuntime(){
@@ -227,7 +230,8 @@ window.RSINativeUpdate=(()=>{
   adoptRevision(snapshot);
   // Polling can call this every second; only changed text is written, so an
   // unchanged snapshot costs comparisons instead of a full panel rewrite.
-  setText(n.status,statusText(snapshot)+(snapshot.version?' · '+snapshot.version:''));
+  setText(n.title,t('本机桌面客户端'));
+  setText(n.status,checkPending?t('正在检查更新'):statusText(snapshot)+(snapshot.version?' · '+snapshot.version:''));
   setHidden(n.progress,phase!=='downloading');
   setText(n.progress,progressText(Object.assign({},snapshot,{speed:Number(snapshot.bytes_per_second)>0?snapshot.bytes_per_second:currentSpeed})));
   const code=errorCode();setHidden(n.error,!code);setText(n.error,code?errorText(code):'');
@@ -241,7 +245,7 @@ window.RSINativeUpdate=(()=>{
   if(document.activeElement!==n.select)n.select.value=policy;
   setText(n.scope,t(scopeText(runtimeInfo)));
   for(const [action,[button,text]] of Object.entries(n.buttons)){
-   setText(button,t(text));setDisabled(button,action!=='cancel'&&busy);
+   setText(button,t(text));setDisabled(button,action!=='cancel'&&busy||action==='check'&&checkBlocked(phase));
    setHidden(button,action==='download'?snapshot.state!=='available':action==='install'?snapshot.state!=='ready':action==='cancel'?!['downloading','waiting_idle'].includes(snapshot.state):false);
   }
   setText(n.manual,t('手动下载安装包'));
@@ -283,8 +287,10 @@ window.RSINativeUpdate=(()=>{
   date=date||new Date();
   return installWindow==='night'?(date.getHours()>=22||date.getHours()<6):installWindow==='weekend'?[0,6].includes(date.getDay()):false;
  }
+ function checkBlocked(phase){return phase==='checking'||phase==='restarting'||ACTIVE_PHASES.includes(phase);}
  async function run(action,automatic=false){
-  if(busy)return;busy=true;installPending=action==='install';
+  if(busy||action==='check'&&checkBlocked(phaseOf(snapshot)))return;
+  busy=true;checkPending=action==='check';installPending=action==='install';
   if(action==='install')authorizationError='';
   render();
   // The call stays pending for the whole operation, so the timer has to switch
@@ -311,12 +317,17 @@ window.RSINativeUpdate=(()=>{
   }catch(error){
    snapshot={state:'error',error_code:String(error)};
    failureCounts[action]=(failureCounts[action]||0)+1;failures=failureCounts[action];const next=Date.now()+Math.min(300000,5000*2**Math.min(failures-1,6));if(action==='install')installRetryAt=next;else retryAt=next;
-  }finally{busy=false;installPending=false;render();schedulePoll();}
+  }finally{completedActions++;busy=false;checkPending=false;installPending=false;render();schedulePoll();}
  }
  async function readStatus(){
   if(polling||!enabled())return false;polling=true;
-  try{snapshot=await window.RSIDesktop.invoke('native_update',{action:'status'});statusRetryAt=0;render();return true;}
-  catch(error){failures++;statusRetryAt=Date.now()+Math.min(300000,5000*2**Math.min(failures-1,6));retryAt=statusRetryAt;return false;}
+  const observedActions=completedActions;
+  try{
+   const observed=await window.RSIDesktop.invoke('native_update',{action:'status'});
+   if(observedActions!==completedActions)return false;
+   snapshot=observed;statusRetryAt=0;render();return true;
+  }
+  catch(error){if(observedActions!==completedActions)return false;failures++;statusRetryAt=Date.now()+Math.min(300000,5000*2**Math.min(failures-1,6));retryAt=statusRetryAt;return false;}
   finally{polling=false;}
  }
  // An automatic download or install keeps its IPC call pending for as long as the

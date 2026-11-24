@@ -4,7 +4,9 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    io::{BufRead, BufReader, IsTerminal, Read, Write},
+    fs::{self, File},
+    io::{self, BufRead, BufReader, IsTerminal, Read, Write},
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     sync::{Mutex, MutexGuard},
@@ -807,6 +809,79 @@ fn startup_budget(deadline: std::time::Instant) -> Result<Duration, String> {
     Ok(remaining)
 }
 
+fn prepare_runtime_log_directory(path: &Path) -> io::Result<PathBuf> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "Invalid runtime log directory");
+    if !fs::symlink_metadata(path)?.is_dir() {
+        return Err(invalid());
+    }
+    // Resolve system aliases in the parent without accepting a redirected app directory.
+    let parent = path.parent().ok_or_else(invalid)?.canonicalize()?;
+    let expected = parent.join(path.file_name().ok_or_else(invalid)?);
+    let directory = path.canonicalize()?;
+    if directory != expected {
+        return Err(invalid());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let dir = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&directory)?;
+        if dir.metadata()?.permissions().mode() & 0o777 != 0o700 {
+            dir.set_permissions(fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(directory)
+}
+
+fn runtime_log_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let path = app.path().app_log_dir().map_err(|_| "Cannot locate runtime log")?;
+    prepare_runtime_log_directory(&path).map_err(|_| "Cannot prepare runtime log directory".into())
+}
+
+fn rotate_runtime_log(directory: &Path) -> io::Result<File> {
+    let current = directory.join("runtime.log");
+    let previous = directory.join("runtime.log.1");
+    // Stage a private file before touching either generation. If the final
+    // publish fails, the last run is still available under the previous name.
+    let fresh = tempfile::NamedTempFile::new_in(directory)?;
+    match fs::symlink_metadata(&current) {
+        Ok(entry) if entry.is_file() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+                let old = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&current)?;
+                let metadata = old.metadata()?;
+                if !metadata.is_file()
+                    || metadata.nlink() != 1
+                    || metadata.dev() != entry.dev()
+                    || metadata.ino() != entry.ino()
+                {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid runtime log"));
+                }
+                old.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
+            fs::rename(&current, &previous)?;
+        }
+        Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid runtime log")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fresh.persist_noclobber(current).map_err(|error| error.error)
+}
+
 fn bootstrap_local(app: &tauri::AppHandle, select: bool) -> Result<(), String> {
     if cfg!(target_os = "windows") {
         return Err("Use a Linux/macOS server connection on Windows".into());
@@ -826,21 +901,6 @@ fn bootstrap_local(app: &tauri::AppHandle, select: bool) -> Result<(), String> {
     } else {
         return Err("Bundled runtime is missing".into());
     };
-    let log_dir = app
-        .path()
-        .app_log_dir()
-        .map_err(|_| "Cannot locate runtime log")?;
-    std::fs::create_dir_all(&log_dir).map_err(|_| "Cannot create runtime log directory")?;
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let log = options
-        .open(log_dir.join("runtime.log"))
-        .map_err(|_| "Cannot create runtime log")?;
     let mut paths: Vec<std::path::PathBuf> =
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
     if let Some(home) = std::env::var_os("HOME") {
@@ -862,6 +922,8 @@ fn bootstrap_local(app: &tauri::AppHandle, select: bool) -> Result<(), String> {
         "PATH",
         std::env::join_paths(paths).map_err(|_| "Cannot prepare tool paths")?,
     );
+    let log_dir = runtime_log_directory(app)?;
+    let log = rotate_runtime_log(&log_dir).map_err(|_| "Cannot create runtime log")?;
     let health_deadline = std::time::Instant::now() + Duration::from_secs(60);
     let child = command
         .env("ADAPTIVE_RSI_DESKTOP_OWNER_PID", std::process::id().to_string())
@@ -1517,6 +1579,13 @@ async fn choose_folder(app: tauri::AppHandle) -> Result<Option<String>, String> 
         .transpose()
 }
 #[tauri::command]
+fn open_runtime_log_directory(app: tauri::AppHandle) -> Result<(), String> {
+    let directory = runtime_log_directory(&app)?;
+    app.opener()
+        .open_path(directory.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(|_| "Cannot open runtime log directory".into())
+}
+#[tauri::command]
 fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     let parsed = reqwest::Url::parse(&url).map_err(|_| "Invalid URL")?;
     if parsed.scheme() != "https"
@@ -1656,6 +1725,7 @@ fn main() {
             validate_connection_target,
             connect,
             choose_folder,
+            open_runtime_log_directory,
             open_url,
             notify,
             check_desktop_update,
@@ -1816,6 +1886,61 @@ mod regression_tests;
 mod tests {
     use super::*;
     use std::{net::TcpListener, sync::Arc};
+
+    #[test]
+    fn startup_log_keeps_only_current_and_previous_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = prepare_runtime_log_directory(&temp.path().join("runtime-logs")).unwrap();
+        let runs: [&[u8]; 3] = [b"first", b"second", b"third"];
+        for run in runs {
+            rotate_runtime_log(&directory).unwrap().write_all(run).unwrap();
+        }
+        assert_eq!(fs::read(directory.join("runtime.log")).unwrap(), b"third");
+        assert_eq!(fs::read(directory.join("runtime.log.1")).unwrap(), b"second");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o700);
+            for name in ["runtime.log", "runtime.log.1"] {
+                assert_eq!(fs::metadata(directory.join(name)).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_rotation_preserves_the_existing_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        fs::write(directory.join("runtime.log"), b"last startup").unwrap();
+        fs::create_dir(directory.join("runtime.log.1")).unwrap();
+        assert!(rotate_runtime_log(directory).is_err());
+        assert_eq!(fs::read(directory.join("runtime.log")).unwrap(), b"last startup");
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_logs_refuse_redirected_directory_and_current_log() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let redirect = temp.path().join("redirect");
+        symlink(&target, &redirect).unwrap();
+        assert!(prepare_runtime_log_directory(&redirect).is_err());
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+
+        let directory = prepare_runtime_log_directory(&temp.path().join("runtime-logs")).unwrap();
+        let unrelated = target.join("unrelated");
+        fs::write(&unrelated, b"unrelated data").unwrap();
+        fs::write(directory.join("runtime.log.1"), b"previous startup").unwrap();
+        symlink(&unrelated, directory.join("runtime.log")).unwrap();
+        assert!(rotate_runtime_log(&directory).is_err());
+        assert_eq!(fs::read(unrelated).unwrap(), b"unrelated data");
+        assert_eq!(fs::read(directory.join("runtime.log.1")).unwrap(), b"previous startup");
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 2);
+    }
 
     fn receive_request(listener: &TcpListener, path: &str) -> (std::net::TcpStream, String) {
         let (stream, _) = listener.accept().unwrap();

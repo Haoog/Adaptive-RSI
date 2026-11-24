@@ -49,6 +49,7 @@ footer{display:flex;justify-content:space-between;padding:24px 0;font-size:12px;
 }
 
 .form-error { color: #9d3029; background: #fff1ed; border-left: 3px solid #b54636; padding: 12px 16px; line-height: 1.6; overflow-wrap: anywhere; }
+dialog .form-error:empty, .desktop-connection-progress:empty { margin: 0; padding: 0; border: 0; }
 #import-status { white-space: pre-line; overflow-wrap: anywhere; }
 
 .topbar { justify-content: flex-end; }
