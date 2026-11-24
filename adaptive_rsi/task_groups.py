@@ -80,10 +80,10 @@ def acceptance_evidence(store, task, project):
             linked = [{**check, "run": run["id"], "stage": "acceptance_candidate", "index": i}
                       for i, check in result_rows if check["name"] in unique]
             state = "unknown"
-            if not ambiguous:
+            if not ambiguous and linked and names == unique:
                 if any(check.get("passed") is False for check in linked):
                     state = "fail"
-                elif linked and names == unique and all(check.get("passed") is True for check in linked):
+                elif all(check.get("passed") is True for check in linked):
                     state = "pass"
             requirements.append({"task": original["id"], "index": index, "criterion": criterion,
                                  "state": state, "checks": linked})

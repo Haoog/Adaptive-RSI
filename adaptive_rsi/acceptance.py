@@ -10,6 +10,9 @@ def seal(spec, criteria, directory):
     spec = copy.deepcopy(spec)
     if not spec["files"] or not spec["checks"]:
         raise RuntimeError("Independent acceptance must contain executable checks")
+    names = {check["name"] for check in spec["checks"]}
+    if len(names) != len(spec["checks"]):
+        raise RuntimeError("Independent acceptance check names must be unique")
     covered = set()
     directory = Path(directory)
     directory.mkdir()

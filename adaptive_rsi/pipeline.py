@@ -812,7 +812,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             def _invoke_acceptance():
                 return runtime.invoke("acceptance", "Independently design executable acceptance BEFORE implementation. Inspect baseline code. "
                     "Return files only beneath .rsi-acceptance/ and checks that exercise real public behavior. "
-                    "Map each check to zero-based acceptance criterion indexes; cover every criterion. "
+                    "Use a unique name for each check. Map checks to zero-based criterion indexes and cover every criterion. "
                     "Use python3 for Python checks; do not assume a python executable alias exists. "
                     "Checks must fail on incorrect behavior, avoid source-string assertions and test-count-only assertions. "
                     "For new APIs or modules, handle absence and assert the missing public behavior explicitly; import/setup errors alone are not improvement evidence. "

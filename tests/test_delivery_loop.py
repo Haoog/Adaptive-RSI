@@ -107,6 +107,14 @@ class DeliveryLoopTest(unittest.TestCase):
             with self.assertRaises((RuntimeError, ValueError)):
                 seal(spec, ["correct sum"], self.root / str(time.time_ns()))
 
+    def test_independent_acceptance_rejects_duplicate_names_before_writing_files(self):
+        directory = self.root / "duplicate-acceptance"
+        spec = copy.deepcopy(SPEC)
+        spec["checks"].append({**spec["checks"][0], "criteria": [1]})
+        with self.assertRaisesRegex(RuntimeError, "check names must be unique"):
+            seal(spec, ["first criterion", "second criterion"], directory)
+        self.assertFalse(directory.exists())
+
     def test_generated_python_alias_is_normalized_before_sealing_without_mutating_input(self):
         spec = copy.deepcopy(SPEC)
         spec["checks"][0]["argv"][0] = "python"
