@@ -2614,20 +2614,22 @@ mod tests {
 
         let _gate = BACKUP_TEST_GATE.lock().await;
         let cases = [
-            (Some(ErrorKind::Unsupported), false, false, true),
-            (Some(ErrorKind::CrossesDevices), false, false, true),
-            (Some(ErrorKind::PermissionDenied), false, false, true),
-            (Some(ErrorKind::Unsupported), true, false, false),
+            (Some(ErrorKind::Unsupported.into()), false, false, true),
+            (Some(io::Error::from_raw_os_error(libc::ENOTSUP)), false, false, true),
+            (Some(ErrorKind::CrossesDevices.into()), false, false, true),
+            (Some(ErrorKind::PermissionDenied.into()), false, false, true),
+            (Some(ErrorKind::Unsupported.into()), true, false, false),
             (None, true, false, false),
-            (Some(ErrorKind::Other), false, false, false),
-            (Some(ErrorKind::Unsupported), false, true, false),
+            (Some(ErrorKind::Other.into()), false, false, false),
+            (Some(ErrorKind::Unsupported.into()), false, true, false),
         ];
+        let case_count = cases.len();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let connection = backup_connection(&listener).await;
         let valid = backup_fixture(512);
         let body = valid.clone();
         let worker = std::thread::spawn(move || {
-            for _ in cases {
+            for _ in 0..case_count {
                 let (stream, _) = receive_request(&listener, "/api/backup?id=fixture");
                 answer_request(stream, 200, "Content-Type: application/vnd.sqlite3\r\n", &body);
             }
@@ -2648,7 +2650,7 @@ mod tests {
                     staging
                 };
                 match link_error {
-                    Some(error) => Err(tempfile::PersistError { error: error.into(), file: staging }),
+                    Some(error) => Err(tempfile::PersistError { error, file: staging }),
                     None => staging.persist_noclobber(path),
                 }
             }).await;
@@ -2662,6 +2664,57 @@ mod tests {
                 }
             }
             assert_eq!(folder.path().read_dir().unwrap().count(), usize::from(succeeds || claimed));
+        }
+        worker.join().unwrap();
+        tauri::async_runtime::spawn_blocking(move || drop(connection)).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires RSI_TEST_NO_HARDLINK_DIR on a writable volume without hard links"]
+    async fn backup_saves_on_real_volume_without_hard_links() {
+        let _gate = BACKUP_TEST_GATE.lock().await;
+        let volume = std::env::var_os("RSI_TEST_NO_HARDLINK_DIR").expect("set the mounted volume path");
+        let folder = tempfile::tempdir_in(volume).unwrap();
+        let destination = folder.path().join("backup.sqlite3");
+        let probe = folder.path().join("probe");
+        fs::write(&probe, b"probe").unwrap();
+        let link_error = fs::hard_link(&probe, &destination).expect_err("volume supports hard links");
+        assert!(link_error.raw_os_error() == Some(libc::ENOTSUP)
+            || matches!(link_error.kind(), io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied),
+            "unexpected hard-link error: {link_error}");
+        fs::remove_file(probe).unwrap();
+
+        let fixture_name = std::env::var_os("RSI_TEST_BACKUP_FIXTURE").expect("set the SQLite fixture path");
+        let fixture = fs::read(fixture_name).unwrap();
+        let body = fixture.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let connection = backup_connection(&listener).await;
+        let claimed_path = destination.clone();
+        let worker = std::thread::spawn(move || {
+            for claim in [false, true] {
+                let (mut stream, _) = receive_request(&listener, "/api/backup?id=fixture");
+                if claim {
+                    fs::write(&claimed_path, b"claimed during download").unwrap();
+                }
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.sqlite3\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        {
+            let _activity = BackupTestActivity::begin();
+            transport::save_backup(&connection, "fixture", &destination).await.unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), fixture);
+            fs::remove_file(&destination).unwrap();
+            assert_eq!(folder.path().read_dir().unwrap().count(), 0);
+        }
+        {
+            let _activity = BackupTestActivity::begin();
+            assert_eq!(transport::save_backup(&connection, "fixture", &destination).await.unwrap_err(),
+                "Cannot publish backup; choose a new filename");
+            assert_eq!(fs::read(&destination).unwrap(), b"claimed during download");
+            fs::remove_file(&destination).unwrap();
+            assert_eq!(folder.path().read_dir().unwrap().count(), 0);
         }
         worker.join().unwrap();
         tauri::async_runtime::spawn_blocking(move || drop(connection)).await.unwrap();
