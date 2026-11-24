@@ -289,13 +289,15 @@ pub(super) fn reconcile(path: &Path, current_version: &str, health: StartupHealt
     if record["signature_verified"] != true {
         return transition(path, "failed", Some("update_download_or_signature_failed"), None);
     }
-    if record["to_version"].as_str() != Some(current_version) {
-        return transition(path, "failed", Some("update_version_mismatch"), None);
-    }
     match health {
+        // An external installer may still be running. Seeing the old version
+        // start without a health probe cannot settle the pending attempt.
+        StartupHealth::Unavailable => Ok(record),
+        _ if record["to_version"].as_str() != Some(current_version) => {
+            transition(path, "failed", Some("update_version_mismatch"), None)
+        }
         StartupHealth::Healthy => transition(path, "succeeded", None, Some(current_version)),
         StartupHealth::Failed => transition(path, "failed", Some("update_health_failed"), None),
-        StartupHealth::Unavailable => Ok(record),
     }
 }
 
@@ -773,9 +775,10 @@ mod receipt_tests {
         assert_eq!(reconcile(&path, "1.2.4", StartupHealth::Healthy).unwrap(), failed);
 
         update.operation_id = "22222222".into();
-        begin_pending(&path, &update).unwrap();
-        let failed = reconcile(&path, "1.2.3", StartupHealth::Unavailable).unwrap();
-        assert_eq!(failed["error_code"], "update_version_mismatch");
+        let pending = begin_pending(&path, &update).unwrap();
+        assert_eq!(reconcile(&path, "1.2.3", StartupHealth::Unavailable).unwrap(), pending);
+        let failed = transition(&path, "failed", Some("update_install_failed"), None).unwrap();
+        assert_eq!(reconcile(&path, "1.2.4", StartupHealth::Unavailable).unwrap(), failed);
 
         update.operation_id = "33333333".into();
         update.signature_verified = false;
