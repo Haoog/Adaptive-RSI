@@ -79,6 +79,40 @@ test('desktop keeps the old page fenced after accepting a new connection',async(
  assert.deepEqual(calls.map(call=>call.command),['runtime_info','request','validate_connection_target','connect']);
 });
 
+test('selecting the current local runtime closes the dialog without reloading the page',async()=>{
+ const handlers={},calls=[];
+ const current={kind:'local',connected:true,scope:'local',connection_generation:7};
+ let form,dialog,input,reloads=0;
+ const element=()=>({children:[],append(...children){this.children.push(...children);},prepend(){},setAttribute(){},addEventListener(){}});
+ const window={fetch:async()=>{},__TAURI_INTERNALS__:{invoke:async(command,args)=>{
+  calls.push({command,args});
+  if(command==='runtime_info'||command==='connect')return current;
+  if(command==='request')return {status:200,body:'{}'};
+ }}};
+ const document={body:element(),querySelector:element,getElementById:element,
+  createElement(tag){
+   const node=element();
+   if(tag==='dialog')dialog=Object.assign(node,{open:true,close(){this.open=false;}});
+   if(tag==='form')form=node;
+   if(tag==='input')input=node;
+   return node;
+  },
+  addEventListener(name,handler){handlers[name]=handler;}};
+ vm.runInNewContext(desktopSource,{window,document,t:value=>value,crypto:webcrypto,Response,DOMException,console,
+  location:{reload(){reloads++;}}});
+ await handlers.DOMContentLoaded();
+ const local=form.children.find(node=>node.textContent==='使用本机');
+ input.value='pending address';
+ await local.onclick();
+ assert.equal(reloads,0);
+ assert.equal(dialog.open,false);
+ assert.equal(input.value,'');
+ assert.equal(local.disabled,false);
+ assert.equal((await window.fetch('/api/state')).status,200);
+ assert.deepEqual(calls.map(call=>call.command),['runtime_info','connect','request']);
+ assert.equal(calls.at(-1).args.connectionGeneration,7);
+});
+
 test('a stale page waits for native recovery then reloads without replaying its request',async()=>{
  const calls=[];
  let current={scope:'local',connected:true,connection_generation:1},reloads=0;

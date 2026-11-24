@@ -94,6 +94,11 @@ if(window.__TAURI_INTERNALS__){
     switching=true;
     const next=await invoke('connect',args);
     input.value='';
+    if(args.url===null&&next?.connected&&next.connection_generation===info.connection_generation){
+     switching=false;
+     dialog.close();
+     return;
+    }
     reloadRuntime(info,next);
    }catch(e){
     switching=switched;
