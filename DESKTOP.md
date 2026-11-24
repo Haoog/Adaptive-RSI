@@ -54,7 +54,7 @@ npm run --prefix desktop dev
 
 配置了更新签名公钥的桌面构建可在应用内检查并下载签名更新包，随后选择「重启并更新」，或选择任务空闲时自动安装。桌面拥有的运行器先停止领取新任务并等待现有工作结束；新版启动并确认引擎版本后继续运行。下载、等待或安装失败时显示错误并保留手动安装入口。
 
-修改更新模式、版本范围或安装时间会递增本机授权版本并撤销仍可取消的等待安装；旧授权不能跨过替换边界。安装前将事务写入私有目录，记录来源与目标版本、更新包和签名摘要、授权版本及安装窗口。重启后只有应用版本匹配目标、bundled engine 版本匹配且本机服务健康，回执才从 `pending` 变为 `succeeded`；版本或健康检查失败记为 `failed`。导出的 `receipt_version:2` 包含持久事务 `transaction`，无法读取时明确提供 `transaction_error`。
+修改更新模式、版本范围或安装时间会递增本机授权版本并撤销仍可取消的等待安装；旧授权不能跨过替换边界。安装前将事务写入私有目录，记录来源与目标版本、更新包和签名摘要、授权版本及安装窗口。重启后只有应用版本匹配目标、bundled engine 版本匹配且本机服务健康，回执才从 `pending` 变为 `succeeded`；版本或健康检查失败记为 `failed`。Windows 兼容路径没有自带运行器，版本匹配但缺少健康证据时保持 `pending`。导出的 `receipt_version:2` 优先在 `transaction` 中提供当前安装版本的成功回执，其次提供最近的未完成或失败事务。无法读取时提供 `transaction_error`。后续尝试开始前，终态回执保存在应用数据目录的 `update-receipts/update-receipt-<operation_id>.json`。
 
 可运行 `python3 -B scripts/upgrade_harness.py --stage signing receipt authorization` 检查临时密钥签名、回执和授权边界；`--stage isolation --app <构建产物.app>` 在私有副本中检查签名，不接受已安装应用。该工具目前只覆盖 `staging_only`：真实签名 N→N+1 替换尚需发布环境执行，`--require-complete` 在未完成真实替换时退出非零。
 

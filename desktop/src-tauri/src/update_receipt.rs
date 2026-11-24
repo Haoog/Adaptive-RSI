@@ -217,9 +217,13 @@ pub(super) fn begin_pending(path: &Path, transaction: &Transaction) -> Result<Va
     Ok(record)
 }
 
+fn history_name(id: &str) -> String {
+    format!("update-receipt-{id}.json")
+}
+
 fn archive_terminal(path: &Path, record: &Value) -> Result<(), String> {
     let id = record["operation_id"].as_str().ok_or("update_receipt_invalid")?;
-    let archive = path.with_file_name(format!("update-receipt-{id}.json"));
+    let archive = path.with_file_name(history_name(id));
     let directory = archive.parent().ok_or("update_receipt_unavailable")?;
     let mut temp = tempfile::NamedTempFile::new_in(directory).map_err(|_| "update_receipt_unavailable")?;
     serde_json::to_writer_pretty(&mut temp, record).map_err(|_| "update_receipt_unavailable")?;
@@ -269,9 +273,15 @@ pub(super) fn transition(path: &Path, state: &str, error_code: Option<&str>,
     Ok(record)
 }
 
-/// Only a restarted process that reports the expected version and a healthy
-/// local runtime may turn the pending record into a success.
-pub(super) fn reconcile(path: &Path, current_version: &str, healthy: bool) -> Result<Value, String> {
+#[derive(Clone, Copy)]
+pub(super) enum StartupHealth {
+    Healthy,
+    Failed,
+    Unavailable,
+}
+
+/// Success requires both the expected version and affirmative health evidence.
+pub(super) fn reconcile(path: &Path, current_version: &str, health: StartupHealth) -> Result<Value, String> {
     let record = read_receipt(path)?;
     if record["state"] != "pending" {
         return Ok(record);
@@ -282,10 +292,11 @@ pub(super) fn reconcile(path: &Path, current_version: &str, healthy: bool) -> Re
     if record["to_version"].as_str() != Some(current_version) {
         return transition(path, "failed", Some("update_version_mismatch"), None);
     }
-    if !healthy {
-        return transition(path, "failed", Some("update_health_failed"), None);
+    match health {
+        StartupHealth::Healthy => transition(path, "succeeded", None, Some(current_version)),
+        StartupHealth::Failed => transition(path, "failed", Some("update_health_failed"), None),
+        StartupHealth::Unavailable => Ok(record),
     }
-    transition(path, "succeeded", None, Some(current_version))
 }
 
 pub(super) fn app_receipt_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -301,19 +312,55 @@ pub(super) fn prepare_app(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-pub(super) fn reconcile_app(app: &tauri::AppHandle, current_version: &str, healthy: bool) -> Result<Value, String> {
+pub(super) fn reconcile_app(app: &tauri::AppHandle, current_version: &str, health: StartupHealth) -> Result<Value, String> {
     let path = app_receipt_path(app)?;
     if std::fs::symlink_metadata(&path).is_err() {
         return Ok(Value::Null);
     }
-    reconcile(&path, current_version, healthy)
+    reconcile(&path, current_version, health)
 }
 
-/// Reads the persisted transaction for export. The UI never assembles a receipt
-/// from polled state, so the exported file cannot claim an install that was not
-/// recorded on disk.
+/// The latest attempt and the installed version can refer to different releases.
+/// Look through existing archives when the installed version's success is no
+/// longer at the active path. This also supports receipts archived by older builds.
+fn installed_receipt(path: &Path, current_version: &str) -> Result<Value, String> {
+    let current_success = |receipt: &Value| {
+        receipt["state"] == "succeeded" && receipt["to_version"].as_str() == Some(current_version)
+    };
+    let directory = path.parent().filter(|directory| {
+        std::fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.is_dir())
+    }).ok_or("update_receipt_missing")?;
+    let latest = read_receipt(path);
+    if latest.as_ref().is_ok_and(current_success) {
+        return latest;
+    }
+    let mut installed: Option<Value> = None;
+    let order = |receipt: &Value| (receipt["updated_at"].as_u64(), receipt["created_at"].as_u64());
+    for entry in std::fs::read_dir(directory).map_err(|_| "update_receipt_unavailable")?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|name| {
+            name.starts_with("update-receipt-") && name.ends_with(".json")
+        }) else { continue; };
+        let Ok(receipt) = read_receipt(&entry.path()) else { continue; };
+        let id = receipt["operation_id"].as_str().unwrap_or_default();
+        if name == history_name(id) && current_success(&receipt)
+            && installed.as_ref().is_none_or(|saved| order(&receipt) > order(saved))
+        {
+            installed = Some(receipt);
+        }
+    }
+    if let Some(receipt) = installed {
+        return Ok(receipt);
+    }
+    // A manual replacement can leave a receipt for a version that no longer runs.
+    latest.and_then(|receipt| {
+        if receipt["state"] == "succeeded" { Err("update_receipt_missing".into()) } else { Ok(receipt) }
+    })
+}
+
 pub(super) fn export(app: &tauri::AppHandle) -> Value {
-    export_result(app_receipt_path(app).and_then(|path| read_receipt(&path)))
+    let current_version = app.package_info().version.to_string();
+    export_result(app_receipt_path(app).and_then(|path| installed_receipt(&path, &current_version)))
 }
 
 fn export_result(result: Result<Value, String>) -> Value {
@@ -589,26 +636,26 @@ mod receipt_tests {
         let mut unverified = transaction("cccccccc", "1.2.4");
         unverified.signature_verified = false;
         begin_pending(&path, &unverified).unwrap();
-        assert_eq!(reconcile(&path, "1.2.4", true).unwrap()["state"], json!("failed"));
+        assert_eq!(reconcile(&path, "1.2.4", StartupHealth::Healthy).unwrap()["state"], json!("failed"));
         begin_pending(&path, &transaction("aaaaaaaa", "1.2.4")).unwrap();
         // 旧版本重新启动：替换没有发生，不能记成成功。
-        let mismatch = reconcile(&path, "1.2.3", true).unwrap();
+        let mismatch = reconcile(&path, "1.2.3", StartupHealth::Healthy).unwrap();
         assert_eq!(mismatch["state"], json!("failed"));
         assert_eq!(mismatch["error_code"], json!("update_version_mismatch"));
 
         begin_pending(&path, &transaction("bbbbbbbb", "1.2.4")).unwrap();
-        let unhealthy = reconcile(&path, "1.2.4", false).unwrap();
+        let unhealthy = reconcile(&path, "1.2.4", StartupHealth::Failed).unwrap();
         assert_eq!(unhealthy["state"], json!("failed"));
         assert_eq!(unhealthy["error_code"], json!("update_health_failed"));
 
         begin_pending(&path, &transaction("cccccccc", "1.2.4")).unwrap();
-        let succeeded = reconcile(&path, "1.2.4", true).unwrap();
+        let succeeded = reconcile(&path, "1.2.4", StartupHealth::Healthy).unwrap();
         assert_eq!(succeeded["state"], json!("succeeded"));
         assert_eq!(succeeded["error_code"], Value::Null);
         assert!(succeeded["updated_at"].as_u64().unwrap() >= succeeded["created_at"].as_u64().unwrap());
         // A finished transaction is immutable evidence and is not rewritten on later starts.
-        assert_eq!(reconcile(&path, "1.2.4", true).unwrap(), succeeded);
-        assert_eq!(reconcile(&path, "9.9.9", false).unwrap(), succeeded);
+        assert_eq!(reconcile(&path, "1.2.4", StartupHealth::Healthy).unwrap(), succeeded);
+        assert_eq!(reconcile(&path, "9.9.9", StartupHealth::Failed).unwrap(), succeeded);
     }
 
     #[test]
@@ -624,7 +671,7 @@ mod receipt_tests {
         assert_eq!(failed["state"], json!("failed"));
         assert_eq!(failed["error_code"], json!("update_download_or_signature_failed"));
         // A later healthy start of the same version must not launder the failure.
-        assert_eq!(reconcile(&path, "1.2.4", true).unwrap()["state"], json!("failed"));
+        assert_eq!(reconcile(&path, "1.2.4", StartupHealth::Healthy).unwrap()["state"], json!("failed"));
     }
 
     #[test]
@@ -648,7 +695,7 @@ mod receipt_tests {
         let assert_invalid = |record: &Value| {
             write_receipt(&path, record).unwrap();
             assert_eq!(read_receipt(&path).unwrap_err(), "update_receipt_invalid");
-            assert_eq!(reconcile(&path, "1.2.4", true).unwrap_err(), "update_receipt_invalid");
+            assert_eq!(reconcile(&path, "1.2.4", StartupHealth::Healthy).unwrap_err(), "update_receipt_invalid");
             assert_eq!(export_result(read_receipt(&path)),
                 json!({"available": false, "error": "update_receipt_invalid"}));
         };
@@ -684,29 +731,57 @@ mod receipt_tests {
     }
 
     #[test]
-    fn retry_keeps_installed_success_and_failed_attempt_retrievable() {
+    fn retry_preserves_current_success_and_keeps_failed_attempt_readable() {
         let folder = tempfile::tempdir().unwrap();
         let path = receipt_path(folder.path());
-        let exportable = |path: &Path, receipt: &Value| {
-            assert_eq!(export_result(read_receipt(path)), json!({"available": true, "receipt": receipt}));
-        };
-        let pending = begin_pending(&path, &transaction("11111111", "1.2.4")).unwrap();
-        exportable(&path, &pending);
-        let success = reconcile(&path, "1.2.4", true).unwrap();
-        exportable(&path, &success);
+        let first = begin_pending(&path, &transaction("11111111", "1.2.4")).unwrap();
+        assert_eq!(installed_receipt(&path, "1.2.3").unwrap(), first);
+        let success = reconcile(&path, "1.2.4", StartupHealth::Healthy).unwrap();
+        assert_eq!(installed_receipt(&path, "1.2.4").unwrap(), success);
 
-        let success_history = folder.path().join("update-receipt-11111111.json");
-        let later = begin_pending(&path, &transaction("22222222", "1.2.5")).unwrap();
-        exportable(&path, &later);
-        exportable(&success_history, &success);
-        let failed = reconcile(&path, "1.2.4", true).unwrap();
+        let mut next = transaction("22222222", "1.2.5");
+        next.from_version = "1.2.4".into();
+        begin_pending(&path, &next).unwrap();
+        assert_eq!(installed_receipt(&path, "1.2.4").unwrap(), success);
+        let failed = transition(&path, "failed", Some("update_install_failed"), None).unwrap();
+        assert_eq!(installed_receipt(&path, "1.2.4").unwrap(), success);
+
+        next.operation_id = "33333333".into();
+        let retry = begin_pending(&path, &next).unwrap();
+        assert_eq!(read_receipt(&folder.path().join(history_name("22222222"))).unwrap(), failed);
+        assert_eq!(read_receipt(&folder.path().join(history_name("11111111"))).unwrap(), success);
+        assert_eq!(installed_receipt(&path, "1.2.4").unwrap(), success);
+        assert_eq!(installed_receipt(&path, "1.2.5").unwrap(), retry);
+        let switched = reconcile(&path, "1.2.5", StartupHealth::Healthy).unwrap();
+        assert_eq!(installed_receipt(&path, "1.2.5").unwrap(), switched);
+        assert_eq!(installed_receipt(&path, "1.2.6").unwrap_err(), "update_receipt_missing");
+    }
+
+    #[test]
+    fn windows_requires_health_evidence_and_preserves_known_failures() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = receipt_path(folder.path());
+        let mut update = transaction("11111111", "1.2.4");
+        update.platform = "windows".into();
+        let pending = begin_pending(&path, &update).unwrap();
+        assert_eq!(reconcile(&path, "1.2.4", StartupHealth::Unavailable).unwrap(), pending);
+        assert_eq!(read_receipt(&path).unwrap(), pending);
+        let failed = reconcile(&path, "1.2.4", StartupHealth::Failed).unwrap();
         assert_eq!(failed["state"], "failed");
-        exportable(&path, &failed);
-        exportable(&success_history, &success);
+        assert_eq!(failed["error_code"], "update_health_failed");
+        assert_eq!(reconcile(&path, "1.2.4", StartupHealth::Unavailable).unwrap(), failed);
+        assert_eq!(reconcile(&path, "1.2.4", StartupHealth::Healthy).unwrap(), failed);
 
-        begin_pending(&path, &transaction("33333333", "1.2.5")).unwrap();
-        exportable(&folder.path().join("update-receipt-22222222.json"), &failed);
-        exportable(&success_history, &success);
+        update.operation_id = "22222222".into();
+        begin_pending(&path, &update).unwrap();
+        let failed = reconcile(&path, "1.2.3", StartupHealth::Unavailable).unwrap();
+        assert_eq!(failed["error_code"], "update_version_mismatch");
+
+        update.operation_id = "33333333".into();
+        update.signature_verified = false;
+        begin_pending(&path, &update).unwrap();
+        let failed = reconcile(&path, "1.2.4", StartupHealth::Unavailable).unwrap();
+        assert_eq!(failed["error_code"], "update_download_or_signature_failed");
     }
 
 }

@@ -928,9 +928,11 @@ fn rotate_runtime_log(directory: &Path) -> io::Result<File> {
     fresh.persist_noclobber(current).map_err(|error| error.error)
 }
 
+const WINDOWS_REMOTE_ONLY: &str = "Use a Linux/macOS server connection on Windows";
+
 fn bootstrap_local(app: &tauri::AppHandle, select: bool) -> Result<(), String> {
     if cfg!(target_os = "windows") {
-        return Err("Use a Linux/macOS server connection on Windows".into());
+        return Err(WINDOWS_REMOTE_ONLY.into());
     }
     let exe = std::env::current_exe().map_err(|_| "Cannot locate app")?;
     let binary = exe
@@ -1883,16 +1885,22 @@ fn main() {
             }
             tray.build(app)?;
             if !ssh_tunnel_startup {
-                let started = bootstrap(app.handle());
-                // Windows is a remote-only client and has no bundled runtime to probe.
-                let healthy = cfg!(target_os = "windows") || started.is_ok();
-                if let Err(error) = started {
-                    *app.state::<RuntimeState>().error.lock().unwrap() = error;
-                }
-                // A pending upgrade receipt is settled only by this process observing
-                // its own version and a healthy runtime. Anything else is recorded as
-                // a failed upgrade instead of being reported as applied.
-                let _ = update_receipt::reconcile_app(app.handle(), &app.package_info().version.to_string(), healthy);
+                use update_receipt::StartupHealth;
+
+                let health = if cfg!(target_os = "windows") {
+                    // Windows is remote-only and has no bundled runtime to probe.
+                    *app.state::<RuntimeState>().error.lock().unwrap() = WINDOWS_REMOTE_ONLY.into();
+                    StartupHealth::Unavailable
+                } else {
+                    match bootstrap(app.handle()) {
+                        Ok(()) => StartupHealth::Healthy,
+                        Err(error) => {
+                            *app.state::<RuntimeState>().error.lock().unwrap() = error;
+                            StartupHealth::Failed
+                        }
+                    }
+                };
+                let _ = update_receipt::reconcile_app(app.handle(), &app.package_info().version.to_string(), health);
             }
             Ok(())
         })
