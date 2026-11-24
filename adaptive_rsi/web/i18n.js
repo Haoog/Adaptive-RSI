@@ -651,6 +651,8 @@ const english = {
   "次调用": "calls",
   "运行机器": "Runtime machine",
   "连接运行机器": "Connect a runtime",
+  "重新连接运行机器": "Reconnect to a runtime",
+  "本机服务连接已中断。请选择“使用本机”重连，或连接服务器。": "The local runtime is disconnected. Choose “Use this computer” to reconnect, or connect to a server.",
   "无法读取当前运行机器。请连接服务器或使用本机。": "Could not read the current runtime. Connect a server or use this computer.",
   "未能连接本机运行服务，请稍后重试。": "Could not connect to the local runtime. Try again.",
   "连接服务器时粘贴 HTTPS 认证地址。账号和项目保留在运行机器，关闭客户端不会停止服务器任务。": "Paste the HTTPS authentication URL to connect a server. Accounts and projects stay on that machine. Closing the client does not stop server tasks.",

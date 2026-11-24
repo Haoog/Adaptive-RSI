@@ -233,7 +233,7 @@ async function runtimePage({invoke,fetch=async()=>assert.fail('unexpected networ
  const node=id=>{if(!nodes.has(id))nodes.set(id,element());return nodes.get(id);};
  const body=element(),tools=element(),document={body,documentElement:{dataset:{build:'loaded'}},visibilityState:'visible',getElementById:node,
   querySelector:selector=>selector==='.project-tools'?tools:selector==='#language-select'?node('language-select'):null,
-  querySelectorAll:()=>[],createTextNode:text=>({textContent:text}),
+  querySelectorAll:selector=>selector==='[data-inspect]'?[node('inspect-button')]:[],createTextNode:text=>({textContent:text}),
   createElement(tag){const child=element();if(tag==='dialog')dialogs.push(child);return child;},
   addEventListener(name,handler){(handlers[name]??=[]).push(handler);}};
  let reloads=0,confirmations=0,timer=0,now=0;
@@ -268,8 +268,141 @@ async function runtimePage({invoke,fetch=async()=>assert.fail('unexpected networ
  await startup;
  const dialog=dialogs[0],form=dialog?.children[0];
  return {window,context,dialog,form,machine:tools.children[0],node,tick,storageReads,warnings,routes,
-  reload,reloads:()=>reloads,confirmations:()=>confirmations};
+  advance,reload,reloads:()=>reloads,confirmations:()=>confirmations};
 }
+const reconnectMachine='重新连接运行机器';
+const reconnectLocal='本机服务连接已中断。请选择“使用本机”重连，或连接服务器。';
+async function exitedLocalPage(){
+ const calls=[],probes=[],connections=[],validations=[],writes=[];
+ let initialState=true;
+ const scope='http://127.0.0.1:6090';
+ const page=await runtimePage({invoke:async(command,args)=>{
+  calls.push({command,args});
+  if(command==='runtime_info'){
+   if(calls.length===1)return {kind:'local',name:'本机',scope,connected:true,owned:true,connection_generation:7};
+   return new Promise(resolve=>probes.push(resolve));
+  }
+  if(command==='request'){
+   if(args.path==='sys-metrics')return {status:200,body:'{}'};
+   if(args.path==='config')return new Promise(resolve=>writes.push(resolve));
+   if(args.path.startsWith('state?')&&initialState){initialState=false;return stateReply();}
+   throw 'Runtime connection changed';
+  }
+  if(command==='validate_connection_target')return new Promise(resolve=>validations.push(resolve));
+  if(command==='connect')return new Promise((resolve,reject)=>connections.push({resolve,reject}));
+  if(command==='set_native_language')return;
+  assert.fail(`Unexpected command: ${command}`);
+ }});
+ await page.tick();
+ assert.equal(page.node('connection').textContent,'已连接');
+ vm.runInContext('projectId="fixture"',page.context);
+ page.node('inspect-button').dataset.inspect='test';
+ const clickInspect=()=>page.node('inspect-button').listeners.click[0].handler();
+ return {...page,scope,calls,probes,connections,validations,writes,clickInspect,alert:page.form.children[6],local:page.form.children[8]};
+}
+const disconnectedLocal={connected:false,connection_generation:8,error:'Local runtime exited'};
+test('desktop running local disconnect offers manual recovery after the inspect button aborts',async()=>{
+ const page=await exitedLocalPage();
+ const draft=page.node('goal-text');draft.value='待编辑内容';
+ const click=page.clickInspect();await page.tick();
+ assert.equal(page.probes.length,1);
+ page.probes.shift()(disconnectedLocal);
+ await click;
+ assert.equal(page.machine.textContent,reconnectMachine,`toast=${page.node('toast').textContent}`);
+ assert.equal(page.node('connection').textContent,'连接中断');
+ assert.equal(page.dialog.open,false);
+ assert.equal(page.reloads(),0);
+ assert.equal(draft.value,'待编辑内容');
+ assert.equal(page.node('toast').textContent,'');
+ assert.equal(page.calls.filter(call=>call.command==='connect').length,0);
+ page.machine.onclick();
+ assert.equal(page.dialog.open,true);
+ assert.equal(page.alert.textContent,reconnectLocal);
+ vm.runInContext('language="en";window.RSIDesktop.translate()',page.context);
+ assert.equal(page.machine.textContent,'Reconnect to a runtime');
+ assert.equal(page.alert.textContent,'The local runtime is disconnected. Choose “Use this computer” to reconnect, or connect to a server.');
+ assert.equal(page.node('connection').textContent,'Disconnected');
+ page.local.onclick();await page.tick();
+ assert.equal(page.connections.length,1);
+ page.connections.shift().reject('private native error');await page.tick();
+ assert.equal(page.alert.textContent,'Could not connect to the local runtime. Try again.');
+ assert.equal(page.local.disabled,false);
+ assert.equal(draft.value,'待编辑内容');
+ page.local.onclick();await page.tick();
+ assert.equal(page.connections.length,1);
+ const request=page.calls.find(call=>call.command==='request'&&call.args.path==='request');
+ assert.equal(request.args.connectionGeneration,7);
+ assert.deepEqual({...request.args.body},{project:'fixture',kind:'test'});
+ assert.equal(page.calls.filter(call=>call.args.path==='request').length,1);
+ page.connections[0].resolve({scope:page.scope,connected:true,connection_generation:9});
+ await page.tick();
+ assert.equal(page.reloads(),1);
+});
+
+test('desktop running local disconnect ignores older probes and lets polling discover recovery once',async()=>{
+ const page=await exitedLocalPage();
+ const sent=page.window.fetch('/api/config',{method:'POST',body:'{}'});
+ const older=page.clickInspect(),newer=page.clickInspect();await page.tick();
+ assert.equal(page.probes.length,2);
+ const [oldSnapshot,newSnapshot]=page.probes.splice(0);
+ newSnapshot({...disconnectedLocal,connection_generation:10});await newer;
+ oldSnapshot({scope:page.scope,connected:true,connection_generation:9});await older;
+ assert.equal(page.reloads(),0);
+ assert.equal(page.machine.textContent,reconnectMachine);
+ assert.equal(page.dialog.open,false);
+ assert.equal(page.node('toast').textContent,'');
+ page.writes.shift()({status:200,body:'{"saved":true}'});
+ assert.deepEqual(await (await sent).json(),{saved:true});
+ const staleRead=assert.rejects(page.window.fetch('/api/state'),{name:'AbortError'});
+ await page.tick();
+ page.probes.shift()({scope:page.scope,connected:true,connection_generation:10});await staleRead;
+ assert.equal(page.reloads(),0);
+ assert.equal(page.node('connection').textContent,'连接中断');
+
+ page.advance(15000);await page.tick();
+ const late=page.clickInspect();await page.tick();
+ assert.equal(page.probes.length,2);
+ const recovered={scope:page.scope,connected:true,connection_generation:11};
+ page.probes.shift()(recovered);await page.tick();
+ assert.equal(page.reloads(),1);
+ page.probes.shift()(disconnectedLocal);await late;
+ assert.equal(page.reloads(),1);
+ assert.equal(page.dialog.open,false);
+ assert.equal(page.node('toast').textContent,'');
+ assert.equal(page.calls.filter(call=>call.command==='connect').length,0);
+ assert.deepEqual(page.calls.filter(call=>call.command==='request'&&call.args.body!==null)
+  .map(({args})=>[args.path,args.connectionGeneration]),[['config',7],['request',7],['request',7],['request',7]]);
+});
+
+test('desktop running local disconnect discards probe feedback after a connection choice begins',async()=>{
+ const page=await exitedLocalPage();
+ const earlier=page.clickInspect();await page.tick();
+ const lateSnapshot=page.probes.shift();
+ page.machine.onclick();
+ page.form.children[5].value='https://fixture.example.test/';
+ page.form.onsubmit({preventDefault(){}});await page.tick();
+ assert.equal(page.validations.length,1);
+ await page.clickInspect();
+ assert.equal(page.probes.length,0);
+ page.validations.shift()(false);await page.tick();
+ const validation='请输入 HTTPS 认证地址。';
+ assert.equal(page.alert.textContent,validation);
+ lateSnapshot(disconnectedLocal);await earlier;
+ assert.equal(page.alert.textContent,validation);
+ assert.equal(page.machine.textContent,'本机');
+ assert.equal(page.node('connection').textContent,'已连接');
+ assert.equal(page.node('toast').textContent,'');
+ assert.equal(page.reloads(),0);
+
+ page.advance(15000);await page.tick();
+ assert.equal(page.probes.length,1);
+ page.probes.shift()(disconnectedLocal);await page.tick();
+ assert.equal(page.machine.textContent,reconnectMachine);
+ assert.equal(page.alert.textContent,validation);
+ assert.equal(page.node('toast').textContent,'');
+ assert.equal(page.calls.filter(call=>call.command==='connect').length,0);
+});
+
 async function sessionPage(kind,scope){
  const pending=[],cancelled=[];
  const page=await runtimePage({invoke:async(command,args)=>{

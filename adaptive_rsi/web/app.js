@@ -296,7 +296,7 @@ async function sendApi(path,body,signal,{text=false}={}){
   }catch{throw new TypeError(t('正在连接本地服务，请稍候再提交。'));}
  }
  let response;
- try{response=await fetch('/api/'+path,options);}catch(error){if(signal?.aborted)throw signal.reason??error;throw new TypeError(runtimeConnectionError());}
+ try{response=await fetch('/api/'+path,options);}catch(error){if(signal?.aborted)throw signal.reason??error;if(error?.runtimeConnectionChanged)throw error;throw new TypeError(runtimeConnectionError());}
  signal?.throwIfAborted();
  const requestHeader=response.headers?.get?.('X-RSI-Request-ID');
  const requestId=typeof requestHeader==='string'&&/^[a-f0-9]{16}$/.test(requestHeader)?requestHeader:null;
@@ -458,6 +458,7 @@ async function safe(fn,form){
  let feedback=form?.querySelector?.('[data-form-error]');
  if(feedback)feedback.hidden=true;
  try{await fn();}catch(error){
+  if(error?.runtimeConnectionChanged)return;
   const message=error instanceof SyntaxError?t('JSON 格式有误，请检查逗号、引号和括号；输入已保留。'):error.message;
   if(form&&!feedbackCurrent()){toast(t('先前的提交未成功。当前输入已保留，请回到原来的项目或设置范围检查。'),true);return;}
   if(form){if(!feedback){feedback=el('p',undefined,'form-error');feedback.dataset.formError='';feedback.setAttribute('role','alert');form.append(feedback);}feedback.textContent=message;feedback.hidden=false;}
@@ -476,7 +477,7 @@ function expireSession(){
  sessionExpired=true;clearTimeout(refreshPollTimer);refreshPollTimer=null;
  expireSessionCopy();
 }
-function scheduleRefreshPoll(delay=refreshDelay()){if(sessionExpired)return;clearTimeout(refreshPollTimer);refreshPollTimer=setTimeout(()=>{refreshPollTimer=null;refresh().catch(()=>{if(!sessionExpired)$('connection').textContent=t('连接中断');});},delay);}
+function scheduleRefreshPoll(delay=refreshDelay()){if(sessionExpired)return;clearTimeout(refreshPollTimer);refreshPollTimer=setTimeout(()=>{refreshPollTimer=null;refresh().catch(error=>{if(!sessionExpired&&!error?.runtimeConnectionChanged)$('connection').textContent=t('连接中断');});},delay);}
 if(window.RSIDesktop)window.RSIDesktop.onRemoteSessionRecovered=build=>{
  if(!sessionExpired)return;
  sessionExpired=false;
@@ -538,13 +539,13 @@ async function refresh(options={}){
    }
    if(returned.has('analytics')){loadedStateSections.analyticsProject=next.selected_project??null;loadedStateSections.analyticsAt=Date.now();}
    if(returned.has('candidates')){loadedStateSections.candidatesProject=next.selected_project??null;loadedStateSections.candidatesAt=Date.now();}
-   lastRefreshAt=Date.now();$('connection').textContent=t('已连接');$('version').textContent='Adaptive RSI '+state.version;
+   lastRefreshAt=Date.now();if(!window.RSIDesktop?.isLocalDisconnected?.())$('connection').textContent=t('已连接');$('version').textContent='Adaptive RSI '+state.version;
    const select=$('project-select'),old=projectId;if(!state.projects.some(p=>p.id===projectId)){stashGoalDraft();projectId=state.projects[0]?.id||'';restoreGoalDraft();goalDraftRestoredProject=projectId;}
    if(JSON.stringify([...select.options].map(x=>[x.value,x.text]))!==JSON.stringify(state.projects.map(p=>[p.id,projectLabel(p)]))){select.replaceChildren(...state.projects.map(p=>{const o=el('option',projectLabel(p));o.value=p.id;o.title=projectPath(p);return o;}));if(!state.projects.length){const o=el('option',t('尚未接入项目'));o.value='';select.append(o);}}
    if(projectId&&!scopeChosen&&!scopeInitialized){stashSettings();$('config-scope').value='project';settingsBaseline=null;scopeInitialized=true;}
    select.value=projectId;rememberNavigationHome();if(old!==projectId){stashSettings();closeTaskDetail();settingsBaseline=null;localWrite('rsi-project',projectId);goalDraftRestoredProject=projectId;}if(goalDraftRestoredProject!==projectId){restoreGoalDraft();goalDraftRestoredProject=projectId;}
    render();if(firstState&&view==='usage')window.RSIUsage?.show();window.RSIExperience?.refreshed();
-  }catch(error){if(!ownsRestoreCheck()||runtime!==window.__RSI_MACHINE_KEY__)return;if(controller.signal.aborted){if(timedOut&&requestedProject===projectId)$('connection').textContent=t('连接超时');return;}throw error;}
+  }catch(error){if(!ownsRestoreCheck()||runtime!==window.__RSI_MACHINE_KEY__)return;if(controller.signal.aborted){if(timedOut&&requestedProject===projectId&&!window.RSIDesktop?.isLocalDisconnected?.())$('connection').textContent=t('连接超时');return;}throw error;}
   finally{clearTimeout(timeout);}
  })();refreshPromise=operation;
  try{return await operation;}catch(error){

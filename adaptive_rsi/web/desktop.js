@@ -20,10 +20,13 @@ if(window.__TAURI_INTERNALS__){
   }catch{return null;}
   finally{clearTimeout(timer);}
  })();
- let switching=false,switched=false,remoteSessionExpired=false;
+ let switching=false,switched=false,changing=false,remoteSessionExpired=false;
+ let runtimeProbe=0,lastRuntimeReply=0,disconnectedGeneration=null,renderRuntimeConnection;
+ const isLocalDisconnected=()=>disconnectedGeneration!==null;
  let stateRequest=0,lastSessionReply=0,clearConnectionExpiry;
+ const localDisconnectedMessage='本机服务连接已中断。请选择“使用本机”重连，或连接服务器。';
  const sessionExpiredMessage='远端登录已失效。请生成新的认证地址并重新连接。';
- window.RSIDesktop={invoke,ready,isSshTunnel:()=>sshTunnelConnected,
+ window.RSIDesktop={invoke,ready,isSshTunnel:()=>sshTunnelConnected,isLocalDisconnected,
   remoteSessionExpiry:()=>remoteRuntime?remoteSessionExpired:undefined};
  const aborted=()=>new DOMException('Aborted','AbortError');
  function observeRemoteSession(ticket,reply){
@@ -63,11 +66,27 @@ if(window.__TAURI_INTERNALS__){
    if(error==='Runtime connection changed'){
     // Native recovery can change the connection outside the dialog. Reload
     // only once a replacement is available, without retrying the old request.
-    if(!switching){
+    const wasLocal=info.kind==='local'&&info.connected;
+    let obsolete=switching||changing;
+    if(!obsolete){
+     const probe=++runtimeProbe;
      const next=await invoke('runtime_info').catch(()=>null);
-     if(!switching&&next?.connected&&next.connection_generation!==info.connection_generation)reloadRuntime(info,next);
+     obsolete=switching||changing||probe<=lastRuntimeReply;
+     if(!obsolete&&typeof next?.connected==='boolean'){
+      lastRuntimeReply=probe;
+      const generation=next.connection_generation;
+      if(next.connected&&generation!==info.connection_generation&&
+       (!isLocalDisconnected()||generation>disconnectedGeneration))reloadRuntime(info,next);
+      if(wasLocal&&!next.connected&&Number.isSafeInteger(generation)){
+       const first=!isLocalDisconnected();
+       disconnectedGeneration=first?generation:Math.max(disconnectedGeneration,generation);
+       if(first)renderRuntimeConnection?.();
+      }
+     }
     }
-    throw aborted();
+    const error=aborted();
+    if(wasLocal&&(obsolete||isLocalDisconnected()||switched))error.runtimeConnectionChanged=true;
+    throw error;
    }
    if(switched||error==='Request cancelled')throw aborted();
    throw error;
@@ -88,7 +107,7 @@ if(window.__TAURI_INTERNALS__){
   mode.value=sshTunnelConnected?'ssh':'https';
   modeLabel.append(modeText,mode);
   const hint=document.createElement('p');hint.id='desktop-connect-hint';
-  const ownership=document.createElement('p');ownership.className='muted';ownership.hidden=info?.kind!=='local'||info.owned;
+  const ownership=document.createElement('p');ownership.className='muted';
   const compatibility=document.createElement('p');compatibility.className='muted';compatibility.hidden=true;
   const input=document.createElement('input');input.type='password';input.required=true;input.autocomplete='off';input.setAttribute('aria-describedby',hint.id);
   const error=document.createElement('p');error.className='form-error';error.setAttribute('role','alert');error.hidden=true;
@@ -112,6 +131,9 @@ if(window.__TAURI_INTERNALS__){
   mode.onchange=()=>{input.value='';showConnectionError('');updateConnectionMode();};
   async function change(args){
    if(connect.disabled)return;
+   changing=true;
+   // A new choice supersedes probes that started before its preflight.
+   lastRuntimeReply=runtimeProbe;
    mode.disabled=connect.disabled=local.disabled=close.disabled=true;
    showConnectionError('');
    try{
@@ -137,7 +159,7 @@ if(window.__TAURI_INTERNALS__){
       :'未能通过 SSH 隧道连接。请检查终端中的转发仍在运行，并核对本机端口后重试。',
       /^(?:Error: )?Server connection failed$/.test(message)?'Server connection failed':'');
     }else if(args.url===null){
-     showConnectionError(info?message:'未能连接本机运行服务，请稍后重试。');
+     showConnectionError(info&&!isLocalDisconnected()?message:'未能连接本机运行服务，请稍后重试。');
     }else if(checkRejected){
      showConnectionError('HTTPS 认证被拒绝。请生成新的认证地址后重试。');
     }else if(/^(?:Error: )?(?:Server connection failed|Cannot connect to the selected runtime)$/.test(message)){
@@ -149,6 +171,7 @@ if(window.__TAURI_INTERNALS__){
      showConnectionError('未能完成 HTTPS 连接。请核对完整的认证地址，并确认远端服务正在运行后重试。');
     }
    }finally{
+    changing=false;
     if(!switching)mode.disabled=connect.disabled=local.disabled=close.disabled=false;
    }
   }
@@ -162,9 +185,21 @@ if(window.__TAURI_INTERNALS__){
   };
   local.onclick=()=>change({url:null});
   clearConnectionExpiry=()=>{if(connectionError===sessionExpiredMessage)showConnectionError('');};
+  renderRuntimeConnection=()=>{
+   const disconnected=isLocalDisconnected();
+   machine.textContent=t(disconnected?'重新连接运行机器':info?.name||'连接运行机器');
+   ownership.hidden=disconnected||info?.kind!=='local'||info.owned;
+   if(disconnected){
+    document.getElementById('connection').textContent=t('连接中断');
+    if(dialog.open&&!connectionError)showConnectionError(localDisconnectedMessage);
+   }
+  };
   function openMachine(){
    if(dialog.open)return;
-   if(remoteSessionExpired&&!connectionError)showConnectionError(sessionExpiredMessage);
+   if(!connectionError){
+    if(isLocalDisconnected())showConnectionError(localDisconnectedMessage);
+    else if(remoteSessionExpired)showConnectionError(sessionExpiredMessage);
+   }
    dialog.showModal();
   }
   machine.onclick=openMachine;
@@ -199,7 +234,7 @@ if(window.__TAURI_INTERNALS__){
   });
   document.getElementById('local-project-fields').append(folder);
   window.RSIDesktop.translate=()=>{
-   machine.textContent=t(info?.name||'连接运行机器');machine.title=t('运行机器');title.textContent=t('运行机器');
+   renderRuntimeConnection();machine.title=t('运行机器');title.textContent=t('运行机器');
    modeText.textContent=t('服务器连接方式');httpsOption.textContent='HTTPS';sshOption.textContent=t('SSH 隧道');
    updateConnectionMode();showConnectionError(connectionError,connectionDetail);
    ownership.textContent=t('当前连接已有本机服务，退出软件不会停止它。');
