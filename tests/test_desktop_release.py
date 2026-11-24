@@ -48,7 +48,7 @@ class DesktopReleasePackageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             for name in ['scripts/release.py', 'scripts/classify_changes.py', 'scripts/package_desktop.py',
-                         *release.RELEASE_FILES]:
+                         'scripts/sbom.py', *release.RELEASE_FILES]:
                 destination = root / name
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(release.ROOT / name, destination)
@@ -81,6 +81,22 @@ class DesktopReleasePackageTest(unittest.TestCase):
                                         env=env, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('Desktop build mode: ' + expected, result.stdout)
+            sbom = root / 'scripts/sbom.py'
+            with sbom.open('a') as stream:
+                stream.write('\n# Inventory-only change\n')
+            git(root, 'add', 'scripts/sbom.py')
+            git(root, '-c', 'user.name=Test', '-c', 'user.email=test@localhost', 'commit', '-qm', 'sbom')
+            env['HEAD_SHA'] = git(root, 'rev-parse', 'HEAD')
+            env['HEAD_REF'] = 'sbom-only'
+            git(root, 'checkout', '--detach', base)
+            outputs = root / 'outputs'
+            outputs.unlink()
+            result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', script], cwd=root,
+                                    env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ['Desktop build mode: full', 'scripts/sbom.py'])
+            self.assertEqual(outputs.read_text(), 'mode=full\n')
+
             env['EVENT_NAME'] = 'workflow_dispatch'
             result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', script], cwd=root,
                                     env=env, text=True, capture_output=True)
