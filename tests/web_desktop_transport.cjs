@@ -4,6 +4,7 @@ const {webcrypto}=require('node:crypto');
 const desktopSource=fs.readFileSync('adaptive_rsi/web/desktop.js','utf8');
 const appSource=fs.readFileSync('adaptive_rsi/web/app.js','utf8');
 const i18nSource=fs.readFileSync('adaptive_rsi/web/i18n.js','utf8');
+const immediateBridgeTimers={setTimeout(){},clearTimeout(){}};
 // Loads the desktop transport with a stubbed Tauri bridge; app.js is loaded by tests that exercise api().
 function desktop(reply){
  const element=()=>({textContent:'',dataset:{},children:[],classList:{add(){},remove(){},toggle(){}},addEventListener(){},append(){},prepend(){},setAttribute(){},querySelector(){return null},querySelectorAll(){return[]},remove(){},focus(){},showModal(){},close(){},style:{}});
@@ -23,7 +24,7 @@ test('desktop abort forwards the same request ID and releases the caller',async(
   if(command==='runtime_info')return {kind:'local'};
   if(command==='request')return new Promise(resolve=>{release=resolve;});
  }}};
- vm.runInNewContext(desktopSource,{window,document:{addEventListener(){}},crypto:webcrypto,Response,DOMException,console});
+ vm.runInNewContext(desktopSource,{...immediateBridgeTimers,window,document:{addEventListener(){}},crypto:webcrypto,Response,DOMException,console});
  await window.RSIDesktop.ready;
  const controller=new AbortController(),request=window.fetch('/api/state',{signal:controller.signal});
  await new Promise(setImmediate);
@@ -66,7 +67,7 @@ test('desktop keeps the old page fenced after accepting a new connection',async(
   createElement(tag){const element=makeElement();if(tag==='form')form=element;if(tag==='input')input=element;return element;},
   addEventListener(name,handler){handlers[name]=handler;}};
  const reloaded=new Promise(resolve=>{finishReload=resolve;});
- vm.runInNewContext(desktopSource,{window,document,t:value=>value,crypto:webcrypto,Response,DOMException,console,
+ vm.runInNewContext(desktopSource,{...immediateBridgeTimers,window,document,t:value=>value,crypto:webcrypto,Response,DOMException,console,
   history:{replaceState(){}},location:{reload:finishReload}});
  await handlers.DOMContentLoaded();
  const oldSuccess=assert.rejects(window.fetch('/api/state'),{name:'AbortError'});
@@ -156,7 +157,7 @@ function testConnectionRejection(name,{mode,rejection,expected,english}){
    createElement(tag){const element=makeElement();elements[tag]=element;return element;},
    addEventListener(name,handler){handlers[name]=handler;}};
   let reloads=0;
-  const context=vm.createContext({window,document,NodeFilter:{SHOW_TEXT:4},crypto:webcrypto,Response,DOMException,console,
+  const context=vm.createContext({...immediateBridgeTimers,window,document,NodeFilter:{SHOW_TEXT:4},crypto:webcrypto,Response,DOMException,console,
    location:{reload(){reloads++;}}});
   vm.runInContext(i18nSource,context);
   vm.runInContext(desktopSource,context);
@@ -205,7 +206,7 @@ test('a stale page waits for native recovery then reloads without replaying its 
   calls.push(args);
   throw 'Runtime connection changed';
  }}};
- vm.runInNewContext(desktopSource,{window,document:{addEventListener(){}},crypto:webcrypto,Response,DOMException,console,
+ vm.runInNewContext(desktopSource,{...immediateBridgeTimers,window,document:{addEventListener(){}},crypto:webcrypto,Response,DOMException,console,
   location:{reload(){reloads++;}}});
  await window.RSIDesktop.ready;
  current={connected:false,connection_generation:2};
@@ -222,7 +223,7 @@ const sessionError='远端登录已失效。请生成新的认证地址并重新
 const sessionButton='登录已失效，重新打开控制台';
 const refreshButton='界面有更新，保存输入后刷新';
 const stateReply=(build='running')=>({status:200,body:JSON.stringify({projects:[],build,version:'test'})});
-async function runtimePage({invoke,fetch=async()=>assert.fail('unexpected network request')}){
+async function runtimePage({invoke,fetch=async()=>assert.fail('unexpected network request'),beforeStartup}){
  const handlers={},nodes=new Map(),dialogs=[],storageReads=[],warnings=[],routes=[];
  const element=()=>({textContent:'',value:'',open:false,hidden:false,options:[],dataset:{},children:[],listeners:{},
   classList:{add(){},remove(){},toggle(){}},style:{},setAttribute(){},focus(){},querySelector(){return null},querySelectorAll(){return[]},remove(){},
@@ -235,13 +236,19 @@ async function runtimePage({invoke,fetch=async()=>assert.fail('unexpected networ
   querySelectorAll:()=>[],createTextNode:text=>({textContent:text}),
   createElement(tag){const child=element();if(tag==='dialog')dialogs.push(child);return child;},
   addEventListener(name,handler){(handlers[name]??=[]).push(handler);}};
- let reloads=0,confirmations=0,timer=0;
+ let reloads=0,confirmations=0,timer=0,now=0;
+ const timers=new Map();
+ const advance=ms=>{
+  now+=ms;
+  for(const [id,{run,at}] of timers){if(at<=now){timers.delete(id);run();}}
+ };
  const window={fetch,addEventListener(){}};
  if(invoke)window.__TAURI_INTERNALS__={invoke};
  const storage={getItem(key){storageReads.push(key);return null;},setItem(){},removeItem(){}};
  const context=vm.createContext({window,document,localStorage:storage,sessionStorage:storage,structuredClone,URLSearchParams,AbortController,DOMException,queueMicrotask,
   TextEncoder,TextDecoder,crypto:webcrypto,Response,console:{...console,warn(...args){warnings.push(args);}},
-  setTimeout:()=>++timer,clearTimeout(){},setInterval(){},clearInterval(){},NodeFilter:{SHOW_TEXT:4},
+  setTimeout(run,delay){timers.set(++timer,{run,at:now+delay});return timer;},clearTimeout:id=>timers.delete(id),
+  setInterval(){},clearInterval(){},NodeFilter:{SHOW_TEXT:4},
   history:{replaceState(_state,_title,url){routes.push(url);}},location:{hash:'',pathname:'/index.html',search:'',reload(){reloads++;}},
   navigator:{clipboard:{}},matchMedia:()=>({matches:false,addEventListener(){}})});
  document.documentElement.style={};
@@ -255,8 +262,10 @@ async function runtimePage({invoke,fetch=async()=>assert.fail('unexpected networ
  vm.runInContext(appSource,context);
  context.render=()=>{};
  context.uiConfirm=async()=>{confirmations++;return true;};
- await Promise.all((handlers.DOMContentLoaded??[]).map(handler=>handler()));
+ const startup=Promise.all((handlers.DOMContentLoaded??[]).map(handler=>handler()));
  const tick=()=>new Promise(setImmediate);
+ if(beforeStartup)await beforeStartup({window,node,tools,dialogs,tick,advance,timers});
+ await startup;
  const dialog=dialogs[0],form=dialog?.children[0];
  return {window,context,dialog,form,machine:tools.children[0],node,tick,storageReads,warnings,routes,
   reload,reloads:()=>reloads,confirmations:()=>confirmations};
@@ -310,7 +319,8 @@ for(const recovery of ['local','server']){
    if(command==='request')return stateReply();
    assert.fail(`Unexpected command: ${command}`);
   };
-  const {window,context,machine,dialog,form,node,tick,warnings,storageReads,routes,reloads}=await runtimePage({invoke});
+  const {window,context,machine,dialog,form,node,tick,warnings,storageReads,routes,reloads}=await runtimePage({invoke,
+   beforeStartup:async({timers,tick})=>{await tick();assert.equal(timers.size,0);}});
   assert.equal(await window.RSIDesktop.ready,null);
   assert.equal(machine?.textContent,'连接运行机器');
   assert.equal(dialog.open,true);
@@ -369,6 +379,98 @@ for(const recovery of ['local','server']){
   assert.deepEqual(reloaded.storageReads.filter(key=>/^rsi-(project|navigation)/.test(key)),[`rsi-project:${scope}`,`rsi-navigation:${scope}`]);
   const requests=calls.filter(({command})=>command==='request').map(({args})=>[args.path.split('?')[0],args.connectionGeneration]);
   assert.deepEqual(requests,[['sys-metrics',8],['state',8]]);
+ });
+}
+
+for(const recovery of ['local','server']){
+ test(`desktop startup times out a pending runtime snapshot and reconnects through ${recovery}`,async()=>{
+  const calls=[];
+  const url=recovery==='local'?null:'https://rsi.example.test/?token=fixture';
+  let resolveProbe,rejectProbe,finishConnect,ready,fetchError;
+  const page=await runtimePage({invoke:async(command,args)=>{
+   calls.push({command,args});
+   if(command==='runtime_info')return new Promise((resolve,reject)=>{resolveProbe=resolve;rejectProbe=reject;});
+   if(command==='set_native_language')return;
+   if(command==='validate_connection_target')return true;
+   if(command==='connect')return new Promise(resolve=>{finishConnect=resolve;});
+   assert.fail(`Unexpected command: ${command}`);
+  },beforeStartup:async({window,node,tools,dialogs,tick,advance,timers})=>{
+   window.RSIDesktop.ready.then(info=>{ready=info;});
+   window.fetch('/api/config',{method:'POST',body:'{}'}).catch(error=>{fetchError=error;});
+   advance(4999);await tick();
+   assert.equal(ready,undefined);
+   assert.equal(fetchError,undefined);
+   assert.equal(node('connection').textContent,'正在连接服务…');
+   assert.equal(tools.children.length,0);
+   assert.equal(dialogs.length,0);
+   assert.deepEqual(calls.map(({command})=>command),['runtime_info']);
+   advance(1);await tick();
+   assert.equal(ready,null,'startup ready releases when the snapshot deadline expires');
+   assert.equal(fetchError?.name,'AbortError');
+   assert.equal(timers.size,0);
+  }});
+  const {window,machine,dialog,form,node,tick,storageReads,routes,reloads}=page;
+  const [input,alert,connect,local]=form.children.slice(5);
+  assert.equal(machine.textContent,'连接运行机器');
+  assert.equal(dialog.open,true);
+  assert.equal(alert.textContent,startupError);
+  assert.equal(node('connection').textContent,'连接中断');
+  const submit=()=>{
+   if(url===null)return local.onclick();
+   input.value=url;
+   form.onsubmit({preventDefault(){}});
+  };
+  submit();await tick();
+  assert.equal(connect.disabled,true);
+  if(recovery==='local')resolveProbe({kind:'remote',name:'Old runtime',scope:'ssh:old',connected:true,connection_generation:7});
+  else rejectProbe(new Error('Late runtime snapshot failure'));
+  await tick();
+  assert.equal(await window.RSIDesktop.ready,null);
+  assert.equal(window.__RSI_MACHINE_KEY__,undefined);
+  assert.equal(window.RSIDesktop.isSshTunnel(),false);
+  assert.equal(machine.textContent,'连接运行机器');
+  assert.equal(node('connection').textContent,'连接中断');
+  assert.deepEqual(storageReads.filter(key=>/^rsi-(project|navigation)/.test(key)),[]);
+  assert.equal(reloads(),0);
+  await assert.rejects(window.fetch('/api/state'),{name:'AbortError'});
+  finishConnect({scope:url===null?'local':'https://rsi.example.test',connected:true,connection_generation:8});
+  await tick();
+  assert.equal(reloads(),1);
+  assert.deepEqual(routes,['/index.html']);
+  assert.equal(window.__RSI_MACHINE_KEY__,undefined);
+  await assert.rejects(window.fetch('/api/config',{method:'POST',body:'{}'}),{name:'AbortError'});
+  assert.deepEqual(calls.map(({command})=>command),['runtime_info','set_native_language',
+   ...(url===null?[]:['validate_connection_target']),'connect']);
+  assert.equal(calls.at(-1).args.url,url);
+ });
+}
+
+for(const [kind,scope,ssh] of [['local','local',false],['remote','ssh:fixture',true],['remote','https://rsi.example.test',false]]){
+ test(`desktop startup keeps ${scope} when the runtime snapshot arrives just before the deadline`,async()=>{
+  const requests=[];
+  const snapshot={kind,scope,name:'Known runtime',connected:true,connection_generation:7};
+  let resolveProbe;
+  const page=await runtimePage({invoke:async(command,args)=>{
+   if(command==='runtime_info')return new Promise(resolve=>{resolveProbe=resolve;});
+   if(command==='set_native_language')return;
+   assert.equal(command,'request');requests.push(args);
+   return stateReply();
+  },beforeStartup:async({advance,tick,timers})=>{
+   advance(4999);
+   const deadline=[...timers.keys()][0];
+   assert.equal(timers.get(deadline)?.at,5000);
+   resolveProbe(snapshot);await tick();
+   assert.equal(timers.has(deadline),false);
+   advance(1);await tick();
+  }});
+  assert.equal(await page.window.RSIDesktop.ready,snapshot);
+  assert.equal(page.window.__RSI_MACHINE_KEY__,scope);
+  assert.equal(page.window.RSIDesktop.isSshTunnel(),ssh);
+  assert.equal(page.form.children[1].children[1].value,ssh?'ssh':'https');
+  assert.equal(page.dialog.open,false);
+  assert.equal(page.machine.textContent,'Known runtime');
+  assert.equal(page.node('connection').textContent,'已连接');
+  assert.deepEqual(requests.map(args=>args.connectionGeneration),[7,7]);
  });
 }
 
@@ -521,7 +623,7 @@ test('desktop download links are handled as downloads while ordinary external li
  }}};
  const document={body:element(),createElement:element,querySelector:element,getElementById:element,
   addEventListener(name,handler){handlers[name]=handler;}};
- vm.runInNewContext(desktopSource,{window,document,t:value=>value,console});
+ vm.runInNewContext(desktopSource,{...immediateBridgeTimers,window,document,t:value=>value,console});
  await handlers.DOMContentLoaded();
  const click=(href,download)=>{
   let cancelled=false;

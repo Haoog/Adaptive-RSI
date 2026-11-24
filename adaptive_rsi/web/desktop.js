@@ -3,12 +3,23 @@ if(window.__TAURI_INTERNALS__){
  const invoke=(command,args={})=>window.__TAURI_INTERNALS__.invoke(command,args);
  const originalFetch=window.fetch.bind(window);
  let remoteRuntime=false,sshTunnelConnected=false;
- const ready=invoke('runtime_info').then(info=>{
-  window.__RSI_MACHINE_KEY__=info.scope||'disconnected';
-  remoteRuntime=info.kind==='remote';
-  sshTunnelConnected=remoteRuntime&&/^(?:ssh:|http:\/\/127\.0\.0\.1(?::|$))/.test(info.scope||'');
-  return info;
- }).catch(()=>null);
+ const ready=(async()=>{
+  let timer;
+  try{
+   // Apply only the winning snapshot. Once startup falls back to the connection
+   // dialog, a late IPC reply cannot give this page a runtime or generation.
+   const info=await Promise.race([
+    invoke('runtime_info'),
+    new Promise(resolve=>{timer=setTimeout(()=>resolve(null),5000);}),
+   ]);
+   if(info===null)return null;
+   window.__RSI_MACHINE_KEY__=info.scope||'disconnected';
+   remoteRuntime=info.kind==='remote';
+   sshTunnelConnected=remoteRuntime&&/^(?:ssh:|http:\/\/127\.0\.0\.1(?::|$))/.test(info.scope||'');
+   return info;
+  }catch{return null;}
+  finally{clearTimeout(timer);}
+ })();
  let switching=false,switched=false,remoteSessionExpired=false;
  let stateRequest=0,lastSessionReply=0,clearConnectionExpiry;
  const sessionExpiredMessage='远端登录已失效。请生成新的认证地址并重新连接。';
