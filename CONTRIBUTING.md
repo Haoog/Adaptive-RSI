@@ -91,3 +91,7 @@ CI 会先区分文档改动和代码改动。纯文档改动检查本地链接�
 动态文案结构检查：先 `npm ci --ignore-scripts`，再 `node scripts/check_i18n_ast.cjs`。锁定的 Acorn 解析真实 JavaScript 语法，检查传入 `t()` 的字面量、条件表达式、可静态追踪的别名与动态字典，正确处理词法遮蔽和转义 Unicode；原有 Python 检查继续负责翻译重复键和中英内容非空。变量再赋值、解构和 for-of 的值传播、任意用户输入、服务端返回文本及无法静态解析的运行时拼接不视为已覆盖，仍需双语浏览器场景。中英文文档的内容等价由配对差异审查，链接检查不代表语义等价。
 
 审计台账核对：`python3 -B scripts/check_audit_ledger.py` 检查完成项的实现文件与验收入口，并核对由 JSON 生成的中英文计数和索引。修改台账后用 `--write` 更新生成文件。它不运行台账中的验收命令或测试用例，但核对 unittest selector 会导入测试模块并执行其 discovery hook，因此不是纯静态检查，仅用于可信仓库。它不代表当前提交已通过全部测试。隔离安装验证可运行 `python3 -B scripts/check_wheel_install.py`；脚本构建 wheel 并在仓库外临时环境启动 HTTP 契约检查，不调用模型，也不更新本地应用。
+
+离线回放检查优先级可用 `python3 -B scripts/replay_check_scheduling.py /path/to/evaluation/report.json`，也可一次传入多份已审阅、可共享的报告。回放以 `candidate_full` 为准，对比依赖闭包优先集合和完整候选检查，并列出优先集合外的失败。新报告的首个可用失败时间相对于本次阶段派发，取该结果交给 evaluator 的时间。旧报告缺少共同计时基准时显示未知，不用单条命令耗时推算。回放不会执行检查，原有验收及完整检查门禁继续生效。
+
+CI 耗时报告的 schema v2 中，`dependency_wait_seconds` 从本次 attempt 的可信起点算到 job 创建。首次 attempt 以工作流创建为起点，重跑使用该 attempt 自己的 `run_started_at`，缺失、矛盾或晚于 job 创建时返回 `null`。需要旧版从首次创建起算的跨度时，读取 `workflow_creation_to_job_seconds`。例如首次工作流于 t 创建，重跑 job 于 t+20m 创建而该次起点未知，则两字段分别为 `null` 和 `1200`。若该次起点为 t+19m，则分别为 `60` 和 `1200`。

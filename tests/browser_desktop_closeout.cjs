@@ -1,5 +1,6 @@
 'use strict';
 const assert = require('node:assert/strict');
+const fs = require('node:fs/promises');
 const {spawn} = require('node:child_process');
 const {fixtureReady, closeFixture, waitForPausedProject} = require('./fixture_browser.cjs');
 const {chromium} = require('playwright');
@@ -92,7 +93,10 @@ async function checkMachineSwitch(browser,url){
   assert.deepEqual({openAfterEscape,...blocked},{openAfterEscape:true,outcomes:['rejected','rejected'],forwarded:[0,0]});
   assert.equal(await dialog.getByRole('button',{name:'关闭'}).isDisabled(),true);
   await page.evaluate(()=>window.failConnect('Missing runtime authentication'));
-  await dialog.getByRole('alert').filter({hasText:'Missing runtime authentication'}).waitFor();
+  const retryHint='未能完成 HTTPS 连接。请核对完整的认证地址，并确认远端服务正在运行后重试。';
+  const connectionError=dialog.getByRole('alert').filter({hasText:retryHint});
+  await connectionError.waitFor();
+  assert.equal(await connectionError.textContent(),retryHint,'the dialog shows retry guidance without raw native details');
   assert.equal(await address.inputValue(),remote.scope+'/?token=fixture');
   assert.equal(await page.evaluate(async()=>(await fetch('/api/state?sections=core')).status),200);
   await connect.click();
@@ -202,23 +206,29 @@ async function main(){
 
   await page.click('#storage-tools');
   await page.locator('dialog[open] h2').filter({hasText:'数据与诊断'}).waitFor();
-  const consent=page.locator('#diagnostic-consent');
-  await consent.waitFor();
-  const exportButton=page.getByRole('button',{name:'导出诊断包'});
-  assert.equal(await exportButton.isDisabled(),true,'diagnostic export must require explicit consent');
+  const panel = page.locator('dialog[open]');
+  const diagnostic = panel.locator('details').filter({hasText:'诊断导出预览'});
+  const [previewResponse] = await Promise.all([
+   page.waitForResponse(response => new URL(response.url()).pathname === '/api/diagnostics/preview'),
+   diagnostic.locator('summary').click(),
+  ]);
+  assert.equal(previewResponse.ok(), true);
+  const preview = await previewResponse.json();
+  assert.ok(preview.snapshot);
+  const consent = diagnostic.locator('#diagnostic-consent');
+  const exportButton = diagnostic.getByRole('button', {name:'导出诊断包'});
+  assert.equal(await exportButton.isDisabled(), true, 'diagnostic export must require explicit consent');
   await consent.check();
-  assert.equal(await exportButton.isDisabled(),false);
-  const exported=await page.evaluate(async()=>{
-   const original=window.fetch;let body=null;
-   window.fetch=async(url,options)=>{if(url==='/api/diagnostics/export'){body=JSON.parse(options.body);return new Response(JSON.stringify({filename:'adaptive-rsi-diagnostics.json',body:'{"format":1}',bytes:10}),{status:200,headers:{'Content-Type':'application/json'}});}return original(url,options);};
-   const click=HTMLAnchorElement.prototype.click;HTMLAnchorElement.prototype.click=function(){window.__diagnosticDownload=this.download;};
-   document.querySelector('dialog[open]').querySelectorAll('button').forEach(button=>{if(button.textContent==='导出诊断包')button.click();});
-   for(let i=0;i<50&&!window.__diagnosticDownload;i++)await new Promise(resolve=>setTimeout(resolve,20));
-   HTMLAnchorElement.prototype.click=click;window.fetch=original;
-   return {body,download:window.__diagnosticDownload};
-  });
-  assert.deepEqual(exported.body,{consent:true});
-  assert.equal(exported.download,'adaptive-rsi-diagnostics.json');
+  assert.equal(await diagnostic.locator('pre').textContent(), preview.body);
+  const [exportResponse, download] = await Promise.all([
+   page.waitForResponse(response => new URL(response.url()).pathname === '/api/diagnostics/export'),
+   page.waitForEvent('download'),
+   exportButton.click(),
+  ]);
+  assert.equal(exportResponse.ok(), true);
+  assert.deepEqual(exportResponse.request().postDataJSON(), {consent:true, snapshot:preview.snapshot});
+  assert.equal(download.suggestedFilename(), 'adaptive-rsi-diagnostics.json');
+  assert.equal(await fs.readFile(await download.path(), 'utf8'), preview.body);
 
   const scopeCases = [
     {kind: 'local', owned: true, expected: '更新本机客户端并先排空自有服务任务。'},

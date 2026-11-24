@@ -18,6 +18,7 @@ BUILTIN_PROVIDERS = [
 
 DEFAULTS = {
     "sources": {"inspection": True, "issues": True},
+    "inspection": {"module_paths": []},
     "schedule": {"light_minutes": 60, "issues_minutes": 60, "deep_minutes": 60,
                  "weight": 1, "working_hours": [0, 24], "timezone": "Asia/Shanghai"},
     "providers": [],
@@ -97,6 +98,23 @@ def _validate(config, *, _ignore_invalid_health_urls=False):
                 raise ValueError(path + key + " has the wrong type")
     shape(config, DEFAULTS)
     config = merge(DEFAULTS, config)
+    from pathlib import PurePosixPath
+    module_paths = config["inspection"]["module_paths"]
+    if len(module_paths) > 100:
+        raise ValueError("At most 100 inspection module path rules are allowed")
+    modules = set()
+    for rule in module_paths:
+        if not isinstance(rule, dict) or set(rule) != {"cwd", "paths"}:
+            raise ValueError("Inspection module rules require cwd and paths")
+        cwd, paths = rule["cwd"], rule["paths"]
+        if relative_path(cwd) != str(PurePosixPath(cwd)) or cwd in modules:
+            raise ValueError("Inspection module cwd must be unique and normalized")
+        if not isinstance(paths, list) or not 1 <= len(paths) <= 32:
+            raise ValueError("Inspection module rules require 1 to 32 paths")
+        for path in paths:
+            if relative_path(path) != str(PurePosixPath(path)) or path == ".":
+                raise ValueError("Inspection paths must be normalized project-relative files or directories")
+        modules.add(cwd)
     controls = config["validation"]["controls"]
     if len(controls) > 32:
         raise ValueError("At most 32 maintainer controls are allowed")

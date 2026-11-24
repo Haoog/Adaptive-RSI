@@ -77,6 +77,28 @@ function fixture({visibility='visible',readyState,policy,versionScope='patch',re
  };
 }
 
+test('the client check shows a pending result and ignores both duplicate clicks and older status replies',async()=>{
+ let finishCheck,finishStatus;
+ const f=fixture({respond:args=>{
+  if(args.action==='status')return new Promise(resolve=>{finishStatus=resolve;});
+  if(args.action==='check')return new Promise(resolve=>{finishCheck=resolve;});
+  assert.fail('unexpected action '+args.action);
+ }});
+ f.api.render();
+ const button=f.button('检查桌面客户端更新');
+ assert.equal(button.disabled,false);
+ const observation=f.api.tick();
+ const checking=button.onclick();
+ assert.equal(button.disabled,true);
+ assert.match(f.text(),/正在检查更新/);
+ await button.onclick();
+ assert.equal(f.calls.filter(call=>call.action==='check').length,1);
+ finishCheck({state:'latest'});await checking;
+ finishStatus({state:'checking'});await observation;
+ assert.equal(button.disabled,false);
+ assert.match(f.text(),/已是最新稳定版/);
+});
+
 test('a pending initial authorization does not block status polling or start automatic actions',async()=>{
  let authorize;
  const gate=new Promise(resolve=>{authorize=resolve;});

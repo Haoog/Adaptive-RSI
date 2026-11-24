@@ -170,6 +170,63 @@ class AuditRound3Test(unittest.TestCase):
         self.assertEqual((target / "pkg" / "testdata" / "expected.json").read_text(), "baseline")
         self.assertEqual((target / "pkg" / "testdata" / "added.json").read_text(), "added")
 
+    def test_candidate_stage_preserves_added_nested_fixture_through_unchanged_link(self):
+        baseline = self.root / "same-link-baseline"
+        candidate = self.root / "same-link-candidate"
+        shared = Path("shared/fixtures")
+        (baseline / shared / "nested").mkdir(parents=True)
+        (baseline / shared / "nested" / "expected.json").write_text("baseline")
+        (baseline / "pkg").mkdir()
+        (baseline / "pkg" / "testdata").symlink_to("../shared/fixtures", target_is_directory=True)
+        shutil.copytree(baseline, candidate, symlinks=True)
+        (candidate / "pkg" / "testdata" / "nested" / "expected.json").write_text("candidate")
+        (candidate / "pkg" / "testdata" / "nested" / "added.json").write_text("added")
+        (candidate / "outside.json").write_text("outside")
+        evaluator = Evaluator(Store(self.root / "same-link-state"))
+        self.addCleanup(evaluator.store.close)
+        observed = []
+
+        def check(_spec, target, *_args):
+            fixture = Path(target) / "pkg" / "testdata"
+            observed.append(((fixture / "nested" / "expected.json").read_text(),
+                             (fixture / "nested" / "added.json").read_text(),
+                             (fixture / "outside.json").exists(), fixture.is_symlink()))
+            return {"exit_code": 0, "error": None, "stdout": "1 passed in 0.01s", "stderr": ""}
+
+        config = {"environment": {"seed_paths": [], "setup": []}, "limits": {"concurrency": 1}}
+        with patch("adaptive_rsi.evaluator.Sandbox.check", side_effect=check):
+            evaluator._standard_stage(
+                "candidate", candidate, baseline, candidate,
+                [{"name": "unit", "argv": ["python3", "-c", "pass"]}],
+                self.root / "same-link-stage", config, None, None, None, [])
+
+        self.assertEqual(observed, [("baseline", "added", False, False)])
+        self.assertEqual((candidate / shared / "nested" / "expected.json").read_text(), "candidate")
+
+    def test_freeze_rejects_added_links_and_redirected_fixture_source(self):
+        baseline = self.root / "boundary-baseline"
+        (baseline / "shared" / "fixtures").mkdir(parents=True)
+        (baseline / "shared" / "fixtures" / "expected.json").write_text("baseline")
+        (baseline / "pkg").mkdir()
+        (baseline / "pkg" / "testdata").symlink_to("../shared/fixtures", target_is_directory=True)
+        outside = self.root / "boundary-outside"
+        outside.mkdir()
+        (outside / "secret").write_text("secret")
+
+        for kind in ("nested", "source"):
+            with self.subTest(kind=kind):
+                target = self.root / ("boundary-target-" + kind)
+                shutil.copytree(baseline, target, symlinks=True)
+                if kind == "nested":
+                    (target / "shared" / "fixtures" / "escape").symlink_to(outside, target_is_directory=True)
+                else:
+                    shutil.rmtree(target / "shared" / "fixtures")
+                    (target / "shared" / "fixtures").symlink_to(outside, target_is_directory=True)
+                with self.assertRaisesRegex(RuntimeError, "Candidate symlink"):
+                    freeze_harness(baseline, target)
+                self.assertEqual((outside / "secret").read_text(), "secret")
+                self.assertFalse((outside / "expected.json").exists())
+
     def test_candidate_stage_rejects_fixture_symlink_into_protected_state(self):
         project = self.root / "state-link-project"
         state = self.root / "protected-state"

@@ -56,6 +56,25 @@ class CIMetricsTest(unittest.TestCase):
         self.assertNotIn('secret-log-not-for-report', json.dumps(report))
 
 
+    def test_rerun_wait_uses_scoped_origin_or_stays_unknown_at_t_plus_20m(self):
+        from scripts import ci_metrics
+        evidence = self.evidence()
+        batch = evidence['attempts'][1]
+        job = batch['jobs'][0]
+        job['created_at'] = '2026-10-01T00:20:00Z'
+        evidence['run']['run_started_at'] = '2026-10-01T00:19:00Z'
+        evidence['attempts'][0]['run'] = {'run_started_at': '2026-10-01T00:00:30Z'}
+        for started, attempt, expected in [(None, 2, None), ('2026-10-01T00:00:30Z', 2, None),
+                ('2026-10-01T00:21:00Z', 2, None), ('2026-10-01T00:19:00Z', 1, None),
+                ('2026-10-01T00:19:00Z', 2, 60)]:
+            with self.subTest(started=started, attempt=attempt):
+                batch['run'] = {'run_attempt': attempt, 'created_at': evidence['run']['created_at'],
+                                'run_started_at': started}
+                report = ci_metrics.build_report(evidence)
+                self.assertEqual(report['jobs'][1]['dependency_wait_seconds'], expected)
+                self.assertEqual(report['jobs'][1]['workflow_creation_to_job_seconds'], 1200)
+
+
     def test_ci_metrics_missing_runner_steps_and_timestamps_stay_unknown(self):
         from scripts import ci_metrics
         evidence = self.evidence()

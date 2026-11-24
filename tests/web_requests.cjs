@@ -319,7 +319,7 @@ function productionSettingsPage(scope) {
   // Keep production renderSettings, refresh, draft restoration and dirty status.
   // Isolate only unrelated panels and their background requests.
   vm.runInContext(`view='settings';renderCapabilities=async()=>{};loadReleaseWorkflows=async()=>{};
-    renderUpdateExtras=()=>{};renderNavigation=()=>{};window.RSIExperience.refreshed=()=>{};
+    renderNavigation=()=>{};window.RSIExperience.refreshed=()=>{};
     render=()=>{if(!settingsBaseline)renderSettings();};`, page.context);
   page.node('config-scope').value = scope; page.context.renderSettings();
   const server = structuredClone(page.context.initialState), posts = [];
@@ -463,7 +463,7 @@ for (const outcome of ['failure', 'network', 'timeout']) {
 
 test('update check acknowledgment replaces stale failure and disables only update controls', async () => {
   const page=browser();
-  vm.runInContext('state.update={state:"error",reason:"old-check-error",busy:false};renderUpdateExtras=()=>{};renderUpdate()',page.context);
+  vm.runInContext('state.update={state:"error",reason:"old-check-error",busy:false};renderUpdate()',page.context);
   assert.match(page.node('update-status').textContent,/old-check-error/);
   page.context.fetch=async()=>response({started:true,update:{state:'checking',busy:false}});
   page.node('check-update').handlers.click();await page.context.lastAction;
@@ -478,7 +478,7 @@ test('update check acknowledgment replaces stale failure and disables only updat
 });
 
 test('update check acknowledgment preserves a fast completed result', async () => {
-  const page=browser();vm.runInContext('renderUpdateExtras=()=>{}',page.context);
+  const page=browser();
   page.context.fetch=async()=>response({started:true,update:{state:'up_to_date',busy:false}});
   page.node('check-update').handlers.click();await page.context.lastAction;
   assert.match(page.node('update-status').textContent,/已是最新稳定版/);
@@ -493,7 +493,7 @@ test('primary rate limit shows retry time in both languages and enables checking
     const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
     // Load the real dictionary and translator without static DOM traversal.
     vm.runInContext(i18n.slice(0,i18n.indexOf('const staticText =')),page.context);
-    vm.runInContext(`language=${JSON.stringify(locale)};Date.now=()=>${(reset-1)*1000};state.update={state:'error',reason:'GitHub HTTP 403',reason_code:'github_primary_rate_limit',rate_limit_until:${reset},busy:false};renderUpdateExtras=()=>{};renderUpdate();`,page.context);
+    vm.runInContext(`language=${JSON.stringify(locale)};Date.now=()=>${(reset-1)*1000};state.update={state:'error',reason:'GitHub HTTP 403',reason_code:'github_primary_rate_limit',rate_limit_until:${reset},busy:false};renderUpdate();`,page.context);
     const expectedTime=vm.runInContext(`new Date(${reset}*1000).toLocaleString(language)`,page.context);
     assert.ok(page.node('update-status').textContent.includes(expectedTime));
     assert.match(page.node('update-status').textContent,locale==='en'?/anonymous API quota is exhausted/:/匿名 API 额度已用尽/);
@@ -566,7 +566,7 @@ test('update reasons show Chinese guidance in Chinese and the original text in E
   for (const locale of ['zh-CN', 'en']) for (const [update, zhHint] of cases) {
     const page = browser();
     vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')), page.context);
-    vm.runInContext(`language=${JSON.stringify(locale)};state.update=${JSON.stringify({...update, busy: false})};renderUpdateExtras=()=>{};renderUpdate();`, page.context);
+    vm.runInContext(`language=${JSON.stringify(locale)};state.update=${JSON.stringify({...update, busy: false})};renderUpdate();`, page.context);
     const text = page.node('update-status').textContent;
     if (locale === 'zh-CN') {
       assert.ok(text.includes(zhHint), 'Chinese UI should guide on: ' + update.reason + ' — got: ' + text);
@@ -605,6 +605,615 @@ test('an ambiguous connection failure after a write is never replayed', async ()
   page.context.fetch = async () => { calls++; throw new TypeError('connection lost'); };
   await assert.rejects(page.context.api('projects/import', {url: 'https://github.com/example/project'}), /无法连接本地服务/);
   assert.equal(calls, 1);
+});
+
+function projectAddPage(source = 'github') {
+  const page = browser(new Map(), context => {
+    const document = context.document, dialog = document.getElementById('project-dialog');
+    const close = document.getElementById('close-project-dialog');
+    close.closest = () => dialog;
+    const scopes = ['project', 'global'].map(scope => {
+      const button = document.getElementById('scope-' + scope);
+      button.dataset.settingsScope = scope;
+      return button;
+    });
+    document.querySelectorAll = selector => {
+      if (selector === '.close-dialog') return [close];
+      if (selector === '[data-settings-scope]') return scopes;
+      return [];
+    };
+    context.Event = Event;
+  });
+  const {node, context} = page;
+  const form = node('project-form'), select = node('project-source');
+  form.reset = () => {
+    select.value = 'github';
+    for (const id of ['project-urls', 'project-directory', 'project-path', 'project-name']) node(id).value = '';
+    node('project-enabled').checked = false;
+  };
+  select.dispatchEvent = event => {
+    page.listeners.get(event.type)({target: select});
+    select.handlers[event.type]({target: select});
+  };
+  select.form = form;
+  select.value = source;
+  select.dispatchEvent(new Event('change'));
+  node('add-project').handlers.click();
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', context);
+  return page;
+}
+
+const githubProject = name => `https://github.com/example/${name}`;
+const projectList = (...ids) => ({...snapshot(), projects: [...snapshot().projects, ...ids.map(id => ({id, name: id, paused: true}))]});
+
+test('GitHub project form distinguishes refused and unconfirmed links and retries only retained links manually', async () => {
+  const page = projectAddPage(), {node, context} = page, posts = [];
+  const urls = ['first', 'refused', 'lost', 'missing-id', 'last'].map(githubProject);
+  let retrying = false;
+  node('project-urls').value = urls.join('\n');
+  node('project-directory').value = '/tmp/chosen';
+  node('project-name').value = 'untouched local name';
+  context.fetch = async (url, options) => {
+    if (url.startsWith('/api/state?')) return response(projectList('first', 'lost', 'last', ...(retrying ? ['refused', 'missing-id'] : [])));
+    assert.equal(url, '/api/projects/import');
+    const body = JSON.parse(options.body);
+    posts.push(body);
+    if (retrying) return response({id: body.url.split('/').pop()});
+    if (body.url === urls[1]) return response({error: 'Import directory already exists; register it as a local project instead', error_code: 'validation_error'}, 400);
+    if (body.url === urls[2]) throw new TypeError('receipt lost after registration');
+    if (body.url === urls[3]) return response({});
+    return response({id: body.url.split('/').pop()});
+  };
+  await page.submit('project-form');
+  assert.deepEqual(posts, urls.map(url => ({url, directory: '/tmp/chosen'})));
+  assert.equal(node('project-urls').value, urls.slice(1, 4).join('\n'));
+  const status = node('import-status').textContent;
+  assert.match(status, /已确认接入 2/);
+  assert.ok(status.includes(`服务已拒绝：${urls[1]}`));
+  assert.ok(status.includes(`导入结果未确认：${urls[2]}`));
+  assert.ok(status.includes(`导入结果未确认：${urls[3]}`));
+  assert.equal(node('project-directory').value, '/tmp/chosen');
+  assert.equal(node('project-name').value, 'untouched local name');
+  assert.equal(node('project-dialog').open, true);
+  assert.equal(node('project-submit').disabled, false);
+  assert.equal(vm.runInContext('projectId', context), 'a');
+  retrying = true;
+  await page.submit('project-form');
+  assert.deepEqual(posts.slice(urls.length), urls.slice(1, 4).map(url => ({url, directory: '/tmp/chosen'})));
+  assert.equal(vm.runInContext('projectId', context), 'missing-id');
+  assert.equal(node('project-dialog').open, false);
+});
+
+test('GitHub project form reports an update rejection and an ambiguous server error in English', async () => {
+  const page = projectAddPage(), {node, context} = page, posts = [];
+  const links = ['blocked-by-update', 'server-error'].map(githubProject);
+  const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')) + ';language="en";', context);
+  node('project-urls').value = links.join('\n');
+  context.fetch = async (url, options) => {
+    if (url.startsWith('/api/state')) return response(projectList());
+    const {url: link} = JSON.parse(options.body);
+    posts.push(link);
+    if (posts.length === 1) return response({error: 'Software update in progress', error_code: 'update_in_progress'}, 503);
+    if (link === links[0]) return response({id: 'unexpected-retry'});
+    return response({error: 'Request could not be completed', error_code: 'internal_error'}, 500);
+  };
+  const pending = page.submit('project-form');
+  await new Promise(setImmediate);
+  if (page.timers.some(timer => timer.active && timer.delay === 1000)) await page.resume();
+  await pending;
+  assert.deepEqual(posts, links);
+  assert.equal(node('project-urls').value, links.join('\n'));
+  assert.match(node('import-status').textContent, /Confirmed imports for 0 links/);
+  assert.ok(node('import-status').textContent.includes(`Rejected by the service: ${links[0]}`));
+  assert.ok(node('import-status').textContent.includes(`Import result unconfirmed: ${links[1]}`));
+});
+
+for (const partial of [false, true]) test(`GitHub project form keeps ${partial ? 'partial results' : 'confirmed selection'} when the list read fails`, async () => {
+  const page = projectAddPage(), {node, context} = page, calls = [];
+  const urls = ['first', 'last'].map(githubProject);
+  node('project-urls').value = urls.join('\n');
+  context.fetch = async (url, options) => {
+    if (url.startsWith('/api/state?')) {
+      calls.push('list');
+      throw new TypeError('list unavailable');
+    }
+    const {url: link} = JSON.parse(options.body);
+    calls.push(link);
+    if (partial && link === urls[1]) return response({error: 'Invalid request', error_code: 'invalid_request'}, 400);
+    return response({id: link.split('/').pop()});
+  };
+  await page.submit('project-form');
+  assert.deepEqual(calls, [...urls, 'list']);
+  assert.equal(node('connection').textContent, '连接中断');
+  assert.ok(!node('project-form').querySelector('[data-form-error]'));
+  assert.equal(node('project-dialog').open, partial);
+  assert.equal(vm.runInContext('projectId', context), partial ? 'a' : 'last');
+  assert.equal(node('project-urls').value, partial ? urls[1] : '');
+  if (partial) assert.match(node('import-status').textContent, /已确认接入 1/);
+  else assert.equal(node('toast').textContent, '项目已接入');
+});
+
+for (const change of ['edit', 'reopen', 'source', 'project', 'settings scope']) test(`GitHub project form leaves ${change} alone after the prior batch settles`, async () => {
+  const page = projectAddPage(), {node, context} = page, posts = [];
+  const urls = ['first', 'last'].map(githubProject);
+  const draft = githubProject('new-draft');
+  let finishFirst, finishLast;
+  const first = new Promise(resolve => {finishFirst = resolve;});
+  const last = new Promise(resolve => {finishLast = resolve;});
+  node('project-urls').value = urls.join('\n');
+  context.fetch = (url, options) => {
+    if (url.startsWith('/api/state?')) return Promise.resolve(response(projectList('first', 'last')));
+    const {url: link} = JSON.parse(options.body);
+    posts.push(link);
+    return link === urls[0] ? first : last;
+  };
+  const pending = page.submit('project-form');
+  assert.deepEqual(posts, urls.slice(0, 1));
+  assert.match(node('import-status').textContent, /1 \/ 2/);
+  if (change === 'reopen') {
+    node('close-project-dialog').handlers.click();
+    node('onboard-add').handlers.click();
+  }
+  if (change === 'source') {
+    node('project-source').value = 'local';
+    node('project-source').dispatchEvent(new Event('change'));
+    node('project-path').value = '/draft/local';
+  }
+  if (change === 'project') {
+    node('project-select').value = 'b';
+    node('project-select').handlers.change();
+  }
+  if (change === 'settings scope') {
+    vm.runInContext('renderSettings=()=>{};renderNavigation=()=>{};', context);
+    node('scope-global').handlers.click();
+    node('scope-project').handlers.click();
+  }
+  if (change === 'edit' || change === 'reopen') {
+    node('project-urls').value = draft;
+    if (change === 'edit') page.input('project-urls', 'project-form');
+  }
+  const progress = node('import-status').textContent;
+  node('toast').textContent = 'newer feedback';
+  finishFirst(response({id: 'first'}));
+  await new Promise(setImmediate);
+  assert.deepEqual(posts, urls);
+  assert.equal(node('import-status').textContent, progress);
+  finishLast(change === 'project' ? response({error: 'Invalid request'}, 400) : response({id: 'last'}));
+  await pending;
+  assert.equal(node('import-status').textContent, '');
+  assert.equal(node('toast').textContent, 'newer feedback');
+  assert.equal(node('project-dialog').open, true);
+  assert.equal(node('project-urls').value, change === 'edit' || change === 'reopen' ? draft : urls.join('\n'));
+  assert.equal(node('project-path').value, change === 'source' ? '/draft/local' : '');
+  assert.equal(vm.runInContext('projectId', context), change === 'project' ? 'b' : 'a');
+});
+
+test('GitHub project form preserves a reopened draft while the successful batch list refresh finishes', async () => {
+  const page = projectAddPage(), {node, context} = page;
+  let finishList;
+  const list = new Promise(resolve => {finishList = resolve;});
+  node('project-urls').value = githubProject('added');
+  context.fetch = async url => url.startsWith('/api/state?') ? list : response({id: 'added'});
+  const pending = page.submit('project-form');
+  await new Promise(setImmediate);
+  const feedbackBeforeRefresh = node('toast').textContent;
+  node('onboard-add').handlers.click();
+  node('project-urls').value = githubProject('new-draft');
+  page.input('project-urls', 'project-form');
+  node('toast').textContent = 'newer feedback';
+  finishList(response(projectList('added')));
+  await pending;
+  assert.equal(node('toast').textContent, 'newer feedback');
+  assert.equal(feedbackBeforeRefresh, '项目已接入');
+  assert.equal(node('project-dialog').open, true);
+  assert.equal(node('project-urls').value, githubProject('new-draft'));
+  assert.equal(node('project-submit').disabled, false);
+  assert.equal(vm.runInContext('projectId', context), 'added');
+});
+
+test('local project form keeps the confirmed existing-project feedback when the list read fails', async () => {
+  const page = projectAddPage('local'), {node, context} = page, calls = [];
+  node('project-path').value = '/existing/project';
+  node('project-name').value = 'unsaved rename';
+  node('project-enabled').checked = true;
+  context.fetch = async (url, options) => {
+    if (url.startsWith('/api/state?')) {
+      calls.push('list');
+      throw new TypeError('list unavailable');
+    }
+    assert.equal(url, '/api/projects');
+    calls.push(JSON.parse(options.body));
+    return response({id: 'b', existing: true, name: 'B', paused: true});
+  };
+  await page.submit('project-form');
+  assert.deepEqual(calls, [{path: '/existing/project', name: 'unsaved rename', enabled: true}, 'list']);
+  assert.equal(node('project-dialog').open, false);
+  assert.equal(vm.runInContext('projectId', context), 'b');
+  assert.match(node('toast').textContent, /该路径已接入.*B.*已暂停.*未修改名称或启用状态/);
+  assert.equal(node('connection').textContent, '连接中断');
+});
+
+function pathRestorePage() {
+  const page = projectAddPage('local'), {node, context, document} = page;
+  const posts = [], reads = [], path = '/archived/project';
+  const receipt = {project: 'restored', archived: false, paused: true, name: 'Restored project'};
+  let restore = () => response(receipt), read = () => response(projectList('restored'));
+  document.body = node('body');
+  context.window.scrollTo = () => {};
+  context.window.__RSI_MACHINE_KEY__ = 'local';
+  const draft = () => {
+    node('project-source').value = 'local';
+    node('project-path').value = path;
+    node('project-name').value = 'draft name';
+    node('project-enabled').checked = true;
+  };
+  draft();
+  context.fetch = async (url, options) => {
+    if (/^\/api\/state(?:\?|$)/.test(url)) {
+      assert.equal(options.method, undefined);
+      reads.push(url);
+      return read(url);
+    }
+    assert.equal(options.method, 'POST');
+    posts.push([url, JSON.parse(options.body)]);
+    if (url === '/api/projects') return response({id: receipt.project, existing: true, archived: true, paused: true, name: 'Old name'});
+    assert.equal(url, '/api/project/restore');
+    return restore();
+  };
+  const confirmations = () => document.body.children.filter(box => box.className === 'confirm-dialog' && box.open);
+  const start = async () => {
+    const pending = page.submit('project-form');
+    await waitFor(() => confirmations().length);
+    return {pending, click: yes => confirmations()[0].children.at(-1).children[Number(yes)].handlers.click()};
+  };
+  return {...page, posts, reads, receipt, path, draft, start,
+    onRestore(handler) { restore = handler; }, onRead(handler) { read = handler; },
+    restorePosts: () => posts.filter(([url]) => url === '/api/project/restore'),
+    move(view) { vm.runInContext(`showView(${JSON.stringify(view)})`, context); }};
+}
+
+for (const [reason, invalidate] of [
+  ['form edit', page => { page.node('project-path').value = '/new/draft'; page.input('project-path', 'project-form'); }],
+  ['dialog reopen', page => { page.node('close-project-dialog').handlers.click(); page.node('add-project').handlers.click(); }],
+  ['project switch', page => { page.node('project-select').value = 'b'; page.node('project-select').handlers.change(); }],
+  ['navigation round trip', page => { page.move('settings'); page.move('overview'); }],
+  ['runtime switch', page => { page.context.window.__RSI_MACHINE_KEY__ = 'remote'; }],
+]) {
+  test(`path restore ignores confirmation after ${reason}`, async t => {
+    const page = pathRestorePage(), {pending, click} = await page.start();
+    invalidate(page);
+    click(true);
+    await pending;
+    t.diagnostic(`restore POST ${page.restorePosts().length}`);
+    assert.equal(page.restorePosts().length, 0);
+    assert.equal(page.node('project-dialog').open, true);
+    assert.equal(page.node('project-name').value, 'draft name');
+  });
+}
+
+test('path restore cancellation leaves the local form intact', async () => {
+  const page = pathRestorePage(), {pending, click} = await page.start();
+  click(false);
+  await pending;
+  assert.equal(page.restorePosts().length, 0);
+  assert.equal(page.node('project-dialog').open, true);
+  assert.equal(page.node('project-path').value, page.path);
+});
+
+test('path restore update rejection requires a new manual confirmation', async t => {
+  const page = pathRestorePage();
+  page.onRestore(() => rejected());
+  const {pending, click} = await page.start();
+  click(true);
+  await new Promise(setImmediate);
+  const replayTimer = page.timers.some(timer => timer.active && timer.delay === 1000);
+  if (replayTimer) {
+    page.onRestore(() => response(page.receipt));
+    await page.resume();
+  }
+  await pending;
+  t.diagnostic(`restore POST ${page.restorePosts().length}, automatic wait ${replayTimer}`);
+  assert.equal(page.restorePosts().length, 1);
+  assert.equal(replayTimer, false);
+  assert.match(page.node('toast').textContent, /服务正在更新.*重试/);
+  assert.equal(page.node('project-path').value, page.path);
+  page.onRestore(() => response(page.receipt));
+  const retry = await page.start();
+  retry.click(true);
+  await retry.pending;
+  assert.deepEqual(page.restorePosts().map(([, body]) => body), Array(2).fill({project: 'restored', confirmation: 'restore-project'}));
+});
+
+for (const [reason, change] of [
+  ['wrong project', {project: 'b'}], ['missing archive flag', {archived: undefined}],
+  ['missing pause flag', {paused: undefined}], ['unpaused project', {paused: false}], ['missing name', {name: undefined}],
+]) {
+  test(`path restore rejects ${reason} in a successful HTTP response`, async t => {
+    const page = pathRestorePage();
+    page.onRestore(() => response({...page.receipt, ...change}));
+    const {pending, click} = await page.start();
+    click(true);
+    await pending;
+    t.diagnostic(`selected ${vm.runInContext('projectId', page.context)}, list GET ${page.reads.length}`);
+    assert.equal(page.restorePosts().length, 1);
+    assert.equal(vm.runInContext('projectId', page.context), 'a');
+    assert.equal(page.reads.length, 0);
+    assert.equal(page.node('project-dialog').open, true);
+    assert.equal(page.node('project-name').value, 'draft name');
+    assert.match(page.node('toast').textContent, /恢复结果未确认/);
+  });
+}
+
+test('path restore reports the confirmed paused receipt and keeps a failed list check read-only on retry', async t => {
+  const page = pathRestorePage();
+  page.onRead(() => { throw new TypeError('list unavailable'); });
+  const {pending, click} = await page.start();
+  click(true);
+  await pending;
+  t.diagnostic(`feedback: ${page.node('toast').textContent}`);
+  assert.match(page.node('toast').textContent, /已恢复.*保持暂停.*Restored project|Restored project.*已恢复.*保持暂停/);
+  assert.equal(page.node('connection').textContent, '连接中断');
+  assert.match(page.node('toast').textContent, /重新提交相同路径，仅刷新列表/);
+  page.node('add-project').handlers.click();
+  page.draft();
+  const writes = page.posts.length;
+  page.onRead(() => response(projectList('restored')));
+  await page.submit('project-form');
+  assert.equal(page.posts.length, writes);
+  assert.equal(page.reads.length, 2);
+  assert.equal(page.node('project-dialog').open, false);
+  assert.equal(vm.runInContext('projectId', page.context), 'restored');
+});
+
+test('path restore keeps a late valid receipt for an explicit read without taking over the new project', async () => {
+  const page = pathRestorePage();
+  let finish;
+  page.onRestore(() => new Promise(resolve => { finish = () => resolve(response(page.receipt)); }));
+  const {pending, click} = await page.start();
+  click(true);
+  await waitFor(() => finish);
+  page.onRead(() => response(snapshot()));
+  page.node('project-select').value = 'b';
+  page.node('project-select').handlers.change();
+  await page.context.lastAction;
+  page.node('toast').textContent = 'new project feedback';
+  finish();
+  await pending;
+  assert.equal(vm.runInContext('projectId', page.context), 'b');
+  assert.equal(page.node('project-dialog').open, true);
+  assert.equal(page.node('project-name').value, 'draft name');
+  assert.equal(page.node('toast').textContent, 'new project feedback');
+  assert.equal(page.reads.length, 1);
+  page.onRead(() => response(projectList('restored')));
+  await page.submit('project-form');
+  assert.equal(page.posts.length, 2);
+  assert.equal(page.reads.length, 2);
+  assert.equal(vm.runInContext('projectId', page.context), 'restored');
+});
+
+test('path restore reports the receipt in English and preserves the outgoing goal draft', async () => {
+  const page = pathRestorePage();
+  const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')) + ';language="en"', page.context);
+  page.node('goal-text').value = 'outgoing goal';
+  vm.runInContext('goalDrafts.set("restored","restored goal")', page.context);
+  const {pending, click} = await page.start();
+  click(true);
+  await pending;
+  assert.equal(page.node('toast').textContent, 'Project restored and kept paused: Restored project');
+  assert.equal(page.node('goal-text').value, 'restored goal');
+  page.node('project-select').value = 'a';
+  page.node('project-select').handlers.change();
+  await page.context.lastAction;
+  assert.equal(page.node('goal-text').value, 'outgoing goal');
+});
+
+for (const outcome of ['failure', 'snapshot']) {
+  test(`path restore ignores late list ${outcome} after a navigation round trip and a reopened draft`, async t => {
+    const page = pathRestorePage();
+    vm.runInContext('view="settings"', page.context);
+    let finish;
+    page.onRead(() => new Promise((resolve, reject) => { finish = () => outcome === 'failure'
+      ? reject(new TypeError('late disconnect')) : resolve(response(snapshot())); }));
+    const {pending, click} = await page.start();
+    click(true);
+    await waitFor(() => finish);
+    page.move('models');
+    page.move('settings');
+    page.node('add-project').handlers.click();
+    page.node('project-path').value = '/current/draft';
+    page.input('project-path', 'project-form');
+    page.node('connection').textContent = 'new connection feedback';
+    page.node('toast').textContent = 'new form feedback';
+    finish();
+    await pending;
+    t.diagnostic(`selected ${vm.runInContext('projectId', page.context)}, connection ${page.node('connection').textContent}`);
+    assert.equal(vm.runInContext('projectId', page.context), 'restored');
+    assert.equal(page.node('connection').textContent, 'new connection feedback');
+    assert.equal(page.node('toast').textContent, 'new form feedback');
+    assert.equal(page.node('project-path').value, '/current/draft');
+    assert.equal(page.node('project-dialog').open, true);
+  });
+}
+
+function pausePage() {
+  const page = browser(), {context, node} = page;
+  const paused = {a: 0, b: 1}, posts = [], reads = [];
+  const stateFor = project => ({...snapshot(), selected_project: project, sections: ['core'],
+    projects: snapshot().projects.map(item => ({...item, paused: paused[item.id]})),
+    config: {sources: {}, github: {}, schedule: {light_minutes: 60, issues_minutes: 60}, delivery: {}},
+    tasks: [], runs: [], schedules: [], events: [], task_counts: [],
+  });
+  const reply = body => { paused[body.project] = Number(body.paused); return response({saved: true}); };
+  let post = reply, read = project => response(stateFor(project));
+  context.startState = stateFor('a');
+  context.fetch = async (url, options) => {
+    if (url === '/api/pause') {
+      assert.equal(options.method, 'POST');
+      const body = JSON.parse(options.body);
+      posts.push(body);
+      return post(body);
+    }
+    assert.match(url, /^\/api\/state(?:\?|$)/);
+    assert.equal(options.method, undefined);
+    const project = new URLSearchParams(url.split('?')[1]).get('project');
+    reads.push(project);
+    return read(project, options.signal);
+  };
+  vm.runInContext(`state=startState;language='zh-CN';view='settings';settingsBaseline={};
+    readinessCache.set('a',{items:[]});readinessCache.set('b',{items:[]});
+    renderSettings=()=>{};render=originalRender;
+    safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;};render()`, context);
+  const click = (includeDisabled = false, detail = 1) => {
+    if (node('pause-button').disabled && !includeDisabled) return;
+    node('pause-button').handlers.click({detail});
+    return context.lastAction;
+  };
+  const select = project => {
+    node('project-select').value = project;
+    node('project-select').handlers.change();
+    return context.lastAction;
+  };
+  return {...page, posts, reads, stateFor, reply, click, select,
+    onPost(handler) { post = handler; }, onRead(handler) { read = handler; }};
+}
+
+function pauseCounts(t, page) {
+  t.diagnostic(`POST ${page.posts.length}, GET ${page.reads.length}`);
+}
+
+test('pause button holds one write through redraw and project switch-back, then permits an explicit reversal', async t => {
+  const page = pausePage(), button = page.node('pause-button');
+  let finish;
+  const hold = new Promise(resolve => { finish = resolve; });
+  page.onPost(async body => { await hold; return page.reply(body); });
+  const first = page.click(), duplicate = page.click(true);
+  await page.context.refresh();
+  const afterRedraw = button.disabled;
+  await page.select('b');
+  const otherProject = button.disabled;
+  await page.select('a');
+  const afterReturn = button.disabled;
+  const afterSwitchClick = page.click(true);
+  finish();
+  // Release each old handler as well when running the regression against the parent.
+  await Promise.all([first, duplicate, afterSwitchClick].filter(Boolean));
+  page.onPost(page.reply);
+  await page.click();
+  pauseCounts(t, page);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}, {project:'a', paused:false}]);
+  assert.deepEqual([afterRedraw, otherProject, afterReturn], [true, false, true]);
+  assert.equal(button.textContent, '暂停运行');
+});
+
+for (const destination of ['b', 'a']) {
+  test(`pause button suppresses old rejection after switching ${destination === 'b' ? 'away' : 'away and back'}`, async t => {
+    const page = pausePage();
+    let reject;
+    page.onPost(() => new Promise(resolve => { reject = () => resolve(response({error_code:'invalid_request'}, 400)); }));
+    const first = page.click();
+    await page.select('b');
+    if (destination === 'a') await page.select('a');
+    vm.runInContext('toast("当前页面反馈")', page.context);
+    reject();
+    await first;
+    pauseCounts(t, page);
+    assert.deepEqual(page.posts, [{project:'a', paused:true}]);
+    assert.equal(page.node('toast').textContent, '当前页面反馈');
+    assert.equal(page.node('pause-button').disabled, false);
+  });
+}
+
+test('pause button keeps a saved receipt when the read fails and retries with GET before reversing', async t => {
+  const page = pausePage(), button = page.node('pause-button'), notice = page.node('toast');
+  page.onRead(() => { throw new TypeError('state unavailable'); });
+  await page.click();
+  const failedRead = {label: button.textContent, notice: notice.textContent};
+  const beforeRetry = page.posts.length;
+  await page.click();
+  const afterFailedRetry = page.posts.length;
+  page.onRead(project => response({...page.stateFor(project), runs: [{project:'a', task_title:'旧工作仍在收尾', started:1}]}));
+  await page.click();
+  const afterRead = {label: button.textContent, running: page.node('current-work').textContent, posts: page.posts.length};
+  await page.click();
+  pauseCounts(t, page);
+  assert.deepEqual([beforeRetry, afterFailedRetry, afterRead.posts], [1, 1, 1]);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}, {project:'a', paused:false}]);
+  assert.deepEqual(page.reads, ['a', 'a', 'a', 'a']);
+  assert.equal(failedRead.label, '刷新运行状态');
+  assert.match(failedRead.notice, /调度暂停请求已保存.*运行状态暂未刷新/);
+  assert.deepEqual([afterRead.label, afterRead.running], ['开始运行', '旧工作仍在收尾']);
+});
+
+test('pause button clears its old failure on retry and requires saved true before reporting success', async t => {
+  const page = pausePage(), notice = page.node('toast');
+  page.onPost(() => response({error_code:'invalid_request'}, 400));
+  await page.click();
+  const visibleFailure = !notice.hidden && notice.className === 'error';
+  let finish;
+  page.onPost(() => new Promise(resolve => { finish = () => resolve(response({saved:false})); }));
+  const retry = page.click();
+  const hidOldFailure = notice.hidden;
+  finish();
+  await retry;
+  const unconfirmed = {label:page.node('pause-button').textContent, notice:notice.textContent};
+  page.onPost(page.reply);
+  await page.click();
+  pauseCounts(t, page);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}, {project:'a', paused:true}]);
+  assert.deepEqual(page.reads, ['a']);
+  assert.deepEqual([visibleFailure, hidOldFailure], [true, true]);
+  assert.deepEqual(unconfirmed, {label:'刷新运行状态', notice:'运行状态变更结果未确认，请先刷新运行状态。'});
+  assert.equal(notice.hidden, true);
+  assert.equal(page.node('pause-button').textContent, '暂停运行');
+});
+
+test('pause button ignores the second click of a double click even after a fast refresh', async t => {
+  const page = pausePage();
+  await page.click();
+  await page.click(false, 2);
+  const countAfterDoubleClick = page.posts.length;
+  await page.click();
+  pauseCounts(t, page);
+  assert.equal(countAfterDoubleClick, 1);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}, {project:'a', paused:false}]);
+});
+
+test('pause button never treats a pre-write snapshot as the confirmed state', async t => {
+  const page = pausePage();
+  let finishOld;
+  page.onRead((project, signal) => {
+    if (page.reads.length > 1) return response(page.stateFor(project));
+    const old = page.stateFor(project);
+    return new Promise(resolve => {
+      finishOld = () => resolve(response(old));
+      signal.addEventListener('abort', finishOld, {once:true});
+    });
+  });
+  const old = page.context.refresh();
+  const write = page.click();
+  await new Promise(setImmediate);
+  finishOld();
+  await Promise.all([old, write]);
+  pauseCounts(t, page);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}]);
+  assert.deepEqual(page.reads, ['a', 'a']);
+  assert.equal(page.node('pause-button').textContent, '开始运行');
+});
+
+test('pause button does not replay an update rejection after the user changes projects', async t => {
+  const page = pausePage();
+  page.onPost(body => page.posts.length === 1 ? rejected() : page.reply(body));
+  const pending = page.click();
+  await new Promise(setImmediate);
+  await page.select('b');
+  if (page.timers.some(timer => timer.active && timer.delay === 1000)) await page.resume();
+  await pending;
+  pauseCounts(t, page);
+  assert.deepEqual(page.posts, [{project:'a', paused:true}]);
+  assert.deepEqual(page.reads, ['b']);
+  assert.equal(page.node('pause-button').textContent, '开始运行');
 });
 
 test('a failed capability probe reports the connection error rather than an upgrade hint', async () => {
@@ -907,7 +1516,7 @@ test('inspection entry points follow project, configuration and repository avail
   });
   page.document.querySelectorAll = selector => selector === '[data-inspect]' ? buttons : [];
   page.node('config-scope').value = 'project';
-  vm.runInContext('language="zh-CN";view="settings";settingsBaseline={};readinessCache.set("a",{ready:true,items:[]});renderUpdateExtras=()=>{};originalRender()', page.context);
+  vm.runInContext('language="zh-CN";view="settings";settingsBaseline={};readinessCache.set("a",{ready:true,items:[]});originalRender()', page.context);
   assert.equal(buttons[0].disabled, false, 'manual check stays available when its source is disabled');
   assert.equal(buttons[1].disabled, true, 'missing repository cannot schedule Issue sync');
   page.context.initialState.projects[0].config.sources = {inspection: true, issues: true};
@@ -996,7 +1605,12 @@ test('out-of-order task details cannot attach cancellation for the previous task
     if (url.includes('run?id=ra')) return new Promise(resolve => { finishA = () => resolve(response(detail)); });
     if (url.includes('run?id=rb')) return response(detail);
     if (url.includes('task-cancel-preview?')) return response({affected: [], revision: 'preview-b'});
-    if (url.endsWith('/cancel')) { cancellations.push(JSON.parse(options.body)); return response({saved: true}); }
+    if (url.endsWith('/cancel')) {
+      const body = JSON.parse(options.body);
+      cancellations.push(body);
+      return response({saved: true, revision: body.revision, cascade: body.cascade, impact_truncated: false,
+        receipts: [{id: body.task, state: 'cancelled', previous_state: 'executing', candidates: [], publications: []}]});
+    }
     return response(snapshot());
   };
   const pendingA = page.context.showTask(a);
@@ -1008,6 +1622,198 @@ test('out-of-order task details cannot attach cancellation for the previous task
   assert.equal(buttons.length, 1);
   await buttons[0].handlers.click();
   assert.deepEqual(cancellations, [{task: 'b', cascade: false, revision: 'preview-b', reason: ''}]);
+});
+
+async function taskCancellationPage({preview, post, refresh} = {}) {
+  const page = browser(), task = fixtureTask('cancel-me', 'executing');
+  const previews = [], posts = [], refreshes = [];
+  page.document.body = page.node('fixture-body');
+  page.context.window.__RSI_MACHINE_KEY__ = 'runtime-a';
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.fetch = async (url, options) => {
+    const {pathname, searchParams} = new URL(url, 'http://fixture.test');
+    if (pathname === '/api/task-runs') return response([]);
+    if (pathname === '/api/task-cancel-preview') {
+      previews.push(Object.fromEntries(searchParams));
+      const plan = {task, revision: 'preview-' + previews.length, limit: 1000, truncated: false,
+        affected: [{id: 'child', title: 'Downstream task', state: 'queued', cancellable: true}]};
+      return preview ? preview(plan) : response(plan);
+    }
+    if (pathname === '/api/cancel') {
+      const body = JSON.parse(options.body);
+      posts.push(body);
+      const receipt = {saved: true, revision: body.revision, cascade: body.cascade, impact_truncated: false, receipts: [
+        {id: task.id, state: 'cancelled', previous_state: task.state, candidates: [], publications: []},
+        {id: 'child', state: body.cascade ? 'cancelled' : 'unchanged', previous_state: 'queued', candidates: [], publications: []},
+      ]};
+      return post ? post(receipt) : response(receipt);
+    }
+    assert.equal(pathname, '/api/state');
+    refreshes.push(searchParams.get('project'));
+    return refresh ? refresh() : response(snapshot());
+  };
+  await page.context.showTask(task);
+  const click = label => {
+    const button = buttonWith(page.node('detail-body'), label);
+    assert.ok(button && button.tagName === 'BUTTON');
+    return button.handlers.click();
+  };
+  const dialogs = () => descendants(page.document.body).filter(node => node.className === 'confirm-dialog' && node.open);
+  const choose = (dialog, label) => buttonWith(dialog, label).handlers.click();
+  async function navigate(scope) {
+    if (scope === 'task') await page.context.showTask(fixtureTask('other', 'failed'));
+    if (scope === 'project') {
+      const picker = page.node('project-select');
+      picker.value = 'b';
+      picker.handlers.change();
+      await page.context.lastAction;
+    }
+    if (scope === 'runtime') page.context.window.__RSI_MACHINE_KEY__ = 'runtime-b';
+    page.context.toast('当前界面');
+  }
+  return {page, previews, posts, refreshes, click, dialogs, choose, navigate, toast: page.node('toast')};
+}
+
+test('task cancellation rapid clicks open one preview and require a fresh confirmation after dismissal', async () => {
+  const replies = [];
+  const f = await taskCancellationPage({preview: plan => new Promise(resolve => replies.push(() => resolve(response(plan))))});
+  const pending = f.click('取消任务');
+  const duplicates = [f.click('取消任务'), f.click('取消任务')];
+  for (const reply of replies) reply();
+  await new Promise(setImmediate);
+  assert.deepEqual([f.previews.length, f.dialogs().length, f.posts.length], [1, 1, 0], 'preview, open confirmations, POSTs');
+  f.choose(f.dialogs()[0], '取消');
+  await Promise.all([pending, ...duplicates]);
+  assert.equal(f.posts.length, 0);
+  const confirmed = f.click('取消任务');
+  replies.at(-1)();
+  await waitFor(() => f.dialogs().length === 1);
+  const dialog = f.dialogs()[0], fields = descendants(dialog);
+  const cascade = fields.find(node => node.type === 'checkbox');
+  assert.equal(cascade.checked, false);
+  assert.ok(fields.some(node => node.textContent.includes('Downstream task')));
+  cascade.checked = true;
+  fields.find(node => node.tagName === 'TEXTAREA').value = '  原文\n保留  ';
+  f.choose(dialog, '确认');
+  await confirmed;
+  assert.deepEqual(f.posts, [{task: 'cancel-me', cascade: true, revision: 'preview-2', reason: '  原文\n保留  '}]);
+  assert.equal(f.toast.textContent, '已申请取消任务');
+});
+
+for (const scope of ['task', 'project', 'runtime']) {
+  for (const phase of ['preview', 'preview failure', 'confirm', 'POST failure', 'POST receipt']) {
+    test(`task cancellation ignores a stale ${phase} after switching ${scope}`, async () => {
+      let reply;
+      const rejected = response({}, 503);
+      const f = await taskCancellationPage({
+        preview: phase.startsWith('preview') ? plan => new Promise(resolve => {
+          reply = () => resolve(phase === 'preview' ? response(plan) : rejected);
+        }) : undefined,
+        post: phase.startsWith('POST') ? receipt => new Promise(resolve => {
+          reply = () => resolve(phase === 'POST receipt' ? response(receipt) : rejected);
+        }) : undefined,
+        refresh: phase === 'POST receipt' && scope === 'task' ? () => rejected : undefined,
+      });
+      const pending = f.click('取消任务');
+      if (!phase.startsWith('preview')) await waitFor(() => f.dialogs().length === 1);
+      if (phase.startsWith('POST')) {
+        f.choose(f.dialogs()[0], '确认');
+        await waitFor(() => f.posts.length === 1);
+      }
+      await f.navigate(scope);
+      const refreshCount = f.refreshes.length;
+      if (phase === 'confirm') f.choose(f.dialogs()[0], '确认');
+      else reply();
+      await new Promise(setImmediate);
+      assert.deepEqual([f.dialogs().length, f.posts.length, f.toast.textContent],
+        [0, phase.startsWith('POST') ? 1 : 0, '当前界面'], 'open confirmations, POSTs, toast');
+      await pending;
+      assert.equal(f.refreshes.length - refreshCount, phase === 'POST receipt' && scope === 'task' ? 1 : 0);
+      assert.equal(f.page.node('detail-dialog').open, scope !== 'project');
+      if (scope === 'task') assert.equal(f.page.node('detail-title').textContent, 'Task other');
+    });
+  }
+}
+
+test('task cancellation distinguishes a committed receipt from a refresh failure', async () => {
+  let failRefresh;
+  const f = await taskCancellationPage({refresh: () => new Promise(resolve => { failRefresh = () => resolve(response({}, 503)); })});
+  const pending = f.click('取消任务');
+  await waitFor(() => f.dialogs().length === 1);
+  f.choose(f.dialogs()[0], '确认');
+  await waitFor(() => Boolean(failRefresh));
+  const before = f.toast.textContent;
+  failRefresh();
+  await pending;
+  assert.deepEqual([f.posts.length, f.refreshes.length, before, f.toast.textContent, f.page.node('detail-dialog').open],
+    [1, 1, '已申请取消任务', '已申请取消任务，但列表刷新失败。', false]);
+});
+
+test('task cancellation keeps a later task open when a post-receipt refresh fails', async () => {
+  let failRefresh;
+  const f = await taskCancellationPage({refresh: () => new Promise(resolve => { failRefresh = () => resolve(response({}, 503)); })});
+  const pending = f.click('取消任务');
+  await waitFor(() => f.dialogs().length === 1);
+  f.choose(f.dialogs()[0], '确认');
+  await waitFor(() => Boolean(failRefresh));
+  await f.navigate('task');
+  failRefresh();
+  await pending;
+  assert.equal(f.toast.textContent, '当前界面');
+  assert.equal(f.page.node('detail-dialog').open, true);
+  assert.equal(f.page.node('detail-title').textContent, 'Task other');
+});
+
+for (const [post, message] of [
+  [() => response({saved: true}), '未收到取消回执，请先刷新列表确认任务状态。'],
+  [() => rejected(), '服务正在更新，请稍后重新预览并确认取消。'],
+]) {
+  test(`task cancellation keeps details open and reports ${message}`, async () => {
+    const f = await taskCancellationPage({post});
+    const pending = f.click('取消任务');
+    await waitFor(() => f.dialogs().length === 1);
+    f.choose(f.dialogs()[0], '确认');
+    await pending;
+    assert.equal(f.toast.textContent, message);
+    assert.equal(f.page.node('detail-dialog').open, true);
+    assert.deepEqual([f.posts.length, f.refreshes.length], [1, 0]);
+  });
+}
+
+test('task cancellation requires new confirmation after revision rejection', async () => {
+  let rejected = true;
+  const f = await taskCancellationPage({post: receipt => rejected
+    ? response({error: 'Cancellation preview changed; review it again', error_code: 'validation_error'}, 400)
+    : response(receipt)});
+  const first = f.click('取消任务');
+  await waitFor(() => f.dialogs().length === 1);
+  f.choose(f.dialogs()[0], '确认');
+  await first;
+  assert.equal(f.toast.textContent, '任务或依赖已变化，请重新查看取消预览。');
+  assert.equal(f.page.node('detail-dialog').open, true);
+  assert.deepEqual([f.posts.length, f.refreshes.length], [1, 0]);
+  rejected = false;
+  const second = f.click('取消任务');
+  await waitFor(() => f.dialogs().length === 1);
+  assert.equal(f.posts.length, 1, 'a newer preview still needs explicit confirmation');
+  f.choose(f.dialogs()[0], '确认');
+  await second;
+  assert.deepEqual(f.posts.map(post => [post.revision, post.cascade]), [['preview-1', false], ['preview-2', false]]);
+});
+
+test('task cancellation cannot replay an update-rejected confirmation after switching project', async () => {
+  const f = await taskCancellationPage({post: () => rejected()});
+  const pending = f.click('取消任务');
+  await waitFor(() => f.dialogs().length === 1);
+  f.choose(f.dialogs()[0], '确认');
+  await new Promise(setImmediate);
+  await f.navigate('project');
+  const retry = f.page.timers.find(timer => timer.active && timer.delay === 1000);
+  if (retry) {
+    f.page.fireTimer(1000);
+    await new Promise(setImmediate);
+  } else await pending;
+  assert.deepEqual([f.posts.length, f.toast.textContent], [1, '当前界面']);
 });
 
 test('task run history loads and appends earlier pages with a visible count', async () => {
@@ -1104,6 +1910,51 @@ test('list rows omit body and evidence so the open detail fetches them once', as
   assert.equal(requests.filter(url => url.includes('task?id=')).length, 1,
     'language switches and post-operation redraws reuse the completed detailTask');
   assert.equal(paragraph(requirements()).textContent, '补取的正文', 'redrawing keeps 任务要求 text');
+});
+
+test('a late task requirements disconnect cannot show an error over a different task', async () => {
+  const page = browser();
+  page.node('task-filter').value = 'all';
+  const toast = page.node('toast');
+  toast.hidden = true;
+  page.context.language = 'zh-CN';
+  vm.runInContext(`safe=fn=>{lastAction=originalSafe(fn);return lastAction;};
+    view='tasks';state={...initialState,selected_project:'a',runs:[],tasks:[
+      {id:'old',project:'a',source:'goal',title:'Old task',state:'failed',updated:1},
+      {id:'new',project:'a',source:'goal',title:'New task',state:'completed',updated:1}
+    ]};renderTasks();`, page.context);
+  let disconnectOld, oldRequests = 0;
+  page.context.fetch = async url => {
+    if (url.startsWith('/api/task?id=old')) {
+      if (++oldRequests === 1) return new Promise((_, reject) => {
+        disconnectOld = () => reject(new TypeError('fake disconnect'));
+      });
+      throw new TypeError('fake disconnect');
+    }
+    if (url.startsWith('/api/task?id=new')) return response({id:'new',project:'a',title:'New task',state:'completed',body:'New requirements',evidence:'[]'});
+    if (url.startsWith('/api/task-runs?')) return response([]);
+    assert.fail(`unexpected request: ${url}`);
+  };
+  const open = id => {
+    const row = page.node('tasks-list').children.find(node => node.dataset.taskId === id);
+    descendants(row).find(node => node.textContent === '查看详情').handlers.click();
+    return page.context.lastAction;
+  };
+  await open('old');
+  assert.equal(typeof disconnectOld, 'function');
+  page.context.closeTaskDetail();
+  await open('new');
+  disconnectOld();
+  await new Promise(setImmediate);
+  assert.equal(page.node('detail-title').textContent, 'New task');
+  assert.equal(descendants(page.node('detail-body')).find(node => node.id === 'task-requirements').textContent, 'New requirements');
+  assert.equal(toast.hidden, true, `unexpected error over the newly opened task: ${toast.textContent}`);
+
+  page.context.closeTaskDetail();
+  await open('old');
+  await new Promise(setImmediate);
+  assert.equal(toast.hidden, false, 'an error for the current task must still be reported');
+  assert.match(toast.textContent, /无法连接本地服务/);
 });
 
 test('closing task details while a response waits keeps the dialog closed', async () => {
@@ -1878,6 +2729,125 @@ test('an import form remains unchanged when polling auto-selects a newly importe
   assert.equal(vm.runInContext('importInputUnchanged()',page.context),false);
 });
 
+async function desktopProjectFolder(kind='local') {
+  const page=browser(new Map(),({document})=>{
+    const close=document.getElementById('project-close');
+    close.closest=()=>document.getElementById('project-dialog');
+    document.querySelectorAll=selector=>selector==='.close-dialog'?[close]:[];
+  });
+  const {node,document,context,listeners}=page;
+  const choices=[],posts=[],closeEvents=[];
+  let reloads=0;
+  const dialog=node('project-dialog'),form=node('project-form'),field=node('project-path'),source=node('project-source');
+  source.form=field.form=form;
+  source.dispatchEvent=event=>{listeners.get(event.type)({target:source});source.handlers[event.type]({target:source});};
+  context.Event=Event;
+  dialog.tagName='DIALOG';
+  dialog.querySelector=selector=>selector==='form'?form:null;
+  dialog.close=()=>{dialog.open=false;closeEvents.push(()=>listeners.get('close')({target:dialog}));};
+  form.reset=()=>{listeners.get('reset')({target:form});source.value='github';field.value='';};
+  const close=node('project-close');
+  node('project-enabled').checked=false;
+  document.querySelector=()=>node('project-tools');
+  document.body=node('body');
+  node('toast').hidden=true;
+  context.safe=(fn,owner)=>{context.lastAction=context.originalSafe(fn,owner);return context.lastAction;};
+  context.refresh=async()=>{};
+  context.fetch=async(url,options)=>{posts.push([url,JSON.parse(options.body)]);return response({id:'added'});};
+  context.history={replaceState(){}};
+  context.location={reload(){reloads++;}};
+  context.window.fetch=async()=>{};
+  context.window.__TAURI_INTERNALS__={invoke:async(command)=>{
+    if(command==='runtime_info')return {kind,connected:true,scope:kind,connection_generation:1};
+    if(command==='choose_folder')return new Promise((resolve,reject)=>choices.push({resolve,reject}));
+    if(command==='validate_connection_target')return true;
+    if(command==='connect')return {scope:'remote',connection_generation:2};
+    assert.fail('Unexpected native command: '+command);
+  }};
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/desktop.js'),'utf8'),context);
+  await listeners.get('DOMContentLoaded')();
+  const folder=node('local-project-fields').children.find(button=>button.textContent==='选择文件夹');
+  const select=value=>{source.value=value;source.dispatchEvent(new Event('change'));};
+  node('add-project').handlers.click();select('local');
+  return {
+    ...page,dialog,field,choices,posts,select,pick:()=>folder.onclick(),
+    close:()=>close.handlers.click(),reopen:()=>node('onboard-add').handlers.click(),
+    flushClose:()=>closeEvents.shift()(),
+    edit(value){field.value=value;page.input('project-path','project-form');},
+    async switchRuntime(){
+      node('project-tools').children[0].onclick();
+      const connection=document.body.children[0].children[0];
+      connection.children.find(child=>child.type==='password').value='https://rsi.example.test/?token=fixture';
+      connection.onsubmit({preventDefault(){}});
+      await new Promise(setImmediate);
+      assert.equal(reloads,1);
+    }
+  };
+}
+
+for(const [name,move] of [
+  ['reopened dialog before its queued close event',page=>{page.close();page.reopen();}],
+  ['source toggled away and back',page=>{page.select('github');page.select('local');}],
+  ['manually edited path',page=>page.edit('/manual')],
+  ['manual edit back to the original text',page=>{page.edit('/manual');page.edit('/original');}],
+  ['switched runtime',page=>page.switchRuntime()],
+]){
+  for(const outcome of ['path','error']){
+    test(`desktop project folder ignores stale ${outcome}: ${name}`,async()=>{
+      const page=await desktopProjectFolder();
+      page.edit('/original');
+      const picking=page.pick();
+      assert.equal(page.choices.length,1);
+      await move(page);
+      const expected=page.field.value;
+      if(outcome==='path')page.choices[0].resolve('/late');
+      else page.choices[0].reject('Folder selection interrupted');
+      await picking;
+      assert.equal(page.field.value,expected);
+      assert.equal(page.node('toast').hidden,true);
+    });
+  }
+}
+
+test('desktop project folder coalesces repeated clicks and permits reselection after cancellation',async()=>{
+  const page=await desktopProjectFolder();
+  page.edit('/manual');
+  const first=page.pick(),duplicate=page.pick();
+  const calls=page.choices.length;
+  for(const choice of page.choices)choice.resolve(null);
+  await Promise.all([first,duplicate]);
+  assert.equal(calls,1);
+  assert.equal(page.field.value,'/manual');
+  assert.equal(page.node('toast').hidden,true);
+  const second=page.pick();page.choices.at(-1).resolve('/chosen');await second;
+  assert.equal(page.field.value,'/chosen');
+});
+
+test('desktop project folder preserves selection and ordinary project submission',async()=>{
+  const page=await desktopProjectFolder();
+  const first=page.pick();page.choices.at(-1).resolve('/chosen');await first;
+  assert.equal(page.field.value,'/chosen');
+  page.close();page.reopen();
+  const second=page.pick();page.flushClose();page.choices.at(-1).resolve('/new-choice');await second;
+  assert.equal(page.field.value,'/new-choice');
+  await page.submit('project-form');
+  assert.deepEqual(page.posts,[['/api/projects',{path:'/new-choice',name:null,enabled:false}]]);
+  assert.equal(page.dialog.open,false);
+  assert.equal(page.field.value,'');
+  assert.equal(page.node('project-source').value,'github');
+  assert.equal(page.node('toast').textContent,'项目已接入');
+});
+
+test('desktop project folder on remote runtime keeps manual paths and skips the native chooser',async()=>{
+  const page=await desktopProjectFolder('remote');
+  page.edit('/srv/projects/example');await page.pick();
+  assert.equal(page.choices.length,0);
+  assert.equal(page.node('toast').textContent,'远端项目请填写服务器上的路径。');
+  await page.submit('project-form');
+  assert.deepEqual(page.posts,[['/api/projects',{path:'/srv/projects/example',name:null,enabled:false}]]);
+  assert.equal(page.dialog.open,false);
+});
+
 test('goal drafts stay with their project and submit only to that project', async () => {
   const page=browser(),posts=[];
   page.context.refresh=()=>Promise.resolve();
@@ -2236,6 +3206,7 @@ test('schedule-time rejections are mapped and localized for both console languag
   assert.match(english[apiErrors['Scheduled local time is nonexistent']], /does not exist/);
   assert.match(english[apiErrors['Scheduled local time is ambiguous; specify fold']], /first or second/);
   assert.equal(english['已预约'], 'Reserved');
+  assert.equal(english['预约已保存，但列表刷新失败。'], 'Reservation saved, but the list failed to refresh.');
   assert.equal(english['安排检查：此任务将在指定时刻开始运行。'], 'Schedule check: this task starts at the chosen instant.');
 });
 
@@ -2298,10 +3269,11 @@ test('schedule form omits fold for a single-occurrence time and rejects empty in
   controls.find(node => node.tagName === 'BUTTON' && node.textContent === '预约').handlers.click();
   await page.context.lastAction;
   assert.equal(posts[0].body.fold, undefined, 'single occurrence must not send a fold');
-  // 空输入在本地拦截，不发请求。
-  time.value = '';
+  // 成功后原详情已关闭；从重新打开的正常入口检查空输入。
+  await page.context.showTask(task);
+  const reopened = detailDescendants(page.node('detail-body')).find(node => node.className === 'task-schedule-editor');
   page.node('toast').textContent = '';
-  controls.find(node => node.tagName === 'BUTTON' && node.textContent === '预约').handlers.click();
+  detailDescendants(reopened).find(node => node.tagName === 'BUTTON' && node.textContent === '预约').handlers.click();
   await page.context.lastAction;
   assert.equal(posts.length, 1, 'empty input must not reach the API');
   assert.match(page.node('toast').textContent, /请填写本地时间和时区/);
@@ -2448,6 +3420,198 @@ for (const kind of ['schedule', 'reason']) {
   }
 }
 
+function scheduleRequestPage() {
+  const page = experiencePage({realRefresh: true}), posts = [], refreshes = [];
+  const task = fixtureTask('reservation', 'queued');
+  let refreshFails = false;
+  page.context.location.hash = '';
+  page.context.window.__RSI_MACHINE_KEY__ = 'first';
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.fetch = async (url, options) => {
+    const machine = page.context.window.__RSI_MACHINE_KEY__;
+    if (url === '/api/task/schedule-time') {
+      const body = JSON.parse(options.body);
+      const receipt = {local_time: body.local_time, timezone: body.timezone, fold: body.fold ?? null,
+        at: Date.parse(body.local_time + 'Z') / 1000};
+      return new Promise(resolve => posts.push({machine, body, finish: (reply = response(receipt)) => resolve(reply)}));
+    }
+    if (url.includes('/state?')) {
+      const params = new URL(url, 'http://fixture.test').searchParams;
+      const project = params.get('project');
+      // The dependency editor independently reads candidates with a 200-row page.
+      if (params.get('limit') === '50') {
+        refreshes.push({machine, project});
+        if (refreshFails) throw new Error('offline during list refresh');
+      }
+      return response({...snapshot(), selected_project: project, tasks: [], runs: []});
+    }
+    if (url.includes('/task-runs?')) return response([]);
+    return response(task);
+  };
+  const editor = () => {
+    const box = descendants(page.node('detail-body')).find(node => node.className === 'task-schedule-editor');
+    const controls = descendants(box);
+    return {time: controls.find(node => node.type === 'datetime-local'), zone: controls.find(node => node.type === 'text'),
+      button: controls.find(node => node.tagName === 'BUTTON' && node.textContent === '预约')};
+  };
+  const fill = (time = '2035-01-01T12:00') => {
+    const fields = editor();
+    fields.time.value = time; fields.time.handlers.input();
+    fields.zone.value = 'UTC'; fields.zone.handlers.input();
+  };
+  const click = () => { editor().button.handlers.click(); return page.context.lastAction; };
+  const draft = () => page.context.window.RSIDraftStore.get('task-schedule', task.id);
+  return {page, task, posts, refreshes, editor, fill, click, draft, failRefresh: () => { refreshFails = true; }};
+}
+
+for (const trigger of ['redraw', 'reopen']) {
+  test(`schedule submission stays single across ${trigger} and permits a later reservation`, async () => {
+    const {page, task, posts, editor, fill, click, draft} = scheduleRequestPage();
+    await openExperienceTask(page, task);
+    fill();
+    const pending = click();
+    if (trigger === 'redraw') await changeDetailLanguage(page);
+    else {
+      page.node('detail-dialog').handlers.cancel({preventDefault() {}});
+      await page.context.showTask(task);
+    }
+    await new Promise(setImmediate);
+    const disabled = editor().button.disabled;
+    const duplicate = click();
+    const pendingCount = posts.length;
+    for (const post of posts) post.finish();
+    await Promise.all([pending, duplicate]);
+    assert.equal(pendingCount, 1, 'POST count while awaiting the first receipt');
+    assert.equal(disabled, true);
+    assert.equal(draft(), null);
+    await openExperienceTask(page, task);
+    fill('2035-01-02T13:00');
+    const next = click();
+    assert.equal(posts.length, 2);
+    assert.equal(posts[1].body.local_time, '2035-01-02T13:00');
+    posts[1].finish(); await next;
+  });
+}
+
+test('schedule receipt preserves continued editing in the current editor', async () => {
+  const {page, task, posts, editor, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const pending = click();
+  fill('2035-01-02T13:00');
+  posts[0].finish(); await pending;
+  assert.equal(posts.length, 1);
+  assert.equal(draft().time, '2035-01-02T13:00');
+  assert.equal(page.node('detail-dialog').open, true);
+  assert.equal(editor().button.disabled, false);
+  assert.equal(editor().time.value, '2035-01-02T13:00');
+  const next = click();
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].body.local_time, '2035-01-02T13:00');
+  posts[1].finish(); await next;
+});
+
+test('schedule receipt preserves a draft edited back to the submitted values', async () => {
+  const {page, task, posts, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const pending = click();
+  fill('2035-01-02T13:00');
+  fill();
+  posts[0].finish(); await pending;
+  assert.equal(draft()?.time, '2035-01-01T12:00');
+  assert.equal(page.node('detail-dialog').open, true);
+});
+
+test('schedule rejection after redraw unlocks the current button and keeps its draft', async () => {
+  const {page, task, posts, refreshes, editor, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const pending = click();
+  await changeDetailLanguage(page);
+  await new Promise(setImmediate);
+  posts[0].finish(response({error: 'Scheduled time must be in the future', error_code: 'validation_error'}, 400));
+  await pending;
+  assert.equal(posts.length, 1);
+  assert.equal(refreshes.length, 0);
+  assert.equal(page.node('toast').textContent, '预约时间必须晚于当前时间。');
+  assert.equal(draft()?.time, '2035-01-01T12:00');
+  assert.equal(editor().button.disabled, false);
+  fill('2035-01-02T13:00');
+  const next = click();
+  assert.equal(posts.length, 2);
+  posts[1].finish(); await next;
+});
+
+test('late schedule success in the same project still shows its receipt without closing another task', async () => {
+  const {page, task, posts, refreshes, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const pending = click();
+  const other = fixtureTask('other', 'queued');
+  await page.context.showTask(other);
+  posts[0].finish(); await pending;
+  assert.equal(posts.length, 1);
+  assert.equal(refreshes.length, 1);
+  assert.equal(draft(), null);
+  assert.equal(page.node('toast').textContent, '预约已保存');
+  assert.equal(page.node('detail-dialog').open, true);
+  assert.equal(page.node('detail-title').textContent, other.title);
+});
+
+test('late schedule success leaves the newly selected project alone', async () => {
+  const {page, task, posts, refreshes, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const pending = click();
+  const picker = page.node('project-select');
+  picker.value = 'b'; picker.handlers.change();
+  await page.context.lastAction;
+  const other = {...fixtureTask('other', 'queued'), project: 'b'};
+  await page.context.showTask(other);
+  page.context.toast('新项目反馈');
+  posts[0].finish(); await pending;
+  assert.deepEqual({toast: page.node('toast').textContent, refreshes},
+    {toast: '新项目反馈', refreshes: [{machine: 'first', project: 'b'}]});
+  assert.equal(draft(), null);
+  assert.equal(page.node('detail-dialog').open, true);
+  assert.equal(page.node('detail-title').textContent, other.title);
+});
+
+test('late schedule success cannot clear an identical draft or unlock a request on another runtime', async () => {
+  const {page, task, posts, refreshes, editor, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const old = click();
+  page.context.window.__RSI_MACHINE_KEY__ = 'second';
+  await page.context.showTask(task);
+  fill();
+  const next = click();
+  page.context.toast('新运行环境反馈');
+  assert.deepEqual(posts.map(post => post.machine), ['first', 'second']);
+  posts[0].finish(); await old;
+  const observed = {draft: draft()?.time, toast: page.node('toast').textContent,
+    refreshes: refreshes.slice(), disabled: editor().button.disabled};
+  posts[1].finish(); await next;
+  assert.deepEqual(observed, {draft: '2035-01-01T12:00', toast: '新运行环境反馈', refreshes: [], disabled: true});
+  assert.equal(draft(), null);
+  assert.equal(page.node('toast').textContent, '预约已保存');
+  assert.deepEqual(refreshes, [{machine: 'second', project: 'a'}]);
+});
+
+test('schedule success remains explicit when the subsequent list refresh fails', async () => {
+  const {page, task, posts, refreshes, fill, click, draft, failRefresh} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  failRefresh();
+  const pending = click();
+  posts[0].finish(); await pending;
+  assert.equal(posts.length, 1);
+  assert.equal(refreshes.length, 1);
+  assert.equal(draft(), null);
+  assert.equal(page.node('toast').textContent, '预约已保存，但列表刷新失败。');
+});
+
 test('server schedule rejections reach the console with localized guidance', async () => {
   const page = browser();
   page.context.fetch = async () => ({...response({error: 'Scheduled local time is nonexistent',
@@ -2469,7 +3633,7 @@ test('non-queued task details offer no schedule form', async () => {
   assert.equal(detailDescendants(page.node('detail-body')).filter(node => node.className === 'task-schedule-editor').length, 0);
 });
 
-function experiencePage({navigation = false} = {}) {
+function experiencePage({navigation = false, realRefresh = false} = {}) {
   const page = browser(), ready = [], windowEvents = new Map();
   Object.assign(page.context, {
     URL, navigator: {}, history: {replaceState() {}, pushState() {}},
@@ -2486,7 +3650,7 @@ function experiencePage({navigation = false} = {}) {
   vm.runInContext(experienceSource, page.context);
   if (navigation) ready[0]();
   page.notify = task => windowEvents.get('rsi-notification-open')({detail: task});
-  page.context.refresh = async () => {};
+  if (!realRefresh) page.context.refresh = async () => {};
   return page;
 }
 
@@ -2512,6 +3676,261 @@ function revisionMetadataPage(task, metadata) {
   return page;
 }
 
+function taskRetryPage(...tasks) {
+  const page = experiencePage(), posts = [], metadata = new Map(tasks.map(task => [task.id, task]));
+  const offline = response({error: 'Invalid request', error_code: 'validation_error'}, 400);
+  let failDetailRead = false;
+  page.context.language = 'zh-CN';
+  vm.runInContext('Date.now=()=>1700000000000;safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.fetch = async (url, options) => {
+    if (url.endsWith('/api/retry')) {
+      const body = JSON.parse(options.body), task = metadata.get(body.task);
+      // Model runtime.retry's atomic change to plain queued and delay each reply independently.
+      const eligible = task.state === 'failed' || (task.state === 'queued' && task.available > 1700000000);
+      if (eligible) metadata.set(task.id, {...task, state: 'queued', available: 0});
+      const reply = eligible ? response({saved: true}) : response({error: 'This task cannot be retried', error_code: 'validation_error'}, 400);
+      return new Promise(resolve => posts.push({body, status: reply.status, finish: (result = reply) => resolve(result)}));
+    }
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({tasks: []});
+    const id = new URL(url, 'http://fixture.test').searchParams.get('id');
+    return failDetailRead ? offline : response(metadata.get(id));
+  };
+  const click = button => {
+    button.handlers.click();
+    return page.context.lastAction;
+  };
+  return {page, posts, metadata, click, offline, failDetailRead: value => { failDetailRead = value; }};
+}
+
+for (const direction of ['list → detail', 'detail → list', 'list redraw']) {
+  test(`task retry POST is shared across ${direction}`, async t => {
+    const task = direction === 'list redraw'
+      ? {...fixtureTask('child', 'queued'), available: 1700000100}
+      : {...fixtureTask(), source: 'system_evolve'};
+    const f = taskRetryPage(task), {page} = f;
+    page.context.listTask = task;
+    page.node('task-filter').value = 'all';
+    page.node('show-system-tasks').checked = true;
+    vm.runInContext('state={...state,tasks:[listTask],runs:[]};renderTasks()', page.context);
+    const row = () => page.node('tasks-list').children[0];
+    const listLabel = direction === 'list redraw' ? '立即重试' : '重试';
+    const open = async () => {
+      await f.click(buttonWith(row(), '查看详情'));
+      await page.context.lastAction;
+      return page.node('detail-body').children.find(node => node.className === 'task-controls');
+    };
+    const detailLabel = '基于当前输入重新检查';
+    const firstButton = direction === 'detail → list'
+      ? buttonWith(await open(), detailLabel) : buttonWith(row(), listLabel);
+    const pending = f.click(firstButton);
+    const firstDisabled = firstButton.disabled;
+    let secondButton;
+    if (direction === 'list → detail') {
+      const committed = f.metadata.get(task.id);
+      f.metadata.set(task.id, task); // A detail read can return the last retryable snapshot.
+      secondButton = buttonWith(await open(), detailLabel);
+      f.metadata.set(task.id, committed);
+    } else if (direction === 'detail → list') {
+      page.node('detail-dialog').handlers.cancel({preventDefault() {}});
+      secondButton = buttonWith(row(), listLabel);
+    } else {
+      vm.runInContext('state.tasks=[{...listTask,updated:1}];renderTasks()', page.context);
+      secondButton = buttonWith(row(), listLabel);
+      assert.notEqual(secondButton, firstButton);
+    }
+    const secondDisabled = secondButton.disabled;
+    const duplicate = f.click(secondButton);
+    f.posts.forEach(post => post.finish());
+    await Promise.all([pending, duplicate]);
+    t.diagnostic(JSON.stringify({posts: f.posts.length, statuses: f.posts.map(post => post.status)}));
+    assert.equal(f.posts.length, 1);
+    assert.deepEqual(f.posts[0].body, direction === 'list → detail'
+      ? {task: task.id, force: true} : {task: task.id});
+    assert.equal(firstDisabled, true);
+    assert.equal(secondDisabled, true);
+    assert.equal(secondButton.isConnected, false);
+  });
+}
+
+test('task retry POST rejection re-enables both list and detail controls', async () => {
+  const task = fixtureTask(), f = taskRetryPage(task), {page} = f;
+  page.context.listTask = task;
+  page.node('task-filter').value = 'all';
+  vm.runInContext('state={...state,tasks:[listTask],runs:[]};renderTasks()', page.context);
+  const detail = buttonWith(await openExperienceTask(page, task), '基于当前输入重新检查');
+  const list = buttonWith(page.node('tasks-list'), '重试');
+  const pending = f.click(detail);
+  assert.equal(list.disabled, true);
+  f.metadata.set(task.id, task);
+  f.posts[0].finish(f.offline);
+  await pending;
+  assert.equal(detail.disabled, false);
+  assert.equal(list.disabled, false);
+  page.node('detail-dialog').handlers.cancel({preventDefault() {}});
+  const later = f.click(list);
+  f.posts[1].finish();
+  await later;
+  assert.deepEqual(f.posts.map(post => post.body), [{task: task.id}, {task: task.id, force: false}]);
+});
+
+test('task retry POST keeps separate pending buttons for the same task in distinct runtime scopes', async () => {
+  const task = fixtureTask(), f = taskRetryPage(task), {page} = f;
+  page.context.listTask = task;
+  page.node('task-filter').value = 'all';
+  page.context.window.__RSI_MACHINE_KEY__ = 'local';
+  vm.runInContext('state={...state,tasks:[listTask],runs:[]};renderTasks()', page.context);
+  const local = f.click(buttonWith(page.node('tasks-list'), '重试'));
+  // Desktop reloads on a runtime switch. Exercise the scope keys directly in one VM.
+  page.context.window.__RSI_MACHINE_KEY__ = 'remote';
+  vm.runInContext('renderTasks()', page.context);
+  const remoteButton = buttonWith(page.node('tasks-list'), '重试');
+  assert.equal(remoteButton.disabled, false);
+  f.metadata.set(task.id, task);
+  const remote = f.click(remoteButton);
+  assert.equal(f.posts.length, 2);
+  page.context.toast('当前运行机器反馈');
+  f.posts[0].finish(f.offline);
+  await local;
+  assert.equal(remoteButton.disabled, true);
+  assert.equal(page.node('toast').textContent, '当前运行机器反馈');
+  f.posts[1].finish();
+  await remote;
+  assert.equal(remoteButton.isConnected, false);
+});
+
+for (const [state, label, navigation] of [
+  ['failed', '基于当前输入重新检查', 'task'],
+  ['queued', '立即重试', 'project'],
+]) {
+  test(`task retry POST is single-flight across repeated activation and ${navigation} navigation (${state})`, async t => {
+    const task = {...fixtureTask('child', state), available: 1700000100};
+    const other = {...fixtureTask('other'), project: navigation === 'project' ? 'b' : 'a'};
+    const f = taskRetryPage(task, other);
+    const switchProject = async project => {
+      f.page.node('project-select').value = project;
+      f.page.node('project-select').handlers.change();
+      await f.page.context.lastAction;
+    };
+    const firstButton = buttonWith(await openExperienceTask(f.page, task), label);
+    const first = f.click(firstButton), duplicate = f.click(firstButton);
+    const afterRepeat = f.posts.length;
+    const pendingDisabled = firstButton.disabled;
+    // Simulate a detail response read before the retry was committed, delivered on return.
+    const committed = f.metadata.get(task.id);
+    if (navigation === 'project') await switchProject('b');
+    await openExperienceTask(f.page, other);
+    if (navigation === 'project') await switchProject('a');
+    f.metadata.set(task.id, task);
+    const reopened = buttonWith(await openExperienceTask(f.page, task), label);
+    f.metadata.set(task.id, committed);
+    const afterReturn = f.click(reopened);
+    const reopenedDisabled = reopened.disabled;
+    if (navigation === 'project') await switchProject('b');
+    const otherControls = await openExperienceTask(f.page, other);
+    const draft = supplementForm(otherControls).children[0].children[0];
+    draft.value = '较新详情草稿';
+    draft.handlers.input();
+    const independent = f.click(buttonWith(otherControls, '基于当前输入重新检查'));
+    f.page.context.toast('较新详情反馈');
+    f.posts.filter(post => post.body.task === task.id).forEach(post => post.finish());
+    await Promise.all([first, duplicate, afterReturn]);
+    const afterLate = f.page.node('toast').textContent;
+    const firstTaskStatuses = f.posts.filter(post => post.body.task === task.id).map(post => post.status);
+    t.diagnostic(JSON.stringify({afterRepeat, firstTaskStatuses, afterLate}));
+    assert.equal(f.page.node('detail-title').textContent, other.title);
+    assert.equal(draft.value, '较新详情草稿');
+    const otherPost = f.posts.find(post => post.body.task === other.id);
+    assert.equal(otherPost.status, 200);
+    otherPost.finish();
+    await independent;
+    await f.page.context.lastAction;
+    const currentControls = f.page.node('detail-body').children.find(node => node.className === 'task-controls');
+    assert.equal(supplementForm(currentControls).children[0].children[0].value, draft.value);
+    assert.deepEqual(f.posts.map(post => post.body), [{task: task.id}, {task: other.id}]);
+    assert.equal(afterRepeat, 1);
+    assert.equal(firstTaskStatuses[0], 200);
+    assert.equal(afterLate, '较新详情反馈');
+    assert.equal(pendingDisabled, true);
+    assert.equal(reopenedDisabled, true);
+  });
+}
+
+test('task retry POST releases a rejected request and ignores its old feedback after reopening', async () => {
+  const task = fixtureTask(), f = taskRetryPage(task), label = '基于当前输入重新检查';
+  const first = f.click(buttonWith(await openExperienceTask(f.page, task), label));
+  f.metadata.set(task.id, task);
+  const reopened = buttonWith(await openExperienceTask(f.page, task), label);
+  const disabled = reopened.disabled;
+  f.page.context.toast('较新详情反馈');
+  f.posts[0].finish(f.offline);
+  await first;
+  assert.equal(f.page.node('toast').textContent, '较新详情反馈');
+  assert.equal(reopened.disabled, false);
+  const failed = f.click(reopened);
+  f.metadata.set(task.id, task);
+  f.posts[1].finish(f.offline);
+  await failed;
+  assert.equal(reopened.disabled, false);
+  assert.notEqual(f.page.node('toast').textContent, '较新详情反馈');
+  const later = f.click(reopened);
+  f.posts[2].finish();
+  await later;
+  assert.equal(disabled, true);
+  assert.deepEqual(f.posts.map(post => post.body), [{task: task.id}, {task: task.id}, {task: task.id}]);
+});
+
+test('task retry POST acknowledgement prevents a late metadata read from restoring the old button', async () => {
+  const task = fixtureTask(), f = taskRetryPage(task), label = '基于当前输入重新检查';
+  const pending = f.click(buttonWith(await openExperienceTask(f.page, task), label));
+  const fetch = f.page.context.fetch;
+  let finishRead;
+  f.page.context.fetch = (url, options) => {
+    if (!url.includes('/task?')) return fetch(url, options);
+    return new Promise(resolve => { finishRead = () => resolve(response(task)); });
+  };
+  const reopening = openExperienceTask(f.page, task);
+  await waitFor(() => finishRead);
+  f.posts[0].finish();
+  await pending;
+  finishRead();
+  const reopened = await reopening;
+  assert.equal(buttonWith(reopened, label), undefined);
+  f.page.context.fetch = fetch;
+  f.page.fireTimer(5000);
+  await new Promise(setImmediate);
+  assert.equal(vm.runInContext('detailTask.state', f.page.context), 'queued');
+  assert.deepEqual(f.posts.map(post => post.body), [{task: task.id}]);
+});
+
+test('task retry POST success with a failed detail read only offers to retry the read', async t => {
+  const task = {...fixtureTask('child', 'queued'), available: 1700000100};
+  const f = taskRetryPage(task);
+  const controls = await openExperienceTask(f.page, task);
+  const draft = supplementForm(controls).children[0].children[0];
+  draft.value = '重试后仍保留的草稿';
+  draft.handlers.input();
+  const retryButton = buttonWith(controls, '立即重试');
+  const pending = f.click(retryButton);
+  f.failDetailRead(true);
+  f.posts[0].finish();
+  await pending;
+  const status = f.page.node('detail-live-status');
+  t.diagnostic(JSON.stringify({retryStillAvailable: retryButton.isConnected && !retryButton.disabled, toast: f.page.node('toast').textContent}));
+  assert.equal(status.hidden, false);
+  assert.equal(retryButton.isConnected, false);
+  await f.click(retryButton);
+  assert.equal(f.posts.length, 1);
+  f.failDetailRead(false);
+  await f.click(buttonWith(status, '重试'));
+  await f.page.context.lastAction;
+  assert.equal(status.hidden, true);
+  const updated = f.page.node('detail-body').children.find(node => node.className === 'task-controls');
+  assert.equal(buttonWith(updated, '立即重试'), undefined);
+  assert.equal(supplementForm(updated).children[0].children[0].value, draft.value);
+  assert.deepEqual(f.posts.map(post => post.body), [{task: task.id}]);
+});
+
 test('an active task accepts a supplement and reports its pending application', async () => {
   for (const state of ['planning', 'executing', 'evaluating', 'awaiting_approval']) {
     const task = fixtureTask('active-' + state, state), posts = [];
@@ -2535,6 +3954,160 @@ test('an active task accepts a supplement and reports its pending application', 
     assert.match(page.node('toast').textContent,
       state === 'awaiting_approval' ? /已保存/ : /已收到.*下一轮/);
   }
+});
+
+function pendingSupplementPage(task = fixtureTask('supplement', 'executing')) {
+  const page = experiencePage(), posts = [], metadata = {...task};
+  const reads = {refresh: 0, detail: 0, fail: false};
+  page.context.language = 'zh-CN';
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.refresh = async () => { reads.refresh++; };
+  page.context.fetch = async (url, options) => {
+    if (url.endsWith('/task/revise')) {
+      return new Promise(resolve => posts.push({body: JSON.parse(options.body), finish: resolve}));
+    }
+    if (url.includes('/task-runs?')) return response([]);
+    assert.ok(url.includes('/task?'), url);
+    reads.detail++;
+    if (reads.fail) return response({error_code: 'internal_error'}, 500);
+    const query = new URL(url, 'http://fixture.test').searchParams;
+    return response({...metadata, id: query.get('id'), project: query.get('project')});
+  };
+  function editor() {
+    const form = supplementForm(page.node('detail-body'));
+    const [label, reasonLabel, button] = form.children;
+    const fields = [label.children[0], reasonLabel.children[0]];
+    return {
+      form, button, fields,
+      edit(index, value) { fields[index].value = value; page.input(fields[index].id, form.id); },
+      submit() { form.onsubmit({target: form, preventDefault() {}}); return page.context.lastAction; },
+    };
+  }
+  return {
+    page, task, posts, reads, metadata, editor,
+    async open(next = task) { await openExperienceTask(page, next); return editor(); },
+  };
+}
+
+for (const reopen of [false, true]) {
+  test(`supplement POST blocks repeat submits after ${reopen ? 'reopening' : 'rebuilding'} and keeps newer edits`, async t => {
+    const f = pendingSupplementPage(), original = await f.open();
+    original.edit(0, '原始需求'); original.edit(1, '原始原因');
+    const saving = original.submit();
+    if (reopen) {
+      f.page.context.closeTaskDetail();
+      await f.open();
+    } else {
+      f.metadata.title = '同步后的标题';
+      f.page.fireTimer(5000); await new Promise(setImmediate);
+      await f.page.context.lastAction;
+    }
+    const rebuilt = f.editor(), pendingDisabled = rebuilt.button.disabled;
+    assert.notEqual(rebuilt.form, original.form);
+    assert.deepEqual(rebuilt.fields.map(field => field.value), ['原始需求', '原始原因']);
+    if (reopen) {
+      rebuilt.edit(1, '中间修改'); rebuilt.edit(1, '原始原因');
+    } else {
+      rebuilt.edit(0, '较新需求');
+    }
+    const remaining = reopen ? ['', '原始原因'] : ['较新需求', ''];
+    const overlap = rebuilt.submit();
+    const overlapCount = f.posts.length;
+    f.page.context.toast('较新详情反馈');
+    f.posts[0].finish(response({saved: true, pending: true}));
+    if (overlapCount > 1) f.posts[1].finish(response({error_code: 'validation_error'}, 400));
+    await saving; await overlap;
+    t.diagnostic(JSON.stringify({overlapCount, pendingDisabled, toast: f.page.node('toast').textContent}));
+    assert.equal(overlapCount, 1);
+    assert.equal(pendingDisabled, true);
+    assert.equal(rebuilt.button.disabled, false);
+    assert.deepEqual(rebuilt.fields.map(field => field.value), remaining);
+    const store = f.page.context.window.RSIDraftStore;
+    assert.equal(store.get('task-supplement', f.task.id), remaining[0] || null);
+    assert.equal(store.get('task-reason', f.task.id), remaining[1] || null);
+    assert.equal(f.page.node('toast').textContent, '较新详情反馈');
+    assert.equal(f.reads.refresh, 0);
+    if (reopen) rebuilt.edit(0, '较新需求');
+    const later = rebuilt.submit();
+    assert.deepEqual(f.posts.map(post => post.body), [
+      {task: f.task.id, supplement: '原始需求', reason: '原始原因'},
+      {task: f.task.id, supplement: '较新需求', reason: remaining[1]},
+    ]);
+    f.posts[1].finish(response({saved: true, pending: true})); await later;
+    assert.match(f.page.node('toast').textContent, /已收到.*下一轮/);
+  });
+}
+
+for (const navigation of ['other task', 'other project', 'other runtime']) {
+  for (const accepted of [true, false]) {
+    test(`supplement POST ${accepted ? 'acknowledgement' : 'rejection'} leaves ${navigation} feedback and drafts alone`, async t => {
+      const f = pendingSupplementPage(), original = await f.open();
+      original.edit(0, '原始需求'); original.edit(1, '原始原因');
+      const saving = original.submit();
+      f.page.context.closeTaskDetail();
+      const next = {...f.task};
+      if (navigation === 'other task') next.id = 'other';
+      if (navigation === 'other project') {
+        next.id = 'other'; next.project = 'b';
+        const select = f.page.node('project-select');
+        select.value = 'b'; select.handlers.change();
+        await f.page.context.lastAction;
+      }
+      if (navigation === 'other runtime') f.page.context.window.__RSI_MACHINE_KEY__ = 'other-machine';
+      const current = await f.open(next);
+      current.edit(0, '原始需求'); current.edit(1, '原始原因');
+      f.page.context.toast('较新详情反馈');
+      const refreshes = f.reads.refresh;
+      f.posts[0].finish(accepted ? response({saved: true}) : response({error_code: 'validation_error'}, 400));
+      await saving;
+      const store = f.page.context.window.RSIDraftStore;
+      t.diagnostic(JSON.stringify({toast: f.page.node('toast').textContent, lateRefreshes: f.reads.refresh - refreshes,
+        supplement: store.get('task-supplement', next.id), reason: store.get('task-reason', next.id)}));
+      assert.equal(f.page.node('toast').textContent, '较新详情反馈');
+      assert.equal(f.reads.refresh, refreshes);
+      assert.equal(store.get('task-supplement', next.id), '原始需求');
+      assert.equal(store.get('task-reason', next.id), '原始原因');
+      assert.equal(supplementForm(f.page.node('detail-body')), current.form);
+      assert.equal(current.button.disabled, false);
+    });
+  }
+}
+
+test('supplement POST failure keeps newer input and allows a manual retry', async () => {
+  const f = pendingSupplementPage(), editor = await f.open();
+  editor.edit(0, '原始需求'); editor.edit(1, '原始原因');
+  const saving = editor.submit();
+  editor.edit(0, '较新需求'); editor.edit(1, '较新原因');
+  f.posts[0].finish(response({error_code: 'validation_error'}, 400)); await saving;
+  assert.equal(editor.button.disabled, false);
+  assert.notEqual(f.page.node('toast').className, '');
+  const rebuilt = await f.open();
+  assert.deepEqual(rebuilt.fields.map(field => field.value), ['较新需求', '较新原因']);
+  const retry = rebuilt.submit();
+  assert.deepEqual(f.posts[1].body, {task: f.task.id, supplement: '较新需求', reason: '较新原因'});
+  f.posts[1].finish(response({saved: true})); await retry;
+  assert.match(f.page.node('toast').textContent, /已保存.*重新评估/);
+});
+
+test('supplement POST success with a failed detail read preserves the receipt and retries only the read', async t => {
+  const f = pendingSupplementPage(), editor = await f.open();
+  editor.edit(0, '保留原文'); editor.edit(1, '原始原因');
+  const saving = editor.submit();
+  editor.edit(1, '较新原因');
+  f.reads.fail = true;
+  f.posts[0].finish(response({saved: true, pending: true})); await saving;
+  const status = f.page.node('detail-live-status');
+  t.diagnostic(JSON.stringify({toast: f.page.node('toast').textContent, readRetryVisible: !status.hidden,
+    fields: editor.fields.map(field => field.value)}));
+  assert.match(f.page.node('toast').textContent, /已收到.*下一轮/);
+  assert.equal(status.hidden, false);
+  assert.deepEqual(editor.fields.map(field => field.value), ['', '较新原因']);
+  const detailReads = f.reads.detail;
+  f.reads.fail = false;
+  buttonWith(status, '重试').handlers.click(); await f.page.context.lastAction;
+  assert.equal(status.hidden, true);
+  assert.equal(f.reads.detail, detailReads + 1);
+  assert.equal(f.posts.length, 1, 'the refresh retry does not resubmit the confirmed supplement');
 });
 
 test('detail retry is offered only for a queued task waiting on backoff', async () => {
@@ -3016,6 +4589,137 @@ for (const navigation of ['stay', 'close', 'project', 'other-task']) {
   });
 }
 
+async function liveRetryPage() {
+  const page = experiencePage(), task = fixtureTask('live-retry'), other = fixtureTask('other');
+  Object.assign(page.context, {language: 'zh-CN', tasksForRetry: [task, other]});
+  page.node('task-filter').value = 'all';
+  vm.runInContext('state={...state,tasks:tasksForRetry,runs:[]};renderTasks()', page.context);
+  let metadataReads = 0;
+  const offline = response({error: 'Fixture offline'}, 503);
+  let readMetadata = () => response(task), readHistory = () => response([]);
+  page.context.fetch = async url => {
+    if (url.includes('/task-runs?')) return readHistory();
+    if (url.includes('/task?id=other&')) return response(other);
+    assert.match(url, /\/task\?id=live-retry&/);
+    metadataReads++;
+    return readMetadata();
+  };
+  async function open(row) {
+    buttonWith(page.node('tasks-list').children[row], '查看详情').handlers.click();
+    await page.context.lastAction;
+    await new Promise(setImmediate);
+  }
+  let now = 1700000000000;
+  page.context.retryClock = () => now;
+  vm.runInContext('Date.now=retryClock', page.context);
+  await open(0);
+  // After boot settles, the detail's first poll is the active 5-second timer.
+  const backgroundTimers = new Set(page.timers.filter(timer => timer.delay !== 5000));
+  readMetadata = () => offline;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    now += 5000;
+    page.fireTimer(5000);
+    await new Promise(setImmediate);
+  }
+  const status = page.node('detail-live-status');
+  assert.equal(status.hidden, false);
+  assert.match(textOf(status), /详情可能不是最新/);
+  return {
+    page, status, open, offline,
+    get metadataReads() { return metadataReads; },
+    get pollDelays() { return page.timers.filter(timer => timer.active && !backgroundTimers.has(timer)).map(timer => timer.delay); },
+    holdMetadata() { return new Promise(resolve => { readMetadata = () => new Promise(done => resolve(done)); }); },
+    respondMetadata() { readMetadata = () => response(task); },
+    holdHistory() { return new Promise(resolve => { readHistory = () => new Promise(done => resolve(done)); }); },
+    clickRetry() {
+      buttonWith(status, '重试').handlers.click();
+      return page.context.lastAction;
+    }
+  };
+}
+
+test('live detail retry preserves stale feedback through failure until fresh history arrives', async () => {
+  const f = await liveRetryPage(), copy = textOf(f.status);
+  const started = f.holdMetadata(), reads = f.metadataReads;
+  const retry = buttonWith(f.status, '重试');
+  const failed = f.clickRetry();
+  const finish = await started;
+  assert.equal(f.status.hidden, false, '点击重试后，回包前仍显示详情可能不是最新');
+  assert.equal(textOf(f.status), copy, '重试期间保留上次成功更新时间');
+  assert.equal(retry.disabled, true);
+  await retry.handlers.click();
+  assert.equal(f.metadataReads, reads + 1, '重试进行中只发起一次请求');
+  finish(f.offline);
+  await failed;
+  assert.equal(f.status.hidden, false);
+  assert.equal(textOf(f.status), copy);
+  assert.equal(buttonWith(f.status, '重试').disabled, false);
+  assert.deepEqual(f.pollDelays, [20000]);
+
+  f.respondMetadata();
+  const historyStarted = f.holdHistory();
+  const recovered = f.clickRetry();
+  const finishHistory = await historyStarted;
+  assert.equal(f.status.hidden, false, '只收到未变的任务元数据时仍等待运行记录');
+  finishHistory(response({}));
+  await recovered;
+  assert.equal(f.status.hidden, false, '缺少运行记录的回包不算刷新成功');
+
+  const validHistoryStarted = f.holdHistory();
+  const successful = f.clickRetry();
+  const finishValidHistory = await validHistoryStarted;
+  finishValidHistory(response({runs: [], has_more: false}));
+  await successful;
+  assert.equal(f.status.hidden, true);
+  assert.equal(buttonWith(f.status, '重试'), undefined);
+  assert.deepEqual(f.pollDelays, [5000]);
+});
+
+for (const navigation of ['close', 'switch task']) {
+  test(`live detail retry ignores an in-flight failure after ${navigation}`, async () => {
+    const f = await liveRetryPage(), started = f.holdMetadata();
+    const pending = f.clickRetry();
+    const finish = await started;
+    if (navigation === 'close') f.page.node('detail-dialog').handlers.cancel({preventDefault() {}});
+    else await f.open(1);
+    assert.equal(f.status.hidden, true);
+    finish(f.offline);
+    await pending;
+    assert.equal(f.status.hidden, true, '旧重试失败不会恢复过期提示');
+    assert.equal(f.page.node('detail-dialog').open, navigation !== 'close');
+    if (navigation !== 'close') assert.equal(f.page.node('detail-title').textContent, 'Task other');
+    assert.deepEqual(f.pollDelays, navigation === 'close' ? [] : [5000]);
+  });
+}
+
+test('task detail shows confirmed reuse, invalidation and execution in both languages', async () => {
+  const task = fixtureTask('recovery', 'queued');
+  const recovery = {
+    latest_run: {id: 'run-2', origin: 'manual_retry'}, pending: true,
+    checkpoints: [{run: 'run-1', stage: 'planning', created: 1}],
+    events: [
+      {kind: 'stage_reused', stage: 'planning', from_run: 'run-1'},
+      {kind: 'stage_invalidated', stage: 'review', reason: 'input_signature_changed', from_run: 'run-1'},
+      {kind: 'stage_started', stage: 'review'},
+    ],
+  };
+  const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  for (const lang of ['zh-CN', 'en']) {
+    const page = revisionMetadataPage(task, {...task, recovery});
+    page.context.localStorage.setItem('rsi-language', lang);
+    vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')), page.context);
+    const controls = await openExperienceTask(page, task);
+    const panel = descendants(controls).find(node => node.id === 'task-recovery');
+    const text = descendants(panel).map(node => node.textContent).join(' ');
+    assert.equal(panel.hidden, false);
+    for (const expected of lang === 'zh-CN'
+      ? ['手动重试', 'run-2', '已复用', 'run-1', '阶段输入签名已变化', '本轮实际执行起点', '待重新验证']
+      : ['Manual retry', 'run-2', 'Reused', 'run-1', 'The stage input signature changed', 'First stage actually executed', 'Waiting to verify again']) {
+      assert.ok(text.includes(expected), expected + ' appears in the task detail');
+    }
+  }
+});
+
 test('runless detail polling updates cancellation controls and preserves supplement drafts', async () => {
   const page = experiencePage(), task = fixtureTask('runless', 'queued');
   let metadata = task, reads = 0;
@@ -3217,6 +4921,137 @@ for (const navigation of ['close', 'project', 'other-task']) {
       const other = queueForm(page);
       assert.equal(other.children[0].children[0].value, '');
       assert.equal(other.children[1].children[0].checked, false);
+    }
+  });
+}
+
+for (const scenario of ['success', 'write failure', 'refresh failure', 'refresh failure with undo',
+  'refresh timeout', 'discarded refresh', 'refresh failure after reopen', 'refresh failure after switching task',
+  'write failure after reopen', 'write failure after switching task']) {
+  test(`queue submit separates confirmed saves from ${scenario}`, async t => {
+    const page = experiencePage({realRefresh: true}), posts = [];
+    page.context.location.hash = '';
+    page.context.language = 'zh-CN';
+    const task = {...fixtureTask('child', 'queued'), updated: 1}, other = fixtureTask('other', 'queued');
+    const candidates = [fixtureTask('parent'), fixtureTask('second-parent')];
+    let metadata = task, finishWrite, finishRefresh, refreshes = 0, detailReads = 0;
+    const writeFails = scenario.startsWith('write failure');
+    vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+    page.context.fetch = async (url, options) => {
+      const {pathname, searchParams} = new URL(url, 'http://fixture.test');
+      if (pathname === '/api/task/schedule') {
+        const submitted = JSON.parse(options.body);
+        posts.push(submitted);
+        return new Promise(resolve => {finishWrite = () => {
+          if (writeFails) return resolve(response({error: 'schedule write rejected'}, 400));
+          metadata = {...metadata, updated: metadata.updated + 1, urgency: submitted.urgency,
+            dependency: submitted.dependency ? {dependency: submitted.dependency} : null};
+          resolve(response({saved: true}));
+        };});
+      }
+      if (pathname === '/api/state') {
+        if (searchParams.get('limit') === '200') return response({tasks: candidates});
+        refreshes++;
+        return new Promise((resolve, reject) => {
+          options.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {once: true});
+          finishRefresh = (fails = false) => resolve(fails
+            ? response({error: 'state read failed'}, 503)
+            : response({...snapshot(), selected_project: 'a', tasks: [metadata]}));
+        });
+      }
+      if (pathname === '/api/task-runs') return response([]);
+      if (pathname === '/api/task') {
+        const id = searchParams.get('id');
+        if (id === task.id) {detailReads++; return response(metadata);}
+        return response(candidates.find(candidate => candidate.id === id) || other);
+      }
+      return response([]);
+    };
+    const submitQueue = () => {
+      const form = queueForm(page), button = buttonWith(form, '保存排队设置');
+      assert.equal(button.type, 'submit');
+      assert.equal(button.disabled, false);
+      // The VM has no default click actions. A submit button dispatches its form's submit event.
+      form.onsubmit({submitter: button, preventDefault() {}});
+      return page.context.lastAction;
+    };
+    const fields = () => {
+      const form = queueForm(page);
+      return [form.children[0].children[0], form.children[1].children[0]];
+    };
+    const values = () => fields().map(field => field.type === 'checkbox' ? field.checked : field.value);
+    const navigate = async () => {
+      if (scenario.endsWith('reopen')) page.context.closeTaskDetail();
+      await openExperienceTask(page, scenario.endsWith('reopen') ? task : other);
+      page.context.toast('当前详情提示');
+    };
+    await openExperienceTask(page, task);
+    fields()[0].value = 'parent'; fields()[1].checked = true;
+    const submitted = submitQueue();
+    if (writeFails && scenario.includes('after')) await navigate();
+    finishWrite();
+    if (!writeFails) {
+      await waitFor(() => finishRefresh);
+      if (scenario.includes('after')) await navigate();
+      if (scenario.endsWith('with undo')) fields()[1].checked = false;
+      if (scenario === 'discarded refresh') vm.runInContext('view="settings"', page.context);
+      if (scenario === 'refresh timeout') page.fireTimer(15000);
+      else finishRefresh(scenario.startsWith('refresh failure'));
+    }
+    await submitted;
+    const notice = page.node('detail-live-status'), toast = page.node('toast');
+    const error = queueForm(page).querySelector('[data-form-error]');
+    t.diagnostic(JSON.stringify({posts: posts.length, refreshes, saved: metadata.urgency === 1,
+      toast: toast.textContent, formError: error?.textContent, retry: !notice.hidden}));
+    assert.deepEqual(posts, [{task: task.id, dependency: 'parent', urgency: 1}]);
+    assert.equal(refreshes, writeFails ? 0 : 1);
+    assert.equal(buttonWith(queueForm(page), '保存排队设置').disabled, false);
+    if (scenario.includes('after')) {
+      assert.equal(toast.textContent, '当前详情提示');
+      assert.equal(notice.hidden, true);
+      assert.equal(error, undefined);
+      return;
+    }
+    if (writeFails) {
+      assert.equal(metadata, task);
+      assert.equal(error?.textContent, '操作未完成，请稍后重试。');
+      assert.equal(toast.className, 'error');
+      assert.equal(notice.hidden, true);
+      assert.deepEqual(values(), ['parent', true]);
+      return;
+    }
+    assert.equal(toast.textContent, '排队设置已保存');
+    assert.equal(toast.className, '');
+    assert.equal(error, undefined);
+    if (scenario === 'success') assert.equal(page.node('connection').textContent, '已连接');
+    if (scenario === 'refresh timeout') assert.equal(page.node('connection').textContent, '连接超时');
+    if (scenario === 'discarded refresh') assert.equal(vm.runInContext('state.tasks', page.context), undefined);
+    if (!scenario.startsWith('refresh failure')) {
+      assert.equal(notice.hidden, true);
+      assert.deepEqual(values(), ['parent', true]);
+      return;
+    }
+    assert.equal(notice.hidden, false);
+    assert.match(notice.children[0].textContent, /实时刷新中断/);
+    const readsBeforeRetry = detailReads, undo = scenario.endsWith('with undo');
+    if (undo) metadata = {...metadata, dependency: {dependency: 'second-parent'}, updated: 3};
+    buttonWith(notice, '重试').handlers.click();
+    await page.context.lastAction;
+    await new Promise(setImmediate);
+    assert.ok(detailReads > readsBeforeRetry);
+    assert.equal(posts.length, 1, 'detail recovery only reads');
+    assert.equal(notice.hidden, true);
+    assert.deepEqual(values(), [undo ? 'second-parent' : 'parent', !undo]);
+    if (undo) {
+      finishRefresh = null;
+      const later = submitQueue();
+      assert.deepEqual(posts[1], {task: task.id, dependency: 'second-parent', urgency: 0});
+      finishWrite();
+      await waitFor(() => finishRefresh);
+      finishRefresh();
+      await later;
+      assert.equal(metadata.urgency, 0);
+      assert.equal(toast.textContent, '排队设置已保存');
     }
   });
 }
@@ -3487,14 +5322,39 @@ test('an active run stopping error explains when retry and supplement become ava
   await assert.rejects(page.context.api('retry', {task: 'child'}), /任务仍在停止中，请等当前运行结束后再重试或补充需求。/);
 });
 
-function modelScopePage(savedDrafts = new Map()) {
-  const page=browser(),posts=[],globals={planning:{provider:'ollama',model:'scope-coder',effort:'medium',fallback:null}},overrides=new Map([['a',structuredClone(globals)],['b',{}]]);
+function modelScopePage(savedDrafts = new Map(), {connections=false,renderRoutes=false} = {}) {
+  const page=browser(new Map(),connections?({document,window})=>{
+    window.scrollTo=()=>{};
+    const buttons=(attribute,values)=>values.map(value=>{
+      const button=document.getElementById('model-test-'+attribute+'-'+value);button.dataset[attribute]=value;return button;
+    });
+    const selectors={
+      '[data-view]':buttons('view',['models','overview']),
+      '[data-settings-scope]':buttons('settingsScope',['project','global']),
+      '.view':['models','overview'].map(value=>document.getElementById('view-'+value))
+    };
+    document.querySelectorAll=selector=>selectors[selector]||[];
+  }:null),posts=[],globals={planning:{provider:'ollama',model:'scope-coder',effort:'medium',fallback:null}},overrides=new Map([['a',structuredClone(globals)],['b',{}]]);
   let release,held=false,holdNext=false,probeFailure=false;
   const effective=project=>({...structuredClone(globals),...structuredClone(overrides.get(project)||{})});
-  const modelSnapshot=project=>({project,models:effective(project),global_models:structuredClone(globals),overrides:structuredClone(overrides.get(project)||{}),providers:[{id:'ollama',name:'Ollama',protocol:'ollama',catalog:{models:[{id:'scope-coder',name:'Scope coder'}]}}]});
+  const providers=[{id:'ollama',name:'Ollama',protocol:'ollama',health:{},catalog:{models:[{id:'scope-coder',name:'Scope coder'}]}}];
+  if(connections)providers.push({id:'openai',name:'OpenAI',health:{},catalog:{models:[{id:'other-coder',name:'Other coder'}]}});
+  const modelSnapshot=project=>({project,models:effective(project),global_models:structuredClone(globals),overrides:structuredClone(overrides.get(project)||{}),providers:structuredClone(providers)});
   page.context.english={};page.context.window.addEventListener=()=>{};
-  const tab=page.node('model-tab');tab.dataset.mcTab='roles';tab.parentElement=page.node('model-tabs');
-  page.document.querySelectorAll=selector=>selector==='[data-mc-tab]'?[tab]:[];
+  if(!connections)Object.assign(page.context.location,{href:'http://localhost/#modelTab=roles',hash:'#modelTab=roles'});
+  const tabs=(connections?['providers','roles']:['roles']).map(name=>{
+    const tab=page.node('model-tab-'+name);tab.dataset.mcTab=name;tab.parentElement=page.node('model-tabs');return tab;
+  });
+  const querySelectorAll=page.document.querySelectorAll;
+  page.document.querySelectorAll=selector=>selector==='[data-mc-tab]'?tabs:querySelectorAll(selector);
+  if(connections){
+    page.document.body=page.node('body');
+    page.node('config-scope').value='project';
+    page.node('mc-scope').querySelector=()=>page.node('model-test-project-option');
+    page.node('toast').hidden=true;
+    page.context.renderNavigation=()=>{};
+    page.context.safe=fn=>{page.context.lastAction=page.context.originalSafe(fn);return page.context.lastAction;};
+  }
   for(const id of ['view-models','mc-provider-list','mc-model-list','mc-role-list','mc-extra-role-list'])page.node(id).removeAttribute=()=>{};
   page.node('mc-probe-effort').querySelector=()=>page.node('mc-probe-effort').children[0];
   page.context.window.RSIDraftStore={get:(_type,key)=>structuredClone(savedDrafts.get(key)),set:(_type,key,value)=>savedDrafts.set(key,structuredClone(value)),remove:(_type,key)=>savedDrafts.delete(key)};
@@ -3505,14 +5365,23 @@ function modelScopePage(savedDrafts = new Map()) {
       overrides.set(body.project,Object.fromEntries(Object.entries(body.models).filter(([role,route])=>!body.inherit?.includes(role)&&JSON.stringify(route)!==JSON.stringify(globals[role]))));
       return {saved:true,models:effective(body.project)};
     }
-    if(path==='model-center/probe'){if(probeFailure)throw Object.assign(new Error('Probe failed'),{code:'probe_failed'});return {calls:[{tokens:1}]};}
+    if(path==='model-center/probe'){if(probeFailure)throw Object.assign(new Error('Probe failed'),{code:probeFailure});return {calls:[{tokens:1}]};}
     if(path.startsWith('model-center'))return modelSnapshot(path.includes('?')?decodeURIComponent(path.split('=')[1]):null);
     throw new Error('Unexpected model request '+path);
   };
   page.context.refresh=async()=>{};
+  if(renderRoutes){
+    Object.assign(providers[0].catalog.models[0],{enabled:true,efforts:['low','medium','high']});
+    providers[1].catalog.models[0].enabled=true;
+    for(const role of ['analysis','implementation','review','evolution'])globals[role]=structuredClone(globals.planning);
+    for(const id of ['mc-fallback-provider','mc-fallback-model'])page.node(id).tagName='SELECT';
+    for(const id of ['mc-advanced-effort','mc-fallback-effort'])page.node(id).querySelector=()=>page.node(id).children[0];
+    page.context.history={state:null};
+  }
   const modelSource=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/model-center.js'),'utf8');
-  // Keep production loading, saving, draft persistence and event handlers; omit unrelated catalog rendering.
-  const instrumented=modelSource.replace('  init();',`  render=renderRoles=()=>{updateDirty();persistRouteDraft();};
+  // Keep production loading, saving, draft persistence and event handlers.
+  const stubRendering=renderRoutes?'':`${connections?'':'render='}renderRoles=()=>{updateDirty();persistRouteDraft();};`;
+  const instrumented=modelSource.replace('  init();',`  ${stubRendering}
   window.modelScopeTest={openProbe:()=>openProbe(data.providers[0],data.providers[0].catalog.models[0]),otherProbe:()=>openProbe({id:'ollama',name:'Ollama'},{id:'other-coder',name:'Other coder'}),edit:effort=>{routes().planning.effort=effort;renderRoles();},draft:()=>structuredClone(routes())};
   init();`);
   vm.runInContext(instrumented,page.context);
@@ -3523,9 +5392,227 @@ function modelScopePage(savedDrafts = new Map()) {
     draft(){return page.context.window.modelScopeTest.draft();},
     openProbe(){page.context.window.modelScopeTest.openProbe();},
     otherProbe(){page.context.window.modelScopeTest.otherProbe();},
-    hold(){holdNext=true;},failProbe(){probeFailure=true;},release(){assert(held);release();}
+    hold(){holdNext=true;},failProbe(code='probe_failed'){probeFailure=code;},release(){assert(held);release();}
   };
 }
+
+async function providerRemovalPage(){
+  const page=modelScopePage(new Map(),{connections:true}),requests=[],removed=new Set();
+  const api=page.context.api;
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/remove'){
+      const result=await new Promise((resolve,reject)=>requests.push({body:structuredClone(body),resolve,reject}));
+      if(result?.removed)removed.add(`${body.project}:${body.provider}`);
+      return result;
+    }
+    const result=await api(path,body,options);
+    if(!body)result.providers=result.providers
+      .map((provider,index)=>({...provider,id:`fixture-${index}`,name:`Fixture ${index}`}))
+      .filter(provider=>!removed.has(`${result.project}:${provider.id}`));
+    return result;
+  };
+  page.context.history={state:null};
+  const navigate=async(project)=>{
+    page.context.location.hash=`#view=models&project=${project}&scope=project&modelTab=providers`;
+    page.context.location.href='http://localhost/'+page.context.location.hash;
+    page.windowListeners.get('hashchange')();
+    await page.context.lastAction;
+    await new Promise(setImmediate);
+  };
+  await navigate('a');
+  return {...page,requests,navigate,
+    confirm(value){
+      const box=page.document.body.children.find(node=>node.className==='confirm-dialog'&&node.open);
+      box.children.at(-1).children[value?1:0].handlers.click();
+    },
+    provider(name){page.node('mc-provider-list').children.find(button=>button.attributes['aria-label']===name).handlers.click();},
+    project(id){page.node('project-select').value=id;page.node('project-select').handlers.change();return page.context.lastAction;},
+    remove(){return page.click('mc-remove-provider');},
+    feedback(){return page.node('mc-feedback').textContent;}
+  };
+}
+
+const providerRemovalTransitions={
+  'provider switch':page=>page.provider('Fixture 1'),
+  'project switch':page=>page.project('b'),
+  'history back':page=>page.navigate('b')
+};
+
+for(const [name,transition] of Object.entries(providerRemovalTransitions))test(`model provider removal discards a pending confirmation after ${name}`,async()=>{
+  const page=await providerRemovalPage(),pending=page.remove();
+  await transition(page);
+  page.confirm(true);
+  await new Promise(setImmediate);
+  assert.deepEqual(page.requests.map(request=>request.body),[]);
+  await pending;
+});
+
+test('model provider removal sends one scoped POST and keeps the fallback selection',async()=>{
+  const page=await providerRemovalPage(),pending=page.remove();
+  const repeatedConfirmation=page.remove();
+  assert.equal(page.document.body.children.filter(node=>node.className==='confirm-dialog'&&node.open).length,1);
+  page.confirm(true);
+  await new Promise(setImmediate);
+  const repeatedPost=page.remove();
+  await new Promise(setImmediate);
+  assert.deepEqual(page.requests.map(request=>request.body),[{project:'a',provider:'fixture-0'}]);
+  page.requests[0].resolve({removed:true});
+  await Promise.all([pending,repeatedConfirmation,repeatedPost]);
+  assert.equal(page.feedback(),'连接已移除。');
+  assert.deepEqual(page.node('mc-provider-list').children.map(button=>button.attributes['aria-label']),['Fixture 1']);
+  assert.equal(page.node('mc-provider-list').children[0].attributes['aria-pressed'],'true');
+});
+
+for(const stage of ['catalog read','state refresh'])test(`model provider removal reports acknowledgement when ${stage} fails`,async()=>{
+  const page=await providerRemovalPage(),api=page.context.api,pending=page.remove();
+  page.confirm(true);
+  await new Promise(setImmediate);
+  const failure=new Error('Fixture read failure');
+  if(stage==='catalog read')page.context.api=(path,body)=>body?api(path,body):Promise.reject(failure);
+  else page.context.refresh=async()=>{throw failure;};
+  page.requests[0].resolve({removed:true});
+  await pending;
+  assert.equal(page.feedback(),'连接已移除，但设置刷新失败。请刷新页面核对连接。');
+  assert.equal(page.node('toast').hidden,true);
+  if(stage==='state refresh')assert.equal(page.node('mc-provider-list').children.length,1);
+});
+
+for(const outcome of ['success','rejection'])test(`model provider removal keeps newer feedback after a delayed ${outcome}`,async()=>{
+  const page=await providerRemovalPage(),pending=page.remove();
+  page.confirm(true);
+  await new Promise(setImmediate);
+  assert.deepEqual(page.requests.map(request=>request.body),[{project:'a',provider:'fixture-0'}]);
+  page.provider('Fixture 1');
+  page.node('mc-scope').value='global';
+  await page.node('mc-scope').handlers.change();
+  const api=page.context.api;
+  page.context.api=async(path,body)=>{
+    if(path==='model-center/fetch')throw new Error('Current fixture feedback');
+    return api(path,body);
+  };
+  await page.click('mc-fetch');
+  assert.equal(page.feedback(),'Current fixture feedback');
+  if(outcome==='success')page.requests[0].resolve({removed:true});
+  else page.requests[0].reject(Object.assign(new Error('Fixture rejection'),{code:'provider_in_use'}));
+  await pending;
+  assert.equal(page.feedback(),'Current fixture feedback');
+  assert.equal(page.node('toast').hidden,true);
+});
+
+test('model provider removal requires a positive acknowledgement before refreshing',async()=>{
+  const page=await providerRemovalPage(),pending=page.remove();
+  page.confirm(true);
+  await new Promise(setImmediate);
+  let refreshed=false;
+  page.context.refresh=async()=>{refreshed=true;};
+  page.requests[0].resolve({});
+  await pending;
+  assert.equal(refreshed,false);
+  assert.equal(page.feedback(),'无法确认连接是否已移除。请先刷新页面核对连接。');
+  assert.equal(page.node('mc-provider-list').children.length,2);
+});
+
+test('model provider removal preserves cancel, confirmation failure and backend rejection',async()=>{
+  const page=await providerRemovalPage(),cancelled=page.remove();
+  page.confirm(false);
+  await cancelled;
+  assert.equal(page.requests.length,0);
+  const confirm=page.context.uiConfirm;
+  page.context.uiConfirm=()=>Promise.reject(new Error('Fixture confirmation failed'));
+  await page.remove();
+  assert.equal(page.requests.length,0);
+  assert.equal(page.node('toast').textContent,'Fixture confirmation failed');
+  page.context.uiConfirm=confirm;
+  const pending=page.remove();
+  page.confirm(true);
+  await new Promise(setImmediate);
+  assert.equal(page.requests.length,1);
+  page.requests[0].reject(Object.assign(new Error('Fixture rejection'),{code:'provider_in_use'}));
+  await pending;
+  assert.equal(page.feedback(),'此连接仍被角色或备用模型使用，请先更换相关配置。');
+  assert.equal(page.node('toast').textContent,page.feedback());
+  assert.equal(page.node('mc-provider-list').children.length,2);
+  assert.equal(page.node('mc-remove-provider').disabled,false);
+});
+
+async function diagnosisPage(){
+  const page=modelScopePage(new Map(),{connections:true}),requests=[];
+  const api=page.context.api;
+  page.context.api=(path,body,options)=>path==='model-center/diagnose'
+    ?new Promise((resolve,reject)=>requests.push({body:structuredClone(body),resolve,reject}))
+    :api(path,body,options);
+  const click=id=>page.node(id).handlers.click();
+  const provider=name=>page.node('mc-provider-list').children.find(button=>button.attributes['aria-label']===name).handlers.click();
+  const project=id=>{page.node('project-select').value=id;page.node('project-select').handlers.change();};
+  click('model-test-view-models');await page.context.lastAction;
+  assert.equal(page.node('toast').textContent,'');
+  await provider('Ollama');
+  return {...page,requests,click,provider,project,
+    diagnose:()=>page.node('mc-diagnostics').onclick(),
+    dialogs:()=>page.document.body.children.filter(node=>node.tagName==='DIALOG'&&node.open)
+  };
+}
+
+const diagnosisTransitions={
+  'scope switch while loading':page=>{
+    const api=page.context.api;
+    let release;
+    page.context.api=async(path,...args)=>{
+      if(path==='model-center')await new Promise(resolve=>{release=resolve;});
+      return api(path,...args);
+    };
+    page.click('model-test-settingsScope-global');
+    assert.equal(page.node('mc-provider-name').textContent,'正在读取配置…');
+    const loading=page.context.lastAction;
+    return async()=>{release();await loading;};
+  },
+  'project round trip':async page=>{page.project('b');page.project('a');await new Promise(setImmediate);},
+  'provider switch':page=>page.provider('OpenAI'),
+  'provider round trip':async page=>{await page.provider('OpenAI');await page.provider('Ollama');},
+  'connection tab switch':page=>page.click('model-tab-roles'),
+  'connection tab round trip':page=>{page.click('model-tab-roles');page.click('model-tab-providers');},
+  'leaving the page':page=>page.click('model-test-view-overview'),
+  'returning to the page':async page=>{page.click('model-test-view-overview');page.click('model-test-view-models');await page.context.lastAction;}
+};
+for(const [name,transition] of Object.entries(diagnosisTransitions))for(const failure of [false,true]){
+  test(`read-only diagnosis discards stale ${failure?'failure':'success'} after ${name}`,async()=>{
+    const page=await diagnosisPage(),pending=page.diagnose();
+    assert.deepEqual(page.requests.map(request=>request.body),[{provider:'ollama',model:'scope-coder',project:'a'}]);
+    const finishTransition=await transition(page);
+    if(failure)page.requests[0].reject(new Error('Old diagnosis error'));
+    else page.requests[0].resolve({result:'old'});
+    await pending;
+    await finishTransition?.();
+    assert.equal(page.dialogs().length,0);
+    assert.equal(page.node('toast').hidden,true);
+    assert.equal(page.requests.length,1);
+  });
+}
+
+for(const failure of [false,true])test(`read-only diagnosis keeps current ${failure?'failure':'success'} after a repeated click and refresh`,async()=>{
+  const page=await diagnosisPage(),old=page.diagnose(),current=page.diagnose();
+  await page.show('a');
+  assert.deepEqual(page.requests.map(request=>request.body),Array(2).fill({provider:'ollama',model:'scope-coder',project:'a'}));
+  if(failure)page.requests[1].reject(Object.assign(new Error('Current diagnosis error'),{requestId:'diag-current'}));
+  else page.requests[1].resolve({result:'current'});
+  await current;
+  const dialog=page.dialogs()[0];
+  if(failure){
+    assert.equal(page.dialogs().length,0);
+    assert.equal(page.node('toast').textContent,'Current diagnosis error');
+    assert.equal(page.node('toast').className,'error');
+    assert.equal(page.node('toast').children.at(-1).textContent,'复制诊断标识');
+    page.requests[0].resolve({result:'old'});
+  }else{
+    assert.equal(page.dialogs().length,1);
+    assert.deepEqual(JSON.parse(dialog.children.at(-1).textContent),{result:'current'});
+    page.requests[0].reject(new Error('Old diagnosis error'));
+  }
+  await old;
+  assert.equal(page.dialogs().length,failure?0:1);
+  assert.equal(page.node('toast').hidden,!failure);
+  assert.equal(page.node('toast').textContent,failure?'Current diagnosis error':'');
+});
 
 test('Magpie preset fills the local OpenAI-compatible gateway without a credential', async()=>{
   const page=modelScopePage();await page.show('a');
@@ -3537,15 +5624,622 @@ test('Magpie preset fills the local OpenAI-compatible gateway without a credenti
   assert.equal(page.node('mc-input-auth').value,'none');
 });
 
+async function customModelPage(){
+  const page=modelScopePage(new Map(),{connections:true});
+  const form=page.node('mc-custom-form'),dialog=page.node('mc-custom-dialog'),button=page.node('custom-submit');
+  const id=page.node('mc-custom-id'),name=page.node('mc-custom-name'),error=page.node('mc-custom-error');
+  form.querySelector=selector=>selector==='button[type="submit"]'?button:null;
+  form.reset=()=>{id.value='';name.value='';page.listeners.get('reset')({target:form});};
+  dialog.tagName='DIALOG';dialog.querySelector=()=>form;
+  page.click('model-test-view-models');await page.context.lastAction;
+  const provider=label=>page.node('mc-provider-list').children.find(item=>item.attributes['aria-label']===label).handlers.click();
+  provider('Ollama');
+  const api=page.context.api,requests=[],reads=[];
+  let nextRead;
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/model')return new Promise((resolve,reject)=>requests.push({body:structuredClone(body),resolve,reject}));
+    if(path==='model-center'||path.startsWith('model-center?')){
+      reads.push(path);
+      const beforeRead=nextRead;nextRead=null;
+      if(beforeRead)await beforeRead();
+    }
+    return api(path,body,options);
+  };
+  return {...page,dialog,button,id,name,error,requests,reads,provider,
+    open(modelId,displayName=''){page.click('mc-add-model');id.value=modelId;name.value=displayName;page.input(id.id,form.id);},
+    close(){dialog.close();page.listeners.get('close')({target:dialog});},
+    submit(){return page.submit(form.id);},
+    beforeRead(fn){nextRead=fn;}
+  };
+}
+
 for(const length of [160,161,256])for(const name of ['', '短显示名'])test(`custom model form preserves ${length}-character ID with ${name?'explicit':'blank'} name`,async()=>{
-  const page=modelScopePage();await page.show('a');
-  page.node('mc-custom-form').querySelector=()=>page.node('custom-submit');
-  page.node('mc-custom-dialog').showModal();
-  const id='x'.repeat(length);
-  page.node('mc-custom-id').value=id;page.node('mc-custom-name').value=name;
-  await page.submit('mc-custom-form');
-  assert.deepEqual(page.posts[0],{path:'model-center/model',body:{project:'a',provider:'ollama',model:{id,name,manual:true}}});
-  assert.equal(page.node('mc-custom-dialog').open,false);
+  const page=await customModelPage(),id='x'.repeat(length);
+  page.open(id,name);const pending=page.submit();
+  assert.deepEqual(page.requests[0].body,{project:'a',provider:'ollama',model:{id,name,manual:true}});
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,false);
+});
+
+for(const failure of [false,true])test(`custom model form ignores stale ${failure?'failure':'success'} after reopening with the same inputs`,async()=>{
+  const page=await customModelPage();page.open('fixture-model','Fixture');const pending=page.submit();
+  page.close();page.open('fixture-model','Fixture');
+  if(failure)page.requests[0].reject(new Error('Old POST failed'));
+  else page.requests[0].resolve({});
+  await pending;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.id.value,'fixture-model');
+  assert.equal(page.name.value,'Fixture');
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.button.disabled,false);
+  assert.deepEqual(page.reads,failure?[]:['model-center?project=a']);
+});
+
+for(const target of ['same','provider','scope'])test(`custom model form keeps a reopened ${target} submission pending when the previous POST finishes`,async()=>{
+  const page=await customModelPage();page.open('fixture-model');const old=page.submit();page.close();
+  if(target==='provider')page.provider('OpenAI');
+  if(target==='scope'){page.click('model-test-settingsScope-global');await page.context.lastAction;}
+  page.open('fixture-model');
+  assert.equal(page.button.disabled,false,'a reopened form can submit independently');
+  const current=page.submit();page.submit();
+  assert.deepEqual(page.requests.map(request=>request.body),[
+    {project:'a',provider:'ollama',model:{id:'fixture-model',name:'',manual:true}},
+    {project:target==='scope'?null:'a',provider:target==='provider'?'openai':'ollama',model:{id:'fixture-model',name:'',manual:true}}
+  ]);
+  const reads=page.reads.length;
+  page.requests[0].resolve({});await old;
+  assert.deepEqual(page.reads.slice(reads),target==='scope'?[]:['model-center?project=a']);
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.button.disabled,true);
+  page.requests[1].reject(new Error('Current POST failed'));await current;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.error.textContent,'Current POST failed');
+  assert.equal(page.button.disabled,false);
+});
+
+for(const failure of [false,true])test(`custom model form preserves real drafts after ${failure?'a POST failure':'a successful POST'}`,async()=>{
+  const page=await customModelPage();page.edit('high');page.open('fixture-model');const pending=page.submit();
+  page.name.value='New draft';page.input(page.name.id,'mc-custom-form');
+  if(failure)page.requests[0].reject(new Error('Outdated draft error'));
+  else page.requests[0].resolve({});
+  await pending;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.name.value,'New draft');
+  assert.equal(page.draft().planning.effort,'high');
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.button.disabled,false);
+  assert.deepEqual(page.reads,failure?[]:['model-center?project=a']);
+});
+
+test('custom model form stays closed and still refreshes the catalog after a late save',async()=>{
+  const page=await customModelPage();page.open('fixture-model');const pending=page.submit();page.close();
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,false);
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.deepEqual(page.reads,['model-center?project=a']);
+});
+
+test('custom model form reports a saved model separately from a failed catalog read',async()=>{
+  const page=await customModelPage();page.open('fixture-model');const pending=page.submit();
+  page.beforeRead(()=>{throw new Error('Fixture snapshot read failed');});
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,false);
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.node('mc-feedback').textContent,'模型已保存，但模型列表刷新失败。');
+  assert.deepEqual(page.reads,['model-center?project=a']);
+});
+
+test('custom model form ignores a late catalog read failure after reopening',async()=>{
+  const page=await customModelPage();page.open('fixture-model');const saved=page.submit();
+  let rejectRead;
+  page.beforeRead(()=>new Promise((_,reject)=>{rejectRead=reject;}));
+  page.requests[0].resolve({});await waitFor(()=>rejectRead);
+  assert.equal(page.dialog.open,false);
+  page.open('new-fixture-model');const current=page.submit();
+  page.requests[1].reject(new Error('Current POST failed'));await current;
+  rejectRead(new Error('Old snapshot read failed'));await saved;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.id.value,'new-fixture-model');
+  assert.equal(page.error.textContent,'Current POST failed');
+  assert.equal(page.button.disabled,false);
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+});
+
+async function modelPricePage(){
+  const page=modelScopePage(new Map(),{connections:true});
+  const form=page.node('mc-price-form'),dialog=page.node('mc-price-dialog'),button=page.node('price-submit');
+  const error=page.node('mc-price-error'),requests=[],reads=[],api=page.context.api;
+  const catalogPrice={unit_price:5,prices:{input:1,output:2,cache_read:0.5,cache_write:3}};
+  let nextRead;
+  form.querySelector=selector=>selector==='button[type="submit"]'?button:null;
+  dialog.tagName='DIALOG';dialog.querySelector=()=>form;
+  page.context.safe=(fn,form)=>{page.context.lastAction=page.context.originalSafe(fn,form);return page.context.lastAction;};
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/model')return new Promise((resolve,reject)=>requests.push({body:structuredClone(body),resolve,reject}));
+    if(path==='model-center'||path.startsWith('model-center?')){
+      reads.push(path);
+      const beforeRead=nextRead;nextRead=null;
+      if(beforeRead)await beforeRead();
+      const snapshot=await api(path,body,options);
+      for(const provider of snapshot.providers)Object.assign(provider.catalog.models[0],structuredClone(catalogPrice));
+      return snapshot;
+    }
+    return api(path,body,options);
+  };
+  page.node('mc-model-filter').value='all';
+  page.click('model-test-view-models');await page.context.lastAction;
+  const provider=label=>page.node('mc-provider-list').children.find(item=>item.attributes['aria-label']===label).handlers.click();
+  provider('Ollama');reads.length=0;
+  return {...page,dialog,button,error,requests,reads,provider,
+    open(){
+      const actions=page.node('mc-model-list').children[0].children[1].children[1].children[1];
+      actions.children.find(action=>action.textContent==='估算价格').handlers.click();
+    },
+    close(){dialog.close();page.listeners.get('close')({target:dialog});},
+    change(field,value){const id='mc-price-'+field;page.node(id).value=value;page.input(id,form.id);},
+    submit(){return page.submit(form.id);},
+    beforeRead(fn){nextRead=fn;}
+  };
+}
+
+for(const target of ['same','provider','scope'])test(`model price form keeps a reopened ${target} submission independent`,async()=>{
+  const page=await modelPricePage();page.open();page.change('output','4');const old=page.submit();page.close();
+  if(target==='provider')page.provider('OpenAI');
+  if(target==='scope'){page.click('model-test-settingsScope-global');await page.context.lastAction;}
+  page.open();
+  assert.equal(page.button.disabled,false,'a reopened price form can submit independently');
+  page.change('cache-write','0');const current=page.submit();await page.submit();
+  assert.deepEqual(page.requests.map(request=>request.body),[
+    {project:'a',provider:'ollama',model:{id:'scope-coder',prices:{output:4}}},
+    {project:target==='scope'?null:'a',provider:target==='provider'?'openai':'ollama',
+      model:{id:target==='provider'?'other-coder':'scope-coder',prices:{cache_write:0}}}
+  ]);
+  page.reads.length=0;
+  page.requests[0].resolve({});await old;
+  assert.deepEqual(page.reads,target==='scope'?[]:['model-center?project=a']);
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.button.disabled,true);
+  assert.equal(page.error.textContent,'');
+  page.requests[1].reject(new Error('Current price POST failed'));await current;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.node('mc-price-cache-write').value,'0');
+  assert.equal(page.error.textContent,'Current price POST failed');
+  assert.equal(page.button.disabled,false);
+});
+
+for(const transition of ['reopening','editing','provider round trip','scope round trip'])test(`model price form ignores a rejected POST after ${transition}`,async()=>{
+  const page=await modelPricePage();page.open();page.change('output','4');const pending=page.submit();
+  if(transition==='reopening'){page.close();page.open();page.change('output','4');}
+  if(transition==='editing')page.change('output','6');
+  if(transition==='provider round trip'){page.provider('OpenAI');page.provider('Ollama');}
+  if(transition==='scope round trip'){
+    page.click('model-test-settingsScope-global');await page.context.lastAction;
+    page.click('model-test-settingsScope-project');await page.context.lastAction;
+  }
+  page.reads.length=0;
+  page.requests[0].reject(new Error('Old price POST failed'));await pending;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.node('mc-price-output').value,transition==='editing'?'6':'4');
+  assert.equal(page.button.disabled,false);
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.deepEqual(page.reads,[]);
+});
+
+test('model price form skips unchanged prices and sends only changed fields and explicit clears',async()=>{
+  const page=await modelPricePage();page.open();await page.submit();
+  assert.equal(page.dialog.open,false);
+  assert.deepEqual(page.requests,[]);
+  assert.deepEqual(page.reads,[]);
+  page.open();page.change('input','');page.change('input-tokens','0');page.change('cache-read','');
+  const pending=page.submit();await page.submit();
+  assert.deepEqual(page.requests.map(request=>request.body),[
+    {project:'a',provider:'ollama',model:{id:'scope-coder',unit_price:null,prices:{input:0,cache_read:null}}}
+  ]);
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,false);
+  assert.deepEqual(page.reads,['model-center?project=a']);
+});
+
+test('model price form preserves edits after saving and can restore a previously submitted field',async()=>{
+  const page=await modelPricePage();page.open();page.change('output','4');const pending=page.submit();
+  page.change('output','2');page.change('input','7');
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.node('mc-price-output').value,'2');
+  assert.equal(page.node('mc-price-input').value,'7');
+  assert.equal(page.button.disabled,false);
+  assert.deepEqual(page.reads,['model-center?project=a']);
+  const current=page.submit();
+  assert.deepEqual(page.requests[1].body,{project:'a',provider:'ollama',model:{id:'scope-coder',unit_price:7,prices:{output:2}}});
+  page.requests[1].resolve({});await current;
+  assert.equal(page.dialog.open,false);
+});
+
+test('model price form reports saved pricing separately from a failed catalog read',async()=>{
+  const page=await modelPricePage();page.open();page.change('output','4');const pending=page.submit();
+  page.beforeRead(()=>{throw new Error('Fixture price catalog read failed');});
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,false);
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.node('mc-feedback').textContent,'估算价格已保存，但模型列表刷新失败。');
+  assert.deepEqual(page.reads,['model-center?project=a']);
+});
+
+test('model price form ignores a late catalog read failure after reopening',async()=>{
+  const page=await modelPricePage();page.open();page.change('output','4');const saved=page.submit();
+  let rejectRead;
+  page.beforeRead(()=>new Promise((_,reject)=>{rejectRead=reject;}));
+  page.requests[0].resolve({});await waitFor(()=>rejectRead);
+  assert.equal(page.dialog.open,false);
+  page.open();assert.equal(page.button.disabled,false);
+  page.change('cache-read','1');const current=page.submit();
+  page.requests[1].reject(new Error('New price POST failed'));await current;
+  rejectRead(new Error('Old price catalog read failed'));await saved;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.node('mc-price-cache-read').value,'1');
+  assert.equal(page.error.textContent,'New price POST failed');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+});
+
+async function modelCapabilityPage(){
+  const page=modelScopePage(new Map(),{connections:true}),requests=[],reads=[];
+  const baseApi=page.context.api,getElementById=page.document.getElementById;
+  const find=(element,id)=>element.id===id?element:element.children?.map(child=>find(child,id)).find(Boolean);
+  page.document.getElementById=id=>id.startsWith('mc-capability-')
+    ?find(page.document.body,id)||null:getElementById(id);
+  const node=id=>page.document.getElementById('mc-capability-'+id);
+  const manual={source:'manual',context_tokens:64000,max_output_tokens:4096,source_url:'https://fixture.invalid/model',note:'original'};
+  let capabilities=manual,nextRead;
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/model')return new Promise((resolve,reject)=>requests.push({body:structuredClone(body),resolve,reject}));
+    if(path==='model-center'||path.startsWith('model-center?')){
+      reads.push(path);
+      const beforeRead=nextRead;nextRead=null;
+      if(beforeRead)await beforeRead();
+      const snapshot=await baseApi(path,body,options);
+      snapshot.providers[0].catalog.models[0].capabilities=structuredClone(capabilities);
+      return snapshot;
+    }
+    return baseApi(path,body,options);
+  };
+  page.node('mc-model-filter').value='all';
+  page.click('model-test-view-models');await page.context.lastAction;
+  page.node('mc-provider-list').children.find(button=>button.attributes['aria-label']==='Ollama').handlers.click();
+  reads.length=0;
+  return {...page,requests,reads,field:node,
+    open(){
+      const menu=page.node('mc-model-list').children[0].children[1].children[1].children[1];
+      menu.children.find(action=>action.textContent==='能力元数据').handlers.click();
+    },
+    close(){node('form').children[0].children[1].handlers.click();},
+    change(field,value){const target=node(field);target.value=value;target.form=node('form');page.listeners.get('input')({target});},
+    run(action){
+      if(action==='clear')node('clear').handlers.click();
+      else node('form').handlers.submit({target:node('form'),preventDefault(){}});
+      return page.context.lastAction;
+    },
+    beforeRead(fn){nextRead=fn;},
+    catalog(value){capabilities=value;}
+  };
+}
+
+test('model capability form validates limits and links and submits only changed fields',async()=>{
+  const page=await modelCapabilityPage();page.open();
+  const link=page.field('summary').children.at(-1);
+  assert.equal(link.href,'https://fixture.invalid/model');
+  assert.equal(link.rel,'noreferrer noopener');
+  await page.run('save');
+  assert.equal(page.field('dialog').open,false);
+  page.open();page.change('context','1.5');await page.run('save');
+  assert.equal(page.field('error').textContent,'请输入正整数 token 数量。');
+  page.change('context','1024');await page.run('save');
+  assert.equal(page.field('error').textContent,'输出上限不能超过上下文上限。');
+  page.change('context','64000');page.change('source-url','ftp://fixture.invalid');await page.run('save');
+  assert.equal(page.field('error').textContent,'来源链接必须是 http(s) 地址。');
+  assert.deepEqual(page.requests,[]);
+  page.change('source-url','');page.change('note',' updated ');const pending=page.run('save');
+  assert.deepEqual(page.requests[0].body,{project:'a',provider:'ollama',model:{id:'scope-coder',capability_override:{source_url:null,note:'updated'}}});
+  page.requests[0].resolve({saved:true});await pending;
+  assert.equal(page.field('dialog').open,false);
+  assert.equal(page.node('mc-feedback').textContent,'模型能力元数据已保存。');
+});
+
+for(const action of ['save','clear']){
+  test(`model capability form waits for the rendered catalog before closing after ${action}`,async()=>{
+    const page=await modelCapabilityPage();
+    if(action==='save'){
+      page.catalog({source:'conservative_default',context_tokens:32000,max_output_tokens:2048});
+      await page.context.window.RSIModelCenter.load();
+    }
+    const rowStatus=()=>descendants(page.node('mc-model-list').children[0]).find(node=>node.tagName==='SMALL').textContent;
+    const before=action==='save'?'保守默认值':'人工覆盖',after=action==='save'?'人工覆盖':'保守默认值';
+    page.open();page.change('note','saved');
+    const dialog=page.field('dialog'),pending=page.run(action);
+    let releaseRead,statusAtClose;
+    page.beforeRead(()=>new Promise(resolve=>{releaseRead=resolve;}));
+    const close=dialog.close.bind(dialog);
+    dialog.close=()=>{statusAtClose=rowStatus();close();};
+    page.catalog({source:action==='save'?'manual':'conservative_default',context_tokens:32000,max_output_tokens:2048});
+    page.requests[0].resolve({saved:true});await waitFor(()=>releaseRead);
+    assert.match(rowStatus(),new RegExp(before));
+    assert.equal(dialog.open,true,'the dialog must stay open while the catalog GET is pending');
+    assert.equal(page.field('save').disabled,true);
+    assert.equal(page.node('mc-feedback').textContent,'');
+    releaseRead();await pending;
+    assert.equal(dialog.open,false);
+    assert.match(statusAtClose,new RegExp(after));
+    assert.equal(page.node('mc-feedback').textContent,action==='save'?'模型能力元数据已保存。':'已清除人工能力覆盖。');
+  });
+
+  test(`model capability form preserves edits during the catalog read after ${action}`,async()=>{
+    const page=await modelCapabilityPage();page.open();
+    if(action==='save')page.change('context','65000');
+    const pending=page.run(action);
+    let releaseRead;
+    page.beforeRead(()=>new Promise(resolve=>{releaseRead=resolve;}));
+    page.requests[0].resolve({saved:true});await waitFor(()=>releaseRead);
+    page.change('note','draft');
+    if(action==='save')page.change('context','64000');
+    page.catalog(action==='save'
+      ?{source:'manual',context_tokens:65000,max_output_tokens:4096,note:'original'}
+      :{source:'conservative_default',context_tokens:32000,max_output_tokens:2048});
+    releaseRead();await pending;
+    assert.equal(page.field('dialog').open,true);
+    assert.equal(page.field('note').value,'draft');
+    assert.equal(page.field('context').value,action==='save'?'64000':'32000');
+    assert.equal(page.field('clear').hidden,action==='clear');
+    assert.equal(page.node('mc-feedback').textContent,'');
+    const current=page.run('save');
+    assert.deepEqual(page.requests[1].body.model.capability_override,action==='save'?{context_tokens:64000,note:'draft'}:{note:'draft'});
+    page.requests[1].resolve({saved:true});await current;
+  });
+
+  test(`model capability form ignores an old ${action} rejection after reopening`,async()=>{
+    const page=await modelCapabilityPage();page.open();page.change('note','old');const old=page.run(action);
+    page.close();page.open();page.change('note','new');const current=page.run(action);
+    page.requests[0].reject(new Error('Old capability POST failed'));await old;
+    assert.equal(page.field(action).disabled,true);
+    assert.equal(page.field('error').textContent,'');
+    assert.equal(page.field('note').value,'new');
+    page.requests[1].reject(new Error('Current capability POST failed'));await current;
+    assert.equal(page.field('dialog').open,true);
+    assert.equal(page.field('error').textContent,'Current capability POST failed');
+    assert.equal(page.field('save').disabled,false);
+    assert.equal(page.field('clear').disabled,false);
+    assert.equal(page.node('toast').hidden,true);
+    assert.deepEqual(page.reads,[]);
+  });
+
+  test(`model capability form ignores ${action} feedback after a scope round trip`,async()=>{
+    const page=await modelCapabilityPage();page.open();page.change('note','old');const old=page.run(action);page.close();
+    await page.click('model-test-settingsScope-global');
+    await page.click('model-test-settingsScope-project');
+    page.open();page.change('note','new');const current=page.run(action);page.reads.length=0;
+    page.requests[0].resolve({saved:true});await old;
+    assert.equal(page.field(action).disabled,true);
+    assert.equal(page.field('dialog').open,true);
+    assert.equal(page.field('note').value,'new');
+    assert.equal(page.node('mc-feedback').textContent,'');
+    assert.deepEqual(page.reads,['model-center?project=a']);
+    page.requests[1].resolve({saved:true});await current;
+    assert.equal(page.field('dialog').open,false);
+    assert.equal(page.node('mc-feedback').textContent,action==='save'?'模型能力元数据已保存。':'已清除人工能力覆盖。');
+  });
+
+  test(`model capability form separates a confirmed ${action} from a failed catalog read`,async()=>{
+    const page=await modelCapabilityPage();page.open();page.change('note','new');const pending=page.run(action);
+    if(action==='clear')assert.equal(page.requests[0].body.model.capability_override,null);
+    page.beforeRead(()=>{throw new Error('Fixture capability catalog read failed');});
+    page.requests[0].resolve({saved:true});await pending;
+    assert.equal(page.field('dialog').open,false);
+    assert.equal(page.field('error').textContent,'');
+    assert.equal(page.node('toast').hidden,true);
+    assert.equal(page.node('mc-feedback').textContent,action==='save'
+      ?'模型能力元数据已保存，但模型列表刷新失败。':'已清除人工能力覆盖，但模型列表刷新失败。');
+    assert.deepEqual(page.reads,['model-center?project=a']);
+  });
+
+  test(`model capability form suppresses a ${action} rejection after editing`,async()=>{
+    const page=await modelCapabilityPage();page.open();page.change('note','submitted');const pending=page.run(action);
+    page.change('note','draft');page.requests[0].reject(new Error('Outdated capability POST failed'));await pending;
+    assert.equal(page.field('dialog').open,true);
+    assert.equal(page.field('note').value,'draft');
+    assert.equal(page.field('error').textContent,'');
+    assert.equal(page.field('save').disabled,false);
+    assert.equal(page.field('clear').disabled,false);
+  });
+}
+
+test('model capability form preserves edits after saving and can restore a submitted field',async()=>{
+  const page=await modelCapabilityPage();page.open();page.change('context','65000');const pending=page.run('save');
+  page.change('context','64000');page.change('note','draft');
+  page.catalog({source:'manual',context_tokens:65000,max_output_tokens:4096,source_url:'https://fixture.invalid/model',note:'original'});
+  page.requests[0].resolve({saved:true});await pending;
+  assert.equal(page.field('dialog').open,true);
+  assert.equal(page.field('context').value,'64000');
+  assert.equal(page.field('note').value,'draft');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  const current=page.run('save');
+  assert.deepEqual(page.requests[1].body.model.capability_override,{context_tokens:64000,note:'draft'});
+  page.requests[1].resolve({saved:true});await current;
+});
+
+test('model capability form preserves edits after clearing and uses the refreshed limits',async()=>{
+  const page=await modelCapabilityPage();page.open();const pending=page.run('clear');
+  page.change('note','draft');
+  page.catalog({source:'conservative_default',context_tokens:32000,max_output_tokens:2048});
+  page.requests[0].resolve({saved:true});await pending;
+  assert.equal(page.field('dialog').open,true);
+  assert.equal(page.field('note').value,'draft');
+  assert.equal(page.field('context').value,'32000');
+  assert.equal(page.field('clear').hidden,true);
+  assert.equal(page.node('mc-feedback').textContent,'');
+  const current=page.run('save');
+  assert.deepEqual(page.requests[1].body.model.capability_override,{note:'draft'});
+  page.requests[1].resolve({saved:true});await current;
+});
+
+test('model capability form keeps a new form open after a late catalog read succeeds',async()=>{
+  const page=await modelCapabilityPage();page.open();page.change('note','saved');const old=page.run('save');
+  let releaseRead;
+  page.beforeRead(()=>new Promise(resolve=>{releaseRead=resolve;}));
+  page.requests[0].resolve({saved:true});await waitFor(()=>releaseRead);
+  page.close();page.open();page.change('note','new');const current=page.run('clear');
+  releaseRead();await old;
+  assert.equal(page.field('dialog').open,true);
+  assert.equal(page.field('clear').disabled,true);
+  assert.equal(page.field('note').value,'new');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  page.requests[1].resolve({saved:true});await current;
+  assert.equal(page.field('dialog').open,false);
+});
+
+test('model capability form ignores a late catalog read failure after reopening',async()=>{
+  const page=await modelCapabilityPage();page.open();page.change('note','saved');const old=page.run('save');
+  let rejectRead;
+  page.beforeRead(()=>new Promise((_,reject)=>{rejectRead=reject;}));
+  page.requests[0].resolve({saved:true});await waitFor(()=>rejectRead);
+  if(page.field('dialog').open)page.close();
+  page.open();const current=page.run('clear');
+  page.requests[1].reject(new Error('Current capability POST failed'));await current;
+  rejectRead(new Error('Old capability catalog read failed'));await old;
+  assert.equal(page.field('dialog').open,true);
+  assert.equal(page.field('error').textContent,'Current capability POST failed');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+});
+
+async function providerFormPage({edit=false}={}){
+  const page=modelScopePage(new Map(),{connections:true});await page.show('a');
+  page.node('mc-provider-form').reset=()=>{page.node('mc-provider-preset').value='custom';};
+  page.node('mc-input-auth').querySelector=()=>page.node('keychain-option');
+  page.node(edit?'mc-edit-provider':'mc-add-provider').handlers.click();
+  page.node('mc-input-url').value='https://fixture.invalid/v1';
+  page.node('mc-input-env').value='FIXTURE_KEY';
+  return page;
+}
+
+for(const [stage,expected] of [
+  ['state refresh','连接配置已保存，但设置刷新失败。请刷新页面核对连接。'],
+  ['catalog snapshot','连接配置已保存，但设置刷新失败。请刷新页面核对连接。'],
+  ['catalog fetch','连接配置已保存，但模型目录更新失败。请重试获取模型。'],
+  ['catalog follow-up read','连接配置已保存，但模型目录更新失败。请重试获取模型。']
+])test(`provider form reports a saved connection after ${stage} fails`,async()=>{
+  const page=await providerFormPage(),api=page.context.api;
+  const secret='fixture-secret',failure=new Error(secret+' https://fixture.invalid/private');
+  let fetching=false;
+  page.node('mc-input-key').value=secret;
+  page.node('mc-input-models').value='fixture-model';
+  if(stage==='state refresh')page.context.refresh=async()=>{throw failure;};
+  page.context.api=async(path,body)=>{
+    if(path==='model-center/provider'){await api(path,body);return {id:'ollama'};}
+    if(path==='model-center?project=a'&&(stage==='catalog snapshot'||(fetching&&stage==='catalog follow-up read')))throw failure;
+    const result=await api(path,body);
+    if(path==='model-center/fetch'){fetching=true;if(stage==='catalog fetch')throw failure;}
+    return result;
+  };
+  await page.submit('mc-provider-form');
+  assert.deepEqual(page.posts.map(post=>post.path),['model-center/provider','model-center/model',
+    ...(['catalog fetch','catalog follow-up read'].includes(stage)?['model-center/fetch']:[])]);
+  assert.ok(page.posts.every(({body})=>body.project==='a'));
+  assert.equal(page.node('mc-provider-error').textContent,'');
+  assert.equal(page.node('mc-provider-dialog').open,false);
+  assert.equal(page.node('mc-feedback').textContent,expected);
+  assert.equal(page.node('toast').hidden,true);
+});
+
+test('provider form retains only unfinished custom models after a saved connection',async()=>{
+  const page=await providerFormPage({edit:true}),api=page.context.api;
+  const models=page.node('mc-input-models');models.value='done\nretry\nlater\nretry';
+  page.node('mc-input-auth').value='session';page.node('mc-input-key').value='fixture-key';
+  let failModel=true;
+  page.context.api=async(path,body)=>{
+    const result=await api(path,body);
+    if(path==='model-center/provider')return {id:'openai'};
+    if(failModel&&path==='model-center/model'&&body.model.id==='retry')throw new Error('fixture-key');
+    return result;
+  };
+  await page.submit('mc-provider-form');
+  assert.deepEqual(page.posts.map(({path,body})=>[path,body.project,body.model?.id]),[
+    ['model-center/provider','a',undefined],['model-center/model','a','done'],['model-center/model','a','retry']
+  ]);
+  assert.equal(page.posts[0].body.provider.id,'openai');
+  assert.deepEqual(page.posts[0].body.authentication,{mode:'session',value:'fixture-key'});
+  assert.equal(page.node('mc-input-key').value,'');
+  assert.equal(models.value,'retry\nlater');
+  assert.equal(page.node('mc-provider-dialog').open,true);
+  assert.equal(page.node('mc-provider-submit').disabled,false);
+  assert.equal(page.node('mc-provider-error').textContent,'连接配置已保存。尚未确认添加的自定义模型 ID 已保留，可重试。');
+  assert.equal(page.node('toast').hidden,true);
+  failModel=false;await page.submit('mc-provider-form');
+  assert.deepEqual(page.posts[3].body,{...page.posts[0].body,authentication:{mode:'session',value:''}});
+  assert.deepEqual(page.posts.slice(4).map(({path,body})=>[path,body.project,body.provider,body.model?.id]),[
+    ['model-center/model','a','openai','retry'],['model-center/model','a','openai','later'],['model-center/fetch','a','openai',undefined]
+  ]);
+  assert.equal(page.node('mc-provider-dialog').open,false);
+});
+
+test('provider form keeps its draft when the connection write is unconfirmed',async()=>{
+  const page=await providerFormPage(),api=page.context.api;
+  page.node('mc-input-models').value='unsaved-model';
+  page.node('mc-input-key').value='fixture-key';
+  page.context.api=async(path,body)=>{
+    const result=await api(path,body);
+    if(path==='model-center/provider')throw new Error('fixture-key https://fixture.invalid/private');
+    return result;
+  };
+  await page.submit('mc-provider-form');
+  assert.deepEqual(page.posts.map(post=>post.path),['model-center/provider']);
+  assert.equal(page.node('mc-provider-dialog').open,true);
+  assert.equal(page.node('mc-input-models').value,'unsaved-model');
+  assert.equal(page.node('mc-input-key').value,'');
+  assert.equal(page.node('mc-provider-error').textContent,'无法确认连接配置是否已保存。请先刷新页面核对连接。');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+});
+
+for(const switchScope of [false,true])test(`provider form keeps a newer draft after ${switchScope?'a scope change during refresh':'an earlier catalog fetch fails'}`,async()=>{
+  const page=await providerFormPage(),api=page.context.api,dialog=page.node('mc-provider-dialog');
+  let finish,globalReads=0;
+  page.node('mc-input-models').value='old-model';
+  if(switchScope)page.context.refresh=()=>new Promise(resolve=>{finish=resolve;});
+  page.context.api=async(path,body)=>{
+    if(path==='model-center'&&++globalReads>1)throw new Error('Old refresh read the new scope');
+    const result=await api(path,body);
+    if(path==='model-center/provider')return {id:'ollama'};
+    if(path==='model-center/fetch'&&!switchScope)return new Promise((_,reject)=>{finish=()=>reject(new Error('Old catalog fetch failed'));});
+    return result;
+  };
+  const pending=page.submit('mc-provider-form');await waitFor(()=>finish);
+  if(switchScope){
+    dialog.close();
+    page.node('mc-scope').value='global';page.node('mc-scope').handlers.change();
+    await page.context.lastAction;
+  }
+  page.node('mc-add-provider').handlers.click();
+  page.node('mc-input-name').value='New connection';
+  page.node('mc-input-key').value='new-fixture-key';
+  page.node('mc-input-models').value='new-model';
+  const currentFeedback=page.node('mc-feedback').textContent;
+  finish();await pending;
+  assert.equal(globalReads,switchScope?1:0);
+  assert.deepEqual(page.posts.find(post=>post.path==='model-center/fetch')?.body,{provider:'ollama',project:'a'});
+  assert.equal(dialog.open,true);
+  assert.equal(page.node('mc-input-name').value,'New connection');
+  assert.equal(page.node('mc-input-key').value,'new-fixture-key');
+  assert.equal(page.node('mc-input-models').value,'new-model');
+  assert.equal(page.node('mc-provider-error').textContent,'');
+  assert.equal(page.node('mc-provider-submit').disabled,false);
+  assert.equal(page.node('mc-feedback').textContent,currentFeedback);
+  assert.equal(page.node('toast').hidden,true);
 });
 
 test('provider form sends full custom IDs without inventing truncated display names',async()=>{
@@ -3560,6 +6254,289 @@ test('provider form sends full custom IDs without inventing truncated display na
   page.context.api=async(path,body)=>path==='model-center/provider'?{id:'ollama'}:api(path,body);
   await page.submit('mc-provider-form');
   assert.deepEqual(page.posts.find(post=>post.path==='model-center/model').body.model,{id,manual:true});
+});
+
+async function advancedRoutePage(savedDrafts){
+  const page=modelScopePage(savedDrafts,{connections:true,renderRoutes:true});
+  const navigate=async({view='models',project='a',scope='project',tab='roles'}={})=>{
+    page.context.location.hash=`#view=${view}&project=${project}&scope=${scope}&modelTab=${tab}`;
+    page.context.location.href='http://localhost/'+page.context.location.hash;
+    page.windowListeners.get('hashchange')();
+    await page.context.lastAction;
+    await new Promise(setImmediate);
+  };
+  await navigate();
+  return {...page,navigate,dialog:page.node('mc-advanced-dialog'),
+    openAdvanced(){
+      const planning=page.node('mc-role-list').children.find(row=>descendants(row).some(node=>node.id==='mc-role-model-planning'));
+      descendants(planning).find(node=>node.textContent==='高级参数').handlers.click();
+      assert.equal(page.node('mc-advanced-dialog').open,true);
+    },
+    effort(value){page.node('mc-advanced-effort').querySelector('select').value=value;},
+    fallback(provider,model){
+      page.node('mc-fallback-provider').value=provider;
+      page.node('mc-fallback-provider').handlers.change();
+      page.node('mc-fallback-model').value=model;
+      page.node('mc-fallback-model').handlers.change();
+    }
+  };
+}
+
+const advancedRouteTransitions={
+  'project switch through show':page=>page.show('b'),
+  'global scope through history':page=>page.navigate({scope:'global'}),
+  'tab switch through history':page=>page.navigate({tab:'providers'}),
+  'tab round trip through history':async page=>{await page.navigate({tab:'providers'});await page.navigate();},
+  'page round trip through history':async page=>{await page.navigate({view:'overview'});await page.navigate();}
+};
+for(const [transition,navigate] of Object.entries(advancedRouteTransitions))test(`advanced route form cannot edit a draft after ${transition}`,async()=>{
+  const page=await advancedRoutePage();page.openAdvanced();page.effort('high');page.fallback('openai','other-coder');
+  await navigate(page);
+  const closedOnNavigation=!page.dialog.open;
+  const feedback=page.node('mc-feedback').textContent,dirty=page.node('mc-dirty').textContent;
+  await page.submit('mc-advanced-form');
+  assert.equal(page.draft().planning.effort,'medium');
+  assert.equal(page.draft().planning.fallback,null);
+  assert.equal(page.savedDrafts.size,0);
+  assert.deepEqual(page.posts,[]);
+  assert.equal(page.node('mc-feedback').textContent,feedback);
+  assert.equal(page.node('mc-dirty').textContent,dirty);
+  assert.equal(closedOnNavigation,true);
+});
+
+function routePickerButton(page,role){
+  return descendants(page.node('mc-role-list')).find(node=>node.id==='mc-role-model-'+role);
+}
+
+function routePickerOptions(page){
+  return descendants(page.node('mc-picker-list')).filter(node=>node.className==='mc-picker-option');
+}
+
+for(const [transition,navigate] of Object.entries(advancedRouteTransitions))test(`model picker discards stale options after ${transition}`,async()=>{
+  const page=await advancedRoutePage(),dialog=page.node('mc-picker-dialog');
+  const opener=routePickerButton(page,'planning');opener.handlers.click();
+  assert.equal(dialog.open,true);
+  const option=routePickerOptions(page).find(node=>descendants(node).some(child=>child.textContent==='Other coder'));
+  assert.ok(option);
+  await navigate(page);
+  const closedOnNavigation=!dialog.open;
+  const draft=page.draft(),dirty=page.node('mc-dirty').textContent;
+  option.handlers.click();
+  assert.deepEqual(page.draft(),draft);
+  assert.equal(page.savedDrafts.size,0);
+  assert.equal(page.node('mc-dirty').textContent,dirty);
+  assert.deepEqual(page.posts,[]);
+  assert.equal(closedOnNavigation,true);
+  await page.navigate();
+  routePickerButton(page,'planning').handlers.click();
+  assert.equal(dialog.open,true);
+  assert.equal(page.draft().planning.model,'scope-coder');
+});
+
+test('model picker cannot open from a stale role button after a project switch',async()=>{
+  const page=await advancedRoutePage(),dialog=page.node('mc-picker-dialog');
+  const opener=routePickerButton(page,'planning');
+  await page.show('b');
+  opener.handlers.click();
+  const openedFromStaleButton=Boolean(dialog.open);
+  if(openedFromStaleButton)routePickerOptions(page)[1].handlers.click();
+  assert.equal(page.draft().planning.model,'scope-coder');
+  assert.equal(page.savedDrafts.size,0);
+  assert.equal(openedFromStaleButton,false);
+  routePickerButton(page,'planning').handlers.click();
+  assert.equal(dialog.open,true);
+});
+
+test('model picker options cannot select a model in a reopened session',async()=>{
+  const page=await advancedRoutePage(),dialog=page.node('mc-picker-dialog');
+  routePickerButton(page,'planning').handlers.click();
+  const [sameModel,oldOption]=routePickerOptions(page);
+  assert.equal(routePickerOptions(page).length,2);
+  sameModel.handlers.click();
+  assert.equal(dialog.open,false);
+  assert.equal(page.draft().planning.effort,'medium');
+  routePickerButton(page,'implementation').handlers.click();
+  const currentOption=routePickerOptions(page)[1];
+  oldOption.handlers.click();
+  assert.equal(page.draft().implementation.model,'scope-coder');
+  assert.equal(dialog.open,true);
+  assert.equal(page.savedDrafts.size,0);
+  currentOption.handlers.click();
+  assert.equal(dialog.open,false);
+  assert.deepEqual(page.savedDrafts.get('a').routes.implementation,{provider:'openai',model:'other-coder',effort:'default',fallback:null});
+  assert.equal(page.draft().planning.model,'scope-coder');
+  assert.deepEqual(page.posts,[]);
+});
+
+test('model picker retains filters and pagination across translation and isolates project drafts',async()=>{
+  const page=await advancedRoutePage(),api=page.context.api;
+  page.context.api=async(...args)=>{
+    const result=await api(...args);
+    if(result.providers){
+      const models=result.providers.find(provider=>provider.id==='ollama').catalog.models;
+      for(let index=1;index<=21;index++)models.push({id:'fixture-'+index,name:'Fixture '+index,enabled:true});
+    }
+    return result;
+  };
+  await page.show('a');routePickerButton(page,'planning').handlers.click();
+  const provider=page.node('mc-picker-provider'),search=page.node('mc-picker-search'),pagination=page.node('mc-picker-page');
+  provider.value='openai';provider.handlers.change();
+  assert.equal(routePickerOptions(page).length,1);
+  assert.ok(descendants(routePickerOptions(page)[0]).some(child=>child.textContent==='Other coder'));
+  provider.value='ollama';provider.handlers.change();
+  search.value='fixture';search.handlers.input();
+  assert.equal(pagination.textContent,'1 / 2');
+  assert.equal(routePickerOptions(page).length,20);
+  page.click('mc-picker-next');
+  assert.equal(pagination.textContent,'2 / 2');
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  const english=vm.runInNewContext(i18n.slice(0,i18n.indexOf('let language'))+';english');
+  page.context.t=text=>english[text]??text;
+  page.context.window.RSIModelCenter.translate();
+  assert.match(page.node('mc-picker-title').textContent,/ · Select model$/);
+  assert.equal(provider.value,'ollama');
+  assert.equal(search.value,'fixture');
+  assert.equal(pagination.textContent,'2 / 2');
+  assert.equal(routePickerOptions(page).length,1);
+  routePickerOptions(page)[0].handlers.click();
+  assert.equal(page.node('mc-picker-dialog').open,false);
+  assert.equal(page.savedDrafts.get('a').routes.planning.model,'fixture-21');
+  await page.show('b');
+  assert.equal(page.draft().planning.model,'scope-coder');
+  await page.navigate({scope:'global'});
+  assert.equal(page.draft().planning.model,'scope-coder');
+  await page.navigate();
+  assert.equal(page.draft().planning.model,'fixture-21');
+  assert.deepEqual([...page.savedDrafts.keys()],['a']);
+  assert.deepEqual(page.posts,[]);
+});
+
+test('advanced route form validates and persists a fallback within its current scope',async()=>{
+  const page=await advancedRoutePage();page.click('mc-reset-inheritance');
+  const feedback=page.node('mc-feedback').textContent;
+  assert.match(feedback,/已选择跟随通用设置/);
+  page.openAdvanced();page.effort('high');page.fallback('ollama','scope-coder');
+  await page.submit('mc-advanced-form');
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.node('mc-advanced-error').textContent,'备用模型应与主模型不同。');
+  assert.equal(page.draft().planning.effort,'medium');
+  page.fallback('openai','other-coder');
+  await page.submit('mc-advanced-form');
+  assert.equal(page.dialog.open,false);
+  const expected={provider:'ollama',model:'scope-coder',effort:'high',fallback:{provider:'openai',model:'other-coder',effort:'default'}};
+  assert.deepEqual(page.savedDrafts.get('a').routes.planning,expected);
+  assert.equal(page.node('mc-feedback').textContent,feedback);
+  assert.equal(page.node('mc-dirty').textContent,'模型分工有未保存的修改');
+  assert.deepEqual(page.posts,[]);
+  const reopened=await advancedRoutePage(page.savedDrafts);
+  assert.deepEqual(reopened.draft().planning,expected);
+  await reopened.click('mc-save-routes');
+  assert.deepEqual(reopened.posts.map(({path,body})=>[path,body.project,body.models.planning]),[['model-center/routes','a',expected]]);
+  assert.equal(reopened.savedDrafts.has('a'),false);
+});
+
+for(const failedRead of ['routes','state'])test(`route save acknowledges the write when the ${failedRead} read fails`,async()=>{
+  const page=modelScopePage(),api=page.context.api;
+  vm.runInContext('state.config_revision=7',page.context);
+  await page.show('a');page.edit('high');
+  let refreshes=0,fail=true;
+  page.context.refresh=async()=>{
+    refreshes++;
+    if(fail&&failedRead==='state')throw new Error('State read failed');
+    vm.runInContext('state.config_revision=8',page.context);
+  };
+  page.context.api=async(path,body)=>{
+    if(fail&&failedRead==='routes'&&path==='model-center?project=a')throw new Error('Route read failed');
+    return api(path,body);
+  };
+  page.hold();const saving=page.click('mc-save-routes');
+  page.edit('low');page.release();await saving;
+  assert.equal(page.posts[0].body.revision,7);
+  assert.equal(page.overrides.get('a').planning.effort,'high');
+  assert.equal(page.savedDrafts.get('a').baseline.planning.effort,'high');
+  assert.equal(page.savedDrafts.get('a').routes.planning.effort,'low');
+  assert.equal(page.node('mc-dirty').textContent,'模型分工有未保存的修改');
+  assert.match(page.node('mc-feedback').textContent,/模型分工已保存，但刷新失败/);
+  assert.equal(refreshes,1);
+  fail=false;
+  if(failedRead==='state')await page.context.refresh();
+  await page.click('mc-save-routes');
+  assert.equal(page.posts[1].body.revision,8);
+  assert.equal(page.savedDrafts.has('a'),false);
+});
+
+for(const transition of ['project round trip','returning to the page','connection tab round trip'])test(`route save leaves newer feedback intact after ${transition}`,async()=>{
+  const page=await diagnosisPage();page.click('model-tab-roles');page.edit('high');
+  page.hold();const saving=page.click('mc-save-routes');
+  await diagnosisTransitions[transition](page);
+  page.click('model-tab-roles');
+  assert.equal(page.node('mc-dirty').textContent,'正在保存模型分工…');
+  page.click('mc-reset-inheritance');page.edit('low');
+  const feedback=page.node('mc-feedback').textContent;
+  assert.match(feedback,/已选择跟随通用设置/);
+  page.release();await saving;
+  assert.equal(page.node('mc-feedback').textContent,feedback);
+  assert.equal(page.node('mc-dirty').textContent,'模型分工有未保存的修改');
+  assert.equal(page.overrides.get('a').planning.effort,'high');
+  assert.equal(page.savedDrafts.get('a').routes.planning.effort,'low');
+});
+
+for(const roundTrip of [false,true])test(`route save ${roundTrip?'ignores a stale':'shows the current'} revision rejection`,async()=>{
+  const page=modelScopePage(),api=page.context.api;let reject;
+  await page.show('a');page.edit('high');
+  page.context.api=(path,body)=>path==='model-center/routes'?new Promise((_resolve,fail)=>{reject=fail;}):api(path,body);
+  const saving=page.click('mc-save-routes');
+  if(roundTrip){
+    await page.show('b');await page.show('a');
+    page.click('mc-reset-inheritance');page.edit('low');
+  }
+  reject(Object.assign(new Error('Revision conflict'),{status:409,code:'config_revision_conflict'}));
+  await saving;
+  assert.match(page.node('mc-feedback').textContent,roundTrip?/已选择跟随通用设置/:/Revision conflict/);
+  assert.equal(page.savedDrafts.get('a').routes.planning.effort,roundTrip?'low':'high');
+  assert.equal(page.node('mc-save-routes').disabled,false);
+});
+
+test('route save keeps the conflict detected by the acknowledgement read',async()=>{
+  const page=modelScopePage(),api=page.context.api;
+  await page.show('a');page.edit('high');page.hold();
+  page.context.api=async(path,body)=>{
+    if(path==='model-center?project=a')page.overrides.get('a').planning.effort='xhigh';
+    return api(path,body);
+  };
+  const saving=page.click('mc-save-routes');page.edit('low');page.release();await saving;
+  assert.match(page.node('mc-feedback').textContent,/服务器模型设置已变化/);
+  assert.equal(page.draft().planning.effort,'xhigh');
+  assert.equal(page.node('mc-save-routes').disabled,true);
+});
+
+for(const outcome of ['confirmed write','unconfirmed write','rejected write'])test(`route save reports a ${outcome} accurately after a project switch`,async()=>{
+  const page=await diagnosisPage();page.click('model-tab-roles');page.edit('high');
+  const api=page.context.api;let finish,renderProject;
+  page.context.api=async(path,body)=>{
+    if(path==='model-center?project=b')await new Promise(resolve=>{renderProject=resolve;});
+    if(path==='model-center/routes'&&outcome!=='confirmed write'){
+      await new Promise(resolve=>{finish=resolve;});
+      if(outcome==='rejected write')throw Object.assign(new Error('Revision conflict'),{status:409,code:'config_revision_conflict'});
+      await api(path,body);
+      throw new TypeError('Connection lost');
+    }
+    if(path==='model-center?project=a'&&finish===undefined){
+      await new Promise(resolve=>{finish=resolve;});throw new Error('Route read failed');
+    }
+    return api(path,body);
+  };
+  const saving=page.click('mc-save-routes');await new Promise(setImmediate);
+  page.project('b');await new Promise(setImmediate);
+  assert.equal(page.node('mc-dirty').textContent,'');
+  finish();await saving;
+  assert.equal(page.node('mc-dirty').textContent,'');
+  renderProject();await new Promise(setImmediate);
+  if(outcome==='confirmed write')assert.equal(page.node('toast').hidden,true);
+  else assert.match(page.node('toast').textContent,outcome==='rejected write'?/先前的提交未成功/:/无法确认先前提交的模型分工是否已保存/);
+  assert.equal(page.savedDrafts.has('a'),outcome!=='confirmed write');
+  assert.equal(page.overrides.get('a').planning.effort,outcome==='rejected write'?'medium':'high');
+  assert.equal(page.node('mc-dirty').textContent,'模型分工已保存');
 });
 
 test('equal-valued project overrides can be reset, persisted across reload, and follow later defaults',async()=>{
@@ -3747,6 +6724,328 @@ test('the probe button cancels a running test without closing the dialog',async(
   assert.equal(page.node('mc-probe-start').disabled,false);
   page.release();await probing;
   assert.equal(page.node('mc-probe-dialog').open,true,'cancelling keeps the dialog open for another attempt');
+});
+
+test('the probe wait deadline warns about possible charges and remembers the original target',async()=>{
+  const page=modelScopePage();await page.show('a');page.openProbe();page.hold();
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  vm.runInContext(i18n.slice(0,i18n.indexOf('const staticText =')),page.context);
+  const api=page.context.api;
+  page.context.api=async(path,body,options)=>{
+    const result=await api(path,body,options);
+    options?.signal?.throwIfAborted();
+    return result;
+  };
+  const probing=page.click('mc-probe-start');
+  assert.equal(page.node('mc-probe-result').textContent,'正在执行基础能力测试…');
+  page.fireTimer(16*60*1000);
+  assert.equal(page.probeSignals[0].aborted,true);
+  const deadlineResult=page.node('mc-probe-result').textContent;
+  page.release();await probing;
+  const notice='等待测试结果已超时。测试可能仍在服务端继续并产生费用。';
+  assert.equal(page.node('mc-probe-result').textContent,notice);
+  assert.equal(deadlineResult,notice,'the timer reports the end of the wait before request settlement');
+  assert.equal(page.node('mc-probe-start').textContent,'运行基础能力测试');
+  assert.equal(page.node('mc-probe-start').disabled,false);
+  for(const project of ['b',null]){
+    await page.show(project);page.openProbe();
+    assert.equal(page.node('mc-probe-result').textContent,'');
+  }
+  await page.show('a');page.otherProbe();
+  assert.equal(page.node('mc-probe-result').textContent,'');
+  assert.equal(page.posts.length,1,'switching targets must not resubmit the probe');
+  await page.click('mc-probe-start');
+  page.node('mc-probe-dialog').close();page.openProbe();
+  assert.equal(page.node('mc-probe-result').textContent,notice);
+  assert.equal(page.posts.length,2);
+  vm.runInContext(`language='en';window.RSIModelCenter.translate()`,page.context);
+  assert.equal(page.node('mc-probe-result').textContent,'Timed out waiting for the test result. The test may still be running on the server and may incur charges.');
+  vm.runInContext(`language='zh-CN';window.RSIModelCenter.translate()`,page.context);
+  await page.click('mc-probe-start');
+  assert.match(page.node('mc-probe-result').textContent,/基础能力测试通过/);
+  page.node('mc-probe-dialog').close();page.openProbe();
+  assert.equal(page.node('mc-probe-result').textContent,'');
+  assert.deepEqual(page.posts.map(({body})=>[body.project,body.model]),[['a','scope-coder'],['a','other-coder'],['a','scope-coder']]);
+});
+
+test('a probe service timeout reports the known failure without a retained wait notice',async()=>{
+  const page=modelScopePage();await page.show('a');page.openProbe();page.failProbe('timeout');
+  await page.click('mc-probe-start');
+  assert.equal(page.node('mc-probe-result').textContent,'请求超时，请重试。');
+  assert.equal(page.probeSignals[0].aborted,false);
+  assert.equal(page.timers.some(timer=>timer.active&&timer.delay===16*60*1000),false);
+  page.node('mc-probe-dialog').close();page.openProbe();
+  assert.equal(page.node('mc-probe-result').textContent,'');
+  assert.equal(page.posts.length,1);
+});
+
+async function modelPreferencePage(field){
+  const page=await diagnosisPage(),api=page.context.api,posts=[],reads=[];
+  let finish,stored=false,readFailure=false;
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/model'){
+      posts.push(structuredClone(body));
+      await new Promise((resolve,reject)=>{finish=error=>error?reject(error):resolve();});
+      stored=body.model[field];
+      return {saved:true};
+    }
+    if(path==='model-center'||path.startsWith('model-center?')){
+      reads.push(path);
+      if(readFailure)throw new Error('Confirmation read failed');
+      const snapshot=await api(path,body,options);
+      if(snapshot.project==='a'){
+        const catalog=snapshot.providers.find(provider=>provider.id==='ollama').catalog;
+        catalog.models[0][field]=stored;
+        if(stored)catalog.models.push({id:'new-coder',name:'New coder'});
+      }
+      return snapshot;
+    }
+    return api(path,body,options);
+  };
+  await page.show('a');
+  reads.length=0;
+  const filter=page.node('mc-model-filter');filter.value='all';filter.handlers.change();
+  const control=()=>{
+    const [,actions]=page.node('mc-model-list').children[0].children;
+    const [label,more]=actions.children;
+    return field==='enabled'?label.children[0]:more.children[1].children[0];
+  };
+  return {...page,posts,reads,control,
+    save(){
+      const node=control();
+      if(field==='enabled'){node.checked=true;node.handlers.change();}
+      else node.handlers.click();
+      assert.deepEqual(posts,[{project:'a',provider:'ollama',model:{id:'scope-coder',[field]:true}}]);
+      return page.context.lastAction;
+    },
+    finish(error){finish(error);},
+    failRead(){readFailure=true;},
+    value(){return field==='enabled'?control().checked:control().textContent==='取消收藏';}
+  };
+}
+
+for(const fails of [false,true])test(`model enable keeps the pending value through local redraws and settles after ${fails?'failure':'success'}`,async()=>{
+  const page=await modelPreferencePage('enabled'),pending=page.save();
+  for(const [id,event] of [['mc-search','input'],['mc-model-filter','change']]){
+    page.node(id).handlers[event]();
+    assert.equal(page.control().checked,true);
+    assert.equal(page.control().disabled,true);
+  }
+  assert.equal(page.posts.length,1);
+  page.finish(fails?new Error('Enable request failed'):undefined);
+  await pending;
+  assert.equal(page.control().checked,!fails);
+  assert.equal(page.control().disabled,false);
+});
+
+const preferenceTransitions={
+  'project switch':async page=>{page.project('b');await new Promise(setImmediate);},
+  'project round trip':diagnosisTransitions['project round trip'],
+  'provider switch':diagnosisTransitions['provider switch'],
+  'provider round trip':diagnosisTransitions['provider round trip'],
+  'leaving the page':diagnosisTransitions['leaving the page'],
+  'returning to the page':diagnosisTransitions['returning to the page']
+};
+for(const field of ['enabled','favorite']){
+  for(const [name,transition] of Object.entries(preferenceTransitions))for(const failure of [false,true]){
+    test(`model preference ${field} keeps ${failure?'failure':'success'} scoped after ${name}`,async()=>{
+      const page=await modelPreferencePage(field),pending=page.save();
+      await transition(page);
+      page.reads.length=0;
+      page.finish(failure?new Error('Old model preference error'):undefined);
+      await pending;
+      assert.deepEqual(page.reads,failure||name==='project switch'?[]:['model-center?project=a']);
+      assert.equal(page.node('mc-feedback').textContent,'');
+      assert.equal(page.node('toast').hidden,true);
+      if(!failure&&name!=='project switch'){
+        if(name==='leaving the page'){
+          page.click('model-test-view-models');await page.context.lastAction;
+        }
+        if(name==='provider switch')await page.provider('Ollama');
+        assert.equal(page.value(),true);
+        assert.equal(page.node('mc-model-count').textContent,2,'same-scope refresh keeps directory changes');
+      }
+    });
+  }
+  test(`model preference ${field} keeps current POST failure feedback`,async()=>{
+    const page=await modelPreferencePage(field),pending=page.save();
+    page.finish(new Error('Current model preference error'));await pending;
+    assert.deepEqual(page.reads,[]);
+    assert.equal(page.value(),false);
+    assert.equal(page.control().disabled,false);
+    assert.equal(page.node('mc-feedback').textContent,'Current model preference error');
+    assert.equal(page.node('toast').hidden,field==='enabled');
+  });
+  test(`model preference ${field} keeps confirmed save after a failed read`,async()=>{
+    const page=await modelPreferencePage(field),pending=page.save();
+    page.failRead();page.finish();await pending;
+    assert.deepEqual(page.reads,['model-center?project=a']);
+    assert.equal(page.value(),true);
+    assert.equal(page.control().disabled,false);
+    assert.equal(page.node('mc-feedback').textContent,field==='enabled'?'模型选择范围已保存。':'');
+    assert.equal(page.node('toast').hidden,true);
+    page.node('mc-model-filter').handlers.change();
+    assert.equal(page.value(),true,'confirmed preference survives a local redraw');
+  });
+}
+
+async function modelResumePage(){
+  const page=await diagnosisPage(),api=page.context.api,posts=[],reads=[],resumed=new Set();
+  let readError;
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/resume'){
+      await new Promise((resolve,reject)=>posts.push({body:structuredClone(body),resolve,reject}));
+      resumed.add(body.project+':'+body.provider);
+      return {saved:true,resumed_tasks:0};
+    }
+    if(path==='model-center'||path.startsWith('model-center?')){
+      reads.push(path);
+      if(readError)throw readError;
+      const snapshot=await api(path,body,options);
+      for(const provider of snapshot.providers){
+        provider.health=resumed.has(snapshot.project+':'+provider.id)
+          ?{paused:false,failures:0}:{paused:true,failures:3,code:'timeout'};
+      }
+      return snapshot;
+    }
+    return api(path,body,options);
+  };
+  await page.show('a');
+  reads.length=0;
+  return {...page,posts,reads,failRead(error){readError=error;},resume:()=>page.node('mc-resume'),feedback:()=>page.node('mc-feedback').textContent};
+}
+
+const resumeTransitions={
+  'project switch':preferenceTransitions['project switch'],
+  'project round trip':diagnosisTransitions['project round trip'],
+  'provider switch':diagnosisTransitions['provider switch'],
+  'provider round trip':diagnosisTransitions['provider round trip'],
+  'connection tab round trip':diagnosisTransitions['connection tab round trip'],
+  'returning to the page':diagnosisTransitions['returning to the page']
+};
+for(const [name,transition] of Object.entries(resumeTransitions))for(const failure of [false,true]){
+  test(`model resume keeps late ${failure?'failure':'success'} scoped after ${name}`,async()=>{
+    const page=await modelResumePage(),pending=page.click('mc-resume');
+    assert.deepEqual(page.posts.map(post=>post.body),[{provider:'ollama',project:'a'}]);
+    await transition(page);
+    const provider=page.node('mc-provider-name').textContent;
+    page.reads.length=0;
+    if(failure)page.posts[0].reject(new Error('Old resume error'));
+    else page.posts[0].resolve();
+    await pending;
+    assert.deepEqual(page.reads,failure||name==='project switch'?[]:['model-center?project=a']);
+    assert.equal(page.feedback(),'');
+    assert.equal(page.node('toast').hidden,true);
+    assert.equal(page.node('mc-provider-name').textContent,provider);
+    assert.equal(page.resume().hidden,!failure&&name!=='project switch'&&name!=='provider switch');
+  });
+}
+
+for(const outcome of ['success','POST failure','read failure'])test(`model resume keeps current ${outcome} consistent`,async()=>{
+  const page=await modelResumePage(),pending=page.click('mc-resume');
+  if(outcome==='read failure')page.failRead(new Error('Confirmation read failed'));
+  if(outcome==='POST failure')page.posts[0].reject(new Error('Current resume error'));
+  else page.posts[0].resolve();
+  await pending;
+  const failed=outcome==='POST failure';
+  assert.deepEqual(page.reads,failed?[]:['model-center?project=a']);
+  assert.equal(page.feedback(),failed?'Current resume error':'已恢复请求，下次调用将重新检查。');
+  assert.equal(page.node('toast').hidden,!failed);
+  assert.equal(page.resume().disabled,false);
+  assert.equal(page.resume().hidden,!failed);
+  assert.equal(page.node('mc-health').hidden,!failed);
+  await page.provider('OpenAI');await page.provider('Ollama');
+  assert.equal(page.resume().hidden,!failed,'local redraw preserves the confirmed health mark');
+});
+
+test('model resume prevents a duplicate POST while pending across redraws',async()=>{
+  const page=await modelResumePage(),pending=page.click('mc-resume');
+  await page.provider('OpenAI');await page.provider('Ollama');
+  assert.equal(page.resume().disabled,true);
+  page.click('mc-resume');
+  assert.equal(page.posts.length,1);
+  page.posts[0].reject(new Error('Resume failed'));await pending;
+  assert.equal(page.resume().disabled,false);
+  const retry=page.click('mc-resume');
+  assert.equal(page.posts.length,2);
+  page.posts[1].resolve();await retry;
+  assert.equal(page.resume().hidden,true);
+});
+
+test('model resume preserves a newer provider error after an earlier provider succeeds',async()=>{
+  const page=await modelResumePage(),earlier=page.click('mc-resume');
+  await page.provider('OpenAI');
+  const current=page.click('mc-resume');
+  assert.deepEqual(page.posts.map(post=>post.body),[{provider:'ollama',project:'a'},{provider:'openai',project:'a'}]);
+  page.posts[1].reject(new Error('Current provider error'));await current;
+  page.posts[0].resolve();await earlier;
+  assert.equal(page.feedback(),'Current provider error');
+  assert.equal(page.node('toast').textContent,'Current provider error');
+  assert.equal(page.resume().hidden,false);
+  await page.provider('Ollama');
+  assert.equal(page.resume().hidden,true);
+});
+
+test('model resume ignores a late confirmation-read error after switching projects',async()=>{
+  const page=await modelResumePage(),api=page.context.api;
+  let rejectRead;
+  page.context.api=(path,...args)=>path==='model-center?project=a'
+    ?new Promise((_,reject)=>{rejectRead=reject;})
+    :api(path,...args);
+  const pending=page.click('mc-resume');
+  page.posts[0].resolve();await new Promise(setImmediate);
+  assert.equal(typeof rejectRead,'function');
+  await preferenceTransitions['project switch'](page);
+  rejectRead(new Error('Old confirmation read error'));await pending;
+  assert.equal(page.feedback(),'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.resume().hidden,false);
+});
+
+for(const failure of [false,true])test(`model catalog ignores stale ${failure?'failure':'success'} after a provider round trip`,async()=>{
+  const page=await diagnosisPage(),api=page.context.api;
+  let finish,reads=0;
+  page.context.api=(path,body,options)=>{
+    if(path==='model-center/fetch')return new Promise((resolve,reject)=>{finish=()=>failure?reject(new Error('Old catalog error')):resolve({});});
+    if(path.startsWith('model-center?'))reads++;
+    return api(path,body,options);
+  };
+  const pending=page.click('mc-fetch');
+  assert.equal(page.node('mc-fetch').disabled,true);
+  await page.provider('OpenAI');await page.provider('Ollama');
+  assert.equal(page.node('mc-fetch').disabled,true);
+  finish();await pending;
+  assert.equal(reads,1,'the persisted catalog is still refreshed');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.node('mc-fetch').disabled,false);
+});
+
+test('model catalog does not surface a stale snapshot error after leaving the page',async()=>{
+  const page=await diagnosisPage(),api=page.context.api;
+  let rejectSnapshot;
+  page.context.api=(path,body,options)=>{
+    if(path==='model-center/fetch')return Promise.resolve({});
+    if(path==='model-center?project=a'&&!rejectSnapshot)return new Promise((_,reject)=>{rejectSnapshot=reject;});
+    return api(path,body,options);
+  };
+  const pending=page.click('mc-fetch');await new Promise(setImmediate);
+  page.click('model-test-view-overview');
+  rejectSnapshot(new Error('Old catalog snapshot error'));await pending;
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.node('mc-feedback').textContent,'');
+});
+
+for(const failure of [false,true])test(`model catalog keeps current ${failure?'failure':'success'} feedback`,async()=>{
+  const page=await diagnosisPage(),api=page.context.api;
+  page.context.api=async(path,body,options)=>{
+    if(path!=='model-center/fetch')return api(path,body,options);
+    if(failure)throw new Error('Current catalog error');
+    return {};
+  };
+  await page.click('mc-fetch');
+  assert.equal(page.node('mc-feedback').textContent,failure?'Current catalog error':'模型列表已更新，原来选择的模型没有改变。');
+  assert.equal(page.node('mc-fetch').disabled,false);
 });
 
 for(const fails of [false,true])test(`catalog callback ${fails?'failure':'success'} preserves feedback after provider switch`,async()=>{
@@ -4327,9 +7626,16 @@ function usagePage() {
   page.node('usage-sort').value = 'recent';
   vm.runInContext('view="usage"', page.context);
   page.context.fetch = url => new Promise(resolve => {
-    requests.push({params: new URLSearchParams(url.split('?')[1]), finish(title, status = 200, callTotal = 0) {
-      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [], calls: [], call_total: callTotal,
-        tasks: [{task: title, title, project: 'a', state: 'failed', tokens: 100, attempts: 1}], total: 60}, status));
+    const params = new URLSearchParams(url.split('?')[1]);
+    requests.push({params, finish(title, status = 200, callTotal = 0, total = 60) {
+      const tasks = Number(params.get('offset')) < total
+        ? [{task: title, title, project: 'a', state: 'failed', tokens: 100, attempts: 1}] : [];
+      const offset = Number(params.get('offset')), limit = Number(params.get('limit'));
+      const calls = params.has('task') ? Array.from({length: Math.max(0, Math.min(limit, callTotal - offset))},
+        (_, index) => ({role: 'triage', model: `${title} ${offset + index + 1}`, provider: 'fixture',
+          effort: 'high', state: 'done', created: 1700000000 - offset - index, unit: 'http_request'})) : [];
+      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [], calls, call_total: callTotal,
+        tasks, total}, status));
     }});
   });
   return Object.assign(page, {
@@ -4386,6 +7692,139 @@ test('usage details retain the visible report time window after a filter refresh
   assert.equal(page.requests[2].params.get('end'), originalEnd);
   page.requests[2].finish('Details'); await detail;
   assert.equal(page.node('usage-detail').open, true);
+});
+
+test('usage details recover when the call total shrinks during pagination', async () => {
+  const page = usagePage();
+  let now = 1700000000000;
+  page.context.Date = class extends Date { static now() { return now; } };
+  page.node('usage-period').value = '7';
+  page.search('fixture task');
+  page.fireTimer(350);
+  const report = page.context.lastAction;
+  page.requests[0].finish('fixture task'); await report;
+  const content = page.node('usage-detail-content');
+  const dialog = page.node('usage-detail');
+  const button = label => descendants(content).find(node => node.tagName === 'BUTTON' && node.textContent === label);
+  const calls = () => descendants(content).filter(node => node.className === 'usage-call');
+  const open = page.node('usage-tasks').children[0].children.at(-1);
+  assert.equal(open.textContent, '查看用量明细');
+  assert.equal(page.requests[0].params.get('q'), 'fixture task');
+  const expectedScope = new URLSearchParams(page.requests[0].params);
+  expectedScope.delete('q');
+  expectedScope.set('task', 'fixture task');
+  expectedScope.delete('offset');
+  function checkRequest(request, offset) {
+    const scope = new URLSearchParams(request.params);
+    assert.equal(scope.get('offset'), String(offset));
+    scope.delete('offset');
+    assert.deepEqual(Object.fromEntries(scope), Object.fromEntries(expectedScope));
+  }
+  function startPage(node, offset) {
+    const index = page.requests.length;
+    assert.ok(node);
+    node.handlers.click();
+    const request = page.requests[index];
+    checkRequest(request, offset);
+    return {pending: page.context.lastAction, request};
+  }
+  async function lastRequest(offset) {
+    const count = page.requests.length;
+    await new Promise(setImmediate);
+    assert.equal(page.requests.length, count + 1);
+    const request = page.requests[count];
+    checkRequest(request, offset);
+    return request;
+  }
+  async function loadPage(node, offset, label, total) {
+    const {pending, request} = startPage(node, offset);
+    request.finish(label, 200, total); await pending;
+  }
+
+  await loadPage(open, 0, 'First', 60);
+  assert.equal(calls().length, 25);
+  await loadPage(button('下一页'), 25, 'Second', 60);
+  assert.match(textOf(calls()[0]), /Second 26/);
+  now += 120000;
+  const next = startPage(button('下一页'), 50);
+  next.request.finish('Out of range', 200, 36);
+  await new Promise(setImmediate);
+  assert.equal(calls().length, 25, 'an empty out-of-range response must not replace the visible calls');
+  assert.equal(page.requests.length, 5);
+  checkRequest(page.requests[4], 25);
+  page.requests[4].finish('Last', 200, 36); await next.pending;
+  assert.equal(calls().length, 11);
+  assert.match(textOf(calls()[0]), /Last 26/);
+  assert.match(textOf(content.children.at(-1)), /36 次调用/);
+  assert.equal(button('下一页'), undefined);
+  assert.ok(button('上一页'));
+
+  dialog.close();
+  await loadPage(open, 0, 'First', 60);
+  await loadPage(button('下一页'), 25, 'Visible', 60);
+  const visibleRows = calls(), visibleSelection = content.children[2];
+  const shrinking = startPage(button('下一页'), 50);
+  shrinking.request.finish('Out of range', 200, 36);
+  const secondFallback = await lastRequest(25);
+  secondFallback.finish('Shrank again', 200, 25);
+  const firstFallback = await lastRequest(0);
+  assert.deepEqual(calls(), visibleRows);
+  firstFallback.finish('Unavailable', 503); await shrinking.pending;
+  assert.deepEqual(calls(), visibleRows);
+  const notice = content.querySelector('[data-form-error]');
+  assert.equal(notice.attributes.role, 'status');
+  assert.match(textOf(notice), /仍显示上次加载的记录/);
+  await loadPage(button('重试'), 0, 'Retried', 26);
+  assert.ok(!content.querySelector('[data-form-error]'));
+  assert.equal(content.children[2].textContent, visibleSelection.textContent);
+  assert.match(textOf(calls()[0]), /Retried 1/);
+  assert.equal(button('上一页'), undefined);
+
+  const exhausted = startPage(button('下一页'), 25);
+  const zeroRequestCount = page.requests.length;
+  exhausted.request.finish('No calls', 200, 0); await exhausted.pending;
+  assert.equal(page.requests.length, zeroRequestCount);
+  assert.equal(calls().length, 0);
+  assert.match(textOf(content.children.at(-1)), /0 次调用/);
+  assert.equal(button('上一页'), undefined);
+  assert.equal(button('下一页'), undefined);
+
+  const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')), page.context);
+  page.context.translateStatic = () => {};
+  for (const trigger of ['newer page', 'close', 'language', 'project']) {
+    if (dialog.open) dialog.close();
+    await loadPage(open, 0, 'First', 60);
+    await loadPage(button('下一页'), 25, 'Visible', 60);
+    const next = startPage(button('下一页'), 50);
+    next.request.finish('Out of range', 200, 36);
+    const fallback = await lastRequest(25);
+    if (trigger === 'newer page') {
+      await loadPage(button('上一页'), 0, 'Newer', 60);
+    } else if (trigger === 'close') {
+      dialog.close();
+    } else if (trigger === 'language') {
+      page.node('language-select').value = 'en';
+      page.node('language-select').handlers.change(); await page.context.lastAction;
+      assert.equal(page.context.t('无法加载此页用量明细，仍显示上次加载的记录。'),
+        'This page of usage details could not load. The last loaded records are still shown.');
+    } else {
+      vm.runInContext('projectId="b"', page.context);
+      page.node('project-select').handlers.change();
+      const project = page.context.lastAction;
+      assert.equal(page.requests.at(-1).params.get('project'), 'b');
+      page.requests.at(-1).finish('New project'); await project;
+    }
+    const visibleContent = [...content.children], requestCount = page.requests.length;
+    fallback.finish('Stale', trigger === 'language' ? 503 : 200, 12); await next.pending;
+    assert.equal(page.requests.length, requestCount, trigger);
+    assert.deepEqual(content.children, visibleContent, trigger);
+    assert.equal(dialog.open, trigger === 'newer page', trigger);
+    if (trigger === 'language') {
+      page.node('language-select').value = 'zh-CN';
+      page.node('language-select').handlers.change(); await page.context.lastAction;
+    }
+  }
 });
 
 test('usage coalesces repeated input, resets pagination and refreshes the latest query', async () => {
@@ -4456,28 +7895,142 @@ test('usage clamps an offset beyond the total and reloads the clamped page', asy
   page.requests[1].finish('Page two'); await second;
   page.node('usage-next').onclick(); const third = page.context.lastAction;
   page.requests[2].finish('Page three'); await third;
-  const shrunk = [];
-  const textOf = node => [node.textContent, ...(node.children || []).map(textOf)].filter(Boolean).join(' ');
-  page.context.fetch = url => new Promise(resolve => {
-    const params = new URLSearchParams(url.split('?')[1]);
-    shrunk.push({params, finish(total) {
-      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [],
-        tasks: [{task: 'Clamped', title: 'Clamped', project: 'a', state: 'failed', tokens: 100, attempts: 1}],
-        total}));
-    }});
-  });
-  page.node('usage-refresh').onclick();
-  await waitFor(() => shrunk.length >= 1);
-  assert.equal(shrunk[0].params.get('offset'), '50');
-  shrunk[0].finish(36);
-  await waitFor(() => shrunk.length >= 2 && shrunk[1].params.get('offset') === '25');
-  shrunk[1].finish(36);
-  await new Promise(setImmediate);
+  page.node('usage-refresh').onclick(); const refresh = page.context.lastAction;
+  assert.equal(page.requests[3].params.get('offset'), '50');
+  page.requests[3].finish('Out of range', 200, 0, 36); await refresh;
+  const clamped = page.context.lastAction;
+  assert.equal(page.requests[4].params.get('offset'), '25');
+  page.requests[4].finish('Clamped', 200, 0, 36); await clamped;
   assert.equal(page.node('usage-page').textContent, '36 条记录 · 26–36');
-  assert.equal(textOf(page.node('usage-tasks')).includes('Clamped'), true, 'the clamped page must render its own rows');
+  assert.equal(page.title(), 'Clamped', 'the clamped page must render its own rows');
   assert.equal(page.node('usage-next').disabled, true, 'next must be disabled after clamping to the last page');
   assert.equal(page.node('usage-prev').disabled, false);
 });
+
+test('usage retains the visible report when offset recovery fails after a filter change', async () => {
+  const page = usagePage();
+  const lastSuccess = 1700000000000;
+  let now = lastSuccess;
+  page.context.Date = class extends Date { static now() { return now; } };
+  const stamp = time => vm.runInContext(`stamp(${time / 1000})`, page.context);
+  const initial = page.show();
+  page.requests[0].finish('Page one'); await initial;
+  page.node('usage-next').onclick(); const second = page.context.lastAction;
+  page.requests[1].finish('Page two'); await second;
+  page.node('usage-next').onclick(); const third = page.context.lastAction;
+  page.requests[2].finish('Visible task'); await third;
+  const visibleEnd = page.requests[2].params.get('end');
+
+  now += 60000;
+  page.node('usage-period').value = '7';
+  page.node('usage-period').handlers.change(); const filtered = page.context.lastAction;
+  assert.equal(page.requests[3].params.get('offset'), '0');
+  page.requests[3].finish('Unavailable', 503); await filtered;
+  const notice = page.node('usage-totals').staleNotice;
+  const visibleWarning = notice.children[0].textContent;
+  assert.match(visibleWarning, /全部时间/);
+  assert.ok(visibleWarning.includes(stamp(lastSuccess)));
+
+  now += 60000;
+  page.node('usage-refresh').onclick(); const refresh = page.context.lastAction;
+  assert.equal(page.requests[4].params.get('offset'), '50');
+  page.requests[4].finish('Out of range', 200, 0, 36); await refresh;
+  const clamped = page.context.lastAction;
+  assert.equal(page.requests[5].params.get('offset'), '25');
+  assert.equal(page.title(), 'Visible task');
+  assert.equal(notice.hidden, false, 'an out-of-range response must keep the existing stale warning visible');
+
+  page.node('usage-tasks').children[0].children.at(-1).handlers.click();
+  const detail = page.context.lastAction;
+  assert.equal(page.requests[6].params.get('task'), 'Visible task');
+  assert.equal(page.requests[6].params.get('start'), '0');
+  assert.equal(page.requests[6].params.get('end'), visibleEnd);
+  page.requests[6].finish('Details'); await detail;
+  assert.ok(textOf(page.node('usage-detail-content')).includes('全部时间'));
+  assert.ok(textOf(page.node('usage-detail-content')).includes(stamp(lastSuccess)));
+
+  page.requests[5].finish('Unavailable', 503); await clamped;
+  assert.equal(page.title(), 'Visible task');
+  assert.equal(page.node('usage-page').textContent, '60 条记录 · 51–60');
+  assert.equal(notice.hidden, false);
+  assert.equal(notice.children[0].textContent, visibleWarning);
+});
+
+for (const status of [200, 503]) {
+  test(`usage language changes preserve visible pagination while loading (recovery ${status})`, async () => {
+    const page = usagePage();
+    const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+    vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')), page.context);
+    page.context.translateStatic = () => {};
+    async function changeLanguage(language) {
+      page.node('language-select').value = language;
+      page.node('language-select').handlers.change();
+      await page.context.lastAction;
+    }
+    function pagination() {
+      return {title: page.title(), label: page.node('usage-page').textContent,
+        disabled: ['usage-prev', 'usage-next', 'usage-refresh'].map(id => page.node(id).disabled)};
+    }
+    async function checkDetail(requestIndex, reportRequest, title, at) {
+      page.node('usage-tasks').children[0].children.at(-1).handlers.click();
+      const detail = page.context.lastAction, request = page.requests[requestIndex];
+      assert.equal(request.params.get('task'), title);
+      assert.equal(request.params.get('start'), reportRequest.params.get('start'));
+      assert.equal(request.params.get('end'), reportRequest.params.get('end'));
+      assert.equal(request.params.get('offset'), '0');
+      request.finish('Details'); await detail;
+      const stamp = vm.runInContext(`stamp(${at / 1000})`, page.context);
+      assert.equal(page.node('usage-detail-content').children[2].textContent, `All time · A · ${stamp}`);
+    }
+
+    let now = 1700000000000;
+    page.context.Date = class extends Date { static now() { return now; } };
+    const initial = page.show();
+    page.requests[0].finish('First page'); await initial;
+    page.node('usage-next').onclick(); const second = page.context.lastAction;
+    await changeLanguage('en');
+    const ordinary = pagination();
+    page.requests[1].finish('Second page'); await second;
+    const loaded = pagination();
+    page.node('usage-next').onclick(); const third = page.context.lastAction;
+    page.requests[2].finish('Visible last page'); await third;
+    const visibleAt = now;
+    await changeLanguage('zh-CN');
+
+    now += 60000;
+    page.node('usage-refresh').onclick(); const refresh = page.context.lastAction;
+    assert.equal(page.requests[3].params.get('offset'), '50');
+    page.requests[3].finish('Out of range', 200, 0, 36); await refresh;
+    const recovery = page.context.lastAction;
+    assert.equal(page.requests[4].params.get('offset'), '25');
+    await changeLanguage('en');
+    const recovering = pagination();
+    await checkDetail(5, page.requests[2], 'Visible last page', visibleAt);
+
+    page.requests[4].finish('Recovered page', status, 0, 36); await recovery;
+    const settled = pagination();
+    const notice = page.node('usage-totals').staleNotice;
+    if (status === 200) {
+      assert.equal(notice.hidden, true);
+      await checkDetail(6, page.requests[4], 'Recovered page', now);
+    } else {
+      assert.equal(notice.hidden, false);
+      await checkDetail(6, page.requests[2], 'Visible last page', visibleAt);
+      notice.children[1].handlers.click(); const retry = page.context.lastAction;
+      assert.equal(page.requests[7].params.get('offset'), '50');
+      page.requests[7].finish('Retried last page'); await retry;
+      assert.equal(page.title(), 'Retried last page');
+    }
+    assert.deepEqual({ordinary, loaded, recovering, settled}, {
+      ordinary: {title: 'First page', label: '60 records · 1–25', disabled: [true, true, true]},
+      loaded: {title: 'Second page', label: '60 records · 26–50', disabled: [false, false, false]},
+      recovering: {title: 'Visible last page', label: '60 records · 51–60', disabled: [true, true, true]},
+      settled: status === 200
+        ? {title: 'Recovered page', label: '36 records · 26–36', disabled: [false, true, false]}
+        : {title: 'Visible last page', label: '60 records · 51–60', disabled: [false, true, false]}
+    });
+  });
+}
 
 test('usage detail roles fall back to the usage role names for triage and acceptance', async () => {
   const page = usagePage(), initial = page.show();
@@ -4636,7 +8189,7 @@ function desktopPage() {
   page.context.clearInterval = id => { if (id === intervalId) poll = null; };
   page.context.uiConfirm = async () => true;
   page.context.window.RSIDesktop = desktop;
-  for (const id of ['update-status', 'update-notes', 'apply-update', 'desktop-update'])
+  for (const id of ['update-status', 'update-notes', 'apply-update', 'desktop-update', 'check-legacy-desktop-update'])
     Object.assign(page.node(id), {after(...children) { this.children.push(...children); }, remove() { this.removed = true; }});
   page.desktop = desktop;
   page.tick = async () => {
@@ -4698,7 +8251,8 @@ test('repeated update checks during a download keep one poller and the reported 
   await vm.runInContext('checkDesktopUpdate(true)', page.context);
   assert.equal(vm.runInContext('desktopUpdateTimer', page.context), first, 'a repeated check never starts a second poller');
   assert.equal(vm.runInContext('desktopUpdate.percent', page.context), 40, 'a repeated check keeps the reported progress');
-  assert.equal(page.desktop.checks, 2);
+  assert.equal(page.desktop.checks, 1, 'the disabled check neither calls the native command nor disturbs polling');
+  assert.equal(page.node('check-legacy-desktop-update').disabled, true);
   assert.match(String(page.node('desktop-update').children[0]), /40%/);
 });
 
@@ -4734,7 +8288,7 @@ function desktopBootPage({lastChecked = Date.now() - 60000, failCheck = false} =
   });
   page.context.fetch = async () => response(snapshot());
   page.context.localStorage.setItem('rsi-native-update-checked', String(lastChecked));
-  Object.assign(page.node('update-status'), {after(...children) { this.children.push(...children); }});
+  Object.assign(page.node('legacy-desktop-update'), {after(...children) { this.children.push(...children); }});
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/native-update.js'), 'utf8'), page.context);
   page.calls = calls;
   page.checkCalls = () => calls.filter(action => action === 'check').length;
@@ -4770,12 +8324,96 @@ test('opening the desktop console respects an active check backoff', async () =>
   assert.equal(page.checkCalls(), 1, 'the retry waits for the existing backoff');
 });
 
-test('the check-update button still forces an immediate check', async () => {
+test('desktop client and backend service keep separate check actions, results and busy states', async () => {
   const page = desktopBootPage();
+  const requests=[];
+  let reply;
+  page.context.fetch=(url, options)=>{
+    if(url==='/api/sys-metrics')return Promise.resolve(response({}));
+    requests.push([url,options.method]);
+    return new Promise(resolve=>{reply=resolve;});
+  };
   await page.fireReady();
-  assert.equal(page.checkCalls(), 0);
-  await page.node('check-update').handlers.click();
-  assert.equal(page.checkCalls(), 1, 'an explicit click bypasses the six-hour window');
+  assert.equal(page.checkCalls(),0);
+  const panel=page.node('legacy-desktop-update').children[0];
+  const clientCheck=panel.children.find(node=>node.textContent==='检查桌面客户端更新');
+  const clientStatus=panel.children.find(node=>node.attributes.role==='status');
+  const serviceCheck=page.node('check-update');
+  vm.runInContext('state.update={state:"unchecked",channel:"managed"};renderUpdate()',page.context);
+  const serviceAction=serviceCheck.handlers.click();
+  await new Promise(setImmediate);
+  assert.equal(serviceCheck.disabled,true);
+  assert.equal(clientCheck.disabled,false);
+  assert.match(page.node('update-status').textContent,/正在检查更新/);
+  await clientCheck.onclick();
+  assert.equal(page.checkCalls(),1,'the explicit client check bypasses the six-hour window');
+  assert.match(clientStatus.textContent,/已是最新稳定版/);
+  assert.equal(serviceCheck.disabled,true);
+  reply(response({started:true,update:{state:'available',version:'9.0.0',channel:'managed'}}));
+  await serviceAction;
+  assert.match(page.node('update-status').textContent,/9\.0\.0/);
+  assert.doesNotMatch(clientStatus.textContent,/9\.0\.0/);
+  assert.deepEqual(requests,[['/api/updates/check','POST']]);
+  assert.deepEqual(page.calls.filter(action=>['check','download','install'].includes(action)),['check']);
+  vm.runInContext('state.update={state:"unchecked",channel:"desktop",desktop_managed:true};renderUpdate()',page.context);
+  assert.match(page.node('update-status').textContent,/随桌面客户端更新/);
+  assert.equal(serviceCheck.disabled,true);
+  assert.equal(page.node('apply-update').disabled,true);
+  assert.equal(clientCheck.disabled,false);
+  await serviceCheck.handlers.click();
+  assert.equal(requests.length,1);
+  vm.runInContext('state.update={state:"available",version:"9.0.0",channel:"managed"};renderUpdate()',page.context);
+  assert.equal(serviceCheck.disabled,false);
+  page.context.window.RSIDesktop.isLocalDisconnected=()=>true;
+  vm.runInContext('renderUpdate()',page.context);
+  assert.equal(serviceCheck.disabled,true);
+  assert.equal(page.node('apply-update').disabled,true);
+  assert.equal(clientCheck.disabled,false);
+});
+
+test('operations confirmation names the action and restores focus after dismissal', async () => {
+  const page=browser();
+  const opener=page.node('apply-update');
+  page.document.activeElement=opener;
+  opener.focus=()=>{page.document.activeElement=opener;};
+  page.document.body=page.node('body');
+  const create=page.document.createElement;
+  page.document.createElement=tag=>{
+    const node=create(tag);node.focus=()=>{page.document.activeElement=node;};return node;
+  };
+  const result=page.context.uiConfirm('确认后台服务更新？');
+  const dialog=page.document.body.children.at(-1),cancel=dialog.children.at(-1).children[0];
+  assert.equal(dialog.attributes['aria-label'],'确认后台服务更新？');
+  assert.equal(page.document.activeElement,cancel);
+  dialog.close();
+  assert.equal(await result,false);
+  assert.equal(page.document.activeElement,opener);
+  assert.equal(dialog.isConnected,false);
+});
+
+test('global configuration repair keeps failure inside its named dialog and restores focus on close',async()=>{
+  const page=browser(),opener=page.node('settings-save');
+  page.document.activeElement=opener;
+  opener.focus=()=>{page.document.activeElement=opener;};
+  page.document.body=page.node('body');
+  const create=page.document.createElement;
+  page.document.createElement=tag=>{
+    const node=create(tag);node.focus=()=>{page.document.activeElement=node;};return node;
+  };
+  page.context.api=async route=>{
+    assert.equal(route,'config/repair-global');
+    throw Error('fixture repair failure');
+  };
+  page.context.offerGlobalConfigRepair({});
+  const dialog=page.document.body.children.at(-1),[title,,alert,actions]=dialog.children;
+  const [cancel,repair]=actions.children;
+  assert.equal(dialog.attributes['aria-labelledby'],title.id);
+  assert.equal(page.document.activeElement,cancel);
+  await repair.onclick();
+  assert.equal(dialog.open,true);
+  assert.equal(alert.attributes.role,'alert');assert.equal(alert.textContent,'fixture repair failure');
+  assert.equal(repair.disabled,false);
+  cancel.onclick();assert.equal(page.document.activeElement,opener);
 });
 
 test('multiple predecessors survive language rebuild and save as one dependency set', async () => {
@@ -4968,6 +8606,42 @@ test('runtime restoration preserves an explicit task route and its settings scop
   assert.equal(vm.runInContext('projectId',page.context),'b');
   assert.equal(vm.runInContext('view',page.context),'overview');
   assert.equal(page.node('config-scope').value,'global');
+});
+
+test('runtime restoration keeps the model settings scope selected on each connection', async () => {
+  const localScope='http://127.0.0.1:18450',remoteScope='https://remote.example.test';
+  const local=browser(),remote=browser();
+  const storage=local.context.localStorage;
+  function desktopPage(page,runtime,hash='') {
+    Object.assign(page.context,{
+      localStorage:storage,
+      location:{href:'https://fixture.test/'+hash,pathname:'/',search:'',hash},
+      history:{replaceState(){},pushState(){}},
+    });
+    page.context.window.__RSI_MACHINE_KEY__=runtime;
+    return page;
+  }
+  for(const [page,runtime,scope] of [[local,localScope,'global'],[remote,remoteScope,'project']]) {
+    desktopPage(page,runtime);
+    page.context.localWrite('rsi-project','a');
+    vm.runInContext('view="models";state.tasks=[]',page.context);
+    page.context.changeSettingsScope(scope);
+  }
+  for(const [runtime,scope] of [[localScope,'global'],[remoteScope,'project']]) {
+    const page=desktopPage(browser(),runtime);
+    page.node('config-scope').value='project';
+    vm.runInContext('state=undefined;scopeInitialized=false',page.context);
+    page.context.fetch=async()=>response({...snapshot(),tasks:[],runs:[],selected_project:'a'});
+    page.context.restoreRuntimeNavigation();
+    await page.context.refresh();
+    assert.equal(vm.runInContext('view',page.context),'models');
+    assert.equal(vm.runInContext('projectId',page.context),'a');
+    assert.equal(page.node('config-scope').value,scope,'the first state load must retain the restored scope');
+  }
+  const deepLink=desktopPage(browser(),localScope,'#view=models&project=b&scope=project');
+  deepLink.context.restoreRuntimeNavigation();
+  assert.equal(deepLink.node('config-scope').value,'project');
+  assert.equal(vm.runInContext('projectId',deepLink.context),'b');
 });
 
 test('log navigation finds an offset zero anchor before moving to the next anchor', async () => {

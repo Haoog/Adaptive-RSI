@@ -19,8 +19,8 @@ window.RSIExperience = (() => {
     liveState = "",
     inboxBusy = false,
     inboxAt = 0;
-  const queueSaves = new Map();
-  let queueEditor, backoffRetry;
+  const queueSaves = new Map(), supplementSaves = new Map();
+  let queueEditor, backoffRetry, liveRetryButton;
   let usageButton;
   const queueKey = task => JSON.stringify([task.project, task.id]);
   function queueEditorCurrent(editor) {
@@ -327,6 +327,21 @@ window.RSIExperience = (() => {
       );
       outcome.append(card);
     }
+    if (data.risk_review_evidence_requests?.length) {
+      const evidenceRequests = el("details");
+      evidenceRequests.open = true;
+      evidenceRequests.append(el("summary", t("高风险复审补证")));
+      for (const request of data.risk_review_evidence_requests) {
+        const card = el("div", undefined, "provider-card");
+        if (request.area) card.append(el("strong", t(request.area)));
+        if (request.title) card.append(el("p", request.title));
+        if (request.path) card.append(el("p", request.path + (request.line ? ":" + request.line : "")));
+        card.append(el("p", request.reason));
+        if (request.suggestion) card.append(el("p", request.suggestion));
+        evidenceRequests.append(card);
+      }
+      outcome.append(evidenceRequests);
+    }
     if (data.phases?.length) {
       const timeline = el("details");
       timeline.append(el("summary", t("阶段耗时")));
@@ -383,15 +398,69 @@ window.RSIExperience = (() => {
         ),
       );
   }
+  function renderTaskRecovery(node, recovery) {
+    if (!node) return;
+    const signature = JSON.stringify(recovery || null);
+    if (node.dataset.recovery === signature) return;
+    node.dataset.recovery = signature;
+    node.hidden = !recovery?.latest_run;
+    node.replaceChildren();
+    if (node.hidden) return;
+    const run = recovery.latest_run;
+    const origins = {
+      manual_retry: "手动重试", manual_scan: "手动发起巡检", scheduled_scan: "定时巡检",
+      provider_retry: "供应商故障后重试", provider_cooldown: "供应商冷却后重试",
+      budget_retry: "额度等待后重试", automatic_retry: "自动重试",
+    };
+    const stages = {
+      planning: "判断价值", acceptance: "确定完成标准", implementation: "修改代码",
+      evaluation: "运行检查", review: "代码评审", risk_review: "风险复审", validated_candidate: "已验证候选补丁",
+    };
+    const reasons = {
+      input_signature_changed: "阶段输入签名已变化", reused_record_invalid: "历史记录无法通过验证",
+      result_requires_rework: "历史结果需要重新处理", patch_hash_changed: "补丁校验值不一致",
+      patch_replay_failed: "补丁无法应用到当前工作区",
+    };
+    const labels = {stage_reused: "已复用", stage_invalidated: "检查点已失效", stage_started: "本轮已开始执行"};
+    const stageName = stage => t(stages[stage] || stage);
+    node.append(el("h3", t("运行来源与阶段恢复")), el("p", t("最近一次运行来源") + " · " +
+      t(origins[run.origin] || sourceNames[run.origin] || run.origin || "历史运行来源未记录") + " · " + run.id));
+    if (recovery.pending) node.append(el("p", t("待重新验证，阶段恢复结果以新运行记录为准。"), "muted"));
+    const events = recovery.events || [];
+    const first = events.find(event => event.kind === "stage_started");
+    if (first) node.append(el("p", t("本轮实际执行起点") + " · " + stageName(first.stage)));
+    if (events.length) {
+      const list = el("ul");
+      for (const event of events) {
+        const source = event.from_run || event.checkpoint || event.from_checkpoint;
+        const parts = [stageName(event.stage), t(labels[event.kind] || event.kind)];
+        if (event.reason) parts.push(t(reasons[event.reason] || event.reason));
+        if (source) parts.push(t("来源") + " " + source);
+        if (event.error) parts.push(event.error);
+        list.append(el("li", parts.join(" · ")));
+      }
+      node.append(list);
+    }
+    if (recovery.checkpoints?.length) {
+      const details = el("details"), list = el("ul");
+      details.append(el("summary", t("最近两次运行的检查点")));
+      for (const checkpoint of recovery.checkpoints)
+        list.append(el("li", stageName(checkpoint.stage) + " · " + checkpoint.run + " · " + stamp(checkpoint.created)));
+      details.append(list);
+      node.append(details);
+    }
+  }
   async function taskControls(task, body, ticket, queueDraft, editor) {
-    const project = projectId, baselineVersion = editor.version;
-    const current = () => projectId === project && ticket === detailSequence && body.isConnected;
+    const project = projectId, baselineVersion = editor.version, retryKey = taskRetryKey(task);
+    const sameRuntime = () => taskRetryKey(task) === retryKey;
+    const current = () => projectId === project && ticket === detailSequence && body.isConnected && sameRuntime();
     async function refreshTaskDetail() {
       await refresh();
       if (!current()) return;
       const updated = await api("task?id=" + encodeURIComponent(task.id) + "&project=" + encodeURIComponent(task.project));
       if (current()) await showTask(updated);
     }
+    const retryAtRead = taskRetries.get(retryKey);
     const metadata = await api(
       "task?id=" +
         encodeURIComponent(task.id) +
@@ -400,6 +469,10 @@ window.RSIExperience = (() => {
     );
     if (!current()) return;
     const controls = el("section", undefined, "task-controls");
+    const recovery = el("section");
+    recovery.id = "task-recovery";
+    renderTaskRecovery(recovery, metadata.recovery);
+    controls.append(recovery);
     if (metadata.revision_pending)
       controls.append(el("p", t("补充已收到，将在当前阶段结束后带入下一轮。"), "muted"));
     const waitReason = metadata.wait_reason || task.wait_reason ||
@@ -433,42 +506,26 @@ window.RSIExperience = (() => {
       causes.addEventListener('toggle',()=>{if(causes.open)safe(loadCauses);});reload.onclick=()=>safe(loadCauses);
     }
     controls.append(el("h3", t("下一步")));
-    if (
-      [
-        "failed",
-        "blocked",
-        "waiting_budget",
-        "interrupted",
-        "expired",
-        "insufficient_evidence",
-        "deferred",
-        "rejected",
-        "cancelled",
-        "obsolete",
-      ].includes(metadata.state)
-    )
-      controls.append(
-        action(
-          t("基于当前输入重新检查"),
-          async () => {
-            if (!current()) return;
-            await api("retry", { task: task.id });
+    const inBackoff = metadata.state === "queued" && Number(metadata.available) > Date.now() / 1000;
+    const canRecheck = [
+      "failed", "blocked", "waiting_budget", "interrupted", "expired",
+      "insufficient_evidence", "deferred", "rejected", "cancelled", "obsolete",
+    ].includes(metadata.state);
+    // A metadata read started during a write may still describe the old retryable state.
+    if ((canRecheck || inBackoff) && !retryAtRead?.accepted) {
+      const retry = taskRetryButton(task, detailTaskRetryButtons,
+        canRecheck ? t("基于当前输入重新检查") : t("立即重试"), {task: task.id}, current, async () => {
+          try {
             await refreshTaskDetail();
-          },
-          "button",
-        ),
-      );
-    else if (metadata.state === "queued" && Number(metadata.available) > Date.now() / 1000) {
-      backoffRetry = action(
-        t("立即重试"),
-        async () => {
-          if (!current()) return;
-          await api("retry", { task: task.id });
-          await refreshTaskDetail();
-        },
-        "button",
-      );
-      controls.append(backoffRetry);
+          } catch {
+            if (!current()) return;
+            toast(t("已安排重试"));
+            liveFailures += 1;
+            liveNotice();
+          }
+        });
+      if (inBackoff) backoffRetry = retry;
+      controls.append(retry);
     }
     if (
       [
@@ -498,38 +555,73 @@ window.RSIExperience = (() => {
       input.maxLength = 10000;
       // 空白补充由下面的显式校验拦下；HTML required 会放过纯空白并产生未本地化的原生提示。
       input.setAttribute("aria-required", "true");
-        input.value = draftStore.get('task-supplement', task.id) || '';
-        supplement.open = !!input.value;
-        input.addEventListener('input', () => draftStore.set('task-supplement', task.id, input.value));
       label.append(input);
       const reasonLabel = el("label", t("干预原因（可选，保留原文）")), reason = el("textarea");
       reason.rows = 2;reason.maxLength = 2000;reasonLabel.append(reason);
-      // 详情轮询与语言切换会整块重建；按任务恢复未提交的审计原文，提交成功后清除。
-      reason.value = draftStore.get('task-reason', task.id) || '';
-      if (reason.value) supplement.open = true;
-      reason.addEventListener('input', () => draftStore.set('task-reason', task.id, reason.value));
+      const fields = {'task-supplement': input, 'task-reason': reason};
+      for (const [kind, field] of Object.entries(fields)) {
+        field.value = draftStore.get(kind, task.id) || '';
+        field.addEventListener('input', () => {
+          if (!current()) return;
+          supplementSaves.get(retryKey)?.edited.add(kind);
+          draftStore.set(kind, task.id, field.value);
+        });
+      }
+      supplement.open = !!(input.value || reason.value);
       const submit = el("button", t("保存补充并重新评估"), "button");
       submit.type = "submit";
+      const formView = {
+        clear(kind, value) {
+          if (current() && fields[kind].value === value) fields[kind].value = '';
+        },
+        unlock() { submit.disabled = false; },
+      };
+      const pending = supplementSaves.get(retryKey);
+      if (pending) {
+        pending.view = formView;
+        submit.disabled = true;
+      }
       form.append(label, reasonLabel, submit);
       form.onsubmit = (event) => {
         event.preventDefault();
+        if (!current() || supplementSaves.has(retryKey)) return;
         safe(async () => {
-          if (!current()) return;
           const value = input.value, submittedReason = reason.value;
           if (!value.trim()) throw Error(t("补充需求不能为空，请输入需要保留或补充的要求。"));
+          const save = {edited: new Set(), view: formView};
+          supplementSaves.set(retryKey, save);
           submit.disabled = true;
           try {
-            const receipt = await api("task/revise", {
-              task: task.id,
-              supplement: value,
-              reason: submittedReason,
-            });
-            if (draftStore.get('task-supplement', task.id) === value) draftStore.remove('task-supplement', task.id);
-            if (draftStore.get('task-reason', task.id) === submittedReason) draftStore.remove('task-reason', task.id);
+            let receipt;
+            try {
+              receipt = await api("task/revise", {
+                task: task.id,
+                supplement: value,
+                reason: submittedReason,
+              });
+            } catch (error) {
+              if (current()) throw error;
+              return;
+            }
+            // draftStore resolves its namespace against the active runtime at each call.
+            if (!sameRuntime()) return;
+            for (const [kind, submitted] of [['task-supplement', value], ['task-reason', submittedReason]]) {
+              if (save.edited.has(kind)) continue;
+              if (draftStore.get(kind, task.id) === submitted) draftStore.remove(kind, task.id);
+              save.view.clear(kind, submitted);
+            }
+            if (!current()) return;
             toast(t(receipt.pending ? "补充已收到，将在当前阶段结束后带入下一轮。" : "补充已保存，将重新评估。"));
-            await refreshTaskDetail();
+            try {
+              await refreshTaskDetail();
+            } catch {
+              if (!current()) return;
+              liveFailures += 1;
+              liveNotice();
+            }
           } finally {
-            submit.disabled = false;
+            supplementSaves.delete(retryKey);
+            save.view.unlock();
           }
         }, form);
       };
@@ -637,10 +729,17 @@ window.RSIExperience = (() => {
         safe(async () => {
           if (!current() || queueSaves.has(editor.key)) return;
           const parents = selection(), submitted = {task: task.id, ...(parents.length > 1 ? {dependencies: parents} : {dependency: parents[0] || null}), urgency: urgency.checked ? 1 : 0};
+          const ownsFeedback = () => sameRuntime() && queueEditorCurrent(editor);
           queueSaves.set(editor.key, submitted);
           submit.disabled = true;
           try {
-            await api("task/schedule", submitted);
+            try {
+              await api("task/schedule", submitted);
+            } catch (error) {
+              if (ownsFeedback()) throw error;
+              return;
+            }
+            if (!sameRuntime()) return;
             // Rebase even if this form was rebuilt. Its editor still owns newer edits.
             editor.baseline = {dependencies: parents, urgency: !!submitted.urgency};
             editor.version++;
@@ -649,9 +748,15 @@ window.RSIExperience = (() => {
               queueEditor.baseline = {dependencies: parents, urgency: !!submitted.urgency};
               queueEditor.version++;
             }
-            if (!queueEditorCurrent(editor)) return;
-            await refresh();
-            if (queueEditorCurrent(editor)) toast(t("排队设置已保存"));
+            if (!ownsFeedback()) return;
+            toast(t("排队设置已保存"));
+            try {
+              await refresh();
+            } catch {
+              if (!ownsFeedback()) return;
+              liveFailures += 1;
+              liveNotice();
+            }
           } finally {
             queueSaves.delete(editor.key);
             if (queueEditor?.key === editor.key && queueEditor.submit)
@@ -816,6 +921,7 @@ window.RSIExperience = (() => {
   }
   function taskOpened(task, queueDraft) {
     const key = queueKey(task);
+    detailTaskRetryButtons.clear();
     if (queueEditor?.key !== key)
       queueEditor = {key, project: task.project, task: task.id, version: 0};
     queueEditor.draft = queueDraft;
@@ -874,6 +980,7 @@ window.RSIExperience = (() => {
   function liveNotice() {
     const node = liveStatusNode();
     if (!liveFailures) {
+      liveRetryButton = null;
       node.hidden = true;
       node.replaceChildren();
       return;
@@ -881,12 +988,12 @@ window.RSIExperience = (() => {
     const copy = liveLastSuccess
       ? t("实时刷新中断 · 上次成功更新 {time}。详情可能不是最新，可立即重试。").replace("{time}", stamp(liveLastSuccess / 1000))
       : t("实时刷新中断 · 尚未成功更新。详情可能不是最新，可立即重试。");
-    node.replaceChildren(document.createTextNode(copy), action(t("重试"), () => {
-      liveFailures = 0;
-      liveNotice();
-      clearTimeout(liveTimer);
-      return liveDetail();
-    }, "text-button"));
+    const retry = action(t("重试"), () => {
+      if (retry === liveRetryButton) return liveDetail();
+    }, "text-button");
+    retry.disabled = liveBusy;
+    liveRetryButton = retry;
+    node.replaceChildren(document.createTextNode(copy), retry);
     node.hidden = false;
   }
   // 隐藏页面或连续失败时退避；已结束的稳定交付仍保留 10 秒轮询，交付状态与价值反馈可以继续变化。
@@ -899,6 +1006,8 @@ window.RSIExperience = (() => {
   async function liveDetail() {
     if (liveBusy || !detailTask || !$("detail-dialog").open) return;
     liveBusy = true;
+    clearTimeout(liveTimer);
+    if (liveRetryButton) liveRetryButton.disabled = true;
     const task = detailTask,
       ticket = detailSequence;
     const current = () => ticket === detailSequence && projectId === task.project && $("detail-dialog").open;
@@ -907,7 +1016,11 @@ window.RSIExperience = (() => {
         "task?id=" + task.id + "&project=" + task.project,
       );
       if (!current()) return;
+      if (metadata?.id !== task.id || metadata.project !== task.project ||
+          typeof metadata.title !== "string" || typeof metadata.state !== "string")
+        throw Error("Invalid live task metadata");
       liveState = metadata.state || liveState;
+      renderTaskRecovery($("task-recovery"), metadata.recovery);
       // Issue sync may revise title, body or evidence while the task stays queued.
       // Rebuild only when the visible input changed so unchanged polls keep drafts and DOM.
       if (backoffRetry && !(metadata.state === "queued" && Number(metadata.available) > Date.now() / 1000)) {
@@ -930,11 +1043,15 @@ window.RSIExperience = (() => {
       );
       if (!current()) return;
       // `/api/task-runs` returns a page envelope; keep accepting the old bare array.
-      const history = Array.isArray(page) ? page : (Array.isArray(page?.runs) ? page.runs : []);
+      const history = Array.isArray(page) ? page : page?.runs;
+      if (!Array.isArray(history) || (history.length && !history[0]?.id))
+        throw Error("Invalid live task history");
       const latest = history[0];
       if (latest) {
         const data = await api("run?id=" + latest.id);
         if (!current()) return;
+        if (!data?.result || typeof data.result !== "object" || Array.isArray(data.result))
+          throw Error("Invalid live run result");
         liveEnded = data.ended != null;
         const signature = JSON.stringify([
           latest.id,
@@ -970,6 +1087,7 @@ window.RSIExperience = (() => {
       }
     } finally {
       liveBusy = false;
+      if (liveRetryButton) liveRetryButton.disabled = false;
       if (detailTask && $("detail-dialog").open) {
         clearTimeout(liveTimer);
         liveTimer = setTimeout(liveDetail, liveDelay());
@@ -1068,21 +1186,63 @@ window.RSIExperience = (() => {
       ),
     );
   }
+  const restoreChecks = new Map();
+  let storageCache, storageDialog;
   async function storage() {
-    const data = await api("storage"),
-      box = dialog("数据与诊断");
-    box.append(
-      el(
-        "p",
-        t("数据库、运行文件与备份占用") +
-          " · " +
-          Object.entries(data.bytes)
-            .map(
-              ([key, value]) =>
-                t(({database:'数据库',runs:'运行文件',backups:'备份',suites:'评估集',archives:'归档',installations:'安装版本'})[key] || key) + ": " + (value / 1048576).toFixed(1) + " MB",
-            )
-            .join(" / "),
-      ),
+    if (storageDialog?.open) return;
+    if (window.RSIDesktop) await window.RSIDesktop.ready;
+    if (storageDialog?.open) return;
+    const box = dialog("数据与诊断");
+    box.classList.add("storage-dialog");
+    storageDialog = box;
+    const machine = window.__RSI_MACHINE_KEY__;
+    const session = state?.csrf;
+    const previous = storageCache?.machine === machine && storageCache?.session === session ? storageCache : null;
+    storageCache = {machine, session, usage: previous?.usage};
+    const controller = new AbortController();
+    const visible = () => box.open && !controller.signal.aborted &&
+      machine === window.__RSI_MACHINE_KEY__ && session === state?.csrf;
+    box.addEventListener("close", () => controller.abort());
+    const read = async path => {
+      const request = new AbortController();
+      const cancel = () => request.abort();
+      controller.signal.addEventListener("abort", cancel, {once:true});
+      if (!visible()) cancel();
+      const deadline = setTimeout(cancel, 15000);
+      try {
+        return await api(path, undefined, {signal:request.signal});
+      } finally {
+        clearTimeout(deadline);
+        controller.signal.removeEventListener("abort", cancel);
+      }
+    };
+    const usage = el("p"), usageStatus = el("p", undefined, "muted"), summary = el("div");
+    usageStatus.setAttribute("role", "status");
+    const paintUsage = data => {
+      usage.textContent = t("数据库、运行文件与备份占用") + " · " + Object.entries(data.bytes)
+        .map(([key, value]) => t(({database:'数据库',runs:'运行文件',backups:'备份',suites:'评估集',archives:'归档',installations:'安装版本'})[key] || key) +
+             ": " + (value / 1048576).toFixed(1) + " MB").join(" / ") +
+        " · " + t("统计时间") + " " + stamp(data.scanned_at);
+    };
+    if (storageCache.usage) paintUsage(storageCache.usage);
+    const refreshUsage = action(t("刷新占用统计"), () => loadUsage(true), "text-button");
+    async function loadUsage(refresh = false) {
+      refreshUsage.disabled = true;
+      usageStatus.textContent = t("正在统计存储占用…");
+      try {
+        const data = await read("storage?usage=true" + (refresh ? "&refresh=true" : ""));
+        if (!visible()) return;
+        storageCache.usage = data;
+        paintUsage(data);
+        usageStatus.textContent = "";
+      } catch (error) {
+        if (visible()) usageStatus.textContent = t(error.code === "storage_scan_in_progress"
+          ? "正在进行其他占用统计，请稍后刷新。" : "存储占用统计未完成，可重新刷新。");
+      } finally {
+        refreshUsage.disabled = false;
+      }
+    }
+    box.append(usage, usageStatus, refreshUsage,
       el(
         "p",
         t(
@@ -1092,21 +1252,63 @@ window.RSIExperience = (() => {
       ),
     );
     const backupButton = action(t("创建一致性备份"), async () => {
+      if (!visible()) return;
       backupButton.disabled = true;
       let timer, cancelButton;
       try {
-        const operation = await api("operations", {kind:"backup", parameters:{}}),
+        const operation = await api("operations", {kind:"backup", parameters:{}, reuse_active:true}),
           status = el("p", t("正在创建备份"), "muted");
-        cancelButton = action(t("取消备份"), () => api("operations/cancel", {id:operation.id}), "text-button");
-        box.append(status, cancelButton);
-        let current;
-        do {
-          await new Promise(resolve => { timer = setTimeout(resolve, 500); });
-          current = await api("operation?id=" + encodeURIComponent(operation.id));
-          if (current.result?.pages_total) status.textContent = t("正在创建备份") + " · " +
-            Math.round(current.result.pages_done * 100 / current.result.pages_total) + "%";
-        } while (!current.ended);
-        cancelButton.remove();
+        status.setAttribute("role", "status");
+        void loadOperations();
+        const current = await new Promise(resolve => {
+          let finished = false, showProgress = true;
+          const finish = row => {
+            finished = true;
+            resolve(row);
+          };
+          cancelButton = action(t("取消备份"), async () => {
+            if (finished || cancelButton.disabled || !visible()) return;
+            cancelButton.disabled = true;
+            showProgress = false;
+            status.textContent = t("正在发送备份取消请求…");
+            let row;
+            try {
+              row = await api("operations/cancel", {id:operation.id});
+            } catch {
+              if (finished) return;
+              status.textContent = t("发送备份取消请求失败，可重试取消。");
+              cancelButton.disabled = false;
+              return;
+            }
+            if (finished) return;
+            if (row.ended) finish(row);
+            else status.textContent = t("已请求取消备份，等待服务确认…");
+          }, "text-button");
+          box.append(status, cancelButton);
+          const poll = async () => {
+            if (finished) return;
+            if (!visible()) { finish(); return; }
+            try {
+              const row = await api("operation?id=" + encodeURIComponent(operation.id));
+              if (finished) return;
+              if (row.ended) {
+                finish(row);
+                return;
+              }
+              if (showProgress && row.result?.pages_total) status.textContent = t("正在创建备份") + " · " +
+                Math.round(row.result.pages_done * 100 / row.result.pages_total) + "%";
+              timer = setTimeout(poll, 500);
+            } catch {
+              if (!finished) finish();
+            }
+          };
+          timer = setTimeout(poll, 500);
+        });
+        if (!visible()) return;
+        if (!current) {
+          status.textContent = t("无法继续获取备份状态。服务可能仍在创建备份，请稍后查看备份列表。");
+          return;
+        }
         if (current.state !== "completed") {
           status.textContent = t(current.state === "cancelled" ? "备份已取消" : "备份未完成，请重试。");
           return;
@@ -1118,7 +1320,17 @@ window.RSIExperience = (() => {
         link.download = "adaptive-rsi-" + saved.id + ".sqlite3";
         desktopDownload(link, saved.id);
         box.append(link);
+        if (visible()) void loadSummary();
+      } catch (error) {
+        if (!visible()) return;
+        if (error instanceof TypeError || !error.status || error.status >= 500) {
+          const note = el("p", t("若未收到回执，请先查看近期操作。"), "muted");
+          note.setAttribute("role", "status");
+          box.append(note);
+        }
+        throw error;
       } finally {
+        void loadOperations();
         clearTimeout(timer);
         cancelButton?.remove();
         backupButton.disabled = false;
@@ -1135,8 +1347,14 @@ window.RSIExperience = (() => {
         return;
       rotateButton.disabled = true;
       try {
+        if (!visible()) return;
         const saved = await api("session/rotate", { confirm: true });
+        if (machine !== window.__RSI_MACHINE_KEY__) return;
         if (state) state.csrf = saved.csrf;
+        if (!box.open) return;
+        // Close the old authorization scope before displaying the new link.
+        box.close();
+        const rotated = dialog("轮换访问链接");
         const field = el("input");
         field.readOnly = true;
         field.value = saved.url;
@@ -1153,7 +1371,7 @@ window.RSIExperience = (() => {
           }
         }, "text-button");
         const note = el("p", t("已轮换。请立即保存新的认证链接，旧链接已失效："));
-        box.append(note, field, copy);
+        rotated.append(note, field, copy);
         field.focus();
         field.select();
       } finally {
@@ -1161,74 +1379,119 @@ window.RSIExperience = (() => {
       }
     });
     box.append(rotateButton);
-    // 服务端校验没有截止时间；界面最多等待 10 分钟，超时后停止轮询并允许重试。
+    // 界面每次最多查询 10 分钟；停止轮询后仍可继续查看同一操作。
     const restoreCheckTimeout = 10 * 60 * 1000;
-    for (const saved of data.backups) {
-      const link = el(
-        "a",
-        t("下载备份") + " · " + stamp(saved.created),
-        "text-button",
-      );
-      link.href = "/api/backup?id=" + saved.id;
-      link.download = "adaptive-rsi-" + saved.id + ".sqlite3";
-      desktopDownload(link, saved.id);
-      box.append(link);
-      let checking = false, status, timer, deadlineTimer;
-      const checkButton = action(t("验证恢复点"), async () => {
-        // 全库校验可能持续数十秒到数分钟：先禁用按钮，避免重复点击占满后台操作池。
-        if (checking) return;
-        checking = true;
-        checkButton.disabled = true;
-        if (!status) {
-          status = el("p", undefined, "muted");
-          status.setAttribute("role", "status");
-          checkButton.after(status);
-        }
-        status.textContent = t("正在验证恢复点…");
-        const controller = new AbortController();
-        let timedOut = false;
-        try {
-          const operation = await api("operations", {kind:"restore-check", parameters:{id:saved.id}}),
-            deadline = Date.now() + restoreCheckTimeout;
-          deadlineTimer = setTimeout(() => { timedOut = true; controller.abort(); }, restoreCheckTimeout);
-          let current;
-          do {
-            await new Promise(resolve => { timer = setTimeout(resolve, 300); });
-            current = await api("operation?id=" + encodeURIComponent(operation.id), undefined, {signal:controller.signal});
-          } while (!current.ended && Date.now() < deadline);
-          if (!current.ended) {
-            status.textContent = t("验证未完成，请重试。");
-            toast(status.textContent, true);
-            return;
+    function renderSummary(data) {
+      summary.replaceChildren();
+      for (const saved of data.backups) {
+        const link = el(
+          "a",
+          t("下载备份") + " · " + stamp(saved.created),
+          "text-button",
+        );
+        link.href = "/api/backup?id=" + saved.id;
+        link.download = "adaptive-rsi-" + saved.id + ".sqlite3";
+        desktopDownload(link, saved.id);
+        summary.append(link);
+        let status;
+        const checkButton = action(t("验证恢复点"), async () => {
+          if (!visible()) return;
+          const key = JSON.stringify([machine, session, saved.id]);
+          const check = restoreChecks.get(key) ?? {id:null, owner:null};
+          if (check.owner) return;
+          const poll = new AbortController();
+          check.owner = poll;
+          restoreChecks.set(key, check);
+          checkButton.disabled = true;
+          if (!status) {
+            status = el("p", undefined, "muted");
+            status.setAttribute("role", "status");
+            checkButton.after(status);
           }
-          status.textContent = t(current.state === "completed" ? "恢复点验证通过。" : "恢复点验证未通过。");
-          toast(status.textContent, current.state !== "completed");
-        } catch (error) {
-          // 轮询中断时保留错误提示，同时把状态行改成可重试，避免停在“正在验证”。
-          if (status) status.textContent = t("验证未完成，请重试。");
-          if (timedOut) {
-            toast(status.textContent, true);
-            return;
+          status.textContent = t("正在验证恢复点…");
+          let timer, deadlineTimer, wakePoll;
+          const release = () => {
+            if (check.owner !== poll) return;
+            check.owner = null;
+            if (!check.id) restoreChecks.delete(key);
+            checkButton.disabled = false;
+          };
+          const closePoll = () => {
+            // 未收到创建回执时继续保留 guard，避免重开面板后重复提交。
+            if (check.id) release();
+            clearTimeout(timer);
+            clearTimeout(deadlineTimer);
+            wakePoll?.();
+            poll.abort();
+          };
+          controller.signal.addEventListener("abort", closePoll, {once:true});
+          try {
+            if (!check.id) {
+              const operation = await api("operations", {kind:"restore-check", parameters:{id:saved.id}, reuse_active:true});
+              check.id = operation.id;
+              if (!visible()) return;
+              void loadOperations();
+            }
+            const deadline = Date.now() + restoreCheckTimeout;
+            deadlineTimer = setTimeout(() => poll.abort(), restoreCheckTimeout);
+            let current;
+            do {
+              await new Promise(resolve => {
+                wakePoll = resolve;
+                timer = setTimeout(resolve, 300);
+              });
+              wakePoll = null;
+              if (!visible()) return;
+              poll.signal.throwIfAborted();
+              current = await api("operation?id=" + encodeURIComponent(check.id), undefined, {signal:poll.signal});
+              if (!visible()) return;
+              poll.signal.throwIfAborted();
+            } while (!current.ended && Date.now() < deadline);
+            if (current.ended) {
+              check.id = null;
+              status.textContent = t(current.state === "completed" ? "恢复点验证通过。" : "恢复点验证未通过。");
+              toast(status.textContent, current.state !== "completed");
+            } else {
+              status.textContent = t("无法获取验证状态。再次点击可继续查看原验证。");
+              toast(status.textContent, true);
+            }
+          } catch (error) {
+            if (!visible()) return;
+            if (check.id && error.status === 404 && error.code === "operation_not_found") {
+              check.id = null;
+              status.textContent = t("原验证已不存在。再次点击可开始新的验证。");
+              toast(status.textContent, true);
+              return;
+            }
+            status.textContent = t(check.id ? "无法获取验证状态。再次点击可继续查看原验证。" : "若未收到回执，请先查看近期操作。");
+            if (poll.signal.aborted) {
+              toast(status.textContent, true);
+              return;
+            }
+            throw error;
+          } finally {
+            controller.signal.removeEventListener("abort", closePoll);
+            clearTimeout(timer);
+            clearTimeout(deadlineTimer);
+            release();
+            if (visible()) void loadOperations();
           }
-          throw error;
-        } finally {
-          clearTimeout(timer);
-          clearTimeout(deadlineTimer);
-          checking = false;
-          checkButton.disabled = false;
-        }
-      }, "text-button");
-      box.append(checkButton);
-      box.append(action(t("验证备份并生成清单"), async () => {
-        const response = await fetch("/api/backup?id=" + encodeURIComponent(saved.id) + "&format=manifest");
-        if (!response.ok) throw Error(t("备份清单生成失败"));
-        const bundle = await response.blob();
-        const link = el("a", t("下载备份清单"), "button");
-        link.href = URL.createObjectURL(bundle);
-        link.download = "adaptive-rsi-" + saved.id + "-backup-pack.json";
-        link.addEventListener("click", () => setTimeout(() => URL.revokeObjectURL(link.href), 1000));
-        box.append(link);
-      }, "text-button"));
+        }, "text-button");
+        summary.append(checkButton);
+        summary.append(action(t("验证备份并生成清单"), async () => {
+          if (!visible()) return;
+          const response = await fetch("/api/backup?id=" + encodeURIComponent(saved.id) + "&format=manifest",
+            {signal:controller.signal});
+          if (!response.ok) throw Error(t("备份清单生成失败"));
+          const bundle = await response.blob();
+          if (!visible()) return;
+          const link = el("a", t("下载备份清单"), "button");
+          link.href = URL.createObjectURL(bundle);
+          link.download = "adaptive-rsi-" + saved.id + "-backup-pack.json";
+          link.addEventListener("click", () => setTimeout(() => URL.revokeObjectURL(link.href), 1000));
+          summary.append(link);
+        }, "text-button"));
+      }
     }
     box.append(
       el("h3", t("恢复命令")),
@@ -1237,67 +1500,158 @@ window.RSIExperience = (() => {
         "adaptive-rsi --state-dir /NEW/STATE restore /PATH/BACKUP.sqlite3",
       ),
     );
-    const diagnostics = await api("diagnostics/preview"),
-      preview = el("details");
-    preview.append(
-      el("summary", t("诊断导出预览")),
-      el(
-        "p",
-        t(
-          "默认诊断包仅包含版本、数量、故障代码和占用。不含凭据、路径、代码、任务正文或完整提示。",
-        ),
-        "muted",
-      ),
-      el("pre", JSON.stringify(diagnostics, null, 2)),
-    );
-    const consent = el("input");
+    const history = el("div"), historyStatus = el("p", undefined, "muted"), historyRows = el("ul");
+    historyStatus.setAttribute("role", "status");
+    const refreshHistory = action(t("刷新近期操作"), loadOperations, "text-button");
+    let historyTimer;
+    const cancelling = new Set();
+    box.addEventListener("close", () => clearTimeout(historyTimer));
+    history.append(el("h3", t("当前机器的近期备份与恢复验证")), refreshHistory, historyStatus, historyRows);
+    async function loadOperations() {
+      if (!visible() || refreshHistory.disabled || refreshHistory.hidden) return;
+      clearTimeout(historyTimer);
+      refreshHistory.disabled = true;
+      historyStatus.textContent = t("正在查询近期操作…");
+      try {
+        const {operations} = await read("operations");
+        if (!visible()) return;
+        historyRows.replaceChildren();
+        historyStatus.textContent = operations.length ? "" : t("没有近期操作。");
+        for (const row of operations) {
+          const label = t(row.kind === "backup" ? "一致性备份" : "恢复点验证");
+          const states = {queued:t("排队中"), running:t("运行中"), completed:t("已完成"), cancelled:t("已取消"),
+                          failed:t("失败"), interrupted:t("已中断，结果未知")};
+          const backup = row.backup_id || (row.kind === "restore-check" ? t("备份标识未知") : null);
+          const item = el("li", [label, stamp(row.created), states[row.state] || t("未知"), backup, row.id]
+            .filter(Boolean).join(" · "));
+          if (row.progress?.pages_total) item.append(" · " + Math.round(100 * row.progress.pages_done / row.progress.pages_total) + "%");
+          if (row.cancellable) {
+            const cancel = action(t("取消备份"), async () => {
+              if (!visible() || cancelling.has(row.id)) return;
+              cancel.disabled = true;
+              cancelling.add(row.id);
+              try {
+                const result = await api("operations/cancel", {id:row.id}, {signal:controller.signal});
+                if (!visible()) return;
+                if (!result.ended) toast(t("已请求取消备份，等待服务确认…"));
+              } finally {
+                cancelling.delete(row.id);
+                cancel.disabled = false;
+              }
+              await loadOperations();
+            }, "text-button");
+            cancel.disabled = cancelling.has(row.id);
+            item.append(cancel);
+          }
+          historyRows.append(item);
+        }
+        if (operations.some(row => !row.ended)) historyTimer = setTimeout(loadOperations, 2000);
+      } catch (error) {
+        if (!visible()) return;
+        const unsupported = error.code === "unsupported_capability" && error.feature === "operation-history";
+        refreshHistory.hidden = unsupported;
+        historyStatus.textContent = t(unsupported ? "当前服务版本不支持近期操作列表。" : "近期操作查询未完成，可重新刷新。");
+      } finally {
+        refreshHistory.disabled = false;
+      }
+    }
+    const summaryStatus = el("p", undefined, "muted");
+    summaryStatus.setAttribute("role", "status");
+    const refreshSummary = action(t("刷新备份与审批摘要"), loadSummary, "text-button");
+    async function loadSummary() {
+      if (!visible() || refreshSummary.disabled) return;
+      refreshSummary.disabled = true;
+      summaryStatus.textContent = t("正在读取备份与审批摘要…");
+      try {
+        const data = await read("storage?summary=true");
+        if (!visible()) return;
+        renderSummary(data);
+        const counts = [
+          [data.expiring_count ?? data.expiring?.length, "待批准候选会在项目保留期限到达后清理；请及时交付或重新运行。"],
+          [data.delivering_count ?? data.delivering?.length, "已批准候选正在交付，不再计入待批准；交付完成前保留审批记录。"],
+          [data.delivered_count ?? data.delivered?.length, "已交付候选保留在历史记录中，不再计入待批准。"],
+        ];
+        for (const [count, label] of counts) if (count) summary.append(el("p", t(label) + " " + count, "muted"));
+        summaryStatus.textContent = "";
+      } catch {
+        if (visible()) summaryStatus.textContent = t("备份与审批摘要读取失败，可重新刷新。");
+      } finally {
+        refreshSummary.disabled = false;
+      }
+    }
+    box.append(history, refreshSummary, summaryStatus, summary);
+    const preview = el("details"), diagnosticStatus = el("p", undefined, "muted"), content = el("pre");
+    const consent = el("input"), consentLabel = el("label");
     consent.type = "checkbox";
     consent.id = "diagnostic-consent";
-    const consentLabel = el("label");
     consentLabel.append(consent, document.createTextNode(t("我已核对预览内容，并同意导出这份诊断包。")));
+    diagnosticStatus.setAttribute("role", "status");
+    let reviewed;
     const exportButton = action(t("导出诊断包"), async () => {
-      const result = await api("diagnostics/export", { consent: true });
-      const blob = new Blob([result.body], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const link = el("a");
-      link.href = url;
-      link.download = result.filename || "adaptive-rsi-diagnostics.json";
-      link.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-      toast(t("诊断包已导出"));
+      if (!visible() || !reviewed || !consent.checked) return;
+      const snapshot = reviewed;
+      exportButton.disabled = true;
+      try {
+        const result = snapshot.snapshot ? await api("diagnostics/export", {consent:true, snapshot:snapshot.snapshot},
+          {signal:controller.signal}) : snapshot;
+        if (!visible() || reviewed !== snapshot || !consent.checked) return;
+        if (result.body !== snapshot.body) throw Error(t("导出内容与预览不一致，请重新预览。"));
+        const url = URL.createObjectURL(new Blob([result.body], {type:"application/json"}));
+        const link = el("a");
+        link.href = url;
+        link.download = "adaptive-rsi-diagnostics.json";
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        toast(t("诊断包已导出"));
+      } catch (error) {
+        if (!visible()) return;
+        if (error.code !== "diagnostic_preview_expired") throw error;
+        reviewed = null;
+        consent.checked = false;
+        consent.disabled = true;
+        diagnosticStatus.textContent = t("诊断预览已过期，请重新预览并确认。");
+      } finally {
+        exportButton.disabled = !reviewed || !consent.checked;
+      }
     });
-    exportButton.disabled = true;
-    consent.onchange = () => { exportButton.disabled = !consent.checked; };
-    box.append(preview, consentLabel, exportButton);
-    if (data.expiring.length)
-      box.append(
-        el(
-          "p",
-          t("待批准候选会在项目保留期限到达后清理；请及时交付或重新运行。") +
-            " " +
-            data.expiring.length,
-        ),
-      );
-    if (data.delivering?.length)
-      box.append(
-        el(
-          "p",
-          t("已批准候选正在交付，不再计入待批准；交付完成前保留审批记录。") +
-            " " +
-            data.delivering.length,
-          "muted",
-        ),
-      );
-    if (data.delivered?.length)
-      box.append(
-        el(
-          "p",
-          t("已交付候选保留在历史记录中，不再计入待批准。") +
-            " " +
-            data.delivered.length,
-          "muted",
-        ),
-      );
+    exportButton.disabled = consent.disabled = true;
+    consent.onchange = () => { exportButton.disabled = !reviewed || !consent.checked; };
+    const refreshPreview = action(t("重新生成诊断预览"), loadPreview, "text-button");
+    async function loadPreview() {
+      if (!visible() || refreshPreview.disabled) return;
+      reviewed = null;
+      consent.checked = false;
+      exportButton.disabled = consent.disabled = refreshPreview.disabled = true;
+      content.textContent = "";
+      diagnosticStatus.textContent = t("正在生成诊断预览…");
+      try {
+        const data = await read("diagnostics/preview?snapshot=true");
+        if (!visible()) return;
+        // An older service returns the original allowlisted preview object.
+        // Download the text it showed locally rather than asking it to recompute.
+        if (typeof data.snapshot === "string" && typeof data.body === "string") reviewed = data;
+        else if (data.format === 1 && Array.isArray(data.included) && data.row_counts) {
+          reviewed = {body:JSON.stringify(data, null, 2)};
+        } else throw Error("Unsupported diagnostic preview");
+        content.textContent = reviewed.body;
+        diagnosticStatus.textContent = "";
+        consent.disabled = false;
+      } catch {
+        if (visible()) diagnosticStatus.textContent = t("诊断预览未完成，可重新生成。");
+      } finally {
+        refreshPreview.disabled = false;
+      }
+    }
+    preview.append(el("summary", t("诊断导出预览")),
+      el("p", t("诊断包仅包含版本、记录数量、无效证据计数和 SQLite 版本。"), "muted"),
+      diagnosticStatus, content, refreshPreview, consentLabel, exportButton);
+    preview.addEventListener("toggle", () => {
+      if (preview.open && !reviewed) void loadPreview();
+    });
+    box.append(preview);
+    void loadSummary();
+    void loadOperations();
+    void loadUsage();
   }
   function desktopDownload(link, id) {
     if (!window.RSIDesktop) return;
@@ -1324,11 +1678,29 @@ window.RSIExperience = (() => {
   async function metrics() {
     const data = await api("workflow-metrics?project=" + projectId),
       box = dialog("流程质量与耗时");
+    const appendAverage = (label, seconds, samples) => {
+      const duration = samples ? Math.round(seconds / samples) + " " + t("秒") : t("未知");
+      box.append(el("p", t(label) + " · " + duration + " · n=" + samples));
+    };
+    box.append(el("h3", t("最近 30 天的验收与交付")));
+    for (const [key, label] of [
+      ["accepted", "首次验收与评审通过"],
+      ["delivered", "首次确认合并"],
+      ["first_pass", "首次代码尝试通过"],
+    ]) box.append(el("p", t(label) + " · " + data[key]));
+    appendAverage("从入队到首次验收通过的平均耗时", data.elapsed_seconds, data.elapsed_samples);
+    appendAverage("到 PR 的平均耗时", data.to_pr_seconds, data.to_pr_samples);
+    appendAverage("到合并的平均耗时", data.to_merge_seconds, data.to_merge_samples);
+    box.append(el("p", t("每个验收通过任务的已记录 tokens") + " · " + (data.accepted ? Math.round(data.accepted_tokens / data.accepted) : t("未知")) + " · " + data.accepted_unknown_calls + " " + t("次调用用量未知")));
+    box.append(el("p", t("每个已合并任务的已记录 tokens") + " · " + (data.delivered ? Math.round(data.delivered_tokens / data.delivered) : t("未知")) + " · " + data.delivered_unknown_calls + " " + t("次调用用量未知")));
+    for (const [reason, seconds] of Object.entries(data.remote_wait_seconds)) {
+      const samples = data.remote_wait_samples_by_reason?.[reason] || 0;
+      appendAverage(deliveryNames[reason] || reason, seconds, samples);
+    }
+    box.append(el("h3", t("最近 30 天创建的任务")));
+    appendAverage("首次启动前的平均等待", data.queue_seconds, data.queue_samples || 0);
     for (const [key, label] of [
       ["tasks", "任务数"],
-      ["accepted", "验收与评审通过"],
-      ["delivered", "已合并"],
-      ["first_pass", "首次代码尝试通过"],
       ["infrastructure_failures", "连接与环境故障"],
       ["repeated_failures", "反复失败任务"],
       ["requirements_revised", "补充需求任务"],
@@ -1344,32 +1716,6 @@ window.RSIExperience = (() => {
       for(const [key,label] of [['helpful','有帮助'],['unnecessary','没必要'],['false_positive','误报']])box.append(el('p',t(label)+' · '+data.value_feedback[key]));
       box.append(el('p',t('未评价的运行')+' · '+data.unrated_runs+' · '+t('未评价不代表没有价值。'),'muted'));
     }
-    box.append(
-      el(
-        "p",
-        t("从入队到首次验收通过的平均耗时") +
-          " · " +
-          (data.elapsed_samples
-            ? Math.round(data.elapsed_seconds / data.elapsed_samples) +
-              " " +
-              t("秒")
-            : t("未知")) +
-          " · n=" +
-          data.elapsed_samples,
-      ),
-      el(
-        "p",
-        t("每个验收通过任务的已记录 tokens") +
-          " · " +
-          (data.accepted
-            ? Math.round(data.accepted_tokens / data.accepted)
-            : t("未知")) +
-          " · " +
-          data.accepted_unknown_calls +
-          " " +
-          t("次调用用量未知"),
-      ),
-    );
     for (const [phase, seconds] of Object.entries(data.phase_seconds))
       box.append(
         el(
@@ -1381,19 +1727,12 @@ window.RSIExperience = (() => {
             t("秒"),
         ),
       );
-    for (const [key, label] of [["to_pr", "到 PR 的平均耗时"], ["to_merge", "到合并的平均耗时"]]) {
-      box.append(el("p", t(label) + " · " + (data[key + "_samples"] ? Math.round(data[key + "_seconds"] / data[key + "_samples"]) + " " + t("秒") : t("未知")) + " · n=" + data[key + "_samples"]));
-    }
-    box.append(el("p", t("每个已合并任务的已记录 tokens") + " · " + (data.delivered ? Math.round(data.delivered_tokens / data.delivered) : t("未知")) + " · " + data.delivered_unknown_calls + " " + t("次调用用量未知")));
-    for (const [reason, seconds] of Object.entries(data.remote_wait_seconds)) {
-      box.append(el("p", t(deliveryNames[reason] || reason) + " · " + Math.round(seconds) + " " + t("秒")));
-    }
     box.append(el("p", t("缓存与重评失效记录") + " · " + Object.entries(data.invalidations).map(([key, value]) => t(({stage_invalidated: "阶段输入变化", requirements_revised: "需求修订", triage_recheck: "暂缓唤醒", issue_revision: "Issue 更新"})[key]) + ": " + value).join(" / ")));
     box.append(
       el(
         "p",
         t(
-          "最近 30 天创建的逻辑任务。阶段时间为各运行累计，含并行任务，不代表总体墙钟时间；未知用量不按零计算。",
+          "验收、PR 和合并按首次确认时间统计。远端等待按结束时间入窗。阶段时间累计各次运行，含并行阶段。",
         ),
         "muted",
       ),
@@ -1476,7 +1815,7 @@ window.RSIExperience = (() => {
     if (!window.RSIDesktop && "serviceWorker" in navigator && isSecureContext)
       navigator.serviceWorker.register("/sw.js").catch(() => {});
   });
-  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { queueEditor = null; liveFailures = 0; liveNotice(); clearTimeout(liveTimer); }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时");const inbox=$("attention-inbox");if(inbox)inbox.textContent=t("所有项目待办")+(inbox.textContent.match(/ · \d+$/)?.[0]||''); } };
+  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { detailTaskRetryButtons.clear(); queueEditor = null; liveFailures = 0; liveNotice(); clearTimeout(liveTimer); }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时");const inbox=$("attention-inbox");if(inbox)inbox.textContent=t("所有项目待办")+(inbox.textContent.match(/ · \d+$/)?.[0]||''); } };
 })();
 
 'use strict';

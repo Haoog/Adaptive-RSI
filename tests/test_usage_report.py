@@ -272,6 +272,7 @@ class UsageReportTest(unittest.TestCase):
                 if version <= 6:
                     db.execute("INSERT INTO schema_migrations VALUES (?,?,?)",
                                (version, hashlib.sha256(content).hexdigest(), 0))
+            db.execute("CREATE TABLE tasks(id TEXT PRIMARY KEY)")
             db.execute("CREATE TABLE calls(id TEXT PRIMARY KEY,project TEXT,run TEXT,role TEXT,model TEXT,"
                        "effort TEXT,state TEXT,tokens INTEGER DEFAULT 0,seconds REAL DEFAULT 0,created REAL,"
                        "provider TEXT DEFAULT 'openai',unit_price REAL,unit TEXT DEFAULT 'unknown',"
@@ -289,7 +290,8 @@ class UsageReportTest(unittest.TestCase):
         db.close()
         store = Store(root)
         self.addCleanup(store.close)
-        self.assertEqual([row["version"] for row in store.schema_migrations()], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        self.assertEqual([row["version"] for row in store.schema_migrations()], list(range(1, 13)))
         row = store.one("SELECT * FROM calls WHERE id='old'")
         self.assertEqual((row["tokens"], row["unit_price"], row["input_price"]), (123, 2, None))
         self.assertIsNone(row["price_basis"])
+        self.assertEqual(row["remote_attempt"], 0)

@@ -35,15 +35,19 @@ class RelatedWorkTest(unittest.TestCase):
         self.assertIsNone(related_task(rows, second))
         self.assertEqual(related_task(rows, {**first, "title": "  Handle HTTP 401   response "}), "first")
 
-    def test_near_identical_titles_are_deduplicated_without_merging_error_variants(self):
-        backlog = [{"id": "retry", "title": "Fix failed login retry loop",
-                    "evidence": encode([{"path": "login.py", "quote": "redirect()"}])}]
-        self.assertEqual(related_task(backlog, {
-            "title": "Failed login retry loop", "path": "login.py", "quote": "retry()"}), "retry")
-        self.assertIsNone(related_task(backlog, {
-            "title": "Fix failed login retry status 429", "path": "login.py", "quote": "retry()"}))
-        self.assertIsNone(related_task(backlog, {
-            "title": "Fix failed login retry loop", "path": "login.py", "quote": "retry()"}))
+    def test_historical_anchors_suppress_only_the_same_report(self):
+        original = {"title": "Fix failed login retry loop", "path": "login.py", "quote": "redirect()"}
+        backlog = [{"id": "retry", "title": original["title"], "evidence": encode([original])}]
+        for changes, expected in [
+            ({"title": "  FIX failed login retry loop  "}, "retry"),
+            ({"title": "Failed login retry loop", "quote": "retry()"}, None),
+            ({"title": "Fix failed login retry status 429", "quote": "retry()"}, None),
+            ({"quote": "retry()"}, None),
+            ({"path": "other/login.py"}, None),
+            ({"title": "Failed login retry loop"}, None),
+        ]:
+            with self.subTest(changes=changes):
+                self.assertEqual(related_task(backlog, {**original, **changes}), expected)
 
     def test_current_related_results_are_project_scoped_and_invalidate_context(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -488,6 +488,11 @@ class ReliabilityTest(unittest.TestCase):
         self.assertIn("Saved implementation evidence changed", json.loads(row["result"])["reason"])
         self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 1)
         self.assertFalse((self.run_directory(second) / "resume.patch").exists())
+        from adaptive_rsi.recovery import task_recovery
+        events = task_recovery(self.store, {"id": task, "project": self.project})["events"]
+        implementation = [event for event in events if event["stage"] == "implementation"]
+        self.assertEqual(implementation, [{"stage": "implementation", "kind": "stage_invalidated",
+                                           "reason": "patch_hash_changed", "from_run": run["id"]}])
 
     def test_legacy_implementation_checkpoint_without_patch_is_reimplemented(self):
         """只有 hash 的旧记录不可重放：作废这一项后重新实现，而不是让重试崩掉。"""
@@ -682,6 +687,38 @@ class ReliabilityTest(unittest.TestCase):
         self.assertFalse(self.store.query("SELECT * FROM stages WHERE run=? AND stage='validated_candidate'", (run["id"],)))
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
+    def test_passing_high_risk_rereview_keeps_first_round_evidence_gap(self):
+        from adaptive_rsi.review import risk_review_evidence_requests
+
+        class HighRisk(FakeAgent):
+            reviews = 0
+
+            def invoke(self, role, *args, **kwargs):
+                result = super().invoke(role, *args, **kwargs)
+                if role == "planning":
+                    result["risk"] = "high"
+                if role == "review":
+                    self.reviews += 1
+                    if self.reviews == 1:
+                        result["assessments"][1]["decision"] = "insufficient_evidence"
+                    else:
+                        result["findings"].append({"area": "security", "severity": "low", "path": "calculator.py",
+                            "line": 1, "title": "Boundary coverage", "reason": "An error path lacks a check",
+                            "suggestion": "Add a regression check asserting denial leaves state unchanged"})
+                return result
+
+        self.runtime.agent = HighRisk()
+        task, run = self.claim()
+        self.runtime.process(run)
+        result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+        self.assertEqual(self.runtime.agent.reviews, 2)
+        self.assertEqual(result["review"]["decision"], "insufficient_evidence")
+        self.assertEqual(result["risk_review"]["decision"], "pass")
+        self.assertEqual(risk_review_evidence_requests(result["risk_review"])[0]["suggestion"],
+                         "Add a regression check asserting denial leaves state unchanged")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "insufficient_evidence")
+
+    @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_ordinary_high_risk_does_not_force_a_second_review(self):
         class HighRisk(FakeAgent):
             def invoke(self, role, *args, **kwargs):
@@ -709,6 +746,24 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(code_map(self.repo, "calculator", limit=1)["files"][0]["path"], "calculator.py")
         self.assertEqual(_code_index.cache_info().misses, cached.misses + 1)
         self.assertEqual(_code_map_cached.cache_info().misses, mapping_cached.misses + 1)
+
+    def test_code_map_ranks_a_late_declaration_above_callers(self):
+        symbol = "locate_sealed_snapshot"
+        large = self.repo / "storage.py"
+        prefix = "def placeholder(): pass\n" * 10000
+        declaration = f"def {symbol}(workspace):"
+        large.write_text(prefix + declaration + "\n    return workspace\n")
+        for i in range(13):
+            (self.repo / f"caller_{i}.py").write_text(f"storage.{symbol}(workspace)\n")
+        result = code_map(self.repo, symbol, limit=12)
+        self.assertEqual(result["files"][0]["path"], "storage.py")
+        self.assertEqual(result["files"][0]["anchors"][0], {"line": 10001, "declaration": declaration})
+        explicit = code_map(self.repo, "unrelated", limit=1,
+                            evidence=(("caller_1.py", f"storage.{symbol}(workspace)"),))
+        self.assertEqual(explicit["files"][0], {"path": "caller_1.py", "anchors": [
+            {"line": 1, "declaration": f"storage.{symbol}(workspace)"}]})
+        large.write_text(prefix + "def updated_snapshot(): pass\n")
+        self.assertNotEqual(code_map(self.repo, symbol, limit=1)["files"][0]["path"], "storage.py")
 
     def test_evaluation_baseline_cache_is_project_and_config_scoped(self):
         base = git(self.repo, "rev-parse", "HEAD")
@@ -844,6 +899,61 @@ class ReliabilityTest(unittest.TestCase):
         # Default config keeps affected-check scheduling off, so the candidate
         # stage must never receive a scheduled check subset.
         self.assertEqual(stage_run_checks, [None, None])
+
+    def test_performance_pipeline_runs_each_sealed_repetition(self):
+        from adaptive_rsi.delivery_replay_checks import _acceptance
+
+        class BenchmarkAgent(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                if role == "acceptance":
+                    self.prompt = prompt
+                    return {"files": [{"path": ".rsi-acceptance/benchmark.py", "content": (
+                        "import json, secrets\n"
+                        "from calculator import add\n"
+                        "print(secrets.token_hex(16))\n"
+                        "for load in ('idle', 'busy'):\n"
+                        "    print(json.dumps(dict(metric='latency', unit='ms', load=load, "
+                        "value=4 if add(2, 3) == 5 else 10, repetition=99)))\n"
+                        "    print(json.dumps(dict(metric='memory', unit='MiB', load=load, value=1)))\n"
+                    )}], "checks": [{"name": "benchmark", "criteria": [0], "argv": [
+                        "python3", "-c", "exec(open('.rsi-acceptance/benchmark.py').read())"]}]}
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == "planning":
+                    result.update(change_kind="performance", repetitions=3, load_conditions=["idle", "busy"],
+                                  performance_threshold={"metric": "latency", "unit": "ms", "target": 5,
+                                                         "tolerance": 0, "direction": "lower"},
+                                  guardrails=[{"metric": "memory", "unit": "MiB", "target": 2,
+                                               "tolerance": 0, "direction": "lower"}])
+                return result
+
+        agent = BenchmarkAgent()
+        self.runtime.agent = agent
+        _, run = self.claim("Reduce addition latency")
+        self.runtime.process(run)
+        saved = self.store.one("SELECT state,result,path FROM runs WHERE id=?", (run["id"],))
+        outcome = json.loads(saved["result"])
+        self.assertEqual("awaiting_approval", saved["state"], outcome)
+        self.assertIn("the host reruns all sealed checks", agent.prompt)
+        directory = Path(saved["path"])
+        report = json.loads((directory / "evaluation/report.json").read_text())
+        receipt = json.loads(self.store.one("SELECT data FROM stages WHERE run=? AND stage='evaluation'",
+                                           (run["id"],))["data"])
+        self.assertEqual(receipt["contract"], _acceptance(directory, receipt, receipt["source"])["contract"])
+        tokens = set()
+        for label in ("acceptance_baseline", "acceptance_candidate"):
+            rows = report["checks"][label]
+            fields = ("performance_repetition", "argv", "stdout", "exit_code")
+            self.assertEqual([{key: row[key] for key in fields} for row in receipt["checks"][label]],
+                             [{key: row[key] for key in fields} for row in rows])
+            self.assertEqual([1, 2, 3], [row["performance_repetition"] for row in rows])
+            for row in rows:
+                token, *samples = row["stdout"].splitlines()
+                tokens.add(token)
+                self.assertEqual(4, len(samples))
+        self.assertEqual(6, len(tokens))
+        gate = report["improvement"]
+        self.assertEqual("pass", gate["decision"])
+        self.assertEqual([3, 3, 3, 3], [row["samples"] for row in gate["uncertainty"] + gate["guardrails"]])
 
     def test_baseline_cache_invalidates_when_same_tag_image_id_changes(self):
         base = git(self.repo, "rev-parse", "HEAD")
@@ -1907,6 +2017,155 @@ class ReliabilityTest(unittest.TestCase):
         self.runtime.request(self.project, "light")
         self.runtime.process(self.store.claim(self.project, self.runtime.config(self.project)))
         self.assertEqual([role for role, _ in self.runtime.agent.roles].count("analysis"), 1)
+
+    def test_declared_module_paths_trigger_only_matching_inspection(self):
+        class SyntheticScan(FakeAgent):
+            malformed = False
+
+            def invoke(self, role, prompt, *args, **kwargs):
+                self.roles.append((role, json.loads(prompt.rsplit("\n", 1)[1])))
+                return {} if self.malformed else {"findings": []}
+
+        def commit_file(path):
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("# synthetic change\n")
+            git(self.repo, "add", path)
+            git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", path)
+
+        def scan(task, state="completed", origin="manual_scan"):
+            run = self.store.claim(self.project, self.runtime.config(self.project))
+            self.assertIsNotNone(run)
+            self.assertEqual(run["task"], task)
+            self.runtime.process(run)
+            row = self.store.one("SELECT state,origin,result FROM runs WHERE id=?", (run["id"],))
+            self.assertEqual(row["state"], state, row["result"])
+            self.assertEqual(row["origin"], origin)
+            return json.loads(row["result"])
+
+        def request():
+            return self.runtime.request(self.project, "light")
+
+        self.runtime.agent = SyntheticScan()
+        self.runtime.configure({"inspection": {"module_paths": [
+            {"cwd": "services/api", "paths": ["shared/schema", "package-lock.json"]}]}}, self.project)
+        module = {"cwd": "services/api", "language": "Python", "manifest": "services/api/pyproject.toml"}
+        with patch("adaptive_rsi.runtime.detect", return_value={"modules": [module], "checks": []}):
+            task = request()
+            self.assertEqual(request(), task)
+            scan(task)
+            self.assertIsNone(self.store.claim(self.project, self.runtime.config(self.project)))
+            scan(request())
+            commit_file("shared/schema-other/file.py")
+            scan(request())
+            self.assertEqual(len(self.runtime.agent.roles), 1)
+
+            commit_file("shared/schema/file.py")
+            self.runtime.agent.malformed = True
+            failed = scan(request(), state="blocked")
+            self.assertEqual(failed["failure"]["code"], "inspection_malformed")
+            self.runtime.agent.malformed = False
+            self.runtime.retry(task)
+            scan(task, origin="manual_retry")
+            scan(request())
+            self.assertEqual(len(self.runtime.agent.roles), 3)
+
+            commit_file("services/api/handler.py")
+            scan(request())
+            commit_file("package-lock.json")
+            scan(request())
+        payloads = [data for _, data in self.runtime.agent.roles]
+        self.assertEqual([data["changed_paths"] for data in payloads],
+                         [None, ["shared/schema/file.py"], ["shared/schema/file.py"],
+                          ["services/api/handler.py"], ["package-lock.json"]])
+        self.assertEqual(payloads[-1]["selected_module"]["dependency_paths"], ["package-lock.json", "shared/schema"])
+
+    def test_cited_file_is_read_before_the_context_budget_is_spent(self):
+        (self.repo / "aaa.py").write_text("# noise long enough to spend the content budget\n")
+        quote = "return a - b"
+        with patch("adaptive_rsi.context._INDEX_BYTES", 36):
+            mapping = code_map(self.repo, "noise", limit=1, evidence=[("calculator.py", quote)])
+        self.assertEqual(mapping["files"][0]["path"], "calculator.py")
+        self.assertIn({"line": 2, "declaration": "    " + quote}, mapping["files"][0]["anchors"])
+
+    def test_cooldown_only_waits_persist_and_stop_after_three_deferrals(self):
+        from adaptive_rsi.provider_health import ModelFailure, ProviderHealth
+        task, run = self.claim()
+        config = self.runtime.config(self.project)
+        provider = config["models"]["planning"]["provider"]
+        health = ProviderHealth(self.store)
+        rate_limit = ModelFailure("HTTP 429 from synthetic provider", "rate_limit")
+        rate_limit.retry_after = 3600
+        health.record(config, provider, self.project, rate_limit)
+        latest = health.status(config, provider, self.project)["retry_at"]
+
+        def admit(*_):
+            health.require(config, provider, self.project)
+            self.fail("local admission should stop the candidate")
+
+        with patch.object(self.runtime, "execute_candidate", side_effect=admit):
+            for attempt in range(4):
+                # A billing reservation alone does not prove a dispatched call.
+                self.store.reserve_call(self.project, run["id"], "planning", config["models"]["planning"], config)
+                self.runtime.process(run)
+                reopened = Store(self.store.root)
+                try:
+                    row = reopened.one("SELECT * FROM tasks WHERE id=?", (task,))
+                finally:
+                    reopened.close()
+                self.assertEqual((row["infra_retries"], row["cooldown_waits"], row["attempts"]),
+                                 (0, min(3, attempt + 1), 0))
+                problem = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])["failure"]
+                self.assertEqual(problem["remote_attempt"], False)
+                if attempt == 3:
+                    self.assertEqual(row["state"], "blocked")
+                    self.assertTrue(problem["auto_retry_exhausted"])
+                    break
+                self.assertEqual((row["state"], row["available"], problem["retry_kind"]),
+                                 ("queued", latest, "provider_cooldown"))
+                self.assertIsNone(self.store.claim(self.project, config))
+                # Simulate independent renewals of the shared account cooldown.
+                self.store.execute("UPDATE tasks SET available=0 WHERE id=?", (task,))
+                run = self.store.claim(self.project, config)
+        self.assertEqual(health.status(config, provider, self.project)["failures"], 1)
+        self.runtime.retry(task)
+        next_run = self.store.claim(self.project, config)
+        self.assertEqual(next_run["origin"], "manual_retry")
+        self.assertEqual(self.store.one("SELECT cooldown_waits FROM tasks WHERE id=?", (task,))["cooldown_waits"], 0)
+
+    def test_dispatched_call_with_later_cooldown_preserves_infra_retry_and_cancellation(self):
+        from adaptive_rsi.provider_health import ModelFailure, ProviderHealth
+        task, run = self.claim()
+        config = self.runtime.config(self.project)
+        route = config["models"]["planning"]
+        health = ProviderHealth(self.store)
+        rate_limit = ModelFailure("HTTP 429 from synthetic provider", "rate_limit")
+        rate_limit.retry_after = 3600
+        health.record(config, route["provider"], self.project, rate_limit)
+        cancelled = False
+
+        def invoke_then_require(active, *_):
+            call = self.store.reserve_call(self.project, active["id"], "planning", route, config)
+            self.store.execute("UPDATE calls SET remote_attempt=1 WHERE id=?", (call,))
+            if cancelled:
+                self.runtime.cancel_task(task)
+            health.require(config, route["provider"], self.project)
+
+        with patch.object(self.runtime, "execute_candidate", side_effect=invoke_then_require):
+            self.runtime.process(run)
+            row = self.store.one("SELECT state,available,infra_retries,cooldown_waits FROM tasks WHERE id=?", (task,))
+            self.assertEqual((row["state"], row["infra_retries"], row["cooldown_waits"]), ("queued", 1, 0))
+            self.assertEqual(row["available"], health.status(config, route["provider"], self.project)["retry_at"])
+            problem = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])["failure"]
+            self.assertTrue(problem["remote_attempt"])
+            self.assertEqual(problem["retry_kind"], "infrastructure_retry")
+            self.runtime.retry(task)
+            cancelled = True
+            run = self.store.claim(self.project, config)
+            self.runtime.process(run)
+        self.assertEqual(self.store.one("SELECT state,infra_retries,cooldown_waits FROM tasks WHERE id=?", (task,)),
+                         {"state": "cancelled", "infra_retries": 0, "cooldown_waits": 0})
+        self.assertIsNone(self.store.claim(self.project, config))
 
     def test_due_scan_yields_to_an_existing_repair_backlog(self):
         self.runtime.configure({"sources": {"inspection": True, "issues": False}}, self.project)

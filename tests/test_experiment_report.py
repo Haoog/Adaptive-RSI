@@ -1,6 +1,7 @@
 """Unknown measurements are never turned into zero-cost experimental wins."""
 import unittest
 
+from adaptive_rsi.evolution import Evolution
 from adaptive_rsi.experiment_report import comparison
 
 
@@ -41,6 +42,32 @@ class ExperimentReportTest(unittest.TestCase):
         self.assertEqual(len(report['cohorts']), 2)
         real = next(row for row in report['cohorts'] if row['source'] == 'real')
         self.assertEqual((real['wins'], real['losses']), (0, 1))
+
+    def test_explicit_decisions_and_empty_patches_match_promotion_eligibility(self):
+        row = trial()
+        row['stable']['decision'] = 'insufficient_evidence'
+        row['candidate']['decision'] = 'pass'
+        self.assertEqual(Evolution.split_decision([row], {})['decision'], 'insufficient_evidence')
+        for decisions in ('insufficient_evidence', None, ''):
+            with self.subTest(decisions=decisions):
+                row['stable']['decision'] = decisions
+                report = comparison([row])
+                self.assertEqual((report['trials'], report['incomplete_trials'], report['cohorts']), (0, 1, []))
+        self.assertEqual(comparison([trial(repeat=1), row])['cohorts'], [])
+        confirmed_loss = trial(repeat=1)
+        confirmed_loss['stable']['pass'] = True
+        confirmed_loss['candidate']['pass'] = False
+        self.assertEqual(comparison([confirmed_loss, row])['cohorts'][0]['losses'], 1)
+        row['stable']['decision'] = 'pass'
+        row['candidate']['decision'] = 'fail'
+        self.assertEqual(comparison([row])['cohorts'][0]['losses'], 1)
+        del row['candidate']['pass']
+        self.assertEqual(comparison([row])['cohorts'][0]['losses'], 1)
+        for variant in ('stable', 'candidate'):
+            row[variant]['no_change'] = True
+            self.assertEqual(comparison([row])['incomplete_trials'], 1)
+            self.assertEqual(comparison([row])['cohorts'], [])
+            del row[variant]['no_change']
 
     def test_missing_or_invalid_data_is_not_comparable(self):
         for number in (None, -1, True, float('inf'), float('nan'), 10**1000):

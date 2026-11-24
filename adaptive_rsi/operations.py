@@ -16,6 +16,10 @@ from .store import uid
 OPERATION_DRAIN_TIMEOUT = 30
 
 
+class OperationNotFound(ValueError):
+    pass
+
+
 class Operations:
     def __init__(self, runtime):
         self.runtime, self.store = runtime, runtime.store
@@ -28,6 +32,28 @@ class Operations:
         self.inflight = {}
         self.store.execute("CREATE TABLE IF NOT EXISTS operations "
                            "(id TEXT PRIMARY KEY,kind TEXT,state TEXT,result TEXT,created REAL,ended REAL)")
+        self.store.execute("CREATE TABLE IF NOT EXISTS operation_backup_targets "
+                           "(operation TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE CASCADE, backup TEXT NOT NULL)")
+        self.store.execute("CREATE INDEX IF NOT EXISTS operations_recent_backup "
+                           "ON operations(created DESC,id DESC) WHERE kind IN ('backup','restore-check')")
+
+    def recent_backups(self):
+        from .store import decode_object
+        rows = self.store.query(
+            "SELECT o.id,o.kind,o.state,o.created,o.ended,o.result,t.backup AS backup_id "
+            "FROM operations o LEFT JOIN operation_backup_targets t ON t.operation=o.id "
+            "WHERE o.kind IN ('backup','restore-check') ORDER BY o.created DESC,o.id DESC LIMIT 30")
+        with self.lock:
+            for row in rows:
+                result = decode_object(row.pop("result"))
+                if row["kind"] == "backup" and row["state"] == "completed":
+                    identifier = result.get("id")
+                    if isinstance(identifier, str) and re.fullmatch(r"[a-f0-9]{16}", identifier):
+                        row["backup_id"] = identifier
+                row["cancellable"] = row["kind"] == "backup" and row["ended"] is None
+                if row["cancellable"] and row["id"] in self.progress:
+                    row["progress"] = dict(self.progress[row["id"]])
+        return rows
 
     def recover(self):
         # Called only after the runtime owns the state directory lock.
@@ -117,7 +143,7 @@ class Operations:
                 if not self.inflight[kind]:
                     del self.inflight[kind]
 
-    def start(self, kind, parameters):
+    def start(self, kind, parameters, reuse_active=False):
         if kind not in ("backup", "diagnostics", "probe", "import", "restore-check", "rehearse-restore", "rehearsal"):
             raise ValueError("Unknown background operation")
         if not isinstance(parameters, dict):
@@ -126,12 +152,23 @@ class Operations:
             if self.runtime.stop.is_set():
                 raise ValueError('Runtime is shutting down')
             self.runtime.updates.require_ready()
+            identifier = parameters.get("id")
+            if reuse_active and kind in ("backup", "restore-check"):
+                existing = self.store.one(
+                    "SELECT o.id,o.state FROM operations o LEFT JOIN operation_backup_targets t ON t.operation=o.id "
+                    "WHERE o.kind=? AND o.ended IS NULL AND (o.kind='backup' OR t.backup=?) "
+                    "ORDER BY o.created DESC LIMIT 1", (kind, identifier if isinstance(identifier, str) else None))
+                if existing and existing["id"] in self.active:
+                    return existing
             if len(self.active) >= 4:
                 raise ValueError("Background operations busy")
             operation = uid()
             stop = threading.Event()
-            self.store.execute("INSERT INTO operations VALUES (?,?,?,'{}',?,NULL)",
-                               (operation, kind, "queued", time.time()))
+            with self.store.connect() as db:
+                db.execute("INSERT INTO operations VALUES (?,?,?,'{}',?,NULL)",
+                           (operation, kind, "queued", time.time()))
+                if kind == "restore-check" and isinstance(identifier, str) and re.fullmatch(r"[a-f0-9]{16}", identifier):
+                    db.execute("INSERT INTO operation_backup_targets VALUES (?,?)", (operation, identifier))
             self.active[operation] = stop
             try:
                 future = self.pool.submit(self._run, operation, kind, parameters, stop)
@@ -231,7 +268,7 @@ class Operations:
         from .store import decode_object
         row = self.store.one("SELECT * FROM operations WHERE id=?", (operation,))
         if not row:
-            raise ValueError("Operation not found")
+            raise OperationNotFound("Operation not found")
         row["result"] = decode_object(row["result"])
         with self.lock:
             if row["ended"] is None and operation in self.progress:

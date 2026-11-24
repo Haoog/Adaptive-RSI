@@ -1,9 +1,9 @@
 """Task evidence contracts shared by production and experiment runs."""
 import json
-import math
 import re
 import shlex
 from pathlib import Path
+from sys import float_info
 
 
 ENVIRONMENT_FAILURE = re.compile(
@@ -289,6 +289,62 @@ def documentation_only(files):
     return bool(paths) and all(documentation_path(path) for path in paths)
 
 
+def _measurement_label(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _finite_measurement(value):
+    return type(value) in (int, float) and abs(value) <= float_info.max
+
+
+def _valid_threshold(rule):
+    return (isinstance(rule, dict) and _measurement_label(rule.get("metric"))
+            and _measurement_label(rule.get("unit")) and rule.get("direction") in ("lower", "higher")
+            and all(_finite_measurement(rule.get(key)) for key in ("target", "tolerance"))
+            and rule["tolerance"] >= 0)
+
+
+def _measurement_identity(rule):
+    return rule["metric"].strip(), rule["unit"].strip()
+
+
+def _valid_loads(loads):
+    # [None] is the frozen representation of a benchmark without named loads.
+    return loads == [None] or (isinstance(loads, list) and 1 <= len(loads) <= 20
+                               and all(_measurement_label(load) for load in loads)
+                               and len({load.strip() for load in loads}) == len(loads))
+
+
+HOST_REPETITIONS = "host_repetitions"
+
+
+def _planned_measurements(rows, keys, host_repeats=None):
+    rounds = range(1, host_repeats + 1) if host_repeats is not None else (None,)
+    samples = {repetition: {key: [] for key in keys} for repetition in rounds}
+    for row in rows:
+        repetition = row.get("performance_repetition") if host_repeats is not None else None
+        if host_repeats is not None and (type(repetition) is not int or repetition not in samples
+                                        or row.get("exit_code") != 0 or row.get("error")):
+            return None
+        measurements = samples[repetition]
+        for line in row.get("stdout", "").splitlines():
+            try:
+                sample = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(sample, dict):
+                continue
+            key = sample.get("metric"), sample.get("unit"), sample.get("load")
+            if all(part is None or isinstance(part, str) for part in key) and key in measurements:
+                value = sample.get("value")
+                measurements[key].append(value if _finite_measurement(value) else None)
+    if host_repeats is None:
+        return samples[None]
+    if any(len(values) != 1 for measurements in samples.values() for values in measurements.values()):
+        return None
+    return {key: [measurements[key][0] for measurements in samples.values()] for key in keys}
+
+
 def improvement(results, acceptance):
     if not acceptance:
         return {"decision": "not_requested", "kind": "regression_only"}
@@ -333,38 +389,36 @@ def improvement(results, acceptance):
         import statistics
         repeats = contract.get("repetitions", 1)
         loads = contract.get("load_conditions", [None])
-        if type(repeats) is not int or not 1 <= repeats <= 100 or not isinstance(loads, list) or not loads or len(loads) > 20:
+        secondary = contract.get("guardrails", [])
+        mode = contract.get("measurement_mode")
+        minimum = 3 if mode == HOST_REPETITIONS else 1
+        if ("measurement_mode" in contract and mode != HOST_REPETITIONS
+                or type(repeats) is not int or not minimum <= repeats <= 100 or not _valid_loads(loads)):
             return {"decision": "insufficient_evidence", "kind": kind, "basis": "invalid_measurement_plan"}
-        def measurements(rows, rule, load):
-            values = []
-            for row in rows:
-                for line in row.get("stdout", "").splitlines():
-                    try:
-                        sample = json.loads(line)
-                    except ValueError:
-                        continue
-                    if (isinstance(sample, dict) and sample.get("metric") == rule["metric"]
-                            and sample.get("unit") == rule["unit"] and sample.get("load") == load):
-                        value = sample.get("value")
-                        if type(value) in [int, float] and math.isfinite(value):
-                            values.append(value)
-            return values
+        if not isinstance(secondary, list) or len(secondary) > 20:
+            return {"decision": "insufficient_evidence", "kind": kind, "basis": "invalid_guardrail"}
+        rules = [threshold, *secondary]
+        if not all(_valid_threshold(rule) for rule in rules):
+            return {"decision": "insufficient_evidence", "kind": kind, "basis": "invalid_guardrail"}
+        identities = [_measurement_identity(rule) for rule in rules]
+        if identities[0] in identities[1:]:
+            return {"decision": "insufficient_evidence", "kind": kind,
+                    "basis": "guardrail_must_measure_a_secondary_metric"}
+        if len(set(identities)) != len(identities):
+            return {"decision": "insufficient_evidence", "kind": kind, "basis": "duplicate_guardrail_metric"}
+        keys = [(rule["metric"], rule["unit"], load) for rule in rules for load in loads]
+        host_repeats = repeats if mode == HOST_REPETITIONS else None
+        baseline = _planned_measurements(before, keys, host_repeats)
+        candidate = _planned_measurements(after, keys, host_repeats)
+        if baseline is None or candidate is None:
+            return {"decision": "insufficient_evidence", "kind": kind,
+                    "basis": "one_measurement_required_per_host_repetition"}
         guardrails, estimates, passed = [], [], True
-        rules = [threshold] + contract.get("guardrails", [])
         for index, rule in enumerate(rules):
-            if (not isinstance(rule, dict) or not rule.get("metric") or not rule.get("unit")
-                    or rule.get("direction") not in ("lower", "higher")
-                    or any(type(rule.get(k)) not in (int, float) or not math.isfinite(rule[k]) for k in ("target", "tolerance"))
-                    or rule["tolerance"] < 0):
-                return {"decision": "insufficient_evidence", "kind": kind, "basis": "invalid_guardrail"}
-            if index and (rule["metric"], rule["unit"]) == (threshold["metric"], threshold["unit"]):
-                # Same measurement identity as the primary rule: the primary
-                # samples would satisfy it, so it is no secondary evidence.
-                return {"decision": "insufficient_evidence", "kind": kind,
-                        "basis": "guardrail_must_measure_a_secondary_metric"}
             for load in loads:
-                old, new = measurements(before, rule, load), measurements(after, rule, load)
-                if len(old) != repeats or len(new) != repeats:
+                key = rule["metric"], rule["unit"], load
+                old, new = baseline[key], candidate[key]
+                if len(old) != repeats or len(new) != repeats or None in old or None in new:
                     return {"decision": "insufficient_evidence", "kind": kind,
                             "basis": "one_matching_measurement_required_per_version" if repeats == 1 else "planned_repeated_measurements_required"}
                 target, tolerance = rule["target"], rule["tolerance"]
@@ -381,7 +435,7 @@ def improvement(results, acceptance):
                         "before": statistics.mean(old), "after": statistics.mean(new),
                         "before_range": [min(old), max(old)], "after_range": [min(new), max(new)],
                         "before_stdev": statistics.stdev(old) if repeats > 1 else None,
-                        "after_stdev": statistics.stdev(new) if repeats > 1 else None, "samples": repeats}
+                        "after_stdev": statistics.stdev(new) if repeats > 1 else None, "samples": len(old)}
                 (guardrails if index else estimates).append(item)
         return {"decision": "pass" if passed else "insufficient_evidence", "kind": kind,
                 "before": estimates[0]["before"], "after": estimates[0]["after"], "threshold": threshold,
@@ -407,7 +461,7 @@ def evidence_contract(task, plan, require_preserved=False):
             raise ValueError("Behavior plan must name the existing tests that pin the behavior it must not change")
     requirements = {
         "behavior": "Reproduce the reported behavior before the change and demonstrate it works afterward.",
-        "performance": "Emit one JSON measurement line per version, repetition, load condition and guardrail metric: metric, unit, value and the load label when declared. Use the frozen targets and tolerances.",
+        "performance": "The host reruns the sealed checks for each repetition of each version. In one round of checks, emit exactly one stdout JSON measurement per primary or guardrail metric and load: metric, unit, value and the load label when declared. Use the frozen targets and tolerances.",
         "refactor": "Preserve passing behavior and verify concrete maintainability criteria in independent review.",
         "documentation": "Execute documentation examples, validate local links and demonstrate the requested information is present.",
         "configuration": "Check effective configuration, defaults, invalid inputs and compatibility through public behavior.",
@@ -425,10 +479,8 @@ def evidence_contract(task, plan, require_preserved=False):
             contract[field] = value
     if kind == "performance":
         threshold = plan.get("performance_threshold")
-        if not isinstance(threshold, dict) or not threshold.get("metric") or not threshold.get("unit") or threshold.get("direction") not in ["lower", "higher"]:
-            raise ValueError("Performance plan requires a named metric, unit, target, tolerance and direction")
-        if any(type(threshold.get(k)) not in [int, float] or not math.isfinite(threshold[k]) for k in ["target", "tolerance"]) or threshold["tolerance"] < 0:
-            raise ValueError("Performance threshold must be finite and tolerance nonnegative")
+        if not _valid_threshold(threshold):
+            raise ValueError("Performance plan requires a named metric, unit, direction, finite target and nonnegative tolerance")
         repetitions = plan.get("repetitions", 3)
         loads = plan.get("load_conditions")
         guardrails = plan.get("guardrails")
@@ -436,24 +488,19 @@ def evidence_contract(task, plan, require_preserved=False):
             raise ValueError("Performance plan requires an integer repetition count from 3 to 100")
         if loads is None or loads == []:
             loads = [None]
-        elif (not isinstance(loads, list) or not 1 <= len(loads) <= 20 or
-              any(not isinstance(load, str) for load in loads)):
-            raise ValueError("Performance load_conditions must contain 1..20 text labels")
+        elif loads == [None] or not _valid_loads(loads):
+            raise ValueError("Performance load_conditions must contain 1..20 unique nonblank text labels")
         if not isinstance(guardrails, list) or not 1 <= len(guardrails) <= 20:
             raise ValueError("Performance plan requires at least one secondary guardrail")
-        for rule in guardrails:
-            if (not isinstance(rule, dict) or not rule.get("metric") or not rule.get("unit")
-                    or rule.get("direction") not in ["lower", "higher"]
-                    or any(type(rule.get(k)) not in [int, float] or not math.isfinite(rule[k]) for k in ["target", "tolerance"])
-                    or rule["tolerance"] < 0):
-                raise ValueError("Performance guardrails must be finite thresholds with nonnegative tolerance")
-        # Measurements are matched by metric, unit and load, so a guardrail that
-        # repeats the primary identity is scored against the primary samples and
-        # protects no trade-off. It must name a distinct measurement instead.
-        primary = (threshold["metric"], threshold["unit"])
-        if any((rule["metric"], rule["unit"]) == primary for rule in guardrails):
+        if not all(_valid_threshold(rule) for rule in guardrails):
+            raise ValueError("Performance guardrails must name a metric, unit, direction, finite target and nonnegative tolerance")
+        identities = [_measurement_identity(rule) for rule in guardrails]
+        if _measurement_identity(threshold) in identities:
             raise ValueError("Performance guardrails must measure a secondary metric distinct from the primary threshold")
-        contract["threshold"] = threshold
+        if len(set(identities)) != len(identities):
+            raise ValueError("Performance guardrails must have unique metric and unit identities")
+        contract["measurement_mode"] = HOST_REPETITIONS
+        contract["threshold"] = copy.deepcopy(threshold)
         contract["repetitions"] = repetitions
         contract["load_conditions"] = copy.deepcopy(loads)
         contract["guardrails"] = copy.deepcopy(guardrails)

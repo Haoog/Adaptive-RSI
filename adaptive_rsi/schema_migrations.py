@@ -12,7 +12,8 @@ LOGGER = logging.getLogger(__name__)
 SCRIPTS = ((3, "003_seal_bootstrap.sql"), (4, "004_revision_snapshots.sql"),
            (5, "005_task_group_lineage.sql"), (6, "006_dependency_dag.sql"),
            (7, "007_call_prices.sql"), (8, "008_intervention_history_index.sql"),
-           (9, "009_open_runs_index.sql"), (10, "010_failure_monitor_outbox.sql"))
+           (9, "009_open_runs_index.sql"), (10, "010_failure_monitor_outbox.sql"),
+           (11, "011_task_recovery.sql"), (12, "012_revision_requests.sql"))
 
 # _bootstrap() 的建表 DDL：executescript 会隐式提交，与后续补列/数据迁移事务分离，
 # 进程可能在两者之间中断。提取为常量供 Store 复用，也让回归测试能直接构造
@@ -139,6 +140,11 @@ EVIDENCE = {
         lambda db, tables, indexes: "open_runs" in indexes),
     10: ("table failure_monitor_outbox and its ordering index",
          lambda db, tables, indexes: "failure_monitor_outbox" in tables and "failure_monitor_outbox_order" in indexes),
+    11: ("task cooldown, call attempt and run origin columns with the stage recovery index",
+         lambda db, tables, indexes: "stage_recovery_events" in indexes and
+         all(column in _columns(db, table) for table, column in (
+             ("tasks", "cooldown_waits"), ("calls", "remote_attempt"), ("runs", "origin")))),
+    12: ("table revision_requests", lambda db, tables, indexes: "revision_requests" in tables),
 }
 
 
@@ -310,20 +316,24 @@ def apply(db):
             LOGGER.info("Migration %d was applied by another opener while waiting for the write lock; "
                         "skipping its body", version)
             continue
-        if version == 6:
-            # 006 以文件 sha256 记账，不能在 SQL 里加过滤；预清理与迁移共用同一事务，
-            # 006 失败时隔离记录一并回滚，坏库不会留下半个状态。
-            _quarantine_unsafe_dependencies(db)
-        # executescript commits implicitly; execute complete statements within the
-        # same transaction as the ledger row so interrupted migrations roll back.
-        statement = ""
-        for line in content.decode("utf-8").splitlines(keepends=True):
-            statement += line
-            if sqlite3.complete_statement(statement):
-                db.execute(statement)
-                statement = ""
-        if statement.strip():
-            raise RuntimeError("Incomplete database migration statement")
+        # An earlier missing schema effect can stop heal() before it reaches an
+        # already-applied later migration. Recheck non-idempotent migration 11
+        # after applying earlier versions, under the same lock as the ledger write.
+        recovery_schema_exists = version == 11 and _effect_visible(db, version, _tables(db), _indexes(db))
+        if not recovery_schema_exists:
+            if version == 6:
+                # 清理与迁移共用同一事务，失败时隔离记录一并回滚。
+                _quarantine_unsafe_dependencies(db)
+            # executescript commits implicitly. Run complete statements in the
+            # same transaction as the ledger row so interrupted migrations roll back.
+            statement = ""
+            for line in content.decode("utf-8").splitlines(keepends=True):
+                statement += line
+                if sqlite3.complete_statement(statement):
+                    db.execute(statement)
+                    statement = ""
+            if statement.strip():
+                raise RuntimeError("Incomplete database migration statement")
         try:
             recorded = db.execute("INSERT OR IGNORE INTO schema_migrations VALUES (?,?,?)",
                                   (version, hashlib.sha256(content).hexdigest(), time.time())).rowcount

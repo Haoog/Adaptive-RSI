@@ -62,8 +62,20 @@ const {chromium} = require('playwright');
     assert.ok(grouped, 'grouped task keeps both requirements regardless of ID order');
     await page.getByRole('checkbox', {name:'选择任务 · '+grouped.title}).check();
     await page.getByRole('button', {name:'拆分未开始的任务'}).click();
+    // The group can share either original title. Wait for the confirmed mutation first.
+    const restoreResponse = page.waitForResponse(response => {
+      const request = response.request();
+      if (new URL(response.url()).pathname !== '/api/tasks/batch' || request.method() !== 'POST') return false;
+      const body = request.postDataJSON();
+      return body?.action === 'ungroup' && body.preview === false;
+    });
     await dialog.getByRole('button', {name:'确认', exact:true}).click();
-    await page.getByRole('button', {name:'批量目标二', exact:true}).waitFor();
+    const response = await restoreResponse;
+    assert.equal(response.status(), 200, 'the confirmed restore request succeeds');
+    assert.equal((await response.json()).complete, true, 'the restore receipt is complete');
+    for (const title of ['批量目标一', '批量目标二']) {
+      await page.getByRole('button', {name:title, exact:true}).waitFor();
+    }
     const restored = await page.evaluate(async () => (await fetch('/api/state?filter=all&sections=core')).json());
     assert.ok(!restored.tasks.some(task => task.id === grouped.id && task.state === 'queued'));
     assert.equal(restored.tasks.filter(task => ['批量目标一', '批量目标二'].includes(task.title) && task.state === 'queued').length, 2);

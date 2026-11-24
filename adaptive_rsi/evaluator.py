@@ -16,8 +16,8 @@ from .config import fingerprint
 from .gitops import copy_source, git
 from .process import Cancelled, Sandbox, run_process
 from .store import encode
-from .workflow import (_go_test_options, environment_failure, node_test_options, npm_test_runner,
-                       unittest_discovery_options, pytest_options)
+from .workflow import (HOST_REPETITIONS, _go_test_options, environment_failure, node_test_options,
+                       npm_test_runner, unittest_discovery_options, pytest_options)
 
 MANIFESTS = {"package.json", "pyproject.toml", "setup.py", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py",
              "pom.xml", "build.gradle", "build.gradle.kts", "Makefile", "CMakeLists.txt", "Cargo.toml",
@@ -724,6 +724,33 @@ def _copy_frozen_fixture(source, destination, baseline, state=None, ancestors=()
     shutil.copy2(resolved, destination)
 
 
+def _copy_added_link_fixtures(source, destination, baseline_source):
+    """Preserve new regular files without following candidate-controlled links."""
+    additions = []
+    for parent, dirs, files in os.walk(source, followlinks=False):
+        relative = Path(parent).relative_to(source)
+        for name in list(dirs) + files:
+            candidate = Path(parent) / name
+            original = baseline_source / relative / name
+            if candidate.is_symlink():
+                if not original.is_symlink() or os.readlink(candidate) != os.readlink(original):
+                    raise RuntimeError("Candidate symlink overlaps protected harness")
+                continue
+            if candidate.is_dir():
+                if name in {".git", ".rsi-agent", ".rsi-home", ".rsi-build", "__pycache__"}:
+                    dirs.remove(name)
+                elif original.is_symlink() or (original.exists() and not original.is_dir()):
+                    dirs.remove(name)
+                continue
+            if not candidate.is_file():
+                raise RuntimeError("Candidate fixture is not a regular file")
+            if not original.exists() and not original.is_symlink():
+                additions.append((candidate, destination / relative / name))
+    for candidate, dest in additions:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(candidate, dest)
+
+
 def freeze_harness(baseline, target, checks=(), state=None):
     """Host-owned baseline tests/build entrypoints overwrite candidate-authored gate changes."""
     baseline = Path(baseline).resolve()
@@ -758,7 +785,15 @@ def freeze_harness(baseline, target, checks=(), state=None):
             if dst.is_symlink():
                 if os.readlink(dst) != os.readlink(src):
                     raise RuntimeError("Candidate symlink overlaps protected harness")
+                candidate_source = target / resolved.relative_to(baseline)
+                for item in (candidate_source, *candidate_source.parents):
+                    if item == target.parent:
+                        break
+                    if item.is_symlink():
+                        raise RuntimeError("Candidate symlink overlaps protected harness")
                 dst.unlink()
+                if candidate_source.is_dir():
+                    _copy_added_link_fixtures(candidate_source, dst, resolved)
             if dst.exists() and not dst.is_dir():
                 dst.unlink()
             if dst.is_dir():
@@ -1333,18 +1368,24 @@ class Evaluator:
         data = {"build": BUILD_ID, "inputs": copy.deepcopy(inputs), "result": copy.deepcopy(result), "effect": effect}
         self.store.put_setting("sealed-read-checkpoint:" + name, {**data, "sha256": fingerprint(data)})
 
-    def reuse_checkpoint(self, name, inputs):
+    def reuse_checkpoint(self, name, inputs, on_invalidate=None):
         entry = self.store.setting("sealed-read-checkpoint:" + name)
-        if not isinstance(entry, dict):
+        if entry is None:
             return None
-        data = {key: value for key, value in entry.items() if key != "sha256"}
-        if (data.get("effect") != "read_only" or data.get("build") != BUILD_ID
-                or data.get("inputs") != inputs or fingerprint(data) != entry.get("sha256")):
-            return None
-        return copy.deepcopy(data["result"])
+        data = {key: value for key, value in entry.items() if key != "sha256"} if isinstance(entry, dict) else {}
+        if (data.get("effect") != "read_only" or "result" not in data or
+                fingerprint(data) != entry.get("sha256")):
+            reason = "reused_record_invalid"
+        elif data.get("build") != BUILD_ID or data.get("inputs") != inputs:
+            reason = "input_signature_changed"
+        else:
+            return copy.deepcopy(data["result"])
+        if on_invalidate is not None:
+            on_invalidate(name, reason)
+        return None
 
     def execute_stage(self, name, inputs, action, *, effect="read_only", enabled=False,
-                      accept=None, on_reuse=None, on_reject=None):
+                      accept=None, on_reuse=None, on_reject=None, on_invalidate=None):
         """Run one stage, reusing a sealed checkpoint only for explicitly enabled read-only work.
 
         Write and remote stages always execute: no checkpoint can replay them.
@@ -1357,7 +1398,7 @@ class Evaluator:
         """
         if effect != "read_only" or not enabled:
             return action()
-        reused = self.reuse_checkpoint(name, inputs)
+        reused = self.reuse_checkpoint(name, inputs, on_invalidate=on_invalidate)
         if reused is not None:
             try:
                 acceptable = accept is None or bool(accept(reused))
@@ -1592,13 +1633,24 @@ class Evaluator:
             result = sandbox.check(setup, target, cancel, protected, hidden)
             if result["exit_code"] or result["error"]:
                 return {"setup": result}
+        contract = acceptance.get("contract")
+        rounds = (None,)
+        if isinstance(contract, dict) and contract.get("measurement_mode") == HOST_REPETITIONS:
+            repeats = contract.get("repetitions")
+            if type(repeats) is not int or not 3 <= repeats <= 100:
+                return {"rows": []}
+            rounds = range(1, repeats + 1)
         rows = []
-        for check in acceptance["checks"]:
-            result = check_with_fresh_artifacts(sandbox, check, target, cancel, protected, hidden)
-            result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty_test_run(
-                result["stdout"] + result["stderr"])
-            result["test_identities"] = test_identities(result["stdout"] + result["stderr"])
-            rows.append(result)
+        for repetition in rounds:
+            for check in acceptance["checks"]:
+                result = check_with_fresh_artifacts(sandbox, check, target, cancel, protected, hidden)
+                if repetition is not None:
+                    # Attach provenance after the sandboxed command returns, outside its stdout.
+                    result["performance_repetition"] = repetition
+                text = result["stdout"] + result["stderr"]
+                result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty_test_run(text)
+                result["test_identities"] = test_identities(text)
+                rows.append(result)
         return {"rows": rows}
 
     @staticmethod
@@ -1835,6 +1887,9 @@ class Evaluator:
                     "nonce": time.time_ns()})[:12]
             stages["acceptance_baseline"] = lambda: self._acceptance_stage(
                 physical, baseline, baseline, acceptance, directory, execution_config, cancel, seeds, hidden)
+        contract = acceptance.get("contract") if acceptance else None
+        graph = contract.get("check_dependencies") if isinstance(contract, dict) else None
+        replay_started = time.monotonic() if graph else None
         stages["candidate"] = lambda: self._standard_stage(
             "candidate", candidate, baseline, candidate, scheduled if scheduled is not None else checks,
             directory, execution_config, cancel, overlay, seeds, hidden,
@@ -1857,6 +1912,10 @@ class Evaluator:
             if "setup" in stage_outcome:
                 return
             results[label] = stage_outcome["rows"]
+            if replay_started is not None and label in {"candidate", "candidate_full"}:
+                available = time.monotonic() - replay_started
+                for row in results[label]:
+                    row["verdict_available_seconds"] = available
             if "test_first_rows" in stage_outcome:
                 results["test_first_" + label] = stage_outcome["test_first_rows"]
             try:
@@ -1926,12 +1985,11 @@ class Evaluator:
         if seeds:
             from .process import scrub_tree
             scrub_tree(seeds)
-        contract = acceptance.get("contract") if acceptance else None
-        graph = contract.get("check_dependencies") if isinstance(contract, dict) else None
         if graph:
             data["check_dependency_analysis"] = {
                 "affected": [row["name"] for row in affected_checks(changed_files, full_checks, graph)],
                 "scheduled": [row["name"] for row in scheduled] if scheduled is not None else None,
+                "time_basis": "shared_evaluation_dispatch_monotonic_seconds",
                 "execution": "full_checks_retained_until_graph_is_independently_validated"}
         if acceptance:
             from .workflow import improvement

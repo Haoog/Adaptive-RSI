@@ -1086,6 +1086,9 @@ class NativeAgent:
             response = None
             try:
                 request_args = (provider["base_url"].rstrip("/") + suffix, payload, headers, min(timeout, remaining), max_bytes)
+                if cancel is not None and cancel():
+                    raise Cancelled("Run cancelled before model transport")
+                self.store.execute("UPDATE calls SET remote_attempt=1 WHERE id=?", (call,))
                 response = post_json(*request_args, **({"cancel": cancel} if cancel is not None else {}))
                 request_id = getattr(response, "provider_request_id", None)
                 if request_id:

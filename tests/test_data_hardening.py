@@ -165,6 +165,35 @@ class DataHardeningTest(unittest.TestCase):
         self.assertEqual(detail["body"], body)
         self.assertEqual(detail["evidence"], evidence)
 
+    def test_task_detail_reports_historical_and_actual_recovery_evidence(self):
+        from adaptive_rsi.recovery import cached, save, stage_event
+        store = self.runtime.store
+        self.runtime.pause(self.project, False)
+        task = self.runtime.goal(self.project, "Recover a synthetic task")
+        first = store.claim(self.project, self.runtime.config(self.project))
+        save(self.runtime, first, "planning", {"decision": "ready"}, "stable")
+        save(self.runtime, first, "review", {"decision": "pass"}, "former-input")
+        store.transition(first["id"], "failed", terminal=True)
+        self.runtime.retry(task)
+        path = "/api/task?id=" + task + "&project=" + self.project
+        pending = json.loads(self.get(path))["recovery"]
+        self.assertTrue(pending["pending"])
+        self.assertEqual(pending["events"], [])
+        second = store.claim(self.project, self.runtime.config(self.project))
+        cached(self.runtime, second, "planning", "stable")
+        cached(self.runtime, second, "review", "new-input")
+        stage_event(self.runtime, second, "stage_started", "review")
+        evidence = json.loads(self.get(path))["recovery"]
+        self.assertEqual(evidence["latest_run"]["origin"], "manual_retry")
+        self.assertEqual(evidence["previous_run"], first["id"])
+        self.assertFalse(evidence["pending"])
+        self.assertEqual([row["stage"] for row in evidence["checkpoints"]], ["planning", "review"])
+        self.assertEqual(evidence["events"], [
+            {"kind": "stage_reused", "stage": "planning", "from_run": first["id"]},
+            {"kind": "stage_invalidated", "stage": "review", "from_run": first["id"], "reason": "input_signature_changed"},
+            {"kind": "stage_started", "stage": "review"},
+        ])
+
     def test_readiness_names_missing_tools_and_dependencies_without_model_calls(self):
         config = merge(DEFAULTS, {"checks": [{"name": "missing", "cwd": ".", "argv": ["missing-tool"]}],
                                  "environment": {"seed_paths": ["missing-seed"]}})

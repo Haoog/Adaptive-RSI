@@ -52,7 +52,9 @@ Models, tasks, memory, usage, and delivery authorization remain separate per pro
 
 The task list supports selecting a whole page, clearing the selection or Shift-clicking a range before previewing bulk retries, cancellations and delivery approvals; changing the filter or page drops selections that are no longer visible. Compatible queued goals in one project can be grouped for shared verification. The preview flags known file overlaps and unknown scopes. An unstarted group can be split to restore its original tasks. A transient failure while reading a batch receipt never discards a confirmed operation: it resumes with the same request ID and the server reconciles the stored receipt instead of repeating it.
 
-The workspace brings project status and tasks together. Selecting tasks reveals batch actions, while batch history stays accessible. Added goals link directly to their tasks; details show requirements and waiting reasons before optional supplement, dependency and evidence sections. Model services and runtime settings have separate pages, with model subpages and configuration scope retained on reload. Chinese, English, light and dark themes and mobile layouts are supported; mobile prioritizes tasks and groups less frequent navigation in a menu.
+The workspace brings project status and tasks together. Selecting tasks reveals batch actions, while batch history stays accessible. Added goals link directly to their tasks; details show requirements and waiting reasons before optional supplement, dependency and evidence sections. Model services and runtime settings have separate pages, with model subpages and configuration scope retained on reload. A model capability test may continue on the server and incur charges after the console times out waiting for its result. Chinese, English, light and dark themes and mobile layouts are supported; mobile prioritizes tasks and groups less frequent navigation in a menu.
+
+Calls to `POST /api/task/revise` can include a nonblank `request_id` of at most 100 characters. After a lost response, retry with the same ID, task, supplement, and reason to recover the original receipt; reuse with another task or different content is rejected. Use a new ID for a new revision; omitting the field preserves the existing behavior.
 
 Cancellation previews affected downstream tasks and defaults to cancelling only the current task; cascading requires an explicit selection. Cancelling revokes approval eligibility for undelivered candidates. Restore an archived project before retrying tasks or revising requirements. Requirements can also be supplemented during a run: after the current stage, the old run is retained and the new requirements are replanned and verified in a fresh run. Queued tasks can reserve a start instant from the task detail view: pick a local time, an IANA time zone and the first or second occurrence of a repeated hour; the backend rejects nonexistent or ambiguous daylight-saving times with fixed messages, and the task list shows the authorized instant with its zone. Requirement revisions expose exact before/after snapshots, diffs and paginated history. Task intervention history retains optional reasons, candidate identity and operation effects, and can export loaded records. See [workflow and mobile usage](EXPERIENCE.en.md) for scope and historical-evidence limits.
 
@@ -73,6 +75,8 @@ Desktop builds configured with update signing can check and download updates in 
 
 Closing the window hides the app in the menu bar and active tasks continue. Choosing **Quit** from the menu bar stops the service started by the app. The current DMG uses a temporary signature and is not Apple-notarized.
 
+Settings show separate results for **Check for desktop client updates** and **Check for backend service updates**. The bundled backend updates with the client. If the local service fails to start, open its local log directory from the runtime-machine recovery dialog.
+
 ### Run from source
 
 Requires Python 3.9+ and Git; GitHub import and delivery also require authenticated `gh`:
@@ -84,13 +88,16 @@ python3 scripts/rsi doctor
 
 The launcher reuses an existing service. Task details offer paginated dependency selection; unsaved queue settings survive language changes and requirement supplements. Edits made while settings are saving survive project switches; usage searches invalidate old requests so late responses cannot replace newer queries. The dashboard persistently shows save status: saving scan timing reschedules scans, model assignments are saved separately for new tasks, active tasks retain their configuration, and delivery permissions are rechecked before execution. No restart is required. Edit fixed checks as structured fields and read check results and mobile approval summaries with expandable original evidence. Unconfirmed goals can restore their original text and reuse their request IDs. Pending-approval counts in Data and diagnostics exclude approved, delivering and cancelled candidates, and a failed restore leaves no half-created directory that blocks retry. Issue sync counts only newly added tasks or actual body and evidence changes; an unfinished scan says so and continues next cycle, and open task details update with the synced input while preserving unsaved drafts. See [workflow and mobile use](EXPERIENCE.en.md) for recovery controls and evidence boundaries after database restoration, and [server deployment](SERVER.en.md) for Linux and systemd setup.
 
+Data and diagnostics shows recent backups and restore checks on the current machine, and diagnostic downloads match the confirmed preview.
+
 ## Core Capabilities
 
 - **Continuous discovery:** hourly checks for bugs, feature gaps, performance, usability, and maintenance work, with rotating code modules. Sync GitHub Issues incrementally or add a goal at any time.
+- **Run recovery:** task details show the latest run source, stage checkpoints, and recorded reuse and invalidation. Project advanced settings support dependency files and shared directories for module inspection.
 - **Value gate:** assess current evidence, duplicates, expected benefit, cost, and the impact of doing nothing before implementation.
 - **Isolation and verification:** implementation and review use separate contexts. The host runs new behavior tests in isolation on the baseline and candidate, then runs frozen regression and full-candidate checks. Unsupported runners, high-risk, and performance tasks use independent acceptance; model claims do not establish success.
 - **Code review:** check correctness, security, maintainability, architecture, tests, and scope. Blocking findings or insufficient evidence stop delivery.
-- **Controlled delivery:** keep candidates local by default. Each project can opt into automatic PRs, merging after checks, and release or deployment through pinned workflows.
+- **Controlled delivery:** keep candidates local by default. Each project can opt into automatic PRs, merging after checks, and release or deployment through pinned workflows. When the blocking checks for a PR commit show only cancelled, stale, or startup-failure results for 10 consecutive observations, task details ask for manual CI review and show the first observation time, commit SHA, and check links supplied by GitHub.
 - **PR feedback loop:** delivery tracking associates PR conversation comments, reviews, and failed checks with the original task. A human change request or a failed check requeues the task within the retry budget and closes the superseded PR; if that PR is already merged, the merge commit is recorded and the task is blocked instead of reimplementing the same change. Each observation triggers once and a new attempt can trigger again. Ordinary comments only become untrusted context for later planning and never close a mergeable PR, and automation accounts do not drive replans. Inline comments and check logs are not collected.
 - **Multiple projects and providers:** clone and manage repositories separately. The project selector shows both name and path so same-name repositories remain distinguishable, with support for official providers, gateways, local models, Codex, and OpenCode.
 
@@ -117,6 +124,9 @@ Models must support tool calls and structured results. Protocol support does not
 Long-term capability improvement still requires real tasks and sustained experiments. When fresh holdout cases are insufficient, proposal and trials are skipped before model calls and the stable strategy is retained.
 
 Task details collect changes, checks, usage, reused stages and the delivery commit, with optional Helpful, Unnecessary or False positive feedback. Ratings are observational and do not automatically change ranking or strategies; original-merge verification and later-mainline regressions are counted separately. Model pricing supports input, output and cache components with blended-price fallback; usage details provide historical ranges only when enough comparable samples exist. Missing usage and prices remain unknown. Failed usage or detail refreshes identify retained data and the last successful update. See the [reliable improvement loop](RELIABILITY.en.md) for execution and recovery rules.
+
+Use the [offline scheduling and cost evaluation](docs/policy-evaluation.en.md) to replay a redacted queue or report stage history and automatic task cost ranges from a local snapshot.
+
 
 ## Documentation
 
@@ -165,6 +175,8 @@ Deployment supports consecutive-success gates and multiple health endpoints. A r
 Automatic deployment rollback also requires an explicit backward-data-compatibility declaration; otherwise rollback is blocked and maintainer-provided manual recovery steps are shown.
 
 Execution resources queue model calls, commands and exclusive benchmarks by priority. Requests waiting at least 30 seconds take FIFO precedence; diagnostics include bounded wait samples and cancellation receipts.
+
+Workflow quality and timing shows first independent acceptance and review passes, first confirmed delivery merges, and time to first start for newly created tasks over the last 30 days. Timing includes sample counts. Remote waits enter the window when they end. Run details surface concrete evidence requests from additional high-risk review. A first-round evidence gap still requires verification with new evidence.
 
 Stage budgets accumulate per task across attempts: when a run is interrupted by a crash, upgrade or service stop, consumed preparation and evaluation time is kept, and the next attempt after recovery — including a manual retry — only gets the remainder. Only non-interruption endings such as completion, failure or a stage-deadline block clear it, so a manual retry after those starts with a full budget. Consumed time is checkpointed every 15 seconds, so a hard kill loses at most one interval.
 

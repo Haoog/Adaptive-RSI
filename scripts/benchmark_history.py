@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from adaptive_rsi import telemetry
+from adaptive_rsi import queue_replay, telemetry, usage_report
 from adaptive_rsi.dashboard import records
 from adaptive_rsi.store import Store, encode
 
@@ -88,19 +88,73 @@ def benchmark(count=10000, samples=3, budget_ms=5000, max_response_bytes=8 * 102
             store.close()
 
 
+def read_policy_history(path, start, end, project=None):
+    # Immutable mode is for a completed standalone snapshot only. Reading a live
+    # WAL database this way could silently miss committed records.
+    for suffix in ('-wal', '-shm', '-journal'):
+        if Path(str(path) + suffix).exists():
+            raise ValueError('Use a standalone SQLite snapshot with no WAL, SHM or journal sidecars')
+    db = sqlite3.connect(path.as_uri() + '?mode=ro&immutable=1', uri=True)
+    try:
+        db.row_factory = sqlite3.Row
+        db.execute('PRAGMA query_only=ON')
+        return usage_report.policy_history(db, start, end, project)
+    finally:
+        db.close()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--policy-replay', type=Path, help='read a redacted queue trace JSON')
+    modes.add_argument('--policy-history', type=Path, help='read a standalone local SQLite snapshot')
+    parser.add_argument('--start', type=float, help='history window start (inclusive Unix seconds)')
+    parser.add_argument('--end', type=float, help='history window end (exclusive Unix seconds)')
+    parser.add_argument('--project', help='limit historical cohorts to a project ID')
+    parser.add_argument('--workers', type=int, default=2)
+    parser.add_argument('--planning-slots', type=int, default=1)
+    parser.add_argument('--old-after', type=float, default=86400)
+    parser.add_argument('--old-quota', type=int, default=1)
+    parser.add_argument('--urgent-quota', type=int, default=1)
+    parser.add_argument('--quota-window', type=float, default=3600)
     parser.add_argument('--tasks', type=int, default=10000)
     parser.add_argument('--samples', type=int, default=3)
     parser.add_argument('--budget-ms', type=float, default=5000)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--enforce', action='store_true')
     arguments = parser.parse_args(argv)
-    result = benchmark(arguments.tasks, arguments.samples, arguments.budget_ms)
-    text = json.dumps(result, ensure_ascii=False, indent=2) + '\n'
+    try:
+        if arguments.policy_replay:
+            trace = json.loads(arguments.policy_replay.read_text(encoding='utf-8'))
+            result = queue_replay.evaluate(trace, workers=arguments.workers, planning_slots=arguments.planning_slots,
+                                           old_after=arguments.old_after, old_quota=arguments.old_quota,
+                                           urgent_quota=arguments.urgent_quota, quota_window=arguments.quota_window)
+        elif arguments.policy_history:
+            if arguments.start is None or arguments.end is None:
+                parser.error('--policy-history requires --start and --end')
+            result = read_policy_history(arguments.policy_history.resolve(), arguments.start, arguments.end,
+                                         arguments.project)
+        else:
+            result = benchmark(arguments.tasks, arguments.samples, arguments.budget_ms)
+    except (AttributeError, KeyError, OSError, TypeError, ValueError, sqlite3.Error) as exc:
+        parser.error(str(exc))
+    if arguments.enforce and (arguments.policy_replay or arguments.policy_history):
+        parser.error('--enforce applies only to the performance benchmark')
+    text = json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2) + '\n'
     if arguments.output:
-        arguments.output.parent.mkdir(parents=True, exist_ok=True)
-        arguments.output.write_text(text)
+        if arguments.policy_replay or arguments.policy_history:
+            output = arguments.output.resolve()
+            if arguments.policy_history and output in [Path(str(arguments.policy_history.resolve()) + suffix)
+                                                        for suffix in ('-wal', '-shm', '-journal')]:
+                parser.error('Choose an output outside the SQLite snapshot sidecar paths')
+            try:
+                with output.open('x', encoding='utf-8') as stream:
+                    stream.write(text)
+            except OSError as exc:
+                parser.error(str(exc))
+        else:
+            arguments.output.parent.mkdir(parents=True, exist_ok=True)
+            arguments.output.write_text(text)
     print(text)
     return int(arguments.enforce and not result['passed'])
 

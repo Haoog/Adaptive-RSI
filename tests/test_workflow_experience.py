@@ -1038,22 +1038,36 @@ class ExperienceTest(unittest.TestCase):
             evidence_contract(task, {key: value for key, value in plan.items() if key != "guardrails"})
         with self.assertRaises(ValueError):
             evidence_contract(task, {**plan, "guardrails": [dict(threshold)]})
-        def sample(value, memory=256):
-            return {"passed": True, "stdout": "\n".join(json.dumps(row) for row in [
-                {"metric": "latency", "unit": "ms", "value": value, "load": "idle"},
-                {"metric": "memory", "unit": "MiB", "value": memory, "load": "idle"}])}
+        def sample(repetition, value, memory=256):
+            return {"passed": True, "exit_code": 0, "performance_repetition": repetition,
+                    "stdout": "\n".join(json.dumps({**row, "repetition": repetition}) for row in [
+                        {"metric": "latency", "unit": "ms", "value": value, "load": "idle"},
+                        {"metric": "memory", "unit": "MiB", "value": memory, "load": "idle"}])}
+
         acceptance = {"change_kind": "performance", "contract": contract}
-        checks = {"acceptance_baseline": [sample(100)], "acceptance_candidate": [sample(79)]}
-        self.assertEqual("insufficient_evidence", improvement(checks, acceptance)["decision"])
-        checks = {"acceptance_baseline": [sample(100), sample(101), sample(102)],
-                  "acceptance_candidate": [sample(79), sample(78), sample(77)]}
+        baseline = [sample(1, 100), sample(2, 101), sample(3, 102)]
+        candidate = [sample(1, 79), sample(2, 78), sample(3, 77)]
+        checks = {"acceptance_baseline": baseline, "acceptance_candidate": candidate}
         self.assertEqual("pass", improvement(checks, acceptance)["decision"])
+        # Keep exactly three lines per metric but pack all of them into one host round.
+        # The stdout claims all three repetition numbers.
+        packed = {**candidate[0], "stdout": "\n".join(row["stdout"] for row in candidate)}
+        spoofed = [packed, {**candidate[1], "stdout": ""}, {**candidate[2], "stdout": ""}]
+        for rows in ([packed], spoofed, [{**row, "performance_repetition": 1} for row in candidate],
+                     [{**row, "performance_repetition": None} for row in candidate]):
+            gate = improvement({**checks, "acceptance_candidate": rows}, acceptance)
+            self.assertEqual("insufficient_evidence", gate["decision"])
+        legacy = {**acceptance, "contract": {key: value for key, value in contract.items()
+                                             if key != "measurement_mode"}}
+        self.assertEqual("pass", improvement({"acceptance_baseline": [
+            {**baseline[0], "stdout": "\n".join(row["stdout"] for row in baseline)}],
+            "acceptance_candidate": [packed]}, legacy)["decision"])
         duplicated = {"change_kind": "performance",
                       "contract": {**contract, "guardrails": [dict(threshold)]}}
         self.assertEqual("insufficient_evidence", improvement(checks, duplicated)["decision"])
-        checks["acceptance_candidate"] = [sample(79, 600), sample(78, 610), sample(77, 620)]
+        checks["acceptance_candidate"] = [sample(1, 79, 600), sample(2, 78, 610), sample(3, 77, 620)]
         self.assertEqual("insufficient_evidence", improvement(checks, acceptance)["decision"])
-        checks["acceptance_candidate"] = [sample(99), sample(98), sample(97)]
+        checks["acceptance_candidate"] = [sample(1, 99), sample(2, 98), sample(3, 97)]
         self.assertEqual("insufficient_evidence", improvement(checks, acceptance)["decision"])
 
     def test_metrics_count_logical_interventions_and_same_failure_only(self):
@@ -1167,9 +1181,11 @@ class ExperienceTest(unittest.TestCase):
             },
             "review": {"decision": "pass"},
         }
+        now = time.time()
+        self.store.execute("UPDATE tasks SET created=? WHERE id=?", (now - 10, task))
         for index, (state, evidence) in enumerate([("assessed", {}), ("awaiting_approval", passed)]):
             self.store.execute("INSERT INTO runs(id,task,project,state,result,started,ended) VALUES (?,?,?,?,?,?,?)",
-                ("first-pass-" + str(index), task, self.project, state, encode(evidence), time.time() + index, time.time() + index + 1))
+                ("first-pass-" + str(index), task, self.project, state, encode(evidence), now - 5 + index, now - 4 + index))
         self.assertEqual(1, workflow_metrics(self.store, self.project)["first_pass"])
 
     def test_cancel_during_infrastructure_failure_cannot_be_requeued(self):

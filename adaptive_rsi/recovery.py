@@ -4,7 +4,7 @@ import re
 import time
 
 from .config import fingerprint
-from .store import encode
+from .store import decode_object, encode
 
 
 class BudgetExhausted(RuntimeError):
@@ -65,7 +65,38 @@ def save(runtime, run, stage, data, signature):
                           (run["id"], stage, signature, encode(data), time.time()))
 
 
-def cached(runtime, run, stage, signature, accept=None, normalize=None):
+def stage_event(runtime, run, kind, stage, **data):
+    message = {"stage_reused": "Reused verified stage inputs", "stage_invalidated": "Stage checkpoint could not be reused",
+               "stage_started": "Fresh stage execution began"}[kind]
+    runtime.store.event(kind, message, run["project"], run["id"], {"stage": stage, **data})
+
+
+def task_recovery(store, task):
+    with store.connect() as db:
+        db.execute("BEGIN")
+        state = db.execute("SELECT state FROM tasks WHERE id=? AND project=?", (task["id"], task["project"])).fetchone()
+        runs = db.execute("SELECT id,state,started,origin FROM runs WHERE task=? AND project=? "
+                          "ORDER BY started DESC,rowid DESC LIMIT 2", (task["id"], task["project"])).fetchall()
+        if not runs or not state:
+            return None
+        latest = dict(runs[0])
+        prior = runs[1]["id"] if len(runs) > 1 else None
+        checkpoints = db.execute("SELECT run,stage,created FROM stages WHERE run IN (?,?) ORDER BY created,stage",
+                                 (latest["id"], prior)).fetchall()
+        events = db.execute("SELECT kind,data FROM events WHERE project=? AND run=? AND "
+                            "kind IN ('stage_reused','stage_invalidated','stage_started') ORDER BY seq",
+                            (task["project"], latest["id"])).fetchall()
+    evidence = []
+    for event in events:
+        data = decode_object(event["data"])
+        if isinstance(data.get("stage"), str):
+            evidence.append({"kind": event["kind"], **{key: data[key] for key in
+                             ("stage", "from_run", "checkpoint", "from_checkpoint", "reason", "error") if key in data}})
+    return {"latest_run": latest, "previous_run": prior, "checkpoints": [dict(row) for row in checkpoints],
+            "events": evidence, "pending": state["state"] in ("queued", "waiting_budget", "interrupted")}
+
+
+def cached(runtime, run, stage, signature, accept=None, normalize=None, on_reuse=None):
     row = runtime.store.one("SELECT s.data,s.run FROM stages s JOIN runs r ON s.run=r.id "
                             "WHERE r.task=? AND s.stage=? AND s.signature=? AND r.id<>? "
                             "ORDER BY s.created DESC LIMIT 1", (run["task"], stage, signature, run["id"]))
@@ -73,9 +104,10 @@ def cached(runtime, run, stage, signature, accept=None, normalize=None):
         try:
             data = json.loads(row["data"] or "{}")
         except (TypeError, ValueError):
-            data = {}
-        if not isinstance(data, dict):
-            data = {}
+            data = None
+        if not isinstance(data, dict) or not data:
+            stage_event(runtime, run, "stage_invalidated", stage, reason="reused_record_invalid", from_run=row["run"])
+            return None
         if normalize is not None:
             try:
                 data = normalize(data)
@@ -91,8 +123,10 @@ def cached(runtime, run, stage, signature, accept=None, normalize=None):
             runtime.store.event("stage_invalidated", "Cached stage result requires rework", run["project"], run["id"],
                                 {"stage": stage, "reason": "result_requires_rework", "from_run": row["run"]})
             return None
-        runtime.store.event("stage_reused", "Reused verified stage inputs", run["project"], run["id"],
-                            {"stage": stage, "from_run": row["run"]})
+        if on_reuse is None:
+            stage_event(runtime, run, "stage_reused", stage, from_run=row["run"])
+        else:
+            on_reuse(stage, row["run"])
         return data
     prior = runtime.store.one("SELECT s.run FROM stages s JOIN runs r ON r.id=s.run WHERE r.task=? AND s.stage=? AND r.id<>? ORDER BY s.created DESC LIMIT 1", (run["task"], stage, run["id"]))
     if prior:

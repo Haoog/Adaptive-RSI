@@ -383,6 +383,38 @@ def delivery_checks(pr):
     return (failed + pending)[:CHECK_DETAIL_LIMIT]
 
 
+def _clear_ci_inconclusive(outcome):
+    outcome.pop("delivery_ci_inconclusive", None)
+    # Historical counters were not tied to a head and cannot be resumed safely.
+    outcome.pop("ci_inconclusive_ticks", None)
+    outcome.pop("ci_inconclusive_reported", None)
+
+
+def _observe_ci_inconclusive(outcome, pr, head, now, details):
+    rows = [row for row in pr.get("statusCheckRollup") or [] if isinstance(row, dict)]
+    blockers = {row.get("conclusion") or row.get("state") or row.get("status") for row in rows}
+    blockers -= {"SUCCESS", "NEUTRAL", "SKIPPED"}
+    if not blockers or not blockers <= CHECK_INCONCLUSIVE_STATES:
+        _clear_ci_inconclusive(outcome)
+        return False
+    previous = _dict_field(outcome, "delivery_ci_inconclusive")
+    if previous.get("head") != head:
+        previous = {}
+    _clear_ci_inconclusive(outcome)
+    count = previous.get("observations")
+    if type(count) is not int or not 0 < count <= CI_INCONCLUSIVE_TICKS:
+        count = 0
+    started = previous.get("started_at") if count else None
+    if type(started) not in (int, float) or not 0 <= started < float("inf"):
+        started, count = now, 0
+    observations = min(count + 1, CI_INCONCLUSIVE_TICKS)
+    outcome["delivery_ci_inconclusive"] = {
+        "head": head, "started_at": started, "reasons": sorted(blockers), "checks": details,
+        "observations": observations, "needs_attention": observations == CI_INCONCLUSIVE_TICKS,
+    }
+    return count < observations == CI_INCONCLUSIVE_TICKS
+
+
 def merge_gate(pr, head, base):
     if pr["headRefOid"] != head:
         return "stale"
@@ -1128,12 +1160,26 @@ def _last_poll(store, run, outcome):
                record.get("checked_at", 0) or 0)
 
 
-def _persist_result(store, run, outcome):
+def _persist_result(store, run, outcome, ci_attention=False):
     """仅在编码结果真正变化时写 runs.result；无新证据的 tick 不得整行重写。"""
     encoded = encode(outcome)
-    if encoded == (run.get("result") or "{}"):
+    previous = run.get("result") or "{}"
+    if encoded == previous:
         return False
-    store.execute("UPDATE runs SET result=? WHERE id=?", (encoded, run["id"]))
+    if ci_attention:
+        observation = outcome["delivery_ci_inconclusive"]
+        with store.connect() as db:
+            changed = db.execute("UPDATE runs SET result=? WHERE id=? AND state='pr_open' AND result=?",
+                                 (encoded, run["id"], previous)).rowcount
+            if not changed:
+                return False
+            db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                       (run["project"], run["id"], "delivery_ci_inconclusive",
+                        "CI checks need manual review for %s: %s" % (observation["head"],
+                                                                      ", ".join(observation["reasons"])),
+                        encode(observation), time.time()))
+    else:
+        store.execute("UPDATE runs SET result=? WHERE id=?", (encoded, run["id"]))
     run["result"] = encoded  # 同一 tick 后续调用不再重复写入相同内容。
     return True
 
@@ -1148,6 +1194,7 @@ def _update_pr_task(store, run, state, now):
 
 def _supersede_pr(store, run, outcome, task_state, now, feedback_keys=None):
     """Detach tracking from the task and persist close intent before remote writes."""
+    _clear_ci_inconclusive(outcome)
     outcome.update(replanned=True, close_pending=True)
     if outcome.get('generation_replan'):
         # 关闭被拒绝、响应丢失或退避期间，禁止调度同一任务再次交付。
@@ -1871,6 +1918,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         outcome.pop("delivery_update_blocked", None)
                     if pending_update and pr.get("state") == "OPEN" and not _update_pr_identity(
                             pr, repo, policy["branch"], update_intent.get("head_branch"), policy["head"]):
+                        _clear_ci_inconclusive(outcome)
                         outcome["delivery_status"] = "waiting"
                         _persist_result(store, run, outcome)
                         continue
@@ -1898,6 +1946,9 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     outcome["delivery_checks"] = details
                 else:
                     outcome.pop("delivery_checks", None)
+                ci_attention = False
+                if pr["state"] != "OPEN" or gate != "waiting_ci":
+                    _clear_ci_inconclusive(outcome)
                 if pr["state"] == "MERGED":
                     # 崩溃对账：意图在 gh pr merge 之前落盘，与终态落库原子消费，
                     # 区分「本进程发起的合并」与「人工合并」；缺失或损坏时回落 pr_view。
@@ -1991,27 +2042,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                             continue
                         outcome = previous
                     outcome["delivery_status"] = gate
-                    # 基础设施没让检查裁决（runner 回收、被新提交作废、启动即失败）不构成
-                    # 候选证据：停在 waiting_ci，连续多轮只有未决结论时只记一次事件交人工
-                    # 重跑；不关闭 PR、不重排任务。结论一旦前进或退化为真实失败即清零。
-                    statuses = {check.get("conclusion") or check.get("state") or check.get("status")
-                                for check in pr.get("statusCheckRollup") or [] if isinstance(check, dict)}
-                    blockers = statuses - {"SUCCESS", "NEUTRAL", "SKIPPED"}
-                    if (gate == "waiting_ci" and statuses & CHECK_INCONCLUSIVE_STATES and
-                            not statuses & CHECK_FAILURE_STATES and blockers <= CHECK_INCONCLUSIVE_STATES):
-                        if not outcome.get("ci_inconclusive_reported"):
-                            ticks = outcome.get("ci_inconclusive_ticks")
-                            ticks = (ticks if isinstance(ticks, int) else 0) + 1
-                            outcome["ci_inconclusive_ticks"] = ticks
-                            if ticks >= CI_INCONCLUSIVE_TICKS:
-                                outcome["ci_inconclusive_reported"] = True
-                                store.event("delivery_ci_inconclusive",
-                                            "CI checks stayed inconclusive for %s ticks: %s" %
-                                            (ticks, ", ".join(sorted(statuses & CHECK_INCONCLUSIVE_STATES))),
-                                            project["id"], run["id"])
-                    else:
-                        outcome.pop("ci_inconclusive_ticks", None)
-                        outcome.pop("ci_inconclusive_reported", None)
+                    if gate == "waiting_ci" and pr["state"] == "OPEN":
+                        ci_attention = _observe_ci_inconclusive(outcome, pr, policy["head"], now, details)
                     # 同时要求运行时及当前项目授权，撤销授权立即阻止合并。
                     try:
                         run_config = json.loads(run["config"] or "{}")
@@ -2151,7 +2183,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         continue
                 status = outcome.get("delivery_status")
                 store.remote_wait(run["id"], status if status in ["waiting_ci", "waiting_review", "waiting", "merge_submitted"] else None, now)
-                _persist_result(store, run, outcome)
+                if not _persist_result(store, run, outcome, ci_attention=ci_attention) and ci_attention:
+                    continue
             if outcome.get("merged_sha"):
                 _finish_merge(runtime, project, run, outcome, config, now,
                               active_run, tracking_cancelled, tick_baselines)

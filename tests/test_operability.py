@@ -90,6 +90,29 @@ class OperabilityTest(unittest.TestCase):
             self.assertEqual(result, {"summary": "RSI_OK"})
             self.assertEqual(self.store.one("SELECT provider FROM calls")["provider"], "gateway")
 
+    def test_remote_primary_failure_survives_local_fallback_cooldown(self):
+        with DirectoryServer() as fixture:
+            self.save(fixture)
+            config = self.runtime.config()
+            fallback = {"provider": "openai", "model": "unused", "effort": "default"}
+            config["models"]["probe"] = {"provider": "gateway", "model": "coder-a", "effort": "default",
+                                         "fallback": fallback}
+            health = ProviderHealth(self.store)
+            cooling = ProviderUnavailable("HTTP 429", "rate_limit")
+            cooling.retry_after = 120
+            health.record(config, "openai", "model-center", cooling)
+            upstream = ProviderUnavailable("Synthetic upstream timeout", "timeout")
+            with patch("adaptive_rsi.native.post_json", side_effect=upstream) as post:
+                with self.assertRaises(ProviderUnavailable) as caught:
+                    CodexAgent(self.store).invoke("probe", "test", self.temp.name, "model-center", "remote-first", config)
+            self.assertIs(caught.exception, upstream)
+            self.assertEqual((upstream.provider_id, upstream.code, upstream.fallback_admission),
+                             ("gateway", "timeout", "rate_limit"))
+            self.assertEqual(post.call_count, 1)
+            self.assertEqual(self.store.query("SELECT provider,remote_attempt FROM calls"),
+                             [{"provider": "gateway", "remote_attempt": 1}])
+            self.assertEqual(health.status(config, "openai", "model-center")["failures"], 1)
+
     def test_probe_results_are_per_effort_failures_invalidate_only_matching_proof(self):
         with DirectoryServer() as fixture:
             self.save(fixture)

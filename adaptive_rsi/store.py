@@ -1177,6 +1177,13 @@ class Store:
         return tuple(key)
 
     @staticmethod
+    def project_claim_key(now, waiting_since, worker_seconds, weight, service):
+        age = max(0, now - waiting_since)
+        if age >= 3600:
+            return (0, -age, service)
+        return (1, worker_seconds / max(1, weight), service)
+
+    @staticmethod
     def compatible_source_clause(active_sources):
         if len(active_sources) >= 2:
             return None
@@ -1346,8 +1353,12 @@ class Store:
                     db.rollback()
                     continue
                 run = uid()
-                db.execute("INSERT INTO runs(id,task,project,state,config,started) VALUES (?,?,?,?,?,?)",
-                           (run, task["id"], project, "planning", encode(effective), now))
+                # Read the queue metadata under the claim write lock. A pending
+                # system trigger can have been promoted to manual during the scan.
+                claimed_task = db.execute("SELECT * FROM tasks WHERE id=?", (task["id"],)).fetchone()
+                origin = self._run_origin(db, claimed_task, now)
+                db.execute("INSERT INTO runs(id,task,project,state,config,started,origin) VALUES (?,?,?,?,?,?,?)",
+                           (run, task["id"], project, "planning", encode(effective), now, origin))
                 cursor = db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, "planning", now))
                 self._clock_samples[("phase_times", cursor.lastrowid)] = time.monotonic()
                 db.commit()
@@ -1363,6 +1374,31 @@ class Store:
         if run is None:
             return None
         return self.one("SELECT * FROM runs WHERE id=?", (run,))
+
+    @staticmethod
+    def _run_origin(db, task, now):
+        prior = db.execute("SELECT started,state,result FROM runs WHERE task=? "
+                           "ORDER BY started DESC,rowid DESC LIMIT 1", (task["id"],)).fetchone()
+        manual = db.execute("SELECT 1 FROM events WHERE project=? AND kind='manual_retry' AND created>=? AND created<=? "
+                            "AND json_valid(data) AND json_extract(data,'$.task')=? LIMIT 1",
+                            (task["project"], prior["started"] if prior else task["created"], now, task["id"])).fetchone()
+        if manual:
+            return "manual_retry"
+        if task["source"].startswith("system_"):
+            from .discovery import evidence_anchors
+            for row in evidence_anchors(task["evidence"]):
+                trigger = row.get("scan_trigger")
+                if trigger in ("manual", "automatic"):
+                    return "manual_scan" if trigger == "manual" else "scheduled_scan"
+        if prior:
+            failure = decode_evidence(prior["result"]).get("failure") or {}
+            if task["available"] and task["available"] == failure.get("retry_at"):
+                if failure.get("retry_kind") == "provider_cooldown":
+                    return "provider_cooldown"
+                return {"provider": "provider_retry", "budget": "budget_retry"}.get(failure.get("code"), "automatic_retry")
+            if prior["state"] == "failed" and task["available"]:
+                return "automatic_retry"
+        return task["source"]
 
     def _block_candidate(self, db, project, task, message, reason, evidence, overrides):
         """一条坏任务一个短写事务：条件 UPDATE 命中才补事件，保证不整段持锁。
@@ -1412,7 +1448,7 @@ class Store:
                 elif revision_pending or issue_revision_pending:
                     state, terminal = "superseded", True
                     task_fields = {"state": "blocked" if issue_revision_pending else "queued", "available": 0, "attempts": 0,
-                                   "infra_retries": 0, "budget_waits": 0}
+                                   "infra_retries": 0, "budget_waits": 0, "cooldown_waits": 0}
                     reason = ("Issue changed; synchronize before fresh planning" if issue_revision_pending else
                               "Requirements changed; fresh run scheduled")
                     result = {**(result or {}), "reason": reason}
@@ -1454,7 +1490,7 @@ class Store:
             extra = ""
             values = []
             if task_fields and task and task["state"] != "cancelled":
-                allowed_fields = {"state", "available", "infra_retries", "attempts", "budget_waits"}
+                allowed_fields = {"state", "available", "infra_retries", "attempts", "budget_waits", "cooldown_waits"}
                 safe_fields = {k: v for k, v in task_fields.items() if k in allowed_fields}
                 if safe_fields:
                     extra = "," + ",".join(field + "=?" for field in safe_fields)

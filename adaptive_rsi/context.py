@@ -10,6 +10,10 @@ from pathlib import Path
 from .gitops import git
 
 
+_INDEX_BYTES = 12 * 1024 * 1024
+_FILE_BYTES = 1024 * 1024
+
+
 @lru_cache(maxsize=512)
 def terms(text):
     """Return searchable ASCII words and overlapping CJK fragments.
@@ -54,7 +58,7 @@ def _workspace_fingerprint(workspace):
                          if not name.startswith(".rsi-"))
 
     digest = hashlib.sha256(head.encode("utf-8"))
-    remaining = 12 * 1024 * 1024
+    remaining = _INDEX_BYTES
     for name in names:
         path = root / name
         digest.update(name.encode("utf-8", "surrogateescape"))
@@ -70,87 +74,123 @@ def _workspace_fingerprint(workspace):
             return head + ":" + str(time.time_ns())
         remaining -= size
         with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            unread = size
+            while unread:
+                chunk = stream.read(min(_FILE_BYTES, unread))
+                if not chunk:
+                    return head + ":" + str(time.time_ns())
+                unread -= len(chunk)
                 digest.update(chunk)
+            if os.fstat(stream.fileno()).st_size != size:
+                return head + ":" + str(time.time_ns())
     return digest.hexdigest()
 
 
+_DECLARATION = re.compile(
+    r"^[ \t]*(?:export[ \t]+(?:default[ \t]+)?)?(?:async[ \t]+)?"
+    r"(?:def|class|function|interface|type|fn|struct|trait|enum|const|let|var)[ \t]+"
+    r"(?P<symbol>[^\W\d]\w*)[^\r\n]*", re.MULTILINE,
+)
+
+
 @lru_cache(maxsize=3)
-def _code_index(root, fingerprint):
+def _code_index(root, fingerprint, cited_paths=()):
     """Cache the bounded text index for one exact workspace content state."""
     workspace = Path(root)
-    paths = sorted(set(filter(None, git(workspace, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split("\0"))))
+    cited = set(cited_paths)
+    paths = sorted(set(filter(None, git(workspace, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split("\0"))),
+                   key=lambda path: (path not in cited, path))
     rows = []
-    content_budget = 12 * 1024 * 1024
+    content_budget = _INDEX_BYTES
     text_suffixes = {
-        ".c", ".cc", ".cpp", ".cs", ".css", ".dart", ".ex", ".exs", ".fs", ".go",
+        ".c", ".cc", ".cjs", ".cpp", ".cs", ".css", ".dart", ".ex", ".exs", ".fs", ".go",
         ".h", ".hpp", ".html", ".java", ".js", ".jsx", ".json", ".kt", ".kts",
-        ".lua", ".m", ".md", ".php", ".pl", ".py", ".rb", ".rs", ".scss", ".sh",
+        ".lua", ".m", ".md", ".mjs", ".php", ".pl", ".py", ".pyi", ".rb", ".rs", ".scss", ".sh",
         ".sql", ".swift", ".toml", ".ts", ".tsx", ".vue", ".xml", ".yaml", ".yml",
     }
     for path in paths:
         if path.startswith((".git/", ".rsi-")):
             continue
         content = ""
-        file = Path(workspace) / path
-        if file.suffix.lower() in text_suffixes and not file.is_symlink() and file.is_file():
+        file = workspace / path
+        if content_budget and file.suffix.lower() in text_suffixes:
             try:
-                size = file.stat().st_size
-                if size <= 160000 and size <= content_budget:
-                    content = file.read_text(errors="replace").lower()
-                    content_budget -= size
-            except OSError:
-                content = ""
-        rows.append((path, content))
+                if file.resolve() == file and file.is_file():
+                    size = file.stat().st_size
+                    with file.open("rb") as stream:
+                        data = stream.read(min(_FILE_BYTES, content_budget))
+                    content_budget -= len(data)
+                    if len(data) < size:
+                        # Keep complete lines so every anchor has its original line number and text.
+                        data = data[:data.rfind(b"\n") + 1]
+                    if b"\0" not in data:
+                        content = data.decode("utf-8", errors="replace").replace("\r\n", "\n")
+            except (OSError, RuntimeError):
+                pass
+        declarations = []
+        line, offset = 1, 0
+        for match in _DECLARATION.finditer(content):
+            line += content.count("\n", offset, match.start())
+            offset = match.start()
+            declarations.append((line, match["symbol"].lower(), content[offset: min(match.end(), offset + 160)]))
+        rows.append((path, content, declarations))
     return tuple(rows), len(paths)
 
 
 @lru_cache(maxsize=64)
-def _code_map_cached(root, fingerprint, text, limit):
-    workspace = Path(root)
-    words = terms(text)
-    indexed, total_files = _code_index(root, fingerprint)
-    path_words = sorted(words, key=lambda word: (-len(word), word))[:256]
+def _code_map_cached(root, fingerprint, text, limit, evidence=()):
+    quotes = {}
+    for path, quote in evidence:
+        quotes.setdefault(path, []).append(quote)
+    indexed, total_files = _code_index(root, fingerprint, tuple(sorted(quotes)))
+    path_words = sorted(terms(text), key=lambda word: (-len(word), word))[:256]
     content_words = path_words[:128]
+    symbol_words = set(content_words)
     ranked = []
-    for path, content in indexed:
+    for path, content, declarations in indexed:
         lower_path = path.lower()
         score = sum(6 for word in path_words if word in lower_path)
-        if any(word == Path(path).stem.lower() for word in path_words):
+        if Path(path).stem.lower() in path_words:
             score += 12
         if content:
-            score += sum(1 for word in content_words if word in content)
-        ranked.append((-score, path))
+            lowered = content.lower()
+            score += sum(1 for word in content_words if word in lowered)
+        matches = symbol_words.intersection(symbol for _, symbol, _ in declarations)
+        score += 16 * min(len(matches), 3)
+        ranked.append((path not in quotes, -score, path, content, declarations, matches))
     rows = []
-    for negative_score, path in sorted(ranked)[:limit]:
-        file = Path(workspace) / path
-        anchors = []
-        if not file.is_symlink() and file.is_file() and file.stat().st_size <= 200000:
-            # 同一文件只读一次：声明锚点与内容词匹配共用同一份行列表。
-            lines = file.read_text(errors="replace").splitlines()
-            for n, line in enumerate(lines, 1):
-                if re.match(r"\s*(?:async\s+)?(?:def |class |function |export |interface |type )", line):
-                    anchors.append({"line": n, "declaration": line[:160]})
-                if len(anchors) >= 8:
+    for _, negative_score, path, content, declarations, matches in sorted(ranked)[:limit]:
+        anchors = {}
+        for quote in quotes.get(path, []):
+            offset = content.find(quote) if quote else -1
+            if offset >= 0:
+                start = content.rfind("\n", 0, offset) + 1
+                line = content.count("\n", 0, start) + 1
+                anchors[line] = content[start:start + 160].split("\n", 1)[0]
+        for line, symbol, declaration in declarations:
+            if len(anchors) >= 8:
+                break
+            if symbol in matches:
+                anchors.setdefault(line, declaration)
+        for line, _, declaration in declarations:
+            if len(anchors) >= 8:
+                break
+            anchors.setdefault(line, declaration)
+        if negative_score:
+            for line, value in enumerate(content.splitlines(), 1):
+                if len(anchors) >= 12:
                     break
-            if -negative_score:
-                present = {item["line"] for item in anchors}
-                for n, line in enumerate(lines, 1):
-                    if n in present:
-                        continue
-                    lowered = line.lower()
-                    if any(word in lowered for word in content_words):
-                        anchors.append({"line": n, "declaration": lowered[:160]})
-                        if len(anchors) >= 12:
-                            break
-        rows.append({"path": path, "anchors": anchors})
+                lowered = value.lower()
+                if line not in anchors and any(word in lowered for word in content_words):
+                    anchors[line] = value[:160]
+        rows.append({"path": path, "anchors": [{"line": line, "declaration": value} for line, value in anchors.items()]})
     return {"files": rows, "total_files": total_files, "truncated": total_files > len(rows)}
 
 
-def code_map(workspace, text, limit=24):
+def code_map(workspace, text, limit=24, *, evidence=()):
     root = str(Path(workspace).resolve())
     fingerprint = _workspace_fingerprint(root)
-    return copy.deepcopy(_code_map_cached(root, fingerprint, text, limit))
+    return copy.deepcopy(_code_map_cached(root, fingerprint, text, limit, tuple(evidence)[:8]))
 
 
 def related(rows, text, limit=3, characters=5000):
