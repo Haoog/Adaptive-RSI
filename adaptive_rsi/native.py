@@ -267,9 +267,11 @@ def tools_for(role):
     ]
     if role == "implementation":
         tools += [
-            ("write_file", "Create or replace a UTF-8 source file in the approved scope.", object_schema({"path": TEXT, "content": TEXT})),
+            ("write_file", "Create or replace a UTF-8 source file in the approved scope, including missing parent directories.",
+             object_schema({"path": TEXT, "content": TEXT})),
             ("replace_text", "Replace one unique exact text match in a source file.", object_schema({"path": TEXT, "old": TEXT, "new": TEXT})),
-            ("run_command", "Run a command in the network-disabled sandbox. No credentials or other projects are available.",
+            ("run_command", "Run a command in the network-disabled sandbox. No credentials or other projects are available. "
+             "On Docker, use write_file to create approved sources that do not yet have a writable mount.",
              object_schema({"argv": {"type": "array", "items": TEXT}, "cwd": TEXT})),
         ]
     return tools + [("finish", "Submit the final structured result. Do not combine with other tool calls.", SCHEMAS[role])]
