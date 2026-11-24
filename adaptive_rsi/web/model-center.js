@@ -32,7 +32,10 @@ window.RSIModelCenter = (() => {
   const purpose = {analysis:'查找有依据的改进',planning:'判断是否值得执行',implementation:'实现并补充验证',review:'检查正确性与可维护性',evolution:'分析证据与提出待验证改动'};
   const drafts = new Map(), baselines = new Map(), jobs = new Set(), savingRoutes = new Set(), inheritanceResets = new Map();
   const initialTab=location.href?new URLSearchParams(String(location.hash||'').replace(/^#/, '')).get('modelTab'):null;
-  let data, active='openai', scope=null, tab=initialTab==='roles'?'roles':'providers', sequence=0, editing=null, editorSession=null, probeSession=null, probeRun=null, probeCancelled=null, picking=null, loading=false;
+  let data, active='openai', scope=null, tab=initialTab==='roles'?'roles':'providers', sequence=0, editing=null, editorSession=null, probeSession=null, probeRun=null, picking=null, loading=false;
+  const probeWaitNotices=new Map();
+  const probeTargetKey=({project,provider,model})=>JSON.stringify([project,provider,model]);
+  const probeStopped='已停止等待；测试可能仍在服务端继续、产生费用并记录结果。';
   let feedbackKey='',feedbackError=false,modelPage=0,pickerPage=0,priceTarget=null,capabilityTarget=null;
   const pageSize=20;
   const priceFields=[['input','mc-price-input-tokens'],['output','mc-price-output'],['cache_read','mc-price-cache-read'],['cache_write','mc-price-cache-write']];
@@ -445,13 +448,16 @@ window.RSIModelCenter = (() => {
     finally{jobs.delete(key);if(scope===requested&&data)renderProvider();}
   }
   // 基础能力测试由对话框独占：关闭、切换范围或改测别的模型时中止浏览器请求，服务端调用仍可能继续。
-  function abortProbe(notify=false){
+  function probeWaitNotice(){
+    const notice=probeSession&&probeWaitNotices.get(probeTargetKey(probeSession));
+    return notice?t(notice):'';
+  }
+  function abortProbe(notice){
     const run=probeRun;probeRun=null;
-    if(!run)return null;
+    if(!run)return;
     clearTimeout(run.timeout);run.controller.abort();
-    if(notify)probeCancelled={project:run.session.project,provider:run.session.provider,model:run.session.model};
+    if(notice){probeWaitNotices.set(probeTargetKey(run.session),notice);$('mc-probe-result').textContent=t(notice);}
     $('mc-probe-start').textContent=t('运行基础能力测试');$('mc-probe-start').disabled=false;
-    return run;
   }
   function invalidateProbe(){
     abortProbe();
@@ -468,8 +474,7 @@ window.RSIModelCenter = (() => {
     $('mc-probe-dialog').dataset.provider=provider.id;$('mc-probe-dialog').dataset.model=model.id;
     const route=Object.values(routes()).find(r=>r.provider===provider.id&&r.model===model.id)||{provider:provider.id,model:model.id,effort:'default'};
     $('mc-probe-effort').replaceChildren(effortControl({...route},t('测试模型'),()=>{},true));
-    const cancelled=probeCancelled?.project===scope&&probeCancelled.provider===provider.id&&probeCancelled.model===model.id;
-    $('mc-probe-result').textContent=cancelled?t('已停止等待；测试可能仍在服务端继续、产生费用并记录结果。'):'';
+    $('mc-probe-result').textContent=probeWaitNotice();
     $('mc-probe-start').textContent=t('运行基础能力测试');$('mc-probe-start').disabled=false;$('mc-probe-dialog').showModal();
   }
   function init(){
@@ -558,24 +563,28 @@ window.RSIModelCenter = (() => {
     }));
     $('mc-reset-inheritance').addEventListener('click',()=>{if(!scope)return;inheritanceResets.set(scopeKey(),{models:safeRoutes(data.global_models)});drafts.set(scopeKey(),structuredClone(data.global_models));renderRoles();setStatus(t('已选择跟随通用设置，保存后生效。'));});
     $('mc-advanced-form').addEventListener('submit',event=>{event.preventDefault();try{const provider=$('mc-fallback-provider').value,model=$('mc-fallback-model').value;const fallback=provider?{provider,model,effort:$('mc-fallback-effort').querySelector('select').value}:null,route=routes()[$('mc-advanced-dialog').dataset.role];if(provider&&!model)throw Error(t('请先获取并启用备用模型。'));if(fallback&&provider===route.provider&&model===route.model)throw Error(t('备用模型应与主模型不同。'));route.fallback=fallback;route.effort=$('mc-advanced-effort').querySelector('select').value;$('mc-advanced-dialog').close();renderRoles();}catch(error){$('mc-advanced-error').textContent=error.message;}});
-    $('mc-probe-dialog').addEventListener('close',()=>{if($('mc-probe-dialog').open)return;abortProbe(true);probeSession=null;});
+    $('mc-probe-dialog').addEventListener('close',()=>{if($('mc-probe-dialog').open)return;abortProbe(probeStopped);probeSession=null;});
     $('mc-probe-start').addEventListener('click',event=>safe(async()=>{
       const button=$('mc-probe-start'),session=probeSession;
       if(!session||session.project!==scope||!$('mc-probe-dialog').open)return;
       // 运行中同一按钮变为取消；双击的第二次点击不算取消，避免刚发起就停掉。
-      if(probeRun){if(!(event?.detail>1)){abortProbe(true);$('mc-probe-result').textContent=t('已停止等待；测试可能仍在服务端继续、产生费用并记录结果。');}return;}
-      const current=()=>probeSession===session&&scope===session.project;
-      // 传了 signal 后 api() 不再设置 16 分钟截止时间，这里显式保留同一上限。
-      const controller=new AbortController(),run={controller,session,timedOut:false};
-      run.timeout=setTimeout(()=>{run.timedOut=true;controller.abort();},960000);
-      probeRun=run;probeCancelled=null;
+      if(probeRun){if(!(event?.detail>1))abortProbe(probeStopped);return;}
+      const current=()=>probeSession===session&&scope===session.project&&$('mc-probe-dialog').open;
+      const controller=new AbortController(),run={controller,session};
+      probeRun=run;probeWaitNotices.delete(probeTargetKey(session));
       button.disabled=false;button.textContent=t('停止等待');$('mc-probe-result').textContent=t('正在执行基础能力测试…');
+      // 传了 signal 后 api() 不再设置 16 分钟截止时间，这里显式保留同一上限。
+      run.timeout=setTimeout(()=>{
+        if(probeRun===run&&current())abortProbe('等待测试结果已超时。测试可能仍在服务端继续并产生费用。');
+      },960000);
       try{const result=await api('model-center/probe',{...session,effort:$('mc-probe-effort').querySelector('select').value},{signal:controller.signal});
+        clearTimeout(run.timeout);
         if(probeRun===run&&current()){$('mc-probe-result').textContent=t('基础能力测试通过')+' · '+result.calls.length+' '+t('次调用')+' · '+result.calls.reduce((n,c)=>n+c.tokens,0)+' tokens';await load();}
       }catch(error){
-        // 用户取消时 abortProbe() 已经给出提示，中止带来的连接错误不能再画回对话框。
-        if((!controller.signal.aborted||run.timedOut)&&probeRun===run&&current()){$('mc-probe-result').textContent=run.timedOut?t('请求超时，请重试。'):message(error);await load();}
-      }finally{clearTimeout(run.timeout);if(probeRun===run){probeRun=null;button.disabled=false;button.textContent=t('运行基础能力测试');}}
+        // 停止等待后，迟到的响应或中止错误不能覆盖对话框提示。
+        clearTimeout(run.timeout);
+        if(probeRun===run&&current()){$('mc-probe-result').textContent=message(error);await load();}
+      }finally{if(probeRun===run){probeRun=null;button.disabled=false;button.textContent=t('运行基础能力测试');}}
     }));
     document.querySelectorAll('[data-open-model-center]').forEach(button=>button.addEventListener('click',()=>showView('models')));
     window.addEventListener('beforeunload',event=>{if(modified()){event.preventDefault();event.returnValue='';}});
@@ -586,7 +595,12 @@ window.RSIModelCenter = (() => {
     if($('mc-picker-dialog').open){renderPickerProviders();$('mc-picker-title').textContent=t(roleNames[picking])+' · '+t('选择模型');renderPicker();}
     if($('mc-provider-dialog').open){$('mc-provider-dialog-title').textContent=t(editing?'连接设置':'添加模型服务');$('mc-input-key').placeholder=t(editing&&['stored','configured'].includes(editing.credential_status)?'留空保留当前密钥':'填写 API Key');}
     if($('mc-advanced-dialog').open){const provider=$('mc-fallback-provider').value,model=$('mc-fallback-model').value,effort=$('mc-fallback-effort').querySelector('select').value;renderFallback(provider?{provider,model,effort}:null);const role=$('mc-advanced-dialog').dataset.role;$('mc-advanced-title').textContent=t(roleNames[role])+' · '+t('高级参数');}
-    if($('mc-probe-dialog').open){const dialog=$('mc-probe-dialog'),model=data.providers.find(p=>p.id===dialog.dataset.provider)?.catalog.models.find(m=>m.id===dialog.dataset.model);$('mc-probe-title').textContent=t('测试模型')+' · '+(model?.name||dialog.dataset.model);$('mc-probe-start').textContent=t(probeRun?'停止等待':'运行基础能力测试');}
+    if($('mc-probe-dialog').open){
+      const dialog=$('mc-probe-dialog'),model=data.providers.find(p=>p.id===dialog.dataset.provider)?.catalog.models.find(m=>m.id===dialog.dataset.model);
+      $('mc-probe-title').textContent=t('测试模型')+' · '+(model?.name||dialog.dataset.model);
+      $('mc-probe-start').textContent=t(probeRun?'停止等待':'运行基础能力测试');
+      const notice=probeWaitNotice();if(notice)$('mc-probe-result').textContent=notice;
+    }
   }
   function rememberTab(){
     if(!location.href||location.pathname===undefined)return;
