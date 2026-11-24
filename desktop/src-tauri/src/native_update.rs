@@ -70,7 +70,7 @@ fn preflight_install_space(app: &tauri::AppHandle, cache: &Path, package: u64, s
         if snapshot_bytes > 0 {
             require_space(&[cache], snapshot_bytes, |path| available_space(path))?;
         }
-        (package.saturating_mul(EXTRACTION_SPACE_MULTIPLIER), |path: &Path| {
+        (package.saturating_mul(EXTRACTION_SPACE_MULTIPLIER), move |path: &Path| {
             space_after_snapshot(cache, snapshot_bytes, path, |path| available_space(path))
         })
     };
