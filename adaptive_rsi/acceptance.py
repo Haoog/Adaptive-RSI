@@ -5,13 +5,20 @@ from .agent import SCHEMAS, validate_output
 from .config import fingerprint, relative_path
 
 
+def unique_check_names(spec):
+    checks = spec.get("checks") if isinstance(spec, dict) else None
+    if not isinstance(checks, list) or not checks:
+        return False
+    names = {check["name"] for check in checks if isinstance(check, dict) and isinstance(check.get("name"), str)}
+    return len(names) == len(checks)
+
+
 def seal(spec, criteria, directory):
     validate_output(spec, SCHEMAS["acceptance"])
     spec = copy.deepcopy(spec)
     if not spec["files"] or not spec["checks"]:
         raise RuntimeError("Independent acceptance must contain executable checks")
-    names = {check["name"] for check in spec["checks"]}
-    if len(names) != len(spec["checks"]):
+    if not unique_check_names(spec):
         raise RuntimeError("Independent acceptance check names must be unique")
     covered = set()
     directory = Path(directory)
