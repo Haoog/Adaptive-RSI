@@ -524,8 +524,11 @@ function renderTitle(){
  const base=(project?projectName(project)+(path?' · '+path:'')+' · ':'')+t('Adaptive RSI · 控制台');
  document.title=attentionCount>0&&document.visibilityState==='hidden'?'● '+attentionCount+' · '+t('需要处理的任务')+' · '+base:base;
 }
+function saveNavigation(name){
+ localWrite('rsi-navigation',JSON.stringify({view:name,filter:$('task-filter').value,system:$('show-system-tasks').checked,scope:scopeChosen?$('config-scope').value:undefined}));
+}
 function renderNavigation(){
- localWrite('rsi-navigation',JSON.stringify({view,filter:$('task-filter').value,system:$('show-system-tasks').checked}));
+ saveNavigation(view);
  const parent=parentView(view),configScope=$('config-scope').value,project=currentProject();
  document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+parent);
  attentionCount=attentionTotal();renderTitle();
@@ -671,10 +674,11 @@ function restoreRuntimeNavigation(){
  view=saved&&['overview','evolution','settings','models','usage'].includes(saved.view)?saved.view:'overview';
  if(saved&&['active','attention','history','all'].includes(saved.filter))$('task-filter').value=saved.filter;
  if(saved)$('show-system-tasks').checked=saved.system===true;
+ if(['global','project'].includes(saved?.scope)){$('config-scope').value=saved.scope;scopeChosen=true;}
  readNavigationRoute();
 }
 function writeNavigation(name){
- localWrite('rsi-navigation',JSON.stringify({view:name,filter:$('task-filter').value,system:$('show-system-tasks').checked}));
+ saveNavigation(name);
  rememberNavigationHome();
  if(location.hash!==undefined&&location.pathname!==undefined){const navigation=new URLSearchParams(String(location.hash||'').replace(/^#/,''));navigation.set('view',name);if(projectId)navigation.set('project',projectId);else navigation.delete('project');if(['models','settings'].includes(name))navigation.set('scope',$('config-scope').value);else navigation.delete('scope');const target=location.pathname+location.search+'#'+navigation;if(target!==location.pathname+location.search+location.hash)history.pushState(null,'',target);}
 }

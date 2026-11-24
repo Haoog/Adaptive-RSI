@@ -4970,6 +4970,42 @@ test('runtime restoration preserves an explicit task route and its settings scop
   assert.equal(page.node('config-scope').value,'global');
 });
 
+test('runtime restoration keeps the model settings scope selected on each connection', async () => {
+  const localScope='http://127.0.0.1:18450',remoteScope='https://remote.example.test';
+  const local=browser(),remote=browser();
+  const storage=local.context.localStorage;
+  function desktopPage(page,runtime,hash='') {
+    Object.assign(page.context,{
+      localStorage:storage,
+      location:{href:'https://fixture.test/'+hash,pathname:'/',search:'',hash},
+      history:{replaceState(){},pushState(){}},
+    });
+    page.context.window.__RSI_MACHINE_KEY__=runtime;
+    return page;
+  }
+  for(const [page,runtime,scope] of [[local,localScope,'global'],[remote,remoteScope,'project']]) {
+    desktopPage(page,runtime);
+    page.context.localWrite('rsi-project','a');
+    vm.runInContext('view="models";state.tasks=[]',page.context);
+    page.context.changeSettingsScope(scope);
+  }
+  for(const [runtime,scope] of [[localScope,'global'],[remoteScope,'project']]) {
+    const page=desktopPage(browser(),runtime);
+    page.node('config-scope').value='project';
+    vm.runInContext('state=undefined;scopeInitialized=false',page.context);
+    page.context.fetch=async()=>response({...snapshot(),tasks:[],runs:[],selected_project:'a'});
+    page.context.restoreRuntimeNavigation();
+    await page.context.refresh();
+    assert.equal(vm.runInContext('view',page.context),'models');
+    assert.equal(vm.runInContext('projectId',page.context),'a');
+    assert.equal(page.node('config-scope').value,scope,'the first state load must retain the restored scope');
+  }
+  const deepLink=desktopPage(browser(),localScope,'#view=models&project=b&scope=project');
+  deepLink.context.restoreRuntimeNavigation();
+  assert.equal(deepLink.node('config-scope').value,'project');
+  assert.equal(vm.runInContext('projectId',deepLink.context),'b');
+});
+
 test('log navigation finds an offset zero anchor before moving to the next anchor', async () => {
   const page=browser();
   const lines='[planning]\n'+'x'.repeat(500)+'\n[review]';
