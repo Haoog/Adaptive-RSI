@@ -76,6 +76,35 @@ class OperabilityTest(unittest.TestCase):
         health.record(config, "openai", "first")
         self.assertTrue(health.status(config, "openai", "first")["paused"])
 
+    def test_reset_discards_inflight_updates_from_projects_sharing_an_account(self):
+        config = self.runtime.config()
+        health = ProviderHealth(self.store)
+        provider = "openai"
+        health.record(config, provider, "second", RuntimeError("HTTP 503"))
+        same_project = health.require(config, provider, "first", "first-model")
+        shared_failure = health.require(config, provider, "second", "second-model")
+        shared_success = health.require(config, provider, "second", "third-model")
+        cooling = ProviderUnavailable("HTTP 429", "rate_limit")
+        cooling.retry_after = 120
+        health.record(config, provider, "first", cooling, attempt=health.require(config, provider, "first"))
+        self.assertFalse(health.admission(config, provider, "second")["ready"])
+        health.reset(config, provider, "first")
+
+        for project, model, attempt, error in (
+                ("first", "first-model", same_project, cooling),
+                ("second", "second-model", shared_failure, cooling),
+                ("second", "third-model", shared_success, None)):
+            health.record(config, provider, project, error, model=model, attempt=attempt)
+        self.assertEqual(health.status(config, provider, "first")["failures"], 0)
+        self.assertEqual(health.status(config, provider, "second")["failures"], 1)
+        self.assertTrue(health.admission(config, provider, "first")["ready"])
+        self.assertTrue(health.admission(config, provider, "second")["ready"])
+
+        fresh = health.require(config, provider, "second")
+        health.record(config, provider, "second", cooling, attempt=fresh)
+        self.assertEqual(health.status(config, provider, "first")["cooldown_scope"], "account")
+        self.assertFalse(health.admission(config, provider, "first")["ready"])
+
     def test_paused_primary_uses_only_explicit_fallback(self):
         with DirectoryServer() as fixture:
             self.save(fixture)
