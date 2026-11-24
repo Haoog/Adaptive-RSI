@@ -805,7 +805,7 @@ class Runtime(Maintenance):
                        (now, row["project"], task))
             db.execute("UPDATE runs SET state='superseded' WHERE task=? AND state='awaiting_approval'", (task,))
             # 手动重试代表用户明确要求重新验证：清零基础设施退避计数，瞬时故障仍可自动重试。
-            db.execute("UPDATE tasks SET state='queued',available=0,infra_retries=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (now, task))
+            db.execute("UPDATE tasks SET state='queued',available=0,infra_retries=0,cooldown_waits=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (now, task))
             if force:
                 # 明确的人工重试凭据：只被下一次实验读取一次，不能成为永久绕过去重的开关。
                 db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
@@ -875,7 +875,7 @@ class Runtime(Maintenance):
                 db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
                            ("revision-pending:" + active["id"], encode({"task": task, "revision": revision})))
             else:
-                db.execute("UPDATE tasks SET body=?,evidence=?,state='queued',available=0,infra_retries=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (body, evidence, now, task))
+                db.execute("UPDATE tasks SET body=?,evidence=?,state='queued',available=0,infra_retries=0,cooldown_waits=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (body, evidence, now, task))
                 db.execute("DELETE FROM settings WHERE key=?", ('task-schedule:' + task,))
             db.execute("INSERT INTO events(project,run,kind,message,data,created) "
                        "VALUES (?,?,'requirements_revised','Requirements supplemented; fresh verification required',?,?)",
@@ -948,7 +948,7 @@ class Runtime(Maintenance):
             if problem.get("connection") != current or current != connection_key(resumed_config, provider, task["project"], root=self.store.root):
                 continue
             ProviderHealth(self.store).reset(self.config(task["project"]), provider, task["project"])
-            self.store.execute("UPDATE tasks SET state='queued',available=0,infra_retries=0,updated=? WHERE id=? AND state='blocked'", (time.time(), task["id"]))
+            self.store.execute("UPDATE tasks SET state='queued',available=0,infra_retries=0,cooldown_waits=0,updated=? WHERE id=? AND state='blocked'", (time.time(), task["id"]))
             count += 1
         self.wake.set()
         return count
@@ -2788,27 +2788,44 @@ class Runtime(Maintenance):
                 return
             state = "waiting_budget" if problem["code"] == "budget" else "blocked"
             task = self.store.one("SELECT * FROM tasks WHERE id=?", (run["task"],))
+            task_fields = {}
             if problem["code"] == "provider" and task and not task["source"].startswith("system_"):
                 from .provider_health import ProviderHealth, connection_key, error_code
                 config = json.loads(run["config"])
                 call = self.store.one("SELECT provider FROM calls WHERE run=? ORDER BY created DESC LIMIT 1", (run["id"],))
                 provider = getattr(exc, "provider_id", None) or (call["provider"] if call else config["models"]["planning"]["provider"])
                 problem["connection"] = connection_key(config, provider, run["project"], root=self.store.root)
-                transient = error_code(exc) in ["rate_limit", "timeout", "connection"]
+                code = error_code(exc)
+                transient = code in ("rate_limit", "timeout", "connection")
                 circuit = ProviderHealth(self.store).status(config, provider, run["project"])
-                problem["recoverable"] = transient or error_code(exc) == "provider_paused" and circuit.get("code") in ["rate_limit", "timeout", "connection"]
-                self.store.execute("UPDATE tasks SET attempts=max(0,attempts-1) WHERE id=?", (task["id"],))
-                if transient and task["infra_retries"] < 3 and not self.is_cancelled(run):
-                    import random
-                    delay = min(900, 60 * 2 ** task["infra_retries"]) * random.uniform(0.85, 1.15)
-                    delay = max(delay, getattr(exc, "retry_after", 0))
-                    problem["retry_at"] = time.time() + delay
-                    transitioned = self.store.transition(run["id"], state, {"reason": str(exc), "failure": problem}, True,
-                                                         task_fields={"state": "queued", "available": problem["retry_at"],
-                                                                      "infra_retries": task["infra_retries"] + 1})
-                    if transitioned and self.store.one("SELECT state FROM tasks WHERE id=?", (task["id"],))["state"] == "queued":
-                        self.store.event("infrastructure_retry", "Temporary connection failure; fresh run scheduled", run["project"], run["id"], {"retry_at": problem["retry_at"]})
-                    return
+                problem["recoverable"] = transient or code == "provider_paused" and circuit.get("code") in (
+                    "rate_limit", "timeout", "connection")
+                cooldown = getattr(exc, "cooldown_until", None)
+                fallback_admission = getattr(exc, "fallback_admission", None)
+                if cooldown or fallback_admission:
+                    remote_attempt = bool(self.store.one(
+                        "SELECT 1 FROM calls WHERE run=? AND remote_attempt=1 LIMIT 1", (run["id"],)))
+                    problem["remote_attempt"] = remote_attempt
+                    problem["local_admission"] = fallback_admission or code
+                else:
+                    remote_attempt = False
+                cooldown_only = bool(cooldown) and not remote_attempt
+                counter = "cooldown_waits" if cooldown_only else "infra_retries"
+                retries = task[counter] or 0
+                task_fields["attempts"] = max(0, task["attempts"] - 1)
+                if transient and retries < 3 and not self.is_cancelled(run):
+                    now = time.time()
+                    if cooldown_only:
+                        retry_at = max(now + 1, cooldown)
+                    else:
+                        import random
+                        delay = min(900, 60 * 2 ** retries) * random.uniform(0.85, 1.15)
+                        retry_at = max(now + delay, cooldown or now + getattr(exc, "retry_after", 0))
+                    problem["retry_at"] = retry_at
+                    problem["retry_kind"] = "provider_cooldown" if cooldown_only else "infrastructure_retry"
+                    task_fields.update({"state": "queued", "available": retry_at, counter: retries + 1})
+                elif transient and retries >= 3:
+                    problem["auto_retry_exhausted"] = True
             elif problem["code"] == "budget" and task:
                 # 额度类故障按等待次数退避重排；达到上限后转 blocked，等待用户手动重试。
                 waits = max(0, task["budget_waits"] or 0)
@@ -2818,7 +2835,6 @@ class Runtime(Maintenance):
                 else:
                     delay = min(BUDGET_WAIT_MAX_SECONDS, BUDGET_WAIT_SECONDS * 2 ** waits)
                     problem = {**problem, "budget_waits": waits + 1, "retry_at": time.time() + delay}
-            task_fields = {}
             if problem["code"] == "budget" and task:
                 if state == "waiting_budget":
                     # tasks.available 记录「最早可领取时间」，与状态变更同事务写入，
@@ -2827,8 +2843,14 @@ class Runtime(Maintenance):
                 else:
                     # 退避重试额度用尽转 blocked 时清零计数，手动重试后闸门重新生效。
                     task_fields = {"budget_waits": 0}
-            self.store.transition(run["id"], state, {"reason": str(exc), "failure": problem}, True,
-                                  task_fields=task_fields or None)
+            transitioned = self.store.transition(run["id"], state, {"reason": str(exc), "failure": problem}, True,
+                                                 task_fields=task_fields or None, clear_failure_on_stop=True)
+            if transitioned and problem.get("retry_kind") and self.store.one(
+                    "SELECT state FROM runs WHERE id=?", (run["id"],))["state"] == state:
+                message = ("Provider admission cooldown; fresh run scheduled" if cooldown_only else
+                           "Temporary connection failure; fresh run scheduled")
+                self.store.event(problem["retry_kind"], message, run["project"], run["id"],
+                                 {"retry_at": problem["retry_at"]})
         finally:
             # 只清理已收尾的停止请求；异常或进程退出留下的未完成请求由恢复流程处理。
             self.store.execute("DELETE FROM settings WHERE key=? AND EXISTS "
@@ -2896,6 +2918,11 @@ class Runtime(Maintenance):
                              project["id"], run["id"], {"stored": rotation})
             rotation = 0
         selected = modules["modules"][rotation % len(modules["modules"])] if modules["modules"] else None
+        config = json.loads(run["config"] or "{}")
+        declared = {row["cwd"]: row["paths"] for row in config.get("inspection", {}).get("module_paths", [])}
+        module_scope = (selected or {}).get("cwd", ".")
+        if module_scope in declared:
+            selected = {**(selected or {"cwd": module_scope}), "dependency_paths": sorted(set(declared[module_scope]))}
         selected_key = key + ":" + fingerprint(selected)
         module_head_key = selected_key + ":head"
         previous_head = self.store.setting(module_head_key)
@@ -2904,7 +2931,8 @@ class Runtime(Maintenance):
             try:
                 # The execution workspace is a shallow snapshot at the current
                 # base and may not contain the previous commit object.
-                changed_paths = set(git(Path(project["path"]), "diff", "--name-only", previous_head, head).splitlines())
+                changed_paths = set(filter(None, git(Path(project["path"]), "diff", "--name-only", "--no-renames",
+                                                    "-z", previous_head, head).split("\0")))
             except RuntimeError:
                 changed_paths = None
         module_changes = (sorted(self._relevant_module_paths(selected, changed_paths))
@@ -2912,8 +2940,9 @@ class Runtime(Maintenance):
         relevant_change = previous_head is None or changed_paths is None or bool(module_changes)
         signature_head_key = selected_key + ":signature-head"
         effective_head = head if relevant_change else self.store.setting(signature_head_key, previous_head)
-        module_scope = str((selected or {}).get("cwd", "."))
-        context_paths = module_changes if module_changes else ([module_scope] if module_scope != "." else None)
+        dependency_paths = (selected or {}).get("dependency_paths", [])
+        scope_paths = ([module_scope] if module_scope != "." else []) + dependency_paths
+        context_paths = module_changes or scope_paths or None
         def relevant_path(path):
             if not path:
                 return False
@@ -2957,13 +2986,13 @@ class Runtime(Maintenance):
             self.store.execute("INSERT OR REPLACE INTO settings VALUES (?,?), (?,?)",
                                (signature_head_key, encode(effective_head), module_head_key, encode(head)))
             return
-        selected_context = ({key: selected[key] for key in ["language", "manifest", "cwd", "tool", "checks"]
+        selected_context = ({key: selected[key] for key in ["language", "manifest", "cwd", "tool", "checks", "dependency_paths"]
                              if key in selected} if selected else None)
         findings = self.invoke("analysis", "Inspect only the selected module for concrete, useful improvements. "
                                "No user goal is required. Find reproducible defects, failing CI, missing essential regression coverage, "
                                "or evidenced performance/maintenance problems. Do not turn every TODO/style preference into a task. "
-                               "Use changed_paths as the entry points and inspect their immediate callers. On the initial scan, inspect only the selected module. "
-                               "Do not enumerate unrelated modules or repeat findings already represented by tasks or open PRs. "
+                               "Use changed_paths as entry points and inspect immediate callers within the selected module or its declared dependency_paths. "
+                               "On the initial scan, use that same scope. Treat related tasks and open PRs as hints and verify whether they cover the same defect and quote. "
                                "Return every evidenced finding in scope. Each needs a literal existing-code quote and path, meaningful acceptance, priority 1..100.\n" +
                                encode({"kind": kind, "selected_module": selected_context, "changed_paths": module_changes,
                                        "tasks": [{key: item[key] for key in ["id", "title", "state", "paths"]}
@@ -2983,6 +3012,7 @@ class Runtime(Maintenance):
         recurrences = 0
         rediscoveries = 0
         contents = {}
+        historical = {}
         skipped = 0
         for item in items:
             # 单条 finding 同样来自模型：非 dict、缺字段或字段类型不符时跳过该条，
@@ -2995,6 +3025,9 @@ class Runtime(Maintenance):
                 continue
             try:
                 relative_path(item["path"])
+                if scope_paths and not any(item["path"] == scope or item["path"].startswith(scope + "/")
+                                           for scope in scope_paths):
+                    continue
                 path = (workspace / item["path"]).resolve()
                 path.relative_to(workspace)
                 if not item["quote"].strip():
@@ -3014,7 +3047,7 @@ class Runtime(Maintenance):
                         prior = legacy
                         finding_key = legacy["fingerprint"]
                 if prior and prior["state"] == "merged":
-                    self.store.execute("UPDATE tasks SET state='queued',available=0,attempts=0,infra_retries=0,budget_waits=0,evidence=?,updated=? WHERE id=?",
+                    self.store.execute("UPDATE tasks SET state='queued',available=0,attempts=0,infra_retries=0,cooldown_waits=0,budget_waits=0,evidence=?,updated=? WHERE id=?",
                                        (encode([{"path": item["path"], "quote": item["quote"], "base": head,
                                                  "source": "reported_recurrence"}]), time.time(), prior["id"]))
                     self.store.event("recurrence_reported", "Inspection reported a possible recurrence; planning must reproduce it", project["id"], run["id"], {"task": prior["id"]})
@@ -3027,13 +3060,24 @@ class Runtime(Maintenance):
                         # 确定性环境故障需先由用户修复；自动重新入队只会重复付费。
                         continue
                     # 此前的尝试已结束且没有产出修复；同一条发现不应被指纹去重永久压制。
-                    self.store.execute("UPDATE tasks SET state='queued',available=0,attempts=0,infra_retries=0,budget_waits=0,evidence=?,updated=? WHERE id=?",
+                    self.store.execute("UPDATE tasks SET state='queued',available=0,attempts=0,infra_retries=0,cooldown_waits=0,budget_waits=0,evidence=?,updated=? WHERE id=?",
                                        (encode([{"path": item["path"], "quote": item["quote"], "base": head,
                                                  "source": "rediscovered"}]), time.time(), prior["id"]))
                     self.store.event("finding_requeued", "Earlier attempt ended without a fix; rediscovered finding queued for fresh verification", project["id"], run["id"], {"task": prior["id"]})
                     rediscoveries += 1
                     continue
-                if related_task([entry for entry in backlog if entry["state"] in SUPPRESSING_STATES], item):
+                if prior and prior["state"] in SUPPRESSING_STATES:
+                    continue
+                # The prompt shows a recent sample. Deduplication must also find older exact anchors.
+                cited_path = item["path"]
+                if cited_path not in historical:
+                    historical[cited_path] = self.store.query(
+                        "SELECT t.id,t.title,t.evidence FROM tasks t WHERE t.project=? AND t.source NOT LIKE 'system_%' "
+                        "AND t.state IN (" + ",".join("?" for _ in SUPPRESSING_STATES) + ") AND EXISTS ("
+                        "SELECT 1 FROM json_each(CASE WHEN json_valid(t.evidence) THEN t.evidence ELSE '[]' END) e "
+                        "WHERE json_extract(CASE WHEN e.type='object' THEN e.value ELSE '{}' END,'$.path')=?)",
+                        (project["id"], *SUPPRESSING_STATES, cited_path))
+                if related_task(historical[cited_path], item):
                     continue
                 if finding_key in seen_keys:
                     continue
@@ -3121,15 +3165,18 @@ class Runtime(Maintenance):
         if not changed_paths:
             return set()
         documentation_images = {".png", ".jpg", ".jpeg", ".svg"}
-        if all(path.lower().endswith(".md") or
-               (path.startswith("docs/") and Path(path).suffix.lower() in documentation_images)
-               for path in changed_paths):
-            return set()
+        dependency_paths = (selected or {}).get("dependency_paths", [])
+        shared = {path for path in changed_paths if any(path == root or path.startswith(root + "/")
+                                                       for root in dependency_paths)}
+        changed_paths = {path for path in changed_paths if not (path.lower().endswith(".md") or
+                         (path.startswith("docs/") and Path(path).suffix.lower() in documentation_images))}
         if not selected:
-            return set(changed_paths)
+            return changed_paths
         cwd = str(selected.get("cwd", ".")).rstrip("/") or "."
         if cwd != ".":
-            return {path for path in changed_paths if path == cwd or path.startswith(cwd + "/")}
+            return shared | {path for path in changed_paths if path == cwd or path.startswith(cwd + "/")}
+        if dependency_paths:
+            return shared
         language = selected.get("language", "")
         suffixes = {
             "Python": {".py", ".pyi", ".toml", ".cfg", ".ini", ".txt", ".sql", ".json", ".yaml", ".yml"},

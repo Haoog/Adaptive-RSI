@@ -378,6 +378,7 @@ class CodexAgent:
         routes = [primary] + ([primary["fallback"]] if primary.get("fallback") else [])
         workspace_before = (workspace_signature(workspace, config["limits"]["max_output_mb"] * 1024 * 1024)
                             if role == "implementation" and len(routes) > 1 else None)
+        primary_failure = None
         for index, route in enumerate(routes):
             provider_id = route.get("provider", "openai")
             attempt = None
@@ -412,8 +413,18 @@ class CodexAgent:
                     raise ModelFailure("Primary implementation failed after changing the workspace; fallback refused to prevent mixing partial edits",
                                        "execution") from None
                 if can_fallback:
+                    primary_failure = exc
                     self.store.event("fallback", "Primary provider unavailable; using configured fallback", project, run)
                     continue
+                if primary_failure is not None and getattr(exc, "local_admission", False):
+                    primary_cooldown = getattr(primary_failure, "cooldown_until", None)
+                    fallback_cooldown = getattr(exc, "cooldown_until", None)
+                    if not getattr(primary_failure, "local_admission", False) and error_code(primary_failure) in {
+                            "rate_limit", "timeout", "connection"}:
+                        primary_failure.fallback_admission = error_code(exc)
+                        raise primary_failure from None
+                    if primary_cooldown and (not fallback_cooldown or primary_cooldown < fallback_cooldown):
+                        raise primary_failure from None
                 raise
             health.record(config, provider_id, project, model=route["model"], attempt=attempt)
             return result
@@ -552,6 +563,8 @@ class CodexAgent:
                 raise cancelled
             from .provider_health import cli_failure
             problem = cli_failure("Codex", result)
+            if usage is not None or getattr(problem, "remote_response", False):
+                self.store.execute("UPDATE calls SET remote_attempt=1 WHERE id=?", (call,))
             if problem is not None:
                 raise problem
             data = json.loads(output_path.read_text(encoding="utf-8"))

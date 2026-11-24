@@ -503,6 +503,12 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             current = runtime.store.one("SELECT state,ended FROM runs WHERE id=?", (run["id"],))
             if not current or current["state"] != state or (not terminal and current["ended"] is not None):
                 raise Cancelled("Run stopped or requirements changed at a stage boundary")
+    from .recovery import stage_event
+
+    def record_stage(kind, stage, **data):
+        if not experiment:
+            stage_event(runtime, run, kind, stage, **data)
+
     def sealed(stage, inputs, action, accept=None):
         """Reuse a sealed read-only checkpoint only when the operator opted in.
 
@@ -512,18 +518,20 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         again, and only a fresh outcome that passes is sealed in its place, so
         retrying an inconclusive assessment really obtains a new assessment.
         """
-        if not checkpoint_reuse or not hasattr(runtime, "evaluator"):
+        def execute():
+            record_stage("stage_started", stage)
             return action()
+
+        if not checkpoint_reuse or not hasattr(runtime, "evaluator"):
+            return execute()
         return runtime.evaluator.execute_stage(
-            stage + ":" + project["id"], inputs, action, effect="read_only", enabled=True,
+            stage + ":" + project["id"], inputs, execute, effect="read_only", enabled=True,
             accept=accept,
-            on_reuse=lambda name: runtime.store.event("stage_reused", "Reused sealed read-only checkpoint",
-                                                      run["project"], run["id"],
-                                                      {"stage": stage, "checkpoint": name}),
-            on_reject=lambda name: runtime.store.event("stage_invalidated", "Cached stage result requires rework",
-                                                       run["project"], run["id"],
-                                                       {"stage": stage, "reason": "result_requires_rework",
-                                                        "from_checkpoint": name}))
+            on_reuse=lambda name: record_stage("stage_reused", stage, checkpoint=name),
+            on_reject=lambda name: record_stage("stage_invalidated", stage, reason="result_requires_rework",
+                                                from_checkpoint=name),
+            on_invalidate=lambda name, reason: record_stage("stage_invalidated", stage, reason=reason,
+                                                            from_checkpoint=name))
     from .readiness import inspect as readiness
     check = readiness(runtime, project, config, workspace, required=1, run=run["id"])
     if not check["ready"]:
@@ -608,8 +616,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                             "dependencies": environment["sha256"], "outcomes": planning_outcomes, "prs": open_prs,
                             "related_work": overlaps, "issue_comments": comment_evidence, "pr_feedback": pr_feedback,
                             "skills": skill_evidence})
-    saved_plan = None if experiment else cached(runtime, run, "planning", plan_key)
-    saved_acceptance = None if experiment else cached(runtime, run, "acceptance", plan_key)
+    saved_plan = None
     cited = []
     for anchor in evidence_anchors(task["evidence"]):
         path, quote = anchor.get("path"), anchor.get("quote")
@@ -669,6 +676,11 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         plan = {"decision": "ready", "reason": "Explicit revert of this runner's own patch", "risk": "medium",
                 "scope": scope, "acceptance": ["Reverse the specified patch and pass independent regression checks"]}
     else:
+        def normalize_plan(value):
+            validate_output(value, SCHEMAS["planning"])
+            return value
+
+        saved_plan = None if experiment else cached(runtime, run, "planning", plan_key, normalize=normalize_plan)
         plan = saved_plan
         if plan is None:
             def _invoke_planning():
@@ -679,7 +691,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                            "Use deferred for weak evidence, unclear requirements or low current priority; rejected for cosmetic churn, disproportionate cost or incompatible direction. "
                            "Only ready authorizes implementation. Evidence must cite concrete current-code behavior or a specific user requirement. "
                            "Inspect the current code and verify the report still applies. Deduplicate already fixed work. "
-                           "Check related_work against this baseline and open PRs. Related paths are hints, not proof of the same defect: "
+                           "Check related_work against this baseline and open PRs. Start with shared_path matches. "
+                           "A text_hint suggests related work. Neither match proves the same defect: "
                            "do not duplicate an existing fix, and do not discard a distinct problem merely because it shares a file. "
                            "If ready, scope must contain ONLY literal relative file/directory paths (e.g. calculator.py, tests), without annotations or descriptions. Define observable acceptance criteria separately. "
                            "High risk includes credentials, deployment, database migrations, permissions, dependency or public API changes. "
@@ -791,7 +804,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         from .acceptance import seal
         acceptance_workspace = snapshot(source, directory / "acceptance-design", base)
         restore(seeds, acceptance_workspace, config)
-        spec = saved_acceptance
+        spec = None if experiment else cached(runtime, run, "acceptance", plan_key)
         if spec is None:
             def _invoke_acceptance():
                 return runtime.invoke("acceptance", "Independently design executable acceptance BEFORE implementation. Inspect baseline code. "
@@ -824,7 +837,13 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                                  "skills": skill_evidence,
                                  "plan": plan, "acceptance_hash": acceptance["hash"] if acceptance else None,
                                  "test_first": test_first, "checks": checks})
-    saved_candidate = None if experiment else cached(runtime, run, "validated_candidate", candidate_key)
+    replay_sources = {}
+
+    def record_replay_source(stage, source):
+        replay_sources[stage] = source
+
+    saved_candidate = None if experiment else cached(runtime, run, "validated_candidate", candidate_key,
+                                                     normalize=_reusable_implementation, on_reuse=record_replay_source)
     saved_implementation = None
     if saved_candidate is None and not experiment and task["source"] != "rollback":
         # Evaluation runs after the patch is sealed, so a run that fails inside
@@ -834,7 +853,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         # again.  Replay never carries a verdict, so evaluation, review and the
         # scope gate still run on the replayed patch.
         saved_implementation = cached(runtime, run, "implementation", candidate_key,
-                                      normalize=_reusable_implementation)
+                                      normalize=_reusable_implementation, on_reuse=record_replay_source)
     baseline = snapshot(source, directory / "baseline", base)
     acceptance_executor = None
     acceptance_future = None
@@ -880,21 +899,25 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             if isinstance(acceptance_baseline, dict) and acceptance_baseline.get("decision") == "insufficient_evidence":
                 raise AcceptanceBaselineUnavailable(_acceptance_baseline_outcome(acceptance_future)) from None
     try:
-        if saved_candidate:
-            result = {"summary": saved_candidate["summary"]}
-            patch = saved_candidate["patch"]
-            if fingerprint(patch) != saved_candidate["patch_hash"]:
-                raise RuntimeError("Saved candidate evidence changed; retry refused")
-            (directory / "resume.patch").write_text(patch + "\n", encoding="utf-8")
-            git(workspace, "apply", "--index", str(directory / "resume.patch"))
-        elif saved_implementation is not None:
-            result = {"summary": saved_implementation["summary"]}
-            patch = saved_implementation["patch"]
-            if fingerprint(patch) != saved_implementation["patch_hash"]:
-                raise RuntimeError("Saved implementation evidence changed; retry refused")
-            (directory / "resume.patch").write_text(patch + "\n", encoding="utf-8")
-            git(workspace, "apply", "--index", str(directory / "resume.patch"))
+        if saved_candidate is not None or saved_implementation is not None:
+            stage = "validated_candidate" if saved_candidate is not None else "implementation"
+            checkpoint = saved_candidate if saved_candidate is not None else saved_implementation
+            result = {"summary": checkpoint["summary"]}
+            patch = checkpoint["patch"]
+            evidence = {"from_run": replay_sources[stage]}
+            if fingerprint(patch) != checkpoint["patch_hash"]:
+                record_stage("stage_invalidated", stage, reason="patch_hash_changed", **evidence)
+                label = "candidate" if saved_candidate is not None else "implementation"
+                raise RuntimeError("Saved " + label + " evidence changed; retry refused")
+            try:
+                (directory / "resume.patch").write_text(patch + "\n", encoding="utf-8")
+                git(workspace, "apply", "--index", str(directory / "resume.patch"))
+            except (OSError, RuntimeError):
+                record_stage("stage_invalidated", stage, reason="patch_replay_failed", **evidence)
+                raise
+            record_stage("stage_reused", stage, **evidence)
         elif task["source"] == "rollback":
+            record_stage("stage_started", "implementation")
             git(workspace, "apply", "--reverse", str(patch_path))
             result = {"summary": "Reversed only the saved patch from run " + prior["id"]}
         else:
@@ -910,6 +933,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                 test_instruction = "Add appropriate regression coverage within the declared scope without weakening existing checks. "
                 implementation_context = context
             try:
+                record_stage("stage_started", "implementation")
                 result = runtime.invoke("implementation", "Implement this verified plan. " + test_instruction +
                                      "Do not modify files outside scope. No publishing.\n" +
                                      encode({"plan": plan, **implementation_context}), workspace, run,
@@ -1009,6 +1033,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         if saved_evaluation is not None:
             evaluation = saved_evaluation
         else:
+            record_stage("stage_started", "evaluation")
             evaluation = {**runtime.evaluator.evaluate(
                 baseline, workspace, checks, directory / "evaluation", config,
                 lambda: runtime.is_cancelled(run), seeds=seeds, acceptance=acceptance,

@@ -765,7 +765,8 @@ class OpenCodeAgent:
                 (directory / "events.jsonl").write_text(raw, encoding="utf-8")
                 data, steps = parse_events(raw, strict=False)
                 from .usage import opencode_usage
-                self.store.record_usage(call, run, opencode_usage(steps), time.monotonic() - started)
+                usage = opencode_usage(steps)
+                self.store.record_usage(call, run, usage, time.monotonic() - started)
                 if cancelled is not None:
                     # Exception results are visible to callers too; replace with redacted evidence.
                     for field in ("stdout", "stderr"):
@@ -786,6 +787,8 @@ class OpenCodeAgent:
                     safe_result[field] = value
                 from .provider_health import cli_failure
                 problem = cli_failure("OpenCode", safe_result)
+                if steps or getattr(problem, "remote_response", False):
+                    self.store.execute("UPDATE calls SET remote_attempt=1 WHERE id=?", (call,))
                 if problem is not None:
                     raise problem
                 if data is None:

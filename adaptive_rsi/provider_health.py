@@ -102,7 +102,9 @@ def cli_failure(backend, result):
             except (TypeError, ValueError):
                 status = None
             if status is not None:
-                errors.append(http_failure(message, status))
+                problem = http_failure(message, status)
+                problem.remote_response = True
+                errors.append(problem)
             elif error.get("name") == "ProviderAuthError":
                 errors.append(ModelFailure(message, "auth"))
             else:
@@ -208,6 +210,7 @@ class ProviderHealth:
             if state.get("retry_at", 0) > now:
                 error = ModelFailure("Provider Retry-After cooldown is pending", "rate_limit")
                 error.retry_after = state["retry_at"] - now
+                error.cooldown_until = state["retry_at"]
                 error.provider_id = provider
                 error.model = model
                 error.local_admission = True

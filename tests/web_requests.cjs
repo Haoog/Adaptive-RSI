@@ -3016,6 +3016,34 @@ for (const navigation of ['stay', 'close', 'project', 'other-task']) {
   });
 }
 
+test('task detail shows confirmed reuse, invalidation and execution in both languages', async () => {
+  const task = fixtureTask('recovery', 'queued');
+  const recovery = {
+    latest_run: {id: 'run-2', origin: 'manual_retry'}, pending: true,
+    checkpoints: [{run: 'run-1', stage: 'planning', created: 1}],
+    events: [
+      {kind: 'stage_reused', stage: 'planning', from_run: 'run-1'},
+      {kind: 'stage_invalidated', stage: 'review', reason: 'input_signature_changed', from_run: 'run-1'},
+      {kind: 'stage_started', stage: 'review'},
+    ],
+  };
+  const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  for (const lang of ['zh-CN', 'en']) {
+    const page = revisionMetadataPage(task, {...task, recovery});
+    page.context.localStorage.setItem('rsi-language', lang);
+    vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')), page.context);
+    const controls = await openExperienceTask(page, task);
+    const panel = descendants(controls).find(node => node.id === 'task-recovery');
+    const text = descendants(panel).map(node => node.textContent).join(' ');
+    assert.equal(panel.hidden, false);
+    for (const expected of lang === 'zh-CN'
+      ? ['手动重试', 'run-2', '已复用', 'run-1', '阶段输入签名已变化', '本轮实际执行起点', '待重新验证']
+      : ['Manual retry', 'run-2', 'Reused', 'run-1', 'The stage input signature changed', 'First stage actually executed', 'Waiting to verify again']) {
+      assert.ok(text.includes(expected), expected + ' appears in the task detail');
+    }
+  }
+});
+
 test('runless detail polling updates cancellation controls and preserves supplement drafts', async () => {
   const page = experiencePage(), task = fixtureTask('runless', 'queued');
   let metadata = task, reads = 0;

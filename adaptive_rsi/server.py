@@ -971,6 +971,8 @@ class Handler(BaseHTTPRequestHandler):
                 task["dependency"] = task["dependencies"][0] if task["dependencies"] else None
                 from .task_groups import lineage
                 task["group_lineage"] = lineage(store, task["id"], task["project"])
+                from .recovery import task_recovery
+                task["recovery"] = task_recovery(store, task)
                 self.respond(task)
             elif parsed.path == "/api/workflow-metrics":
                 from .telemetry import workflow_metrics

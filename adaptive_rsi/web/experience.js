@@ -383,6 +383,58 @@ window.RSIExperience = (() => {
         ),
       );
   }
+  function renderTaskRecovery(node, recovery) {
+    if (!node) return;
+    const signature = JSON.stringify(recovery || null);
+    if (node.dataset.recovery === signature) return;
+    node.dataset.recovery = signature;
+    node.hidden = !recovery?.latest_run;
+    node.replaceChildren();
+    if (node.hidden) return;
+    const run = recovery.latest_run;
+    const origins = {
+      manual_retry: "手动重试", manual_scan: "手动发起巡检", scheduled_scan: "定时巡检",
+      provider_retry: "供应商故障后重试", provider_cooldown: "供应商冷却后重试",
+      budget_retry: "额度等待后重试", automatic_retry: "自动重试",
+    };
+    const stages = {
+      planning: "判断价值", acceptance: "确定完成标准", implementation: "修改代码",
+      evaluation: "运行检查", review: "代码评审", risk_review: "风险复审", validated_candidate: "已验证候选补丁",
+    };
+    const reasons = {
+      input_signature_changed: "阶段输入签名已变化", reused_record_invalid: "历史记录无法通过验证",
+      result_requires_rework: "历史结果需要重新处理", patch_hash_changed: "补丁校验值不一致",
+      patch_replay_failed: "补丁无法应用到当前工作区",
+    };
+    const labels = {stage_reused: "已复用", stage_invalidated: "检查点已失效", stage_started: "本轮已开始执行"};
+    const stageName = stage => t(stages[stage] || stage);
+    node.append(el("h3", t("运行来源与阶段恢复")), el("p", t("最近一次运行来源") + " · " +
+      t(origins[run.origin] || sourceNames[run.origin] || run.origin || "历史运行来源未记录") + " · " + run.id));
+    if (recovery.pending) node.append(el("p", t("待重新验证，阶段恢复结果以新运行记录为准。"), "muted"));
+    const events = recovery.events || [];
+    const first = events.find(event => event.kind === "stage_started");
+    if (first) node.append(el("p", t("本轮实际执行起点") + " · " + stageName(first.stage)));
+    if (events.length) {
+      const list = el("ul");
+      for (const event of events) {
+        const source = event.from_run || event.checkpoint || event.from_checkpoint;
+        const parts = [stageName(event.stage), t(labels[event.kind] || event.kind)];
+        if (event.reason) parts.push(t(reasons[event.reason] || event.reason));
+        if (source) parts.push(t("来源") + " " + source);
+        if (event.error) parts.push(event.error);
+        list.append(el("li", parts.join(" · ")));
+      }
+      node.append(list);
+    }
+    if (recovery.checkpoints?.length) {
+      const details = el("details"), list = el("ul");
+      details.append(el("summary", t("最近两次运行的检查点")));
+      for (const checkpoint of recovery.checkpoints)
+        list.append(el("li", stageName(checkpoint.stage) + " · " + checkpoint.run + " · " + stamp(checkpoint.created)));
+      details.append(list);
+      node.append(details);
+    }
+  }
   async function taskControls(task, body, ticket, queueDraft, editor) {
     const project = projectId, baselineVersion = editor.version;
     const current = () => projectId === project && ticket === detailSequence && body.isConnected;
@@ -400,6 +452,10 @@ window.RSIExperience = (() => {
     );
     if (!current()) return;
     const controls = el("section", undefined, "task-controls");
+    const recovery = el("section", undefined, "detail-section");
+    recovery.id = "task-recovery";
+    renderTaskRecovery(recovery, metadata.recovery);
+    controls.append(recovery);
     if (metadata.revision_pending)
       controls.append(el("p", t("补充已收到，将在当前阶段结束后带入下一轮。"), "muted"));
     const waitReason = metadata.wait_reason || task.wait_reason ||
@@ -908,6 +964,7 @@ window.RSIExperience = (() => {
       );
       if (!current()) return;
       liveState = metadata.state || liveState;
+      renderTaskRecovery($("task-recovery"), metadata.recovery);
       // Issue sync may revise title, body or evidence while the task stays queued.
       // Rebuild only when the visible input changed so unchanged polls keep drafts and DOM.
       if (backoffRetry && !(metadata.state === "queued" && Number(metadata.available) > Date.now() / 1000)) {

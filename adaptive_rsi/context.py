@@ -94,10 +94,12 @@ _DECLARATION = re.compile(
 
 
 @lru_cache(maxsize=3)
-def _code_index(root, fingerprint):
+def _code_index(root, fingerprint, cited_paths=()):
     """Cache the bounded text index for one exact workspace content state."""
     workspace = Path(root)
-    paths = sorted(set(filter(None, git(workspace, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split("\0"))))
+    cited = set(cited_paths)
+    paths = sorted(set(filter(None, git(workspace, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split("\0"))),
+                   key=lambda path: (path not in cited, path))
     rows = []
     content_budget = _INDEX_BYTES
     text_suffixes = {
@@ -137,13 +139,13 @@ def _code_index(root, fingerprint):
 
 @lru_cache(maxsize=64)
 def _code_map_cached(root, fingerprint, text, limit, evidence=()):
-    indexed, total_files = _code_index(root, fingerprint)
-    path_words = sorted(terms(text), key=lambda word: (-len(word), word))[:256]
-    content_words = path_words[:128]
-    symbol_words = set(content_words)
     quotes = {}
     for path, quote in evidence:
         quotes.setdefault(path, []).append(quote)
+    indexed, total_files = _code_index(root, fingerprint, tuple(sorted(quotes)))
+    path_words = sorted(terms(text), key=lambda word: (-len(word), word))[:256]
+    content_words = path_words[:128]
+    symbol_words = set(content_words)
     ranked = []
     for path, content, declarations in indexed:
         lower_path = path.lower()
