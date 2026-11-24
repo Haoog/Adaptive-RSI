@@ -22,6 +22,7 @@ from adaptive_rsi.delivery import pr_body
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store, encode
 from adaptive_rsi.updates import automatic_allowed
+from scripts import release_path_metrics
 from tests.test_runtime import fixture
 
 
@@ -1898,6 +1899,86 @@ class ReleaseBatchCadenceTest(unittest.TestCase):
     def test_invalid_explicit_increment_is_rejected(self):
         with self.assertRaisesRegex(ValueError,'Release level'):
             self.prepare(requested='true',level='surprise')
+
+
+class ReleasePathMetricsTest(unittest.TestCase):
+    @staticmethod
+    def job(name, conclusion, created, started, completed, steps=(), runner=1):
+        return dict(name=name, conclusion=conclusion, runner_id=runner, steps=steps,
+                    created_at=f'2026-11-23T10:00:{created:02d}Z',
+                    started_at=f'2026-11-23T10:00:{started:02d}Z',
+                    completed_at=f'2026-11-23T10:00:{completed:02d}Z')
+
+    def test_release_paths_use_the_last_parallel_prerequisite(self):
+        run = dict(id=1, run_attempt=1, html_url='https://github.com/example/project/actions/runs/1',
+                   head_sha=MERGED, conclusion='success', created_at='2026-11-23T10:00:00Z')
+        prepare = self.job('prepare', 'success', 2, 3, 7)
+        publish = self.job('publish', 'success', 50, 52, 59)
+        deps = [self.job('build', 'success', 22, 23, 41), self.job('tests', 'success', 22, 30, 50)]
+        workflow = 'release.yml'
+        cases = [('success', 'reuse_success', None), ('skipped', 'no_reusable_artifact_rebuild', 43),
+                 ('failure', 'revalidation_failed_rebuild', 28),
+                 ('cancelled', 'revalidation_cancelled_rebuild', 28)]
+        for conclusion, path, duration in cases:
+            with self.subTest(conclusion=conclusion):
+                reuse = self.job('reuse', conclusion, 7, 9, 22)
+                jobs = [prepare, reuse, publish] + ([] if conclusion == 'success' else deps)
+                result = release_path_metrics.measure(workflow, run, jobs)
+                self.assertEqual(result['path'], path)
+                self.assertEqual(result['rebuild_gate_seconds'], duration)
+                self.assertEqual(result['rebuild_critical_job'], 'tests' if duration else None)
+                self.assertEqual(result['prepare_to_publish_seconds'], 56)
+                self.assertEqual(result['attempt_to_entry_seconds'], 3)
+                self.assertEqual(result['run_to_entry_seconds'], 3)
+        result = release_path_metrics.measure(workflow, run, [prepare] + deps)
+        self.assertEqual(result['path'], 'incomplete_path_evidence')
+        self.assertIsNone(result['rebuild_gate_seconds'])
+        empty = release_path_metrics.summarize([])['revalidation_failed_rebuild']
+        self.assertEqual(empty['attempts'], 0)
+        self.assertIsNone(empty['rebuild_gate_seconds']['median'])
+
+    def test_rerun_entry_wait_excludes_twenty_minutes_since_workflow_creation(self):
+        created = '2026-11-23T09:40:00Z'
+        run = dict(id=1, run_attempt=2, html_url='https://github.com/example/project/actions/runs/1',
+                   head_sha=TRUSTED, conclusion='success', created_at=created)
+        previous = dict(run, run_attempt=1, run_started_at='2026-11-23T09:40:01Z')
+        for workflow, entry_name in (('release-verify.yml', 'gate'), ('release.yml', 'prepare')):
+            entry = self.job(entry_name, 'success', 1, 3, 5)
+            for started, expected in [('2026-11-23T10:00:00Z', 3), (None, None),
+                                      ('invalid', None), (created, None), (previous['run_started_at'], None),
+                                      ('2026-11-23T09:39:59Z', None), ('2026-11-23T10:00:04Z', None)]:
+                with self.subTest(workflow=workflow, started=started):
+                    for raw_created in (created, '2026-11-23T10:00:02Z'):
+                        result = release_path_metrics.measure(
+                            workflow, dict(run, created_at=raw_created, run_started_at=started),
+                            [entry], [previous])
+                        self.assertEqual(result['attempt_to_entry_seconds'], expected)
+                        self.assertEqual(result['run_to_entry_seconds'], 1203)
+
+    def test_partial_rerun_preserves_inherited_result_without_counting_timing(self):
+        run = dict(id=1, run_attempt=2, html_url='https://github.com/example/project/actions/runs/1',
+                   head_sha=TRUSTED, display_title=f'Release verification PR #1 @{MERGED}', conclusion='success',
+                   created_at='2026-11-23T10:00:00Z', run_started_at='2026-11-23T10:00:29Z')
+        first = dict(run, run_attempt=1, created_at='2026-11-23T10:00:00Z',
+                     run_started_at='2026-11-23T10:00:01Z')
+        gate = self.job('gate', 'success', 30, 2, 5)
+        verify = self.job('verify', 'success', 32, 6, 27)
+        tests = self.job('tests', 'success', 30, 32, 50)
+        result = release_path_metrics.measure('release-verify.yml', run, [gate, verify, tests], [first])
+        self.assertTrue(result['jobs']['gate']['inherited'])
+        self.assertIsNone(result['attempt_to_entry_seconds'])
+        self.assertIsNone(result['run_to_entry_seconds'])
+        self.assertEqual(result['path'], 'no_new_verify')
+        self.assertEqual(result['candidate_head_in_title'], MERGED)
+        self.assertTrue(result['jobs']['verify']['inherited'])
+        self.assertIsNone(result['jobs']['verify']['job_seconds'])
+        self.assertEqual(result['jobs']['tests']['queue_seconds'], 2)
+        smoke = dict(name='最终安装与升级 smoke', conclusion='skipped',
+                     started_at='2026-11-23T10:00:50Z', completed_at='2026-11-23T10:00:50Z')
+        verify = self.job('verify', 'failure', 30, 32, 50, [smoke])
+        result = release_path_metrics.measure('release-verify.yml', run, [verify], [first])
+        self.assertEqual(result['jobs']['verify']['job_seconds'], 18)
+        self.assertIsNone(result['jobs']['verify']['steps']['install_upgrade_smoke']['seconds'])
 
 
 class VerifiedArtifactReuseTest(unittest.TestCase):

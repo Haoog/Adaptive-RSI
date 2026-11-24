@@ -893,6 +893,24 @@ function closeTaskDetail(recordHistory=true){
   if(recordHistory&&location.href&&closingTask){const route=new URLSearchParams(String(location.hash||'').replace(/^#/,''));if(route.get('task')===closingTask){route.delete('task');history.replaceState(history.state,'',location.pathname+location.search+(route.size?'#'+route:''));}}
  }
 }
+function ciAttention(data){
+ const observation=data.result.delivery_ci_inconclusive;
+ if(data.state!=='pr_open'||data.result.delivery_status!=='waiting_ci'||observation?.needs_attention!==true)return null;
+ const panel=el('div');
+ panel.append(el('strong',t('需要人工查看 CI')),el('p',
+  t('未决检查首次发现时间')+' · '+stamp(observation.started_at)+' · '+observation.head,'muted'),
+  el('p',t('未决结论')+' · '+observation.reasons.join(', '),'muted'));
+ const checks=el('ul');
+ for(const check of observation.checks){
+  const row=el('li'),label=check.name+' · '+check.state;
+  if(typeof check.url==='string'&&/^https?:\/\//i.test(check.url)){
+   const link=el('a',label);link.href=check.url;link.target='_blank';link.rel='noreferrer';row.append(link);
+  }else row.textContent=label;
+  checks.append(row);
+ }
+ if(checks.childElementCount)panel.append(checks);
+ return panel;
+}
 function taskOutcome(data){
  const result=data.result,outcome=el('section',undefined,'task-outcome');outcome.append(el('h3',t('这次的结果')));
  outcome.append(el('h4',t('改了什么')),el('p',result.summary||result.reason||t('还没有完成结果。')));
@@ -902,6 +920,8 @@ function taskOutcome(data){
  for(const [key,title]of [['evaluation','运行检查'],['review','代码评审']]){const row=el('p');row.append(el('strong',t(title)+' · '),result[key]?badge(result[key].decision):document.createTextNode(t('尚未完成')));outcome.append(row);}
  const next=result.delivery_status?t(deliveryNames[result.delivery_status]||result.delivery_status):t(statusNames[data.state]||data.state);
  outcome.append(el('p',t('交付状态')+' · '+next));
+ const attention=ciAttention(data);
+ if(attention)outcome.append(attention);
  const guidance={awaiting_approval:'修改保存在本机；确认后可推送并创建 PR。',pr_open:'可以打开 GitHub 查看合并进度。',merged:'修改已合并；合并后的运行情况会继续复查。',failed:'查看检查结果，解决问题后可以重试。',blocked:'按错误提示调整设置后重试。',insufficient_evidence:'需要补充能证明问题已解决的检查。'}[data.state];
  if(guidance)outcome.append(el('p',t(guidance),'muted'));
  if(result.failure){const target=['credentials','provider'].includes(result.failure.code)?'models':'settings';outcome.append(el('p',t(failureNext[result.failure.code]||failureNext.execution),'muted'));outcome.append(action(t(target==='models'?'修复模型连接':'检查项目设置'),()=>{closeTaskDetail();showView(target);},'text-button'));}
