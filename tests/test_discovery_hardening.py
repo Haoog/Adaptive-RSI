@@ -575,7 +575,7 @@ class DiscoveryHardeningTest(unittest.TestCase):
                           "mixed-anchors": (["client.py"], "valid result")})
         self.assertEqual(related_work(self.store, "p", {**task, "evidence": "[null]"}), [])
 
-    def test_related_work_returns_history_connection_to_pool_after_invalid_evidence(self):
+    def test_related_work_closes_history_connection_after_invalid_evidence(self):
         self.add_related("broken", "Handle client response", ["client.py"])
         self.add_related("valid", "Handle client response", ["client.py"])
         self.store.execute("UPDATE tasks SET evidence='invalid-json' WHERE id='broken'")
@@ -591,13 +591,41 @@ class DiscoveryHardeningTest(unittest.TestCase):
                 yield db
 
         with patch.object(self.store, "connect", tracked_connection):
-            related = related_work(self.store, "p", task)
-        self.assertEqual(related[0]["id"], "valid")
-        self.assertEqual(related[0]["shared_paths"], ["client.py"])
+            with self.assertRaises(json.JSONDecodeError):
+                related_work(self.store, "p", task)
         self.assertEqual(len(opened), 1)
-        with connect() as reused:
-            self.assertIs(reused, opened[0])
-            self.assertEqual(reused.execute("SELECT 1").fetchone()[0], 1)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            opened[0].execute("SELECT 1")
+        with connect() as replacement:
+            self.assertEqual(replacement.execute("SELECT 1").fetchone()[0], 1)
+
+    def test_related_work_propagates_invalid_subject_evidence_and_run_result(self):
+        self.add_related("broken", "Different title", ["client.py"], {})
+        self.store.execute("UPDATE runs SET result='invalid-json' WHERE task='broken'")
+        task = {"id": "subject", "title": "Subject", "body": "", "evidence": '[{"path":"client.py"}]'}
+        for evidence, expected in (("[", "["), (task["evidence"], "invalid-json")):
+            with self.subTest(evidence=evidence), self.assertRaises(json.JSONDecodeError) as raised:
+                related_work(self.store, "p", {**task, "evidence": evidence})
+            self.assertEqual(raised.exception.doc, expected)
+
+    def test_planning_related_work_keeps_usable_fields_and_records_json_error(self):
+        from adaptive_rsi.pipeline import _planning_related_work
+
+        self.add_related("bad-evidence", "Different title", [], {"files": ["client.py"], "summary": "kept"}, updated=2)
+        self.add_related("bad-result", "Unrelated title", ["client.py"], {})
+        self.add_related("valid", "Another title", ["client.py"])
+        self.store.execute("UPDATE tasks SET evidence='[invalid' WHERE id='bad-evidence'")
+        self.store.execute("UPDATE runs SET result='invalid-json' WHERE task='bad-result'")
+        task = {"id": "subject", "title": "Subject", "body": "", "evidence": '[{"path":"client.py"}]'}
+
+        overlaps = _planning_related_work(self.store, "p", "plan-run", task)
+        self.assertEqual({row["id"]: row["summary"] for row in overlaps},
+                         {"bad-evidence": "kept", "bad-result": "", "valid": ""})
+        event = self.store.one("SELECT project,run,data FROM events WHERE kind='related_work_invalid_json'")
+        self.assertEqual((event["project"], event["run"]), ("p", "plan-run"))
+        self.assertEqual(json.loads(event["data"]), {"count": 2, "first_error": {
+            "task": "bad-evidence", "field": "evidence", "error": "JSONDecodeError", "line": 1, "column": 2}})
+        self.assertEqual(self.store.one("SELECT evidence FROM tasks WHERE id='bad-evidence'")["evidence"], "[invalid")
 
 
 class IssueRequirementsTest(unittest.TestCase):

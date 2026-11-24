@@ -7,7 +7,7 @@ import logging
 import re
 import time
 
-from .store import decode_object, encode, issue_snapshot_pending, record_issue_sync_corrupt
+from .store import encode, issue_snapshot_pending, record_issue_sync_corrupt
 
 
 ISSUE_COMMENT_TTL = 300
@@ -912,6 +912,10 @@ def evidence_anchors(value):
         rows = json.loads(value or "[]")
     except (TypeError, ValueError):
         return []
+    return _object_anchors(rows)
+
+
+def _object_anchors(rows):
     return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
 
@@ -932,15 +936,30 @@ def related_task(backlog, finding):
     return None
 
 
-def related_work(store, project, task, limit=12):
-    """Provide evidence of overlapping work without merging distinct reports."""
+def related_work(store, project, task, limit=12, *, on_invalid_json=None):
+    """Rank overlapping work; callers may report and skip malformed JSON fields."""
     from .context import terms
-    paths = set(evidence_paths([item.get("path") for item in evidence_anchors(task.get("evidence"))]))
+
+    def parse(raw, task_id, field):
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as error:
+            if on_invalid_json is None:
+                raise
+            on_invalid_json(task_id, field, error)
+            return None
+
+    subject_anchors = _object_anchors(parse(task.get("evidence"), task["id"], "evidence"))
+    paths = set(evidence_paths([item.get("path") for item in subject_anchors]))
     words = terms(task["title"] + " " + task.get("body", ""))
     def ranked(rows):
         for row in rows:
-            result = decode_object(row["result"])
-            anchors = evidence_anchors(row["evidence"])
+            result = parse(row["result"], row["id"], "result")
+            if not isinstance(result, dict):
+                result = {}
+            anchors = _object_anchors(parse(row["evidence"], row["id"], "evidence"))
             other_paths = set(evidence_paths([item.get("path") for item in anchors]))
             other_paths.update(evidence_paths(result.get("files")))
             shared = sorted(paths & other_paths)

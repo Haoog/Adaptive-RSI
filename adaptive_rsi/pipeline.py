@@ -474,6 +474,26 @@ def experiment_skill_context(skills, strategies, baseline_ids=None, injected=Non
     return [m for m in skills if m.get("evidence", {}).get("candidate") in target_ids]
 
 
+def _planning_related_work(store, project_id, run_id, task):
+    from .discovery import related_work
+
+    first_error = None
+    error_count = 0
+
+    def record_invalid_json(task_id, field, error):
+        nonlocal first_error, error_count
+        error_count += 1
+        if first_error is None:
+            first_error = {"task": task_id, "field": field, "error": type(error).__name__,
+                           "line": error.lineno, "column": error.colno}
+
+    overlaps = related_work(store, project_id, task, on_invalid_json=record_invalid_json)
+    if error_count:
+        store.event("related_work_invalid_json", "Skipped invalid JSON fields while gathering related work",
+                    project_id, run_id, {"count": error_count, "first_error": first_error})
+    return overlaps
+
+
 def execute_candidate(runtime, run, project, task, source, base, directory, workspace, strategies, experiment=False,
                       experiment_skills=None, baseline_ids=None):
     """One production path for real tasks and paired experiments; experiments never deliver.
@@ -578,8 +598,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         return {"decision": "insufficient_evidence", "reason": reason, "failure": failure} if experiment else None
     from .context import code_map
     from .recovery import signature, cached, save, enforce_cached_review
-    from .discovery import evidence_anchors, related_work
-    overlaps = related_work(runtime.store, project["id"], task)
+    from .discovery import evidence_anchors
+    overlaps = _planning_related_work(runtime.store, project["id"], run["id"], task)
     issue_comments = {"status": "not_issue", "comments": [], "warning": None, "updated_at": None}
     if task["source"] == "issue":
         from .discovery import issue_comment_context
