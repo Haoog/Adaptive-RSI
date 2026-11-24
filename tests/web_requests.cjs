@@ -3532,14 +3532,39 @@ test('an active run stopping error explains when retry and supplement become ava
   await assert.rejects(page.context.api('retry', {task: 'child'}), /任务仍在停止中，请等当前运行结束后再重试或补充需求。/);
 });
 
-function modelScopePage(savedDrafts = new Map()) {
-  const page=browser(),posts=[],globals={planning:{provider:'ollama',model:'scope-coder',effort:'medium',fallback:null}},overrides=new Map([['a',structuredClone(globals)],['b',{}]]);
+function modelScopePage(savedDrafts = new Map(), {connections=false,renderRoutes=false} = {}) {
+  const page=browser(new Map(),connections?({document,window})=>{
+    window.scrollTo=()=>{};
+    const buttons=(attribute,values)=>values.map(value=>{
+      const button=document.getElementById('model-test-'+attribute+'-'+value);button.dataset[attribute]=value;return button;
+    });
+    const selectors={
+      '[data-view]':buttons('view',['models','overview']),
+      '[data-settings-scope]':buttons('settingsScope',['project','global']),
+      '.view':['models','overview'].map(value=>document.getElementById('view-'+value))
+    };
+    document.querySelectorAll=selector=>selectors[selector]||[];
+  }:null),posts=[],globals={planning:{provider:'ollama',model:'scope-coder',effort:'medium',fallback:null}},overrides=new Map([['a',structuredClone(globals)],['b',{}]]);
   let release,held=false,holdNext=false,probeFailure=false;
   const effective=project=>({...structuredClone(globals),...structuredClone(overrides.get(project)||{})});
-  const modelSnapshot=project=>({project,models:effective(project),global_models:structuredClone(globals),overrides:structuredClone(overrides.get(project)||{}),providers:[{id:'ollama',name:'Ollama',protocol:'ollama',catalog:{models:[{id:'scope-coder',name:'Scope coder'}]}}]});
+  const providers=[{id:'ollama',name:'Ollama',protocol:'ollama',health:{},catalog:{models:[{id:'scope-coder',name:'Scope coder'}]}}];
+  if(connections)providers.push({id:'openai',name:'OpenAI',health:{},catalog:{models:[{id:'other-coder',name:'Other coder'}]}});
+  const modelSnapshot=project=>({project,models:effective(project),global_models:structuredClone(globals),overrides:structuredClone(overrides.get(project)||{}),providers:structuredClone(providers)});
   page.context.english={};page.context.window.addEventListener=()=>{};
-  const tab=page.node('model-tab');tab.dataset.mcTab='roles';tab.parentElement=page.node('model-tabs');
-  page.document.querySelectorAll=selector=>selector==='[data-mc-tab]'?[tab]:[];
+  if(!connections)Object.assign(page.context.location,{href:'http://localhost/#modelTab=roles',hash:'#modelTab=roles'});
+  const tabs=(connections?['providers','roles']:['roles']).map(name=>{
+    const tab=page.node('model-tab-'+name);tab.dataset.mcTab=name;tab.parentElement=page.node('model-tabs');return tab;
+  });
+  const querySelectorAll=page.document.querySelectorAll;
+  page.document.querySelectorAll=selector=>selector==='[data-mc-tab]'?tabs:querySelectorAll(selector);
+  if(connections){
+    page.document.body=page.node('body');
+    page.node('config-scope').value='project';
+    page.node('mc-scope').querySelector=()=>page.node('model-test-project-option');
+    page.node('toast').hidden=true;
+    page.context.renderNavigation=()=>{};
+    page.context.safe=fn=>{page.context.lastAction=page.context.originalSafe(fn);return page.context.lastAction;};
+  }
   for(const id of ['view-models','mc-provider-list','mc-model-list','mc-role-list','mc-extra-role-list'])page.node(id).removeAttribute=()=>{};
   page.node('mc-probe-effort').querySelector=()=>page.node('mc-probe-effort').children[0];
   page.context.window.RSIDraftStore={get:(_type,key)=>structuredClone(savedDrafts.get(key)),set:(_type,key,value)=>savedDrafts.set(key,structuredClone(value)),remove:(_type,key)=>savedDrafts.delete(key)};
@@ -3555,9 +3580,18 @@ function modelScopePage(savedDrafts = new Map()) {
     throw new Error('Unexpected model request '+path);
   };
   page.context.refresh=async()=>{};
+  if(renderRoutes){
+    Object.assign(providers[0].catalog.models[0],{enabled:true,efforts:['low','medium','high']});
+    providers[1].catalog.models[0].enabled=true;
+    for(const role of ['analysis','implementation','review','evolution'])globals[role]=structuredClone(globals.planning);
+    for(const id of ['mc-fallback-provider','mc-fallback-model'])page.node(id).tagName='SELECT';
+    for(const id of ['mc-advanced-effort','mc-fallback-effort'])page.node(id).querySelector=()=>page.node(id).children[0];
+    page.context.history={state:null};
+  }
   const modelSource=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/model-center.js'),'utf8');
-  // Keep production loading, saving, draft persistence and event handlers; omit unrelated catalog rendering.
-  const instrumented=modelSource.replace('  init();',`  render=renderRoles=()=>{updateDirty();persistRouteDraft();};
+  // Keep production loading, saving, draft persistence and event handlers.
+  const stubRendering=renderRoutes?'':`${connections?'':'render='}renderRoles=()=>{updateDirty();persistRouteDraft();};`;
+  const instrumented=modelSource.replace('  init();',`  ${stubRendering}
   window.modelScopeTest={openProbe:()=>openProbe(data.providers[0],data.providers[0].catalog.models[0]),otherProbe:()=>openProbe({id:'ollama',name:'Ollama'},{id:'other-coder',name:'Other coder'}),edit:effort=>{routes().planning.effort=effort;renderRoles();},draft:()=>structuredClone(routes())};
   init();`);
   vm.runInContext(instrumented,page.context);
@@ -3572,6 +3606,224 @@ function modelScopePage(savedDrafts = new Map()) {
   };
 }
 
+async function providerRemovalPage(){
+  const page=modelScopePage(new Map(),{connections:true}),requests=[],removed=new Set();
+  const api=page.context.api;
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/remove'){
+      const result=await new Promise((resolve,reject)=>requests.push({body:structuredClone(body),resolve,reject}));
+      if(result?.removed)removed.add(`${body.project}:${body.provider}`);
+      return result;
+    }
+    const result=await api(path,body,options);
+    if(!body)result.providers=result.providers
+      .map((provider,index)=>({...provider,id:`fixture-${index}`,name:`Fixture ${index}`}))
+      .filter(provider=>!removed.has(`${result.project}:${provider.id}`));
+    return result;
+  };
+  page.context.history={state:null};
+  const navigate=async(project)=>{
+    page.context.location.hash=`#view=models&project=${project}&scope=project&modelTab=providers`;
+    page.context.location.href='http://localhost/'+page.context.location.hash;
+    page.windowListeners.get('hashchange')();
+    await page.context.lastAction;
+    await new Promise(setImmediate);
+  };
+  await navigate('a');
+  return {...page,requests,navigate,
+    confirm(value){
+      const box=page.document.body.children.find(node=>node.className==='confirm-dialog'&&node.open);
+      box.children.at(-1).children[value?1:0].handlers.click();
+    },
+    provider(name){page.node('mc-provider-list').children.find(button=>button.attributes['aria-label']===name).handlers.click();},
+    project(id){page.node('project-select').value=id;page.node('project-select').handlers.change();return page.context.lastAction;},
+    remove(){return page.click('mc-remove-provider');},
+    feedback(){return page.node('mc-feedback').textContent;}
+  };
+}
+
+const providerRemovalTransitions={
+  'provider switch':page=>page.provider('Fixture 1'),
+  'project switch':page=>page.project('b'),
+  'history back':page=>page.navigate('b')
+};
+
+for(const [name,transition] of Object.entries(providerRemovalTransitions))test(`model provider removal discards a pending confirmation after ${name}`,async()=>{
+  const page=await providerRemovalPage(),pending=page.remove();
+  await transition(page);
+  page.confirm(true);
+  await new Promise(setImmediate);
+  assert.deepEqual(page.requests.map(request=>request.body),[]);
+  await pending;
+});
+
+test('model provider removal sends one scoped POST and keeps the fallback selection',async()=>{
+  const page=await providerRemovalPage(),pending=page.remove();
+  const repeatedConfirmation=page.remove();
+  assert.equal(page.document.body.children.filter(node=>node.className==='confirm-dialog'&&node.open).length,1);
+  page.confirm(true);
+  await new Promise(setImmediate);
+  const repeatedPost=page.remove();
+  await new Promise(setImmediate);
+  assert.deepEqual(page.requests.map(request=>request.body),[{project:'a',provider:'fixture-0'}]);
+  page.requests[0].resolve({removed:true});
+  await Promise.all([pending,repeatedConfirmation,repeatedPost]);
+  assert.equal(page.feedback(),'连接已移除。');
+  assert.deepEqual(page.node('mc-provider-list').children.map(button=>button.attributes['aria-label']),['Fixture 1']);
+  assert.equal(page.node('mc-provider-list').children[0].attributes['aria-pressed'],'true');
+});
+
+for(const stage of ['catalog read','state refresh'])test(`model provider removal reports acknowledgement when ${stage} fails`,async()=>{
+  const page=await providerRemovalPage(),api=page.context.api,pending=page.remove();
+  page.confirm(true);
+  await new Promise(setImmediate);
+  const failure=new Error('Fixture read failure');
+  if(stage==='catalog read')page.context.api=(path,body)=>body?api(path,body):Promise.reject(failure);
+  else page.context.refresh=async()=>{throw failure;};
+  page.requests[0].resolve({removed:true});
+  await pending;
+  assert.equal(page.feedback(),'连接已移除，但设置刷新失败。请刷新页面核对连接。');
+  assert.equal(page.node('toast').hidden,true);
+  if(stage==='state refresh')assert.equal(page.node('mc-provider-list').children.length,1);
+});
+
+for(const outcome of ['success','rejection'])test(`model provider removal keeps newer feedback after a delayed ${outcome}`,async()=>{
+  const page=await providerRemovalPage(),pending=page.remove();
+  page.confirm(true);
+  await new Promise(setImmediate);
+  assert.deepEqual(page.requests.map(request=>request.body),[{project:'a',provider:'fixture-0'}]);
+  page.provider('Fixture 1');
+  page.node('mc-scope').value='global';
+  await page.node('mc-scope').handlers.change();
+  const api=page.context.api;
+  page.context.api=async(path,body)=>{
+    if(path==='model-center/fetch')throw new Error('Current fixture feedback');
+    return api(path,body);
+  };
+  await page.click('mc-fetch');
+  assert.equal(page.feedback(),'Current fixture feedback');
+  if(outcome==='success')page.requests[0].resolve({removed:true});
+  else page.requests[0].reject(Object.assign(new Error('Fixture rejection'),{code:'provider_in_use'}));
+  await pending;
+  assert.equal(page.feedback(),'Current fixture feedback');
+  assert.equal(page.node('toast').hidden,true);
+});
+
+test('model provider removal requires a positive acknowledgement before refreshing',async()=>{
+  const page=await providerRemovalPage(),pending=page.remove();
+  page.confirm(true);
+  await new Promise(setImmediate);
+  let refreshed=false;
+  page.context.refresh=async()=>{refreshed=true;};
+  page.requests[0].resolve({});
+  await pending;
+  assert.equal(refreshed,false);
+  assert.equal(page.feedback(),'无法确认连接是否已移除。请先刷新页面核对连接。');
+  assert.equal(page.node('mc-provider-list').children.length,2);
+});
+
+test('model provider removal preserves cancel, confirmation failure and backend rejection',async()=>{
+  const page=await providerRemovalPage(),cancelled=page.remove();
+  page.confirm(false);
+  await cancelled;
+  assert.equal(page.requests.length,0);
+  const confirm=page.context.uiConfirm;
+  page.context.uiConfirm=()=>Promise.reject(new Error('Fixture confirmation failed'));
+  await page.remove();
+  assert.equal(page.requests.length,0);
+  assert.equal(page.node('toast').textContent,'Fixture confirmation failed');
+  page.context.uiConfirm=confirm;
+  const pending=page.remove();
+  page.confirm(true);
+  await new Promise(setImmediate);
+  assert.equal(page.requests.length,1);
+  page.requests[0].reject(Object.assign(new Error('Fixture rejection'),{code:'provider_in_use'}));
+  await pending;
+  assert.equal(page.feedback(),'此连接仍被角色或备用模型使用，请先更换相关配置。');
+  assert.equal(page.node('toast').textContent,page.feedback());
+  assert.equal(page.node('mc-provider-list').children.length,2);
+  assert.equal(page.node('mc-remove-provider').disabled,false);
+});
+
+async function diagnosisPage(){
+  const page=modelScopePage(new Map(),{connections:true}),requests=[];
+  const api=page.context.api;
+  page.context.api=(path,body,options)=>path==='model-center/diagnose'
+    ?new Promise((resolve,reject)=>requests.push({body:structuredClone(body),resolve,reject}))
+    :api(path,body,options);
+  const click=id=>page.node(id).handlers.click();
+  const provider=name=>page.node('mc-provider-list').children.find(button=>button.attributes['aria-label']===name).handlers.click();
+  const project=id=>{page.node('project-select').value=id;page.node('project-select').handlers.change();};
+  click('model-test-view-models');await page.context.lastAction;
+  assert.equal(page.node('toast').textContent,'');
+  await provider('Ollama');
+  return {...page,requests,click,provider,project,
+    diagnose:()=>page.node('mc-diagnostics').onclick(),
+    dialogs:()=>page.document.body.children.filter(node=>node.tagName==='DIALOG'&&node.open)
+  };
+}
+
+const diagnosisTransitions={
+  'scope switch while loading':page=>{
+    const api=page.context.api;
+    let release;
+    page.context.api=async(path,...args)=>{
+      if(path==='model-center')await new Promise(resolve=>{release=resolve;});
+      return api(path,...args);
+    };
+    page.click('model-test-settingsScope-global');
+    assert.equal(page.node('mc-provider-name').textContent,'正在读取配置…');
+    const loading=page.context.lastAction;
+    return async()=>{release();await loading;};
+  },
+  'project round trip':async page=>{page.project('b');page.project('a');await new Promise(setImmediate);},
+  'provider switch':page=>page.provider('OpenAI'),
+  'provider round trip':async page=>{await page.provider('OpenAI');await page.provider('Ollama');},
+  'connection tab switch':page=>page.click('model-tab-roles'),
+  'connection tab round trip':page=>{page.click('model-tab-roles');page.click('model-tab-providers');},
+  'leaving the page':page=>page.click('model-test-view-overview'),
+  'returning to the page':async page=>{page.click('model-test-view-overview');page.click('model-test-view-models');await page.context.lastAction;}
+};
+for(const [name,transition] of Object.entries(diagnosisTransitions))for(const failure of [false,true]){
+  test(`read-only diagnosis discards stale ${failure?'failure':'success'} after ${name}`,async()=>{
+    const page=await diagnosisPage(),pending=page.diagnose();
+    assert.deepEqual(page.requests.map(request=>request.body),[{provider:'ollama',model:'scope-coder',project:'a'}]);
+    const finishTransition=await transition(page);
+    if(failure)page.requests[0].reject(new Error('Old diagnosis error'));
+    else page.requests[0].resolve({result:'old'});
+    await pending;
+    await finishTransition?.();
+    assert.equal(page.dialogs().length,0);
+    assert.equal(page.node('toast').hidden,true);
+    assert.equal(page.requests.length,1);
+  });
+}
+
+for(const failure of [false,true])test(`read-only diagnosis keeps current ${failure?'failure':'success'} after a repeated click and refresh`,async()=>{
+  const page=await diagnosisPage(),old=page.diagnose(),current=page.diagnose();
+  await page.show('a');
+  assert.deepEqual(page.requests.map(request=>request.body),Array(2).fill({provider:'ollama',model:'scope-coder',project:'a'}));
+  if(failure)page.requests[1].reject(Object.assign(new Error('Current diagnosis error'),{requestId:'diag-current'}));
+  else page.requests[1].resolve({result:'current'});
+  await current;
+  const dialog=page.dialogs()[0];
+  if(failure){
+    assert.equal(page.dialogs().length,0);
+    assert.equal(page.node('toast').textContent,'Current diagnosis error');
+    assert.equal(page.node('toast').className,'error');
+    assert.equal(page.node('toast').children.at(-1).textContent,'复制诊断标识');
+    page.requests[0].resolve({result:'old'});
+  }else{
+    assert.equal(page.dialogs().length,1);
+    assert.deepEqual(JSON.parse(dialog.children.at(-1).textContent),{result:'current'});
+    page.requests[0].reject(new Error('Old diagnosis error'));
+  }
+  await old;
+  assert.equal(page.dialogs().length,failure?0:1);
+  assert.equal(page.node('toast').hidden,!failure);
+  assert.equal(page.node('toast').textContent,failure?'Current diagnosis error':'');
+});
+
 test('Magpie preset fills the local OpenAI-compatible gateway without a credential', async()=>{
   const page=modelScopePage();await page.show('a');
   page.node('mc-provider-preset').value='magpie';
@@ -3582,15 +3834,622 @@ test('Magpie preset fills the local OpenAI-compatible gateway without a credenti
   assert.equal(page.node('mc-input-auth').value,'none');
 });
 
+async function customModelPage(){
+  const page=modelScopePage(new Map(),{connections:true});
+  const form=page.node('mc-custom-form'),dialog=page.node('mc-custom-dialog'),button=page.node('custom-submit');
+  const id=page.node('mc-custom-id'),name=page.node('mc-custom-name'),error=page.node('mc-custom-error');
+  form.querySelector=selector=>selector==='button[type="submit"]'?button:null;
+  form.reset=()=>{id.value='';name.value='';page.listeners.get('reset')({target:form});};
+  dialog.tagName='DIALOG';dialog.querySelector=()=>form;
+  page.click('model-test-view-models');await page.context.lastAction;
+  const provider=label=>page.node('mc-provider-list').children.find(item=>item.attributes['aria-label']===label).handlers.click();
+  provider('Ollama');
+  const api=page.context.api,requests=[],reads=[];
+  let nextRead;
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/model')return new Promise((resolve,reject)=>requests.push({body:structuredClone(body),resolve,reject}));
+    if(path==='model-center'||path.startsWith('model-center?')){
+      reads.push(path);
+      const beforeRead=nextRead;nextRead=null;
+      if(beforeRead)await beforeRead();
+    }
+    return api(path,body,options);
+  };
+  return {...page,dialog,button,id,name,error,requests,reads,provider,
+    open(modelId,displayName=''){page.click('mc-add-model');id.value=modelId;name.value=displayName;page.input(id.id,form.id);},
+    close(){dialog.close();page.listeners.get('close')({target:dialog});},
+    submit(){return page.submit(form.id);},
+    beforeRead(fn){nextRead=fn;}
+  };
+}
+
 for(const length of [160,161,256])for(const name of ['', '短显示名'])test(`custom model form preserves ${length}-character ID with ${name?'explicit':'blank'} name`,async()=>{
-  const page=modelScopePage();await page.show('a');
-  page.node('mc-custom-form').querySelector=()=>page.node('custom-submit');
-  page.node('mc-custom-dialog').showModal();
-  const id='x'.repeat(length);
-  page.node('mc-custom-id').value=id;page.node('mc-custom-name').value=name;
-  await page.submit('mc-custom-form');
-  assert.deepEqual(page.posts[0],{path:'model-center/model',body:{project:'a',provider:'ollama',model:{id,name,manual:true}}});
-  assert.equal(page.node('mc-custom-dialog').open,false);
+  const page=await customModelPage(),id='x'.repeat(length);
+  page.open(id,name);const pending=page.submit();
+  assert.deepEqual(page.requests[0].body,{project:'a',provider:'ollama',model:{id,name,manual:true}});
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,false);
+});
+
+for(const failure of [false,true])test(`custom model form ignores stale ${failure?'failure':'success'} after reopening with the same inputs`,async()=>{
+  const page=await customModelPage();page.open('fixture-model','Fixture');const pending=page.submit();
+  page.close();page.open('fixture-model','Fixture');
+  if(failure)page.requests[0].reject(new Error('Old POST failed'));
+  else page.requests[0].resolve({});
+  await pending;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.id.value,'fixture-model');
+  assert.equal(page.name.value,'Fixture');
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.button.disabled,false);
+  assert.deepEqual(page.reads,failure?[]:['model-center?project=a']);
+});
+
+for(const target of ['same','provider','scope'])test(`custom model form keeps a reopened ${target} submission pending when the previous POST finishes`,async()=>{
+  const page=await customModelPage();page.open('fixture-model');const old=page.submit();page.close();
+  if(target==='provider')page.provider('OpenAI');
+  if(target==='scope'){page.click('model-test-settingsScope-global');await page.context.lastAction;}
+  page.open('fixture-model');
+  assert.equal(page.button.disabled,false,'a reopened form can submit independently');
+  const current=page.submit();page.submit();
+  assert.deepEqual(page.requests.map(request=>request.body),[
+    {project:'a',provider:'ollama',model:{id:'fixture-model',name:'',manual:true}},
+    {project:target==='scope'?null:'a',provider:target==='provider'?'openai':'ollama',model:{id:'fixture-model',name:'',manual:true}}
+  ]);
+  const reads=page.reads.length;
+  page.requests[0].resolve({});await old;
+  assert.deepEqual(page.reads.slice(reads),target==='scope'?[]:['model-center?project=a']);
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.button.disabled,true);
+  page.requests[1].reject(new Error('Current POST failed'));await current;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.error.textContent,'Current POST failed');
+  assert.equal(page.button.disabled,false);
+});
+
+for(const failure of [false,true])test(`custom model form preserves real drafts after ${failure?'a POST failure':'a successful POST'}`,async()=>{
+  const page=await customModelPage();page.edit('high');page.open('fixture-model');const pending=page.submit();
+  page.name.value='New draft';page.input(page.name.id,'mc-custom-form');
+  if(failure)page.requests[0].reject(new Error('Outdated draft error'));
+  else page.requests[0].resolve({});
+  await pending;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.name.value,'New draft');
+  assert.equal(page.draft().planning.effort,'high');
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.button.disabled,false);
+  assert.deepEqual(page.reads,failure?[]:['model-center?project=a']);
+});
+
+test('custom model form stays closed and still refreshes the catalog after a late save',async()=>{
+  const page=await customModelPage();page.open('fixture-model');const pending=page.submit();page.close();
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,false);
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.deepEqual(page.reads,['model-center?project=a']);
+});
+
+test('custom model form reports a saved model separately from a failed catalog read',async()=>{
+  const page=await customModelPage();page.open('fixture-model');const pending=page.submit();
+  page.beforeRead(()=>{throw new Error('Fixture snapshot read failed');});
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,false);
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.node('mc-feedback').textContent,'模型已保存，但模型列表刷新失败。');
+  assert.deepEqual(page.reads,['model-center?project=a']);
+});
+
+test('custom model form ignores a late catalog read failure after reopening',async()=>{
+  const page=await customModelPage();page.open('fixture-model');const saved=page.submit();
+  let rejectRead;
+  page.beforeRead(()=>new Promise((_,reject)=>{rejectRead=reject;}));
+  page.requests[0].resolve({});await waitFor(()=>rejectRead);
+  assert.equal(page.dialog.open,false);
+  page.open('new-fixture-model');const current=page.submit();
+  page.requests[1].reject(new Error('Current POST failed'));await current;
+  rejectRead(new Error('Old snapshot read failed'));await saved;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.id.value,'new-fixture-model');
+  assert.equal(page.error.textContent,'Current POST failed');
+  assert.equal(page.button.disabled,false);
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+});
+
+async function modelPricePage(){
+  const page=modelScopePage(new Map(),{connections:true});
+  const form=page.node('mc-price-form'),dialog=page.node('mc-price-dialog'),button=page.node('price-submit');
+  const error=page.node('mc-price-error'),requests=[],reads=[],api=page.context.api;
+  const catalogPrice={unit_price:5,prices:{input:1,output:2,cache_read:0.5,cache_write:3}};
+  let nextRead;
+  form.querySelector=selector=>selector==='button[type="submit"]'?button:null;
+  dialog.tagName='DIALOG';dialog.querySelector=()=>form;
+  page.context.safe=(fn,form)=>{page.context.lastAction=page.context.originalSafe(fn,form);return page.context.lastAction;};
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/model')return new Promise((resolve,reject)=>requests.push({body:structuredClone(body),resolve,reject}));
+    if(path==='model-center'||path.startsWith('model-center?')){
+      reads.push(path);
+      const beforeRead=nextRead;nextRead=null;
+      if(beforeRead)await beforeRead();
+      const snapshot=await api(path,body,options);
+      for(const provider of snapshot.providers)Object.assign(provider.catalog.models[0],structuredClone(catalogPrice));
+      return snapshot;
+    }
+    return api(path,body,options);
+  };
+  page.node('mc-model-filter').value='all';
+  page.click('model-test-view-models');await page.context.lastAction;
+  const provider=label=>page.node('mc-provider-list').children.find(item=>item.attributes['aria-label']===label).handlers.click();
+  provider('Ollama');reads.length=0;
+  return {...page,dialog,button,error,requests,reads,provider,
+    open(){
+      const actions=page.node('mc-model-list').children[0].children[1].children[1].children[1];
+      actions.children.find(action=>action.textContent==='估算价格').handlers.click();
+    },
+    close(){dialog.close();page.listeners.get('close')({target:dialog});},
+    change(field,value){const id='mc-price-'+field;page.node(id).value=value;page.input(id,form.id);},
+    submit(){return page.submit(form.id);},
+    beforeRead(fn){nextRead=fn;}
+  };
+}
+
+for(const target of ['same','provider','scope'])test(`model price form keeps a reopened ${target} submission independent`,async()=>{
+  const page=await modelPricePage();page.open();page.change('output','4');const old=page.submit();page.close();
+  if(target==='provider')page.provider('OpenAI');
+  if(target==='scope'){page.click('model-test-settingsScope-global');await page.context.lastAction;}
+  page.open();
+  assert.equal(page.button.disabled,false,'a reopened price form can submit independently');
+  page.change('cache-write','0');const current=page.submit();await page.submit();
+  assert.deepEqual(page.requests.map(request=>request.body),[
+    {project:'a',provider:'ollama',model:{id:'scope-coder',prices:{output:4}}},
+    {project:target==='scope'?null:'a',provider:target==='provider'?'openai':'ollama',
+      model:{id:target==='provider'?'other-coder':'scope-coder',prices:{cache_write:0}}}
+  ]);
+  page.reads.length=0;
+  page.requests[0].resolve({});await old;
+  assert.deepEqual(page.reads,target==='scope'?[]:['model-center?project=a']);
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.button.disabled,true);
+  assert.equal(page.error.textContent,'');
+  page.requests[1].reject(new Error('Current price POST failed'));await current;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.node('mc-price-cache-write').value,'0');
+  assert.equal(page.error.textContent,'Current price POST failed');
+  assert.equal(page.button.disabled,false);
+});
+
+for(const transition of ['reopening','editing','provider round trip','scope round trip'])test(`model price form ignores a rejected POST after ${transition}`,async()=>{
+  const page=await modelPricePage();page.open();page.change('output','4');const pending=page.submit();
+  if(transition==='reopening'){page.close();page.open();page.change('output','4');}
+  if(transition==='editing')page.change('output','6');
+  if(transition==='provider round trip'){page.provider('OpenAI');page.provider('Ollama');}
+  if(transition==='scope round trip'){
+    page.click('model-test-settingsScope-global');await page.context.lastAction;
+    page.click('model-test-settingsScope-project');await page.context.lastAction;
+  }
+  page.reads.length=0;
+  page.requests[0].reject(new Error('Old price POST failed'));await pending;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.node('mc-price-output').value,transition==='editing'?'6':'4');
+  assert.equal(page.button.disabled,false);
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.deepEqual(page.reads,[]);
+});
+
+test('model price form skips unchanged prices and sends only changed fields and explicit clears',async()=>{
+  const page=await modelPricePage();page.open();await page.submit();
+  assert.equal(page.dialog.open,false);
+  assert.deepEqual(page.requests,[]);
+  assert.deepEqual(page.reads,[]);
+  page.open();page.change('input','');page.change('input-tokens','0');page.change('cache-read','');
+  const pending=page.submit();await page.submit();
+  assert.deepEqual(page.requests.map(request=>request.body),[
+    {project:'a',provider:'ollama',model:{id:'scope-coder',unit_price:null,prices:{input:0,cache_read:null}}}
+  ]);
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,false);
+  assert.deepEqual(page.reads,['model-center?project=a']);
+});
+
+test('model price form preserves edits after saving and can restore a previously submitted field',async()=>{
+  const page=await modelPricePage();page.open();page.change('output','4');const pending=page.submit();
+  page.change('output','2');page.change('input','7');
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.node('mc-price-output').value,'2');
+  assert.equal(page.node('mc-price-input').value,'7');
+  assert.equal(page.button.disabled,false);
+  assert.deepEqual(page.reads,['model-center?project=a']);
+  const current=page.submit();
+  assert.deepEqual(page.requests[1].body,{project:'a',provider:'ollama',model:{id:'scope-coder',unit_price:7,prices:{output:2}}});
+  page.requests[1].resolve({});await current;
+  assert.equal(page.dialog.open,false);
+});
+
+test('model price form reports saved pricing separately from a failed catalog read',async()=>{
+  const page=await modelPricePage();page.open();page.change('output','4');const pending=page.submit();
+  page.beforeRead(()=>{throw new Error('Fixture price catalog read failed');});
+  page.requests[0].resolve({});await pending;
+  assert.equal(page.dialog.open,false);
+  assert.equal(page.error.textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.node('mc-feedback').textContent,'估算价格已保存，但模型列表刷新失败。');
+  assert.deepEqual(page.reads,['model-center?project=a']);
+});
+
+test('model price form ignores a late catalog read failure after reopening',async()=>{
+  const page=await modelPricePage();page.open();page.change('output','4');const saved=page.submit();
+  let rejectRead;
+  page.beforeRead(()=>new Promise((_,reject)=>{rejectRead=reject;}));
+  page.requests[0].resolve({});await waitFor(()=>rejectRead);
+  assert.equal(page.dialog.open,false);
+  page.open();assert.equal(page.button.disabled,false);
+  page.change('cache-read','1');const current=page.submit();
+  page.requests[1].reject(new Error('New price POST failed'));await current;
+  rejectRead(new Error('Old price catalog read failed'));await saved;
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.node('mc-price-cache-read').value,'1');
+  assert.equal(page.error.textContent,'New price POST failed');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+});
+
+async function modelCapabilityPage(){
+  const page=modelScopePage(new Map(),{connections:true}),requests=[],reads=[];
+  const baseApi=page.context.api,getElementById=page.document.getElementById;
+  const find=(element,id)=>element.id===id?element:element.children?.map(child=>find(child,id)).find(Boolean);
+  page.document.getElementById=id=>id.startsWith('mc-capability-')
+    ?find(page.document.body,id)||null:getElementById(id);
+  const node=id=>page.document.getElementById('mc-capability-'+id);
+  const manual={source:'manual',context_tokens:64000,max_output_tokens:4096,source_url:'https://fixture.invalid/model',note:'original'};
+  let capabilities=manual,nextRead;
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/model')return new Promise((resolve,reject)=>requests.push({body:structuredClone(body),resolve,reject}));
+    if(path==='model-center'||path.startsWith('model-center?')){
+      reads.push(path);
+      const beforeRead=nextRead;nextRead=null;
+      if(beforeRead)await beforeRead();
+      const snapshot=await baseApi(path,body,options);
+      snapshot.providers[0].catalog.models[0].capabilities=structuredClone(capabilities);
+      return snapshot;
+    }
+    return baseApi(path,body,options);
+  };
+  page.node('mc-model-filter').value='all';
+  page.click('model-test-view-models');await page.context.lastAction;
+  page.node('mc-provider-list').children.find(button=>button.attributes['aria-label']==='Ollama').handlers.click();
+  reads.length=0;
+  return {...page,requests,reads,field:node,
+    open(){
+      const menu=page.node('mc-model-list').children[0].children[1].children[1].children[1];
+      menu.children.find(action=>action.textContent==='能力元数据').handlers.click();
+    },
+    close(){node('form').children[0].children[1].handlers.click();},
+    change(field,value){const target=node(field);target.value=value;target.form=node('form');page.listeners.get('input')({target});},
+    run(action){
+      if(action==='clear')node('clear').handlers.click();
+      else node('form').handlers.submit({target:node('form'),preventDefault(){}});
+      return page.context.lastAction;
+    },
+    beforeRead(fn){nextRead=fn;},
+    catalog(value){capabilities=value;}
+  };
+}
+
+test('model capability form validates limits and links and submits only changed fields',async()=>{
+  const page=await modelCapabilityPage();page.open();
+  const link=page.field('summary').children.at(-1);
+  assert.equal(link.href,'https://fixture.invalid/model');
+  assert.equal(link.rel,'noreferrer noopener');
+  await page.run('save');
+  assert.equal(page.field('dialog').open,false);
+  page.open();page.change('context','1.5');await page.run('save');
+  assert.equal(page.field('error').textContent,'请输入正整数 token 数量。');
+  page.change('context','1024');await page.run('save');
+  assert.equal(page.field('error').textContent,'输出上限不能超过上下文上限。');
+  page.change('context','64000');page.change('source-url','ftp://fixture.invalid');await page.run('save');
+  assert.equal(page.field('error').textContent,'来源链接必须是 http(s) 地址。');
+  assert.deepEqual(page.requests,[]);
+  page.change('source-url','');page.change('note',' updated ');const pending=page.run('save');
+  assert.deepEqual(page.requests[0].body,{project:'a',provider:'ollama',model:{id:'scope-coder',capability_override:{source_url:null,note:'updated'}}});
+  page.requests[0].resolve({saved:true});await pending;
+  assert.equal(page.field('dialog').open,false);
+  assert.equal(page.node('mc-feedback').textContent,'模型能力元数据已保存。');
+});
+
+for(const action of ['save','clear']){
+  test(`model capability form waits for the rendered catalog before closing after ${action}`,async()=>{
+    const page=await modelCapabilityPage();
+    if(action==='save'){
+      page.catalog({source:'conservative_default',context_tokens:32000,max_output_tokens:2048});
+      await page.context.window.RSIModelCenter.load();
+    }
+    const rowStatus=()=>descendants(page.node('mc-model-list').children[0]).find(node=>node.tagName==='SMALL').textContent;
+    const before=action==='save'?'保守默认值':'人工覆盖',after=action==='save'?'人工覆盖':'保守默认值';
+    page.open();page.change('note','saved');
+    const dialog=page.field('dialog'),pending=page.run(action);
+    let releaseRead,statusAtClose;
+    page.beforeRead(()=>new Promise(resolve=>{releaseRead=resolve;}));
+    const close=dialog.close.bind(dialog);
+    dialog.close=()=>{statusAtClose=rowStatus();close();};
+    page.catalog({source:action==='save'?'manual':'conservative_default',context_tokens:32000,max_output_tokens:2048});
+    page.requests[0].resolve({saved:true});await waitFor(()=>releaseRead);
+    assert.match(rowStatus(),new RegExp(before));
+    assert.equal(dialog.open,true,'the dialog must stay open while the catalog GET is pending');
+    assert.equal(page.field('save').disabled,true);
+    assert.equal(page.node('mc-feedback').textContent,'');
+    releaseRead();await pending;
+    assert.equal(dialog.open,false);
+    assert.match(statusAtClose,new RegExp(after));
+    assert.equal(page.node('mc-feedback').textContent,action==='save'?'模型能力元数据已保存。':'已清除人工能力覆盖。');
+  });
+
+  test(`model capability form preserves edits during the catalog read after ${action}`,async()=>{
+    const page=await modelCapabilityPage();page.open();
+    if(action==='save')page.change('context','65000');
+    const pending=page.run(action);
+    let releaseRead;
+    page.beforeRead(()=>new Promise(resolve=>{releaseRead=resolve;}));
+    page.requests[0].resolve({saved:true});await waitFor(()=>releaseRead);
+    page.change('note','draft');
+    if(action==='save')page.change('context','64000');
+    page.catalog(action==='save'
+      ?{source:'manual',context_tokens:65000,max_output_tokens:4096,note:'original'}
+      :{source:'conservative_default',context_tokens:32000,max_output_tokens:2048});
+    releaseRead();await pending;
+    assert.equal(page.field('dialog').open,true);
+    assert.equal(page.field('note').value,'draft');
+    assert.equal(page.field('context').value,action==='save'?'64000':'32000');
+    assert.equal(page.field('clear').hidden,action==='clear');
+    assert.equal(page.node('mc-feedback').textContent,'');
+    const current=page.run('save');
+    assert.deepEqual(page.requests[1].body.model.capability_override,action==='save'?{context_tokens:64000,note:'draft'}:{note:'draft'});
+    page.requests[1].resolve({saved:true});await current;
+  });
+
+  test(`model capability form ignores an old ${action} rejection after reopening`,async()=>{
+    const page=await modelCapabilityPage();page.open();page.change('note','old');const old=page.run(action);
+    page.close();page.open();page.change('note','new');const current=page.run(action);
+    page.requests[0].reject(new Error('Old capability POST failed'));await old;
+    assert.equal(page.field(action).disabled,true);
+    assert.equal(page.field('error').textContent,'');
+    assert.equal(page.field('note').value,'new');
+    page.requests[1].reject(new Error('Current capability POST failed'));await current;
+    assert.equal(page.field('dialog').open,true);
+    assert.equal(page.field('error').textContent,'Current capability POST failed');
+    assert.equal(page.field('save').disabled,false);
+    assert.equal(page.field('clear').disabled,false);
+    assert.equal(page.node('toast').hidden,true);
+    assert.deepEqual(page.reads,[]);
+  });
+
+  test(`model capability form ignores ${action} feedback after a scope round trip`,async()=>{
+    const page=await modelCapabilityPage();page.open();page.change('note','old');const old=page.run(action);page.close();
+    await page.click('model-test-settingsScope-global');
+    await page.click('model-test-settingsScope-project');
+    page.open();page.change('note','new');const current=page.run(action);page.reads.length=0;
+    page.requests[0].resolve({saved:true});await old;
+    assert.equal(page.field(action).disabled,true);
+    assert.equal(page.field('dialog').open,true);
+    assert.equal(page.field('note').value,'new');
+    assert.equal(page.node('mc-feedback').textContent,'');
+    assert.deepEqual(page.reads,['model-center?project=a']);
+    page.requests[1].resolve({saved:true});await current;
+    assert.equal(page.field('dialog').open,false);
+    assert.equal(page.node('mc-feedback').textContent,action==='save'?'模型能力元数据已保存。':'已清除人工能力覆盖。');
+  });
+
+  test(`model capability form separates a confirmed ${action} from a failed catalog read`,async()=>{
+    const page=await modelCapabilityPage();page.open();page.change('note','new');const pending=page.run(action);
+    if(action==='clear')assert.equal(page.requests[0].body.model.capability_override,null);
+    page.beforeRead(()=>{throw new Error('Fixture capability catalog read failed');});
+    page.requests[0].resolve({saved:true});await pending;
+    assert.equal(page.field('dialog').open,false);
+    assert.equal(page.field('error').textContent,'');
+    assert.equal(page.node('toast').hidden,true);
+    assert.equal(page.node('mc-feedback').textContent,action==='save'
+      ?'模型能力元数据已保存，但模型列表刷新失败。':'已清除人工能力覆盖，但模型列表刷新失败。');
+    assert.deepEqual(page.reads,['model-center?project=a']);
+  });
+
+  test(`model capability form suppresses a ${action} rejection after editing`,async()=>{
+    const page=await modelCapabilityPage();page.open();page.change('note','submitted');const pending=page.run(action);
+    page.change('note','draft');page.requests[0].reject(new Error('Outdated capability POST failed'));await pending;
+    assert.equal(page.field('dialog').open,true);
+    assert.equal(page.field('note').value,'draft');
+    assert.equal(page.field('error').textContent,'');
+    assert.equal(page.field('save').disabled,false);
+    assert.equal(page.field('clear').disabled,false);
+  });
+}
+
+test('model capability form preserves edits after saving and can restore a submitted field',async()=>{
+  const page=await modelCapabilityPage();page.open();page.change('context','65000');const pending=page.run('save');
+  page.change('context','64000');page.change('note','draft');
+  page.catalog({source:'manual',context_tokens:65000,max_output_tokens:4096,source_url:'https://fixture.invalid/model',note:'original'});
+  page.requests[0].resolve({saved:true});await pending;
+  assert.equal(page.field('dialog').open,true);
+  assert.equal(page.field('context').value,'64000');
+  assert.equal(page.field('note').value,'draft');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  const current=page.run('save');
+  assert.deepEqual(page.requests[1].body.model.capability_override,{context_tokens:64000,note:'draft'});
+  page.requests[1].resolve({saved:true});await current;
+});
+
+test('model capability form preserves edits after clearing and uses the refreshed limits',async()=>{
+  const page=await modelCapabilityPage();page.open();const pending=page.run('clear');
+  page.change('note','draft');
+  page.catalog({source:'conservative_default',context_tokens:32000,max_output_tokens:2048});
+  page.requests[0].resolve({saved:true});await pending;
+  assert.equal(page.field('dialog').open,true);
+  assert.equal(page.field('note').value,'draft');
+  assert.equal(page.field('context').value,'32000');
+  assert.equal(page.field('clear').hidden,true);
+  assert.equal(page.node('mc-feedback').textContent,'');
+  const current=page.run('save');
+  assert.deepEqual(page.requests[1].body.model.capability_override,{note:'draft'});
+  page.requests[1].resolve({saved:true});await current;
+});
+
+test('model capability form keeps a new form open after a late catalog read succeeds',async()=>{
+  const page=await modelCapabilityPage();page.open();page.change('note','saved');const old=page.run('save');
+  let releaseRead;
+  page.beforeRead(()=>new Promise(resolve=>{releaseRead=resolve;}));
+  page.requests[0].resolve({saved:true});await waitFor(()=>releaseRead);
+  page.close();page.open();page.change('note','new');const current=page.run('clear');
+  releaseRead();await old;
+  assert.equal(page.field('dialog').open,true);
+  assert.equal(page.field('clear').disabled,true);
+  assert.equal(page.field('note').value,'new');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  page.requests[1].resolve({saved:true});await current;
+  assert.equal(page.field('dialog').open,false);
+});
+
+test('model capability form ignores a late catalog read failure after reopening',async()=>{
+  const page=await modelCapabilityPage();page.open();page.change('note','saved');const old=page.run('save');
+  let rejectRead;
+  page.beforeRead(()=>new Promise((_,reject)=>{rejectRead=reject;}));
+  page.requests[0].resolve({saved:true});await waitFor(()=>rejectRead);
+  if(page.field('dialog').open)page.close();
+  page.open();const current=page.run('clear');
+  page.requests[1].reject(new Error('Current capability POST failed'));await current;
+  rejectRead(new Error('Old capability catalog read failed'));await old;
+  assert.equal(page.field('dialog').open,true);
+  assert.equal(page.field('error').textContent,'Current capability POST failed');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+});
+
+async function providerFormPage({edit=false}={}){
+  const page=modelScopePage(new Map(),{connections:true});await page.show('a');
+  page.node('mc-provider-form').reset=()=>{page.node('mc-provider-preset').value='custom';};
+  page.node('mc-input-auth').querySelector=()=>page.node('keychain-option');
+  page.node(edit?'mc-edit-provider':'mc-add-provider').handlers.click();
+  page.node('mc-input-url').value='https://fixture.invalid/v1';
+  page.node('mc-input-env').value='FIXTURE_KEY';
+  return page;
+}
+
+for(const [stage,expected] of [
+  ['state refresh','连接配置已保存，但设置刷新失败。请刷新页面核对连接。'],
+  ['catalog snapshot','连接配置已保存，但设置刷新失败。请刷新页面核对连接。'],
+  ['catalog fetch','连接配置已保存，但模型目录更新失败。请重试获取模型。'],
+  ['catalog follow-up read','连接配置已保存，但模型目录更新失败。请重试获取模型。']
+])test(`provider form reports a saved connection after ${stage} fails`,async()=>{
+  const page=await providerFormPage(),api=page.context.api;
+  const secret='fixture-secret',failure=new Error(secret+' https://fixture.invalid/private');
+  let fetching=false;
+  page.node('mc-input-key').value=secret;
+  page.node('mc-input-models').value='fixture-model';
+  if(stage==='state refresh')page.context.refresh=async()=>{throw failure;};
+  page.context.api=async(path,body)=>{
+    if(path==='model-center/provider'){await api(path,body);return {id:'ollama'};}
+    if(path==='model-center?project=a'&&(stage==='catalog snapshot'||(fetching&&stage==='catalog follow-up read')))throw failure;
+    const result=await api(path,body);
+    if(path==='model-center/fetch'){fetching=true;if(stage==='catalog fetch')throw failure;}
+    return result;
+  };
+  await page.submit('mc-provider-form');
+  assert.deepEqual(page.posts.map(post=>post.path),['model-center/provider','model-center/model',
+    ...(['catalog fetch','catalog follow-up read'].includes(stage)?['model-center/fetch']:[])]);
+  assert.ok(page.posts.every(({body})=>body.project==='a'));
+  assert.equal(page.node('mc-provider-error').textContent,'');
+  assert.equal(page.node('mc-provider-dialog').open,false);
+  assert.equal(page.node('mc-feedback').textContent,expected);
+  assert.equal(page.node('toast').hidden,true);
+});
+
+test('provider form retains only unfinished custom models after a saved connection',async()=>{
+  const page=await providerFormPage({edit:true}),api=page.context.api;
+  const models=page.node('mc-input-models');models.value='done\nretry\nlater\nretry';
+  page.node('mc-input-auth').value='session';page.node('mc-input-key').value='fixture-key';
+  let failModel=true;
+  page.context.api=async(path,body)=>{
+    const result=await api(path,body);
+    if(path==='model-center/provider')return {id:'openai'};
+    if(failModel&&path==='model-center/model'&&body.model.id==='retry')throw new Error('fixture-key');
+    return result;
+  };
+  await page.submit('mc-provider-form');
+  assert.deepEqual(page.posts.map(({path,body})=>[path,body.project,body.model?.id]),[
+    ['model-center/provider','a',undefined],['model-center/model','a','done'],['model-center/model','a','retry']
+  ]);
+  assert.equal(page.posts[0].body.provider.id,'openai');
+  assert.deepEqual(page.posts[0].body.authentication,{mode:'session',value:'fixture-key'});
+  assert.equal(page.node('mc-input-key').value,'');
+  assert.equal(models.value,'retry\nlater');
+  assert.equal(page.node('mc-provider-dialog').open,true);
+  assert.equal(page.node('mc-provider-submit').disabled,false);
+  assert.equal(page.node('mc-provider-error').textContent,'连接配置已保存。尚未确认添加的自定义模型 ID 已保留，可重试。');
+  assert.equal(page.node('toast').hidden,true);
+  failModel=false;await page.submit('mc-provider-form');
+  assert.deepEqual(page.posts[3].body,{...page.posts[0].body,authentication:{mode:'session',value:''}});
+  assert.deepEqual(page.posts.slice(4).map(({path,body})=>[path,body.project,body.provider,body.model?.id]),[
+    ['model-center/model','a','openai','retry'],['model-center/model','a','openai','later'],['model-center/fetch','a','openai',undefined]
+  ]);
+  assert.equal(page.node('mc-provider-dialog').open,false);
+});
+
+test('provider form keeps its draft when the connection write is unconfirmed',async()=>{
+  const page=await providerFormPage(),api=page.context.api;
+  page.node('mc-input-models').value='unsaved-model';
+  page.node('mc-input-key').value='fixture-key';
+  page.context.api=async(path,body)=>{
+    const result=await api(path,body);
+    if(path==='model-center/provider')throw new Error('fixture-key https://fixture.invalid/private');
+    return result;
+  };
+  await page.submit('mc-provider-form');
+  assert.deepEqual(page.posts.map(post=>post.path),['model-center/provider']);
+  assert.equal(page.node('mc-provider-dialog').open,true);
+  assert.equal(page.node('mc-input-models').value,'unsaved-model');
+  assert.equal(page.node('mc-input-key').value,'');
+  assert.equal(page.node('mc-provider-error').textContent,'无法确认连接配置是否已保存。请先刷新页面核对连接。');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+});
+
+for(const switchScope of [false,true])test(`provider form keeps a newer draft after ${switchScope?'a scope change during refresh':'an earlier catalog fetch fails'}`,async()=>{
+  const page=await providerFormPage(),api=page.context.api,dialog=page.node('mc-provider-dialog');
+  let finish,globalReads=0;
+  page.node('mc-input-models').value='old-model';
+  if(switchScope)page.context.refresh=()=>new Promise(resolve=>{finish=resolve;});
+  page.context.api=async(path,body)=>{
+    if(path==='model-center'&&++globalReads>1)throw new Error('Old refresh read the new scope');
+    const result=await api(path,body);
+    if(path==='model-center/provider')return {id:'ollama'};
+    if(path==='model-center/fetch'&&!switchScope)return new Promise((_,reject)=>{finish=()=>reject(new Error('Old catalog fetch failed'));});
+    return result;
+  };
+  const pending=page.submit('mc-provider-form');await waitFor(()=>finish);
+  if(switchScope){
+    dialog.close();
+    page.node('mc-scope').value='global';page.node('mc-scope').handlers.change();
+    await page.context.lastAction;
+  }
+  page.node('mc-add-provider').handlers.click();
+  page.node('mc-input-name').value='New connection';
+  page.node('mc-input-key').value='new-fixture-key';
+  page.node('mc-input-models').value='new-model';
+  const currentFeedback=page.node('mc-feedback').textContent;
+  finish();await pending;
+  assert.equal(globalReads,switchScope?1:0);
+  assert.deepEqual(page.posts.find(post=>post.path==='model-center/fetch')?.body,{provider:'ollama',project:'a'});
+  assert.equal(dialog.open,true);
+  assert.equal(page.node('mc-input-name').value,'New connection');
+  assert.equal(page.node('mc-input-key').value,'new-fixture-key');
+  assert.equal(page.node('mc-input-models').value,'new-model');
+  assert.equal(page.node('mc-provider-error').textContent,'');
+  assert.equal(page.node('mc-provider-submit').disabled,false);
+  assert.equal(page.node('mc-feedback').textContent,currentFeedback);
+  assert.equal(page.node('toast').hidden,true);
 });
 
 test('provider form sends full custom IDs without inventing truncated display names',async()=>{
@@ -3605,6 +4464,289 @@ test('provider form sends full custom IDs without inventing truncated display na
   page.context.api=async(path,body)=>path==='model-center/provider'?{id:'ollama'}:api(path,body);
   await page.submit('mc-provider-form');
   assert.deepEqual(page.posts.find(post=>post.path==='model-center/model').body.model,{id,manual:true});
+});
+
+async function advancedRoutePage(savedDrafts){
+  const page=modelScopePage(savedDrafts,{connections:true,renderRoutes:true});
+  const navigate=async({view='models',project='a',scope='project',tab='roles'}={})=>{
+    page.context.location.hash=`#view=${view}&project=${project}&scope=${scope}&modelTab=${tab}`;
+    page.context.location.href='http://localhost/'+page.context.location.hash;
+    page.windowListeners.get('hashchange')();
+    await page.context.lastAction;
+    await new Promise(setImmediate);
+  };
+  await navigate();
+  return {...page,navigate,dialog:page.node('mc-advanced-dialog'),
+    openAdvanced(){
+      const planning=page.node('mc-role-list').children.find(row=>descendants(row).some(node=>node.id==='mc-role-model-planning'));
+      descendants(planning).find(node=>node.textContent==='高级参数').handlers.click();
+      assert.equal(page.node('mc-advanced-dialog').open,true);
+    },
+    effort(value){page.node('mc-advanced-effort').querySelector('select').value=value;},
+    fallback(provider,model){
+      page.node('mc-fallback-provider').value=provider;
+      page.node('mc-fallback-provider').handlers.change();
+      page.node('mc-fallback-model').value=model;
+      page.node('mc-fallback-model').handlers.change();
+    }
+  };
+}
+
+const advancedRouteTransitions={
+  'project switch through show':page=>page.show('b'),
+  'global scope through history':page=>page.navigate({scope:'global'}),
+  'tab switch through history':page=>page.navigate({tab:'providers'}),
+  'tab round trip through history':async page=>{await page.navigate({tab:'providers'});await page.navigate();},
+  'page round trip through history':async page=>{await page.navigate({view:'overview'});await page.navigate();}
+};
+for(const [transition,navigate] of Object.entries(advancedRouteTransitions))test(`advanced route form cannot edit a draft after ${transition}`,async()=>{
+  const page=await advancedRoutePage();page.openAdvanced();page.effort('high');page.fallback('openai','other-coder');
+  await navigate(page);
+  const closedOnNavigation=!page.dialog.open;
+  const feedback=page.node('mc-feedback').textContent,dirty=page.node('mc-dirty').textContent;
+  await page.submit('mc-advanced-form');
+  assert.equal(page.draft().planning.effort,'medium');
+  assert.equal(page.draft().planning.fallback,null);
+  assert.equal(page.savedDrafts.size,0);
+  assert.deepEqual(page.posts,[]);
+  assert.equal(page.node('mc-feedback').textContent,feedback);
+  assert.equal(page.node('mc-dirty').textContent,dirty);
+  assert.equal(closedOnNavigation,true);
+});
+
+function routePickerButton(page,role){
+  return descendants(page.node('mc-role-list')).find(node=>node.id==='mc-role-model-'+role);
+}
+
+function routePickerOptions(page){
+  return descendants(page.node('mc-picker-list')).filter(node=>node.className==='mc-picker-option');
+}
+
+for(const [transition,navigate] of Object.entries(advancedRouteTransitions))test(`model picker discards stale options after ${transition}`,async()=>{
+  const page=await advancedRoutePage(),dialog=page.node('mc-picker-dialog');
+  const opener=routePickerButton(page,'planning');opener.handlers.click();
+  assert.equal(dialog.open,true);
+  const option=routePickerOptions(page).find(node=>descendants(node).some(child=>child.textContent==='Other coder'));
+  assert.ok(option);
+  await navigate(page);
+  const closedOnNavigation=!dialog.open;
+  const draft=page.draft(),dirty=page.node('mc-dirty').textContent;
+  option.handlers.click();
+  assert.deepEqual(page.draft(),draft);
+  assert.equal(page.savedDrafts.size,0);
+  assert.equal(page.node('mc-dirty').textContent,dirty);
+  assert.deepEqual(page.posts,[]);
+  assert.equal(closedOnNavigation,true);
+  await page.navigate();
+  routePickerButton(page,'planning').handlers.click();
+  assert.equal(dialog.open,true);
+  assert.equal(page.draft().planning.model,'scope-coder');
+});
+
+test('model picker cannot open from a stale role button after a project switch',async()=>{
+  const page=await advancedRoutePage(),dialog=page.node('mc-picker-dialog');
+  const opener=routePickerButton(page,'planning');
+  await page.show('b');
+  opener.handlers.click();
+  const openedFromStaleButton=Boolean(dialog.open);
+  if(openedFromStaleButton)routePickerOptions(page)[1].handlers.click();
+  assert.equal(page.draft().planning.model,'scope-coder');
+  assert.equal(page.savedDrafts.size,0);
+  assert.equal(openedFromStaleButton,false);
+  routePickerButton(page,'planning').handlers.click();
+  assert.equal(dialog.open,true);
+});
+
+test('model picker options cannot select a model in a reopened session',async()=>{
+  const page=await advancedRoutePage(),dialog=page.node('mc-picker-dialog');
+  routePickerButton(page,'planning').handlers.click();
+  const [sameModel,oldOption]=routePickerOptions(page);
+  assert.equal(routePickerOptions(page).length,2);
+  sameModel.handlers.click();
+  assert.equal(dialog.open,false);
+  assert.equal(page.draft().planning.effort,'medium');
+  routePickerButton(page,'implementation').handlers.click();
+  const currentOption=routePickerOptions(page)[1];
+  oldOption.handlers.click();
+  assert.equal(page.draft().implementation.model,'scope-coder');
+  assert.equal(dialog.open,true);
+  assert.equal(page.savedDrafts.size,0);
+  currentOption.handlers.click();
+  assert.equal(dialog.open,false);
+  assert.deepEqual(page.savedDrafts.get('a').routes.implementation,{provider:'openai',model:'other-coder',effort:'default',fallback:null});
+  assert.equal(page.draft().planning.model,'scope-coder');
+  assert.deepEqual(page.posts,[]);
+});
+
+test('model picker retains filters and pagination across translation and isolates project drafts',async()=>{
+  const page=await advancedRoutePage(),api=page.context.api;
+  page.context.api=async(...args)=>{
+    const result=await api(...args);
+    if(result.providers){
+      const models=result.providers.find(provider=>provider.id==='ollama').catalog.models;
+      for(let index=1;index<=21;index++)models.push({id:'fixture-'+index,name:'Fixture '+index,enabled:true});
+    }
+    return result;
+  };
+  await page.show('a');routePickerButton(page,'planning').handlers.click();
+  const provider=page.node('mc-picker-provider'),search=page.node('mc-picker-search'),pagination=page.node('mc-picker-page');
+  provider.value='openai';provider.handlers.change();
+  assert.equal(routePickerOptions(page).length,1);
+  assert.ok(descendants(routePickerOptions(page)[0]).some(child=>child.textContent==='Other coder'));
+  provider.value='ollama';provider.handlers.change();
+  search.value='fixture';search.handlers.input();
+  assert.equal(pagination.textContent,'1 / 2');
+  assert.equal(routePickerOptions(page).length,20);
+  page.click('mc-picker-next');
+  assert.equal(pagination.textContent,'2 / 2');
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  const english=vm.runInNewContext(i18n.slice(0,i18n.indexOf('let language'))+';english');
+  page.context.t=text=>english[text]??text;
+  page.context.window.RSIModelCenter.translate();
+  assert.match(page.node('mc-picker-title').textContent,/ · Select model$/);
+  assert.equal(provider.value,'ollama');
+  assert.equal(search.value,'fixture');
+  assert.equal(pagination.textContent,'2 / 2');
+  assert.equal(routePickerOptions(page).length,1);
+  routePickerOptions(page)[0].handlers.click();
+  assert.equal(page.node('mc-picker-dialog').open,false);
+  assert.equal(page.savedDrafts.get('a').routes.planning.model,'fixture-21');
+  await page.show('b');
+  assert.equal(page.draft().planning.model,'scope-coder');
+  await page.navigate({scope:'global'});
+  assert.equal(page.draft().planning.model,'scope-coder');
+  await page.navigate();
+  assert.equal(page.draft().planning.model,'fixture-21');
+  assert.deepEqual([...page.savedDrafts.keys()],['a']);
+  assert.deepEqual(page.posts,[]);
+});
+
+test('advanced route form validates and persists a fallback within its current scope',async()=>{
+  const page=await advancedRoutePage();page.click('mc-reset-inheritance');
+  const feedback=page.node('mc-feedback').textContent;
+  assert.match(feedback,/已选择跟随通用设置/);
+  page.openAdvanced();page.effort('high');page.fallback('ollama','scope-coder');
+  await page.submit('mc-advanced-form');
+  assert.equal(page.dialog.open,true);
+  assert.equal(page.node('mc-advanced-error').textContent,'备用模型应与主模型不同。');
+  assert.equal(page.draft().planning.effort,'medium');
+  page.fallback('openai','other-coder');
+  await page.submit('mc-advanced-form');
+  assert.equal(page.dialog.open,false);
+  const expected={provider:'ollama',model:'scope-coder',effort:'high',fallback:{provider:'openai',model:'other-coder',effort:'default'}};
+  assert.deepEqual(page.savedDrafts.get('a').routes.planning,expected);
+  assert.equal(page.node('mc-feedback').textContent,feedback);
+  assert.equal(page.node('mc-dirty').textContent,'模型分工有未保存的修改');
+  assert.deepEqual(page.posts,[]);
+  const reopened=await advancedRoutePage(page.savedDrafts);
+  assert.deepEqual(reopened.draft().planning,expected);
+  await reopened.click('mc-save-routes');
+  assert.deepEqual(reopened.posts.map(({path,body})=>[path,body.project,body.models.planning]),[['model-center/routes','a',expected]]);
+  assert.equal(reopened.savedDrafts.has('a'),false);
+});
+
+for(const failedRead of ['routes','state'])test(`route save acknowledges the write when the ${failedRead} read fails`,async()=>{
+  const page=modelScopePage(),api=page.context.api;
+  vm.runInContext('state.config_revision=7',page.context);
+  await page.show('a');page.edit('high');
+  let refreshes=0,fail=true;
+  page.context.refresh=async()=>{
+    refreshes++;
+    if(fail&&failedRead==='state')throw new Error('State read failed');
+    vm.runInContext('state.config_revision=8',page.context);
+  };
+  page.context.api=async(path,body)=>{
+    if(fail&&failedRead==='routes'&&path==='model-center?project=a')throw new Error('Route read failed');
+    return api(path,body);
+  };
+  page.hold();const saving=page.click('mc-save-routes');
+  page.edit('low');page.release();await saving;
+  assert.equal(page.posts[0].body.revision,7);
+  assert.equal(page.overrides.get('a').planning.effort,'high');
+  assert.equal(page.savedDrafts.get('a').baseline.planning.effort,'high');
+  assert.equal(page.savedDrafts.get('a').routes.planning.effort,'low');
+  assert.equal(page.node('mc-dirty').textContent,'模型分工有未保存的修改');
+  assert.match(page.node('mc-feedback').textContent,/模型分工已保存，但刷新失败/);
+  assert.equal(refreshes,1);
+  fail=false;
+  if(failedRead==='state')await page.context.refresh();
+  await page.click('mc-save-routes');
+  assert.equal(page.posts[1].body.revision,8);
+  assert.equal(page.savedDrafts.has('a'),false);
+});
+
+for(const transition of ['project round trip','returning to the page','connection tab round trip'])test(`route save leaves newer feedback intact after ${transition}`,async()=>{
+  const page=await diagnosisPage();page.click('model-tab-roles');page.edit('high');
+  page.hold();const saving=page.click('mc-save-routes');
+  await diagnosisTransitions[transition](page);
+  page.click('model-tab-roles');
+  assert.equal(page.node('mc-dirty').textContent,'正在保存模型分工…');
+  page.click('mc-reset-inheritance');page.edit('low');
+  const feedback=page.node('mc-feedback').textContent;
+  assert.match(feedback,/已选择跟随通用设置/);
+  page.release();await saving;
+  assert.equal(page.node('mc-feedback').textContent,feedback);
+  assert.equal(page.node('mc-dirty').textContent,'模型分工有未保存的修改');
+  assert.equal(page.overrides.get('a').planning.effort,'high');
+  assert.equal(page.savedDrafts.get('a').routes.planning.effort,'low');
+});
+
+for(const roundTrip of [false,true])test(`route save ${roundTrip?'ignores a stale':'shows the current'} revision rejection`,async()=>{
+  const page=modelScopePage(),api=page.context.api;let reject;
+  await page.show('a');page.edit('high');
+  page.context.api=(path,body)=>path==='model-center/routes'?new Promise((_resolve,fail)=>{reject=fail;}):api(path,body);
+  const saving=page.click('mc-save-routes');
+  if(roundTrip){
+    await page.show('b');await page.show('a');
+    page.click('mc-reset-inheritance');page.edit('low');
+  }
+  reject(Object.assign(new Error('Revision conflict'),{status:409,code:'config_revision_conflict'}));
+  await saving;
+  assert.match(page.node('mc-feedback').textContent,roundTrip?/已选择跟随通用设置/:/Revision conflict/);
+  assert.equal(page.savedDrafts.get('a').routes.planning.effort,roundTrip?'low':'high');
+  assert.equal(page.node('mc-save-routes').disabled,false);
+});
+
+test('route save keeps the conflict detected by the acknowledgement read',async()=>{
+  const page=modelScopePage(),api=page.context.api;
+  await page.show('a');page.edit('high');page.hold();
+  page.context.api=async(path,body)=>{
+    if(path==='model-center?project=a')page.overrides.get('a').planning.effort='xhigh';
+    return api(path,body);
+  };
+  const saving=page.click('mc-save-routes');page.edit('low');page.release();await saving;
+  assert.match(page.node('mc-feedback').textContent,/服务器模型设置已变化/);
+  assert.equal(page.draft().planning.effort,'xhigh');
+  assert.equal(page.node('mc-save-routes').disabled,true);
+});
+
+for(const outcome of ['confirmed write','unconfirmed write','rejected write'])test(`route save reports a ${outcome} accurately after a project switch`,async()=>{
+  const page=await diagnosisPage();page.click('model-tab-roles');page.edit('high');
+  const api=page.context.api;let finish,renderProject;
+  page.context.api=async(path,body)=>{
+    if(path==='model-center?project=b')await new Promise(resolve=>{renderProject=resolve;});
+    if(path==='model-center/routes'&&outcome!=='confirmed write'){
+      await new Promise(resolve=>{finish=resolve;});
+      if(outcome==='rejected write')throw Object.assign(new Error('Revision conflict'),{status:409,code:'config_revision_conflict'});
+      await api(path,body);
+      throw new TypeError('Connection lost');
+    }
+    if(path==='model-center?project=a'&&finish===undefined){
+      await new Promise(resolve=>{finish=resolve;});throw new Error('Route read failed');
+    }
+    return api(path,body);
+  };
+  const saving=page.click('mc-save-routes');await new Promise(setImmediate);
+  page.project('b');await new Promise(setImmediate);
+  assert.equal(page.node('mc-dirty').textContent,'');
+  finish();await saving;
+  assert.equal(page.node('mc-dirty').textContent,'');
+  renderProject();await new Promise(setImmediate);
+  if(outcome==='confirmed write')assert.equal(page.node('toast').hidden,true);
+  else assert.match(page.node('toast').textContent,outcome==='rejected write'?/先前的提交未成功/:/无法确认先前提交的模型分工是否已保存/);
+  assert.equal(page.savedDrafts.has('a'),outcome!=='confirmed write');
+  assert.equal(page.overrides.get('a').planning.effort,outcome==='rejected write'?'medium':'high');
+  assert.equal(page.node('mc-dirty').textContent,'模型分工已保存');
 });
 
 test('equal-valued project overrides can be reset, persisted across reload, and follow later defaults',async()=>{
@@ -3845,6 +4987,261 @@ test('a probe service timeout reports the known failure without a retained wait 
   page.node('mc-probe-dialog').close();page.openProbe();
   assert.equal(page.node('mc-probe-result').textContent,'');
   assert.equal(page.posts.length,1);
+});
+
+async function modelPreferencePage(field){
+  const page=await diagnosisPage(),api=page.context.api,posts=[],reads=[];
+  let finish,stored=false,readFailure=false;
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/model'){
+      posts.push(structuredClone(body));
+      await new Promise((resolve,reject)=>{finish=error=>error?reject(error):resolve();});
+      stored=body.model[field];
+      return {saved:true};
+    }
+    if(path==='model-center'||path.startsWith('model-center?')){
+      reads.push(path);
+      if(readFailure)throw new Error('Confirmation read failed');
+      const snapshot=await api(path,body,options);
+      if(snapshot.project==='a'){
+        const catalog=snapshot.providers.find(provider=>provider.id==='ollama').catalog;
+        catalog.models[0][field]=stored;
+        if(stored)catalog.models.push({id:'new-coder',name:'New coder'});
+      }
+      return snapshot;
+    }
+    return api(path,body,options);
+  };
+  await page.show('a');
+  reads.length=0;
+  const filter=page.node('mc-model-filter');filter.value='all';filter.handlers.change();
+  const control=()=>{
+    const [,actions]=page.node('mc-model-list').children[0].children;
+    const [label,more]=actions.children;
+    return field==='enabled'?label.children[0]:more.children[1].children[0];
+  };
+  return {...page,posts,reads,control,
+    save(){
+      const node=control();
+      if(field==='enabled'){node.checked=true;node.handlers.change();}
+      else node.handlers.click();
+      assert.deepEqual(posts,[{project:'a',provider:'ollama',model:{id:'scope-coder',[field]:true}}]);
+      return page.context.lastAction;
+    },
+    finish(error){finish(error);},
+    failRead(){readFailure=true;},
+    value(){return field==='enabled'?control().checked:control().textContent==='取消收藏';}
+  };
+}
+
+const preferenceTransitions={
+  'project switch':async page=>{page.project('b');await new Promise(setImmediate);},
+  'project round trip':diagnosisTransitions['project round trip'],
+  'provider switch':diagnosisTransitions['provider switch'],
+  'provider round trip':diagnosisTransitions['provider round trip'],
+  'leaving the page':diagnosisTransitions['leaving the page'],
+  'returning to the page':diagnosisTransitions['returning to the page']
+};
+for(const field of ['enabled','favorite']){
+  for(const [name,transition] of Object.entries(preferenceTransitions))for(const failure of [false,true]){
+    test(`model preference ${field} keeps ${failure?'failure':'success'} scoped after ${name}`,async()=>{
+      const page=await modelPreferencePage(field),pending=page.save();
+      await transition(page);
+      page.reads.length=0;
+      page.finish(failure?new Error('Old model preference error'):undefined);
+      await pending;
+      assert.deepEqual(page.reads,failure||name==='project switch'?[]:['model-center?project=a']);
+      assert.equal(page.node('mc-feedback').textContent,'');
+      assert.equal(page.node('toast').hidden,true);
+      if(!failure&&name!=='project switch'){
+        if(name==='leaving the page'){
+          page.click('model-test-view-models');await page.context.lastAction;
+        }
+        if(name==='provider switch')await page.provider('Ollama');
+        assert.equal(page.value(),true);
+        assert.equal(page.node('mc-model-count').textContent,2,'same-scope refresh keeps directory changes');
+      }
+    });
+  }
+  test(`model preference ${field} keeps current POST failure feedback`,async()=>{
+    const page=await modelPreferencePage(field),pending=page.save();
+    page.finish(new Error('Current model preference error'));await pending;
+    assert.deepEqual(page.reads,[]);
+    assert.equal(page.value(),false);
+    assert.equal(page.control().disabled,false);
+    assert.equal(page.node('mc-feedback').textContent,'Current model preference error');
+    assert.equal(page.node('toast').hidden,field==='enabled');
+  });
+  test(`model preference ${field} keeps confirmed save after a failed read`,async()=>{
+    const page=await modelPreferencePage(field),pending=page.save();
+    page.failRead();page.finish();await pending;
+    assert.deepEqual(page.reads,['model-center?project=a']);
+    assert.equal(page.value(),true);
+    assert.equal(page.control().disabled,false);
+    assert.equal(page.node('mc-feedback').textContent,field==='enabled'?'模型选择范围已保存。':'');
+    assert.equal(page.node('toast').hidden,true);
+    page.node('mc-model-filter').handlers.change();
+    assert.equal(page.value(),true,'confirmed preference survives a local redraw');
+  });
+}
+
+async function modelResumePage(){
+  const page=await diagnosisPage(),api=page.context.api,posts=[],reads=[],resumed=new Set();
+  let readError;
+  page.context.api=async(path,body,options)=>{
+    if(path==='model-center/resume'){
+      await new Promise((resolve,reject)=>posts.push({body:structuredClone(body),resolve,reject}));
+      resumed.add(body.project+':'+body.provider);
+      return {saved:true,resumed_tasks:0};
+    }
+    if(path==='model-center'||path.startsWith('model-center?')){
+      reads.push(path);
+      if(readError)throw readError;
+      const snapshot=await api(path,body,options);
+      for(const provider of snapshot.providers){
+        provider.health=resumed.has(snapshot.project+':'+provider.id)
+          ?{paused:false,failures:0}:{paused:true,failures:3,code:'timeout'};
+      }
+      return snapshot;
+    }
+    return api(path,body,options);
+  };
+  await page.show('a');
+  reads.length=0;
+  return {...page,posts,reads,failRead(error){readError=error;},resume:()=>page.node('mc-resume'),feedback:()=>page.node('mc-feedback').textContent};
+}
+
+const resumeTransitions={
+  'project switch':preferenceTransitions['project switch'],
+  'project round trip':diagnosisTransitions['project round trip'],
+  'provider switch':diagnosisTransitions['provider switch'],
+  'provider round trip':diagnosisTransitions['provider round trip'],
+  'connection tab round trip':diagnosisTransitions['connection tab round trip'],
+  'returning to the page':diagnosisTransitions['returning to the page']
+};
+for(const [name,transition] of Object.entries(resumeTransitions))for(const failure of [false,true]){
+  test(`model resume keeps late ${failure?'failure':'success'} scoped after ${name}`,async()=>{
+    const page=await modelResumePage(),pending=page.click('mc-resume');
+    assert.deepEqual(page.posts.map(post=>post.body),[{provider:'ollama',project:'a'}]);
+    await transition(page);
+    const provider=page.node('mc-provider-name').textContent;
+    page.reads.length=0;
+    if(failure)page.posts[0].reject(new Error('Old resume error'));
+    else page.posts[0].resolve();
+    await pending;
+    assert.deepEqual(page.reads,failure||name==='project switch'?[]:['model-center?project=a']);
+    assert.equal(page.feedback(),'');
+    assert.equal(page.node('toast').hidden,true);
+    assert.equal(page.node('mc-provider-name').textContent,provider);
+    assert.equal(page.resume().hidden,!failure&&name!=='project switch'&&name!=='provider switch');
+  });
+}
+
+for(const outcome of ['success','POST failure','read failure'])test(`model resume keeps current ${outcome} consistent`,async()=>{
+  const page=await modelResumePage(),pending=page.click('mc-resume');
+  if(outcome==='read failure')page.failRead(new Error('Confirmation read failed'));
+  if(outcome==='POST failure')page.posts[0].reject(new Error('Current resume error'));
+  else page.posts[0].resolve();
+  await pending;
+  const failed=outcome==='POST failure';
+  assert.deepEqual(page.reads,failed?[]:['model-center?project=a']);
+  assert.equal(page.feedback(),failed?'Current resume error':'已恢复请求，下次调用将重新检查。');
+  assert.equal(page.node('toast').hidden,!failed);
+  assert.equal(page.resume().disabled,false);
+  assert.equal(page.resume().hidden,!failed);
+  assert.equal(page.node('mc-health').hidden,!failed);
+  await page.provider('OpenAI');await page.provider('Ollama');
+  assert.equal(page.resume().hidden,!failed,'local redraw preserves the confirmed health mark');
+});
+
+test('model resume prevents a duplicate POST while pending across redraws',async()=>{
+  const page=await modelResumePage(),pending=page.click('mc-resume');
+  await page.provider('OpenAI');await page.provider('Ollama');
+  assert.equal(page.resume().disabled,true);
+  page.click('mc-resume');
+  assert.equal(page.posts.length,1);
+  page.posts[0].reject(new Error('Resume failed'));await pending;
+  assert.equal(page.resume().disabled,false);
+  const retry=page.click('mc-resume');
+  assert.equal(page.posts.length,2);
+  page.posts[1].resolve();await retry;
+  assert.equal(page.resume().hidden,true);
+});
+
+test('model resume preserves a newer provider error after an earlier provider succeeds',async()=>{
+  const page=await modelResumePage(),earlier=page.click('mc-resume');
+  await page.provider('OpenAI');
+  const current=page.click('mc-resume');
+  assert.deepEqual(page.posts.map(post=>post.body),[{provider:'ollama',project:'a'},{provider:'openai',project:'a'}]);
+  page.posts[1].reject(new Error('Current provider error'));await current;
+  page.posts[0].resolve();await earlier;
+  assert.equal(page.feedback(),'Current provider error');
+  assert.equal(page.node('toast').textContent,'Current provider error');
+  assert.equal(page.resume().hidden,false);
+  await page.provider('Ollama');
+  assert.equal(page.resume().hidden,true);
+});
+
+test('model resume ignores a late confirmation-read error after switching projects',async()=>{
+  const page=await modelResumePage(),api=page.context.api;
+  let rejectRead;
+  page.context.api=(path,...args)=>path==='model-center?project=a'
+    ?new Promise((_,reject)=>{rejectRead=reject;})
+    :api(path,...args);
+  const pending=page.click('mc-resume');
+  page.posts[0].resolve();await new Promise(setImmediate);
+  assert.equal(typeof rejectRead,'function');
+  await preferenceTransitions['project switch'](page);
+  rejectRead(new Error('Old confirmation read error'));await pending;
+  assert.equal(page.feedback(),'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.resume().hidden,false);
+});
+
+for(const failure of [false,true])test(`model catalog ignores stale ${failure?'failure':'success'} after a provider round trip`,async()=>{
+  const page=await diagnosisPage(),api=page.context.api;
+  let finish,reads=0;
+  page.context.api=(path,body,options)=>{
+    if(path==='model-center/fetch')return new Promise((resolve,reject)=>{finish=()=>failure?reject(new Error('Old catalog error')):resolve({});});
+    if(path.startsWith('model-center?'))reads++;
+    return api(path,body,options);
+  };
+  const pending=page.click('mc-fetch');
+  assert.equal(page.node('mc-fetch').disabled,true);
+  await page.provider('OpenAI');await page.provider('Ollama');
+  assert.equal(page.node('mc-fetch').disabled,true);
+  finish();await pending;
+  assert.equal(reads,1,'the persisted catalog is still refreshed');
+  assert.equal(page.node('mc-feedback').textContent,'');
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.node('mc-fetch').disabled,false);
+});
+
+test('model catalog does not surface a stale snapshot error after leaving the page',async()=>{
+  const page=await diagnosisPage(),api=page.context.api;
+  let rejectSnapshot;
+  page.context.api=(path,body,options)=>{
+    if(path==='model-center/fetch')return Promise.resolve({});
+    if(path==='model-center?project=a'&&!rejectSnapshot)return new Promise((_,reject)=>{rejectSnapshot=reject;});
+    return api(path,body,options);
+  };
+  const pending=page.click('mc-fetch');await new Promise(setImmediate);
+  page.click('model-test-view-overview');
+  rejectSnapshot(new Error('Old catalog snapshot error'));await pending;
+  assert.equal(page.node('toast').hidden,true);
+  assert.equal(page.node('mc-feedback').textContent,'');
+});
+
+for(const failure of [false,true])test(`model catalog keeps current ${failure?'failure':'success'} feedback`,async()=>{
+  const page=await diagnosisPage(),api=page.context.api;
+  page.context.api=async(path,body,options)=>{
+    if(path!=='model-center/fetch')return api(path,body,options);
+    if(failure)throw new Error('Current catalog error');
+    return {};
+  };
+  await page.click('mc-fetch');
+  assert.equal(page.node('mc-feedback').textContent,failure?'Current catalog error':'模型列表已更新，原来选择的模型没有改变。');
+  assert.equal(page.node('mc-fetch').disabled,false);
 });
 
 for(const fails of [false,true])test(`catalog callback ${fails?'failure':'success'} preserves feedback after provider switch`,async()=>{

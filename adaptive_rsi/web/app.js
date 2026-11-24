@@ -686,6 +686,7 @@ function showView(name,recordHistory=true){
  if(!state){toast(t('正在连接本地服务，请稍候再提交。'));return;}
  if(!['overview','tasks','evolution','settings','models','usage'].includes(name))return;
  const models=name==='models';name=name==='tasks'?'overview':name;
+ if(view==='models'&&!models)window.RSIModelCenter?.leave?.();
  navigationSequence++;view=name;if(models)window.RSIModelCenter?.connections(false);document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+name);
  if(recordHistory)writeNavigation(models?'models':name);
  render();if(['overview','evolution'].includes(name))safe(refresh);if(models)window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null,true);window.scrollTo(0,0);
