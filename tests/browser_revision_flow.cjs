@@ -72,8 +72,10 @@ async function checkBackoffRetry(page, url, errors) {
 
   await backoffRow.getByRole('button', { name: '查看详情', exact: true }).click();
   await page.locator('#detail-dialog[open]').waitFor({ timeout: 5000 });
-  await page.locator('#detail-body .task-controls').waitFor({ timeout: 8000 });
-  const detailRetry = page.locator('#detail-body .task-controls button', { hasText: '立即重试' });
+  const controls = page.locator('#detail-body .task-controls');
+  await controls.waitFor({ timeout: 8000 });
+  const originalControls = await controls.elementHandle();
+  const detailRetry = controls.locator('button', { hasText: '立即重试' });
   assert.equal(await detailRetry.count(), 1, 'backoff detail offers an immediate retry');
   const retried = page.waitForResponse(
     response => new URL(response.url()).pathname === '/api/retry' && response.request().method() === 'POST');
@@ -90,6 +92,11 @@ async function checkBackoffRetry(page, url, errors) {
   const detail = await (await page.request.get(new URL('/api/task?id=' + taskId + '&project=' + project, url).href)).json();
   assert.equal(detail.available, 0, 'manual retry clears the backoff availability');
   assert.equal(detail.infra_retries, 0, 'manual retry clears infrastructure retries');
+  // 排队徽标本来就存在，实时轮询也可能先移除重试按钮。等详情重绘并加载完操作区再关闭。
+  await page.waitForFunction(node => !node.isConnected, originalControls, { timeout: 10000 });
+  await originalControls.dispose();
+  await controls.waitFor({ timeout: 10000 });
+  await page.locator('#detail-body .task-schedule-editor').waitFor({ state: 'attached', timeout: 10000 });
   await page.locator('#detail-body .badge').filter({ hasText: '排队中' }).waitFor({ timeout: 10000 });
   assert.equal(await page.locator('#detail-body .task-controls button', { hasText: '立即重试' }).count(), 0,
     'immediate retry disappears after the wait is cleared');
