@@ -29,11 +29,11 @@ function changedList(node,rows){const signature=JSON.stringify([projectId,langua
 const draftStore=(()=>{
  const memory=new Map();let warned=false;
  function failed(){if(!warned){warned=true;Promise.resolve().then(()=>toast(t('浏览器未能保存草稿；当前页面仍保留输入，关闭页面前请另行保存。'),true));}}
- const storageKey=()=> 'rsi-ui-drafts'+(window.__RSI_MACHINE_KEY__?':'+window.__RSI_MACHINE_KEY__:''),version=1,ttl=7*24*60*60*1000;
- function read(){if(memory.has(storageKey()))return structuredClone(memory.get(storageKey()));try{const saved=JSON.parse(sessionStorage.getItem(storageKey())||'null');if(saved?.version===version&&saved.entries)return saved;}catch{}return{version,entries:{}};}
- function get(kind,scope){const data=read(),entry=data.entries[kind]?.[scope];if(!entry)return null;if(entry.version!==version||entry.expiresAt<Date.now()){delete data.entries[kind][scope];try{sessionStorage.setItem(storageKey(),JSON.stringify(data));}catch{}return null;}return structuredClone(entry.value);}
- function set(kind,scope,value){const data=read();data.entries[kind]??={};data.entries[kind][scope]={version,savedAt:Date.now(),expiresAt:Date.now()+ttl,value:structuredClone(value)};memory.set(storageKey(),structuredClone(data));try{sessionStorage.setItem(storageKey(),JSON.stringify(data));memory.delete(storageKey());}catch{failed();}}
- function remove(kind,scope){const data=read();if(!data.entries[kind])return;delete data.entries[kind][scope];if(!Object.keys(data.entries[kind]).length)delete data.entries[kind];memory.set(storageKey(),structuredClone(data));try{sessionStorage.setItem(storageKey(),JSON.stringify(data));memory.delete(storageKey());}catch{failed();}}
+ const storageKey=(machine=window.__RSI_MACHINE_KEY__)=> 'rsi-ui-drafts'+(machine?':'+machine:''),version=1,ttl=7*24*60*60*1000;
+ function read(key){if(memory.has(key))return structuredClone(memory.get(key));try{const saved=JSON.parse(sessionStorage.getItem(key)||'null');if(saved?.version===version&&saved.entries)return saved;}catch{}return{version,entries:{}};}
+ function get(kind,scope,machine){const key=storageKey(machine),data=read(key),entry=data.entries[kind]?.[scope];if(!entry)return null;if(entry.version!==version||entry.expiresAt<Date.now()){delete data.entries[kind][scope];try{sessionStorage.setItem(key,JSON.stringify(data));}catch{}return null;}return structuredClone(entry.value);}
+ function set(kind,scope,value,machine){const key=storageKey(machine),data=read(key);data.entries[kind]??={};data.entries[kind][scope]={version,savedAt:Date.now(),expiresAt:Date.now()+ttl,value:structuredClone(value)};memory.set(key,structuredClone(data));try{sessionStorage.setItem(key,JSON.stringify(data));memory.delete(key);}catch{failed();}}
+ function remove(kind,scope,machine){const key=storageKey(machine),data=read(key);if(!data.entries[kind])return;delete data.entries[kind][scope];if(!Object.keys(data.entries[kind]).length)delete data.entries[kind];memory.set(key,structuredClone(data));try{sessionStorage.setItem(key,JSON.stringify(data));memory.delete(key);}catch{failed();}}
  return{get,set,remove};
 })();
 window.RSIDraftStore=draftStore;
@@ -264,7 +264,7 @@ async function negotiateCapabilities(){
  })();
  return serviceContractPromise;
 }
-async function sendApi(path,body,signal,{text=false}={}){
+async function sendApi(path,body,signal,{text=false,current}={}){
  const feature=featureForPath(path);
  // A failed probe returns null: let the real fetch surface the connectivity error
  // instead of misreporting it as an old service. Only a negotiated descriptor decides support.
@@ -283,6 +283,8 @@ async function sendApi(path,body,signal,{text=false}={}){
    options.headers['X-RSI-CSRF']=(await contract.json()).csrf;
   }catch{throw new TypeError(t('正在连接本地服务，请稍候再提交。'));}
  }
+ // 能力协商可能晚于导航；发送前核对归属，已发送的应答仍可用于对账。
+ requireCurrentRequest(current);
  let response;
  try{response=await fetch('/api/'+path,options);}catch(error){if(signal?.aborted)throw signal.reason??error;throw new TypeError(runtimeConnectionError());}
  signal?.throwIfAborted();
@@ -311,10 +313,14 @@ async function sendApi(path,body,signal,{text=false}={}){
  return data;
  }finally{if(timeout!==null)clearTimeout(timeout);}
 }
-async function api(path,body,{signal}={}){
+function requireCurrentRequest(current){
+ if(current&&!current())throw new DOMException('Aborted','AbortError');
+}
+async function api(path,body,{signal,current}={}){
  signal?.throwIfAborted();
  const payload=body===undefined?undefined:structuredClone(body);
- try{return await sendApi(path,payload,signal);}catch(error){if(payload===undefined||error.code!=='update_in_progress')throw error;}
+ try{return await sendApi(path,payload,signal,{current});}catch(error){if(payload===undefined||error.code!=='update_in_progress')throw error;}
+ requireCurrentRequest(current);
  toast(t('服务正在完成更新，表单已保留，恢复后自动提交。'));
  const deadline=Date.now()+120000;
  while(Date.now()<deadline){
@@ -326,12 +332,13 @@ async function api(path,body,{signal}={}){
   });
   signal?.throwIfAborted();
   let next;
-  try{next=await sendApi('state',undefined,signal);}catch(error){if(!signal?.aborted&&error instanceof TypeError)continue;throw error;}
+  try{next=await sendApi('state',undefined,signal,{current});}catch(error){if(!signal?.aborted&&error instanceof TypeError)continue;throw error;}
   signal?.throwIfAborted();
+  requireCurrentRequest(current);
   if(next.update?.busy??['downloading','restarting'].includes(next.update?.state))continue;
   state=next;
   // 只重试服务明确拒绝执行的请求；提交后断线时不重复操作。
-  try{return await sendApi(path,payload,signal);}catch(error){if(error.code!=='update_in_progress')throw error;}
+  try{return await sendApi(path,payload,signal,{current});}catch(error){if(error.code!=='update_in_progress')throw error;}
  }
  throw Error(t('更新尚未完成，已保留输入；请稍后再提交。'));
 }
@@ -415,16 +422,19 @@ async function showActivityHistory(){
 }
 function badge(status){return el('span',t(statusNames[status]||status),'badge '+(['stable','completed','pr_open','merged','verified','pass','awaiting_approval'].includes(status)?'good':['failed','fail','blocked','rolled_back','ci_failed','regressed'].includes(status)?'bad':['queued','planning','executing','evaluating'].includes(status)?'warn':'neutral'));}
 function action(text,callback,cls='button'){const node=el('button',text,cls);node.type='button';node.addEventListener('click',()=>safe(callback));return node;}
-function uiConfirm(message,content){
+function uiConfirm(message,content,{signal}={}){
  // 原生 confirm 无法跟随界面语言且风格割裂；用统一的对话框获取确认结果。
  return new Promise(resolve=>{
+  if(signal?.aborted){resolve(false);return;}
   const box=el('dialog',undefined,'confirm-dialog'),text=el('p',message),row=el('div',undefined,'confirm-actions');
   const no=el('button',t('取消'),'button');no.type='button';
   const yes=el('button',t('确认'),'button primary');yes.type='button';
   row.append(no,yes);box.append(text);if(content)box.append(content);box.append(row);document.body.append(box);
   const previousFocus=document.activeElement;
   let settled=false;
-  const finish=value=>{if(settled)return;settled=true;resolve(value);box.close();box.remove();previousFocus?.focus?.();};
+  const abort=()=>finish(false);
+  const finish=value=>{if(settled)return;settled=true;signal?.removeEventListener('abort',abort);resolve(value);box.close();box.remove();if(!signal?.aborted)previousFocus?.focus?.();};
+  signal?.addEventListener('abort',abort,{once:true});
   no.addEventListener('click',()=>finish(false));
   yes.addEventListener('click',()=>finish(true));
   box.addEventListener('cancel',event=>{event.preventDefault();finish(false);});
@@ -563,6 +573,7 @@ const known={'Project registered (paused)':'项目已接入，等待启动','Pro
  return event.message;
 }
 function render(){
+ window.RSIBatch?.viewChanged?.();
  void renderGoalRecovery();
  renderGoalReceipt();
  const project=currentProject(),tasks=scoped(state.tasks),runs=scoped(state.runs),config=project?.config||state.config;
