@@ -1035,12 +1035,18 @@ mod cache_tests {
     #[test]
     fn cache_preflight_charges_only_the_pending_unix_snapshot() {
         let cache = Path::new("/cache");
-        let before_snapshot = cache_space_required(100, true);
-        let after_snapshot = cache_space_required(100, false);
-        assert_eq!(before_snapshot, if cfg!(unix) { 400 } else { 300 });
-        assert_eq!(after_snapshot, 300);
+        let package = 1024 * 1024;
+        let before_snapshot = cache_space_required(package, true);
+        let after_snapshot = cache_space_required(package, false);
+        assert_eq!(before_snapshot, if cfg!(unix) { 4 * package } else { 3 * package });
+        assert_eq!(after_snapshot, 3 * package);
         assert_eq!(require_space(&[cache], before_snapshot, |_| Ok(before_snapshot - 1)), Err("update_disk_space".into()));
-        assert!(require_space(&[cache], after_snapshot, |_| Ok(300)).is_ok());
+        assert!(require_space(&[cache], before_snapshot, |_| Ok(before_snapshot)).is_ok());
+        let just_over_three_copies = 3 * package + 1;
+        #[cfg(unix)]
+        assert_eq!(require_space(&[cache], before_snapshot, |_| Ok(just_over_three_copies)),
+            Err("update_disk_space".into()));
+        assert!(require_space(&[cache], after_snapshot, |_| Ok(just_over_three_copies)).is_ok());
     }
 }
 

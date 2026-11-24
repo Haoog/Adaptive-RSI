@@ -195,6 +195,7 @@ class DesktopBuildScriptTest(unittest.TestCase):
             script = root / "desktop/scripts/build.mjs"
             script.parent.mkdir(parents=True)
             shutil.copyfile(library / "desktop/scripts/build.mjs", script)
+            shutil.copyfile(library / "desktop/scripts/build-config.mjs", script.with_name("build-config.mjs"))
             (root / "adaptive_rsi").mkdir()
             (root / "adaptive_rsi/__init__.py").write_text('__version__ = "1.2.3"\n')
             runner = root / "record.mjs"
