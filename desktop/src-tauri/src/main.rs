@@ -285,19 +285,11 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
                 return;
             }
         };
-        let fail = |message: String, code: &str| {
-            let state = app.state::<RuntimeState>();
-            let mut guard = state.update.lock().unwrap();
-            if let Some(update) = guard.as_mut() {
-                update.downloading.store(false, Ordering::Relaxed);
-                update.error = message;
-                update.error_code = code.to_string();
-            }
-        };
+        let fail = |message: &str, code: &str| complete_desktop_download(&state, Err((message, code)));
         let client = match update_client() {
             Ok(client) => client,
             Err(error) => {
-                fail(error, "");
+                fail(&error, "");
                 return;
             }
         };
@@ -309,18 +301,18 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
             Ok(response) if response.status().is_success() => {
                 let mut text = String::new();
                 if response.take(4097).read_to_string(&mut text).is_err() || text.len() > 4096 {
-                    fail("Checksum download failed".into(), "checksum_unavailable");
+                    fail("Checksum download failed", "checksum_unavailable");
                     return;
                 }
                 text.split_whitespace().next().unwrap_or("").to_lowercase()
             }
             _ => {
-                fail("Checksum download failed".into(), "checksum_unavailable");
+                fail("Checksum download failed", "checksum_unavailable");
                 return;
             }
         };
         if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
-            fail("Checksum unavailable".into(), "checksum_unavailable");
+            fail("Checksum unavailable", "checksum_unavailable");
             return;
         }
         let arch = match std::env::consts::ARCH {
@@ -333,54 +325,29 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
             .map(|h| std::path::PathBuf::from(h).join("Downloads"))
             .unwrap_or_else(std::env::temp_dir);
         let path = download_dir.join(format!("adaptive-rsi-{}-macos-{}-adhoc.dmg", version, arch));
-        // Previous versions may have published a verified image before attach failed.
-        // Open that image defensively and mount a fresh private copy after rechecking it.
-        let existing = match path.symlink_metadata() {
-            Ok(_) => match native_update::open_bounded_file(&path, native_update::MAX_PACKAGE as u64) {
-                Ok((file, size)) => Some((file, size)),
-                Err(_) => { fail("A download with this name already exists".into(), ""); return; }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => { fail("Cannot write download".into(), ""); return; }
-        };
-        let already_published = existing.is_some();
-        let Ok(staging) = tempfile::Builder::new().prefix(".adaptive-rsi-").tempdir_in(&download_dir) else {
-            fail("Cannot write download".into(), "");
-            return;
-        };
-        let Ok(mut staged) = tempfile::Builder::new().suffix(".dmg").tempfile_in(staging.path()) else {
-            fail("Cannot write download".into(), "");
-            return;
-        };
-        let outcome = (|| -> Result<(), String> {
-            if let Some((file, size)) = existing {
-                let count = std::io::copy(&mut file.take(size + 1), &mut staged)
-                    .map_err(|_| "Cannot read existing installer".to_string())?;
-                if count != size { return Err("Cannot read existing installer".into()); }
-                return staged.flush().map_err(|_| "Cannot write download".into());
-            }
+        let download = |staged: &mut File| -> Result<(), &'static str> {
             let mut response = client.get(&url)
                 .header("User-Agent", "Adaptive-RSI-updater")
-                .send().map_err(|_| "Download failed".to_string())?;
+                .send().map_err(|_| "Download failed")?;
             if response.status() != reqwest::StatusCode::OK {
-                return Err("Download failed".into());
+                return Err("Download failed");
             }
             let total = response.content_length().unwrap_or(0);
-            if total > native_update::MAX_PACKAGE as u64 { return Err("Download exceeds size limit".into()); }
+            if total > native_update::MAX_PACKAGE as u64 { return Err("Download exceeds size limit"); }
             let mut downloaded = 0u64;
             let mut buffer = [0u8; 65536];
             loop {
                 let read = response
                     .read(&mut buffer)
-                    .map_err(|_| "Download interrupted".to_string())?;
+                    .map_err(|_| "Download interrupted")?;
                 if read == 0 {
                     break;
                 }
                 if downloaded.saturating_add(read as u64) > native_update::MAX_PACKAGE as u64 {
-                    return Err("Download exceeds size limit".into());
+                    return Err("Download exceeds size limit");
                 }
                 staged.write_all(&buffer[..read])
-                    .map_err(|_| "Cannot write download".to_string())?;
+                    .map_err(|_| "Cannot write download")?;
                 downloaded += read as u64;
                 if total > 0 {
                     let state = app.state::<RuntimeState>();
@@ -392,71 +359,118 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
                     }
                 }
             }
-            staged.flush().map_err(|_| "Cannot write download".to_string())?;
             Ok(())
-        })();
-        if let Err(message) = outcome {
-            fail(message, "");
-            return;
-        }
-        let digest = Command::new("/usr/bin/shasum")
-            .arg("-a")
-            .arg("256")
-            .arg(staged.path())
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .and_then(|text| text.split_whitespace().next().map(str::to_lowercase))
-            .unwrap_or_default();
-        if digest != expected {
-            fail("Checksum verification failed".into(), "checksum");
-            return;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let mut child = match Command::new("/usr/bin/hdiutil").arg("attach").arg(staged.path()).spawn() {
-                Ok(child) => child,
-                Err(_) => { fail("Cannot open installer".into(), ""); return; }
-            };
-            if !wait_for_child(&mut child, Duration::from_secs(60)) {
-                let _ = child.kill();
-                let _ = child.wait();
-                fail("Cannot open installer".into(), "");
-                return;
-            }
-            if !child.wait().is_ok_and(|status| status.success()) {
-                fail("Cannot open installer".into(), "");
-                return;
-            }
-        }
-        if !already_published {
-            if let Err(error) = staged.persist_noclobber(&path) {
-                let message = if error.error.kind() == std::io::ErrorKind::AlreadyExists {
-                    "A download with this name already exists"
-                } else {
-                    "Cannot write download"
-                };
-                fail(message.into(), "");
-                return;
-            }
-        }
-        {
-            let state = app.state::<RuntimeState>();
-            let mut guard = state.update.lock().unwrap();
-            if let Some(update) = guard.as_mut() {
-                update.percent.store(10000, Ordering::Relaxed);
-                update.opened.store(true, Ordering::Relaxed);
-                update.downloading.store(false, Ordering::Relaxed);
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = &path;
+        };
+        let result = stage_legacy_dmg(&path, &expected, download, attach_legacy_dmg);
+        complete_desktop_download(&state, result);
     });
     // 闸门 try_lock 即刻完成，这里的短暂等待只把启动结果同步给前端。
     receiver
         .recv()
         .unwrap_or_else(|_| Err("Download did not start".into()))
+}
+
+fn complete_desktop_download(state: &RuntimeState, result: Result<(), (&str, &str)>) {
+    let mut guard = state.update.lock().unwrap();
+    if let Some(update) = guard.as_mut() {
+        match result {
+            Ok(()) => {
+                update.percent.store(10000, Ordering::Relaxed);
+                update.opened.store(true, Ordering::Relaxed);
+            }
+            Err((message, code)) => {
+                update.error = message.into();
+                update.error_code = code.into();
+            }
+        }
+        update.downloading.store(false, Ordering::Relaxed);
+    }
+}
+
+fn stage_legacy_dmg(
+    path: &Path,
+    expected: &str,
+    download: impl FnOnce(&mut File) -> Result<(), &'static str>,
+    attach: impl FnOnce(&Path) -> bool,
+) -> Result<(), (&'static str, &'static str)> {
+    const EXISTS: &str = "A download with this name already exists";
+    const CANNOT_WRITE: &str = "Cannot write download";
+    const CANNOT_READ: &str = "Cannot read existing installer";
+
+    // Previous versions may have published a verified image before attach failed.
+    // Open that image defensively and mount a fresh private copy after rechecking it.
+    let existing = match path.symlink_metadata() {
+        Ok(_) => Some(
+            native_update::open_bounded_file(path, native_update::MAX_PACKAGE as u64)
+                .map_err(|_| (EXISTS, ""))?,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => return Err((CANNOT_WRITE, "")),
+    };
+    let already_published = existing.is_some();
+    let download_dir = path.parent().ok_or((CANNOT_WRITE, ""))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".adaptive-rsi-")
+        .tempdir_in(download_dir)
+        .map_err(|_| (CANNOT_WRITE, ""))?;
+    let mut staged = tempfile::Builder::new()
+        .suffix(".dmg")
+        .tempfile_in(staging.path())
+        .map_err(|_| (CANNOT_WRITE, ""))?;
+    if let Some((file, size)) = existing {
+        let count = io::copy(&mut file.take(size + 1), &mut staged).map_err(|_| (CANNOT_READ, ""))?;
+        if count != size {
+            return Err((CANNOT_READ, ""));
+        }
+    } else {
+        download(staged.as_file_mut()).map_err(|message| (message, ""))?;
+    }
+    staged.flush().map_err(|_| (CANNOT_WRITE, ""))?;
+
+    let digest = Command::new("/usr/bin/shasum")
+        .arg("-a")
+        .arg("256")
+        .arg(staged.path())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| text.split_whitespace().next().map(str::to_lowercase))
+        .unwrap_or_default();
+    if digest != expected {
+        return Err(("Checksum verification failed", "checksum"));
+    }
+    if !attach(staged.path()) {
+        return Err(("Cannot open installer", ""));
+    }
+    if !already_published {
+        staged.persist_noclobber(path).map_err(|error| {
+            if error.error.kind() == io::ErrorKind::AlreadyExists {
+                (EXISTS, "")
+            } else {
+                (CANNOT_WRITE, "")
+            }
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn attach_legacy_dmg(path: &Path) -> bool {
+    let Ok(mut child) = Command::new("/usr/bin/hdiutil").arg("attach").arg(path).spawn() else {
+        return false;
+    };
+    if !wait_for_child(&mut child, Duration::from_secs(60)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    }
+    child.wait().is_ok_and(|status| status.success())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn attach_legacy_dmg(_: &Path) -> bool {
+    true
 }
 
 struct PendingChild(Option<Child>);

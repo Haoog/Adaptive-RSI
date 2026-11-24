@@ -214,6 +214,82 @@ fn update_state(downloading: bool, percent: u64) -> DesktopUpdate {
     }
 }
 
+#[cfg(target_os = "macos")]
+const LEGACY_DMG_FIXTURE: &[u8] = b"fixture DMG";
+#[cfg(target_os = "macos")]
+const LEGACY_DMG_SHA256: &str = "eac5da462cb16554774d722fa4093739ffc9ade2f4c6e8ee54041e71908f1408";
+
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_dmg_failed_open_can_be_retried_with_or_without_an_existing_image() {
+    for already_published in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("update.dmg");
+        if already_published {
+            fs::write(&path, LEGACY_DMG_FIXTURE).unwrap();
+        }
+        let state = RuntimeState::default();
+        *state.update.lock().unwrap() = Some(update_state(false, 0));
+        let gate = Mutex::new(());
+        let mut downloads = 0;
+        for opens in [false, true] {
+            let (_, _, _, _gate) = begin_desktop_download(&state, &gate).unwrap();
+            assert!(state.update.lock().unwrap().as_ref().unwrap().error.is_empty());
+            let mut staged_path = None;
+            let result = stage_legacy_dmg(
+                &path,
+                LEGACY_DMG_SHA256,
+                |file| {
+                    downloads += 1;
+                    file.write_all(LEGACY_DMG_FIXTURE).unwrap();
+                    Ok(())
+                },
+                |staged| {
+                    assert_ne!(staged, path);
+                    assert_eq!(fs::read(staged).unwrap(), LEGACY_DMG_FIXTURE);
+                    assert_eq!(path.exists(), already_published);
+                    staged_path = Some(staged.to_path_buf());
+                    opens
+                },
+            );
+            assert!(!staged_path.unwrap().parent().unwrap().exists());
+            complete_desktop_download(&state, result);
+            let guard = state.update.lock().unwrap();
+            let update = guard.as_ref().unwrap();
+            assert!(!update.downloading.load(Ordering::Relaxed));
+            assert_eq!(update.opened.load(Ordering::Relaxed), opens);
+            assert_eq!(update.error, if opens { "" } else { "Cannot open installer" });
+            if opens || already_published {
+                assert_eq!(fs::read(&path).unwrap(), LEGACY_DMG_FIXTURE);
+            } else {
+                assert!(!path.exists());
+            }
+        }
+        assert_eq!(downloads, if already_published { 0 } else { 2 });
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_dmg_does_not_replace_a_file_published_during_attach() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("update.dmg");
+    let result = stage_legacy_dmg(
+        &path,
+        LEGACY_DMG_SHA256,
+        |file| {
+            file.write_all(LEGACY_DMG_FIXTURE).unwrap();
+            Ok(())
+        },
+        |_| {
+            fs::write(&path, b"another writer's image").unwrap();
+            true
+        },
+    );
+    assert_eq!(result, Err(("A download with this name already exists", "")));
+    assert_eq!(fs::read(path).unwrap(), b"another writer's image");
+}
+
 #[test]
 fn force_recheck_never_replaces_an_inflight_download() {
     let mut update = update_state(true, 4200);
