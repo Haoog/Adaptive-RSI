@@ -1177,6 +1177,13 @@ class Store:
         return tuple(key)
 
     @staticmethod
+    def project_claim_key(now, waiting_since, worker_seconds, weight, service):
+        age = max(0, now - waiting_since)
+        if age >= 3600:
+            return (0, -age, service)
+        return (1, worker_seconds / max(1, weight), service)
+
+    @staticmethod
     def compatible_source_clause(active_sources):
         if len(active_sources) >= 2:
             return None
