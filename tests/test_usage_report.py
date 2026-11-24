@@ -6,7 +6,8 @@ import unittest
 from pathlib import Path
 
 from adaptive_rsi.store import Store
-from adaptive_rsi.usage_report import report
+from adaptive_rsi.usage import native_usage
+from adaptive_rsi.usage_report import _history_cost, report
 
 
 class UsageReportTest(unittest.TestCase):
@@ -52,6 +53,19 @@ class UsageReportTest(unittest.TestCase):
         self.assertEqual(rep['summary']['calls'], 1)
         self.assertEqual(rep['summary']['pending_calls'], 0)
         self.assertEqual(rep['summary']['failed_calls'], 0)
+
+    def test_total_only_zero_stays_unpriced_in_all_read_models(self):
+        self.store.execute("UPDATE calls SET input_price=1,output_price=2,unit_price=NULL WHERE id='c1'")
+        details = native_usage('responses', {'usage': {'total_tokens': 0}})
+        self.store.record_usage('c1', 'one', details, 1)
+        summary = self.query(project='a', task='a')
+        first = next(call for call in summary['calls'] if call['id'] == 'c1')
+        self.assertEqual((first['tokens'], first['usage_known'], first['usage_components_known'],
+                          first['price_basis'], first['estimated_usd'], first['priced']),
+                         (0, 1, 0, 'unknown', None, 0))
+        self.assertEqual(summary['summary']['component_priced_calls'], 0)
+        history = self.store.one("SELECT *,state AS call_state FROM calls WHERE id='c1'")
+        self.assertEqual(_history_cost(history)[1:], (None, 'unknown', 'unknown_price'))
 
     def test_all_report_reads_share_one_snapshot(self):
         original_query, original_stream = self.store.query, self.store.stream
@@ -290,8 +304,9 @@ class UsageReportTest(unittest.TestCase):
         db.close()
         store = Store(root)
         self.addCleanup(store.close)
-        self.assertEqual([row["version"] for row in store.schema_migrations()], list(range(1, 13)))
+        self.assertEqual([row["version"] for row in store.schema_migrations()], list(range(1, 14)))
         row = store.one("SELECT * FROM calls WHERE id='old'")
         self.assertEqual((row["tokens"], row["unit_price"], row["input_price"]), (123, 2, None))
         self.assertIsNone(row["price_basis"])
+        self.assertIsNone(row["usage_components_known"])
         self.assertEqual(row["remote_attempt"], 0)

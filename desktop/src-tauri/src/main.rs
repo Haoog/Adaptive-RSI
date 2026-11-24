@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     fs::{self, File},
-    io::{self, BufRead, BufReader, IsTerminal, Read, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -97,20 +97,33 @@ static BACKUP_BYTES: AtomicU64 = AtomicU64::new(0);
 static BACKUP_TOTAL: AtomicU64 = AtomicU64::new(0);
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
-/// Remote runtimes may expose API v1 or v2; the bundled local runtime must
-/// match the client and provide the v2 capability contract.
+const LOCAL_API_VERSION: u64 = 2;
+
+/// Remote runtimes may expose API v1 or v2.
 fn supported_remote_api(version: u64) -> bool {
     matches!(version, 1 | 2)
 }
 
+fn update_redirect_allowed(url: &reqwest::Url, hops: usize) -> bool {
+    url.scheme() == "https" && hops <= 5 && url.host_str().is_some_and(|host| {
+        let name = host.trim_end_matches('.');
+        if name == "localhost" || name.ends_with(".localhost") { return false; }
+        !host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok_and(|ip| {
+            let ip = match ip {
+                std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(ip.into(), Into::into),
+                ip => ip,
+            };
+            ip.is_loopback() || ip.is_unspecified()
+        })
+    })
+}
+
 fn update_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() > 5 {
-            attempt.error("too many redirects")
-        } else if attempt.url().scheme() == "https" {
+        if update_redirect_allowed(attempt.url(), attempt.previous().len()) {
             attempt.follow()
         } else {
-            attempt.error("updater redirects must use HTTPS")
+            attempt.error("updater redirect refused")
         }
     })
 }
@@ -285,19 +298,11 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
                 return;
             }
         };
-        let fail = |message: String, code: &str| {
-            let state = app.state::<RuntimeState>();
-            let mut guard = state.update.lock().unwrap();
-            if let Some(update) = guard.as_mut() {
-                update.downloading.store(false, Ordering::Relaxed);
-                update.error = message;
-                update.error_code = code.to_string();
-            }
-        };
+        let fail = |message: &str, code: &str| complete_desktop_download(&state, Err((message, code)));
         let client = match update_client() {
             Ok(client) => client,
             Err(error) => {
-                fail(error, "");
+                fail(&error, "");
                 return;
             }
         };
@@ -309,18 +314,18 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
             Ok(response) if response.status().is_success() => {
                 let mut text = String::new();
                 if response.take(4097).read_to_string(&mut text).is_err() || text.len() > 4096 {
-                    fail("Checksum download failed".into(), "checksum_unavailable");
+                    fail("Checksum download failed", "checksum_unavailable");
                     return;
                 }
                 text.split_whitespace().next().unwrap_or("").to_lowercase()
             }
             _ => {
-                fail("Checksum download failed".into(), "checksum_unavailable");
+                fail("Checksum download failed", "checksum_unavailable");
                 return;
             }
         };
         if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
-            fail("Checksum unavailable".into(), "checksum_unavailable");
+            fail("Checksum unavailable", "checksum_unavailable");
             return;
         }
         let arch = match std::env::consts::ARCH {
@@ -333,54 +338,29 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
             .map(|h| std::path::PathBuf::from(h).join("Downloads"))
             .unwrap_or_else(std::env::temp_dir);
         let path = download_dir.join(format!("adaptive-rsi-{}-macos-{}-adhoc.dmg", version, arch));
-        // Previous versions may have published a verified image before attach failed.
-        // Open that image defensively and mount a fresh private copy after rechecking it.
-        let existing = match path.symlink_metadata() {
-            Ok(_) => match native_update::open_bounded_file(&path, native_update::MAX_PACKAGE as u64) {
-                Ok((file, size)) => Some((file, size)),
-                Err(_) => { fail("A download with this name already exists".into(), ""); return; }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => { fail("Cannot write download".into(), ""); return; }
-        };
-        let already_published = existing.is_some();
-        let Ok(staging) = tempfile::Builder::new().prefix(".adaptive-rsi-").tempdir_in(&download_dir) else {
-            fail("Cannot write download".into(), "");
-            return;
-        };
-        let Ok(mut staged) = tempfile::Builder::new().suffix(".dmg").tempfile_in(staging.path()) else {
-            fail("Cannot write download".into(), "");
-            return;
-        };
-        let outcome = (|| -> Result<(), String> {
-            if let Some((file, size)) = existing {
-                let count = std::io::copy(&mut file.take(size + 1), &mut staged)
-                    .map_err(|_| "Cannot read existing installer".to_string())?;
-                if count != size { return Err("Cannot read existing installer".into()); }
-                return staged.flush().map_err(|_| "Cannot write download".into());
-            }
+        let download = |staged: &mut File| -> Result<(), &'static str> {
             let mut response = client.get(&url)
                 .header("User-Agent", "Adaptive-RSI-updater")
-                .send().map_err(|_| "Download failed".to_string())?;
+                .send().map_err(|_| "Download failed")?;
             if response.status() != reqwest::StatusCode::OK {
-                return Err("Download failed".into());
+                return Err("Download failed");
             }
             let total = response.content_length().unwrap_or(0);
-            if total > native_update::MAX_PACKAGE as u64 { return Err("Download exceeds size limit".into()); }
+            if total > native_update::MAX_PACKAGE as u64 { return Err("Download exceeds size limit"); }
             let mut downloaded = 0u64;
             let mut buffer = [0u8; 65536];
             loop {
                 let read = response
                     .read(&mut buffer)
-                    .map_err(|_| "Download interrupted".to_string())?;
+                    .map_err(|_| "Download interrupted")?;
                 if read == 0 {
                     break;
                 }
                 if downloaded.saturating_add(read as u64) > native_update::MAX_PACKAGE as u64 {
-                    return Err("Download exceeds size limit".into());
+                    return Err("Download exceeds size limit");
                 }
                 staged.write_all(&buffer[..read])
-                    .map_err(|_| "Cannot write download".to_string())?;
+                    .map_err(|_| "Cannot write download")?;
                 downloaded += read as u64;
                 if total > 0 {
                     let state = app.state::<RuntimeState>();
@@ -392,71 +372,118 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
                     }
                 }
             }
-            staged.flush().map_err(|_| "Cannot write download".to_string())?;
             Ok(())
-        })();
-        if let Err(message) = outcome {
-            fail(message, "");
-            return;
-        }
-        let digest = Command::new("/usr/bin/shasum")
-            .arg("-a")
-            .arg("256")
-            .arg(staged.path())
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .and_then(|text| text.split_whitespace().next().map(str::to_lowercase))
-            .unwrap_or_default();
-        if digest != expected {
-            fail("Checksum verification failed".into(), "checksum");
-            return;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let mut child = match Command::new("/usr/bin/hdiutil").arg("attach").arg(staged.path()).spawn() {
-                Ok(child) => child,
-                Err(_) => { fail("Cannot open installer".into(), ""); return; }
-            };
-            if !wait_for_child(&mut child, Duration::from_secs(60)) {
-                let _ = child.kill();
-                let _ = child.wait();
-                fail("Cannot open installer".into(), "");
-                return;
-            }
-            if !child.wait().is_ok_and(|status| status.success()) {
-                fail("Cannot open installer".into(), "");
-                return;
-            }
-        }
-        if !already_published {
-            if let Err(error) = staged.persist_noclobber(&path) {
-                let message = if error.error.kind() == std::io::ErrorKind::AlreadyExists {
-                    "A download with this name already exists"
-                } else {
-                    "Cannot write download"
-                };
-                fail(message.into(), "");
-                return;
-            }
-        }
-        {
-            let state = app.state::<RuntimeState>();
-            let mut guard = state.update.lock().unwrap();
-            if let Some(update) = guard.as_mut() {
-                update.percent.store(10000, Ordering::Relaxed);
-                update.opened.store(true, Ordering::Relaxed);
-                update.downloading.store(false, Ordering::Relaxed);
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = &path;
+        };
+        let result = stage_legacy_dmg(&path, &expected, download, attach_legacy_dmg);
+        complete_desktop_download(&state, result);
     });
     // 闸门 try_lock 即刻完成，这里的短暂等待只把启动结果同步给前端。
     receiver
         .recv()
         .unwrap_or_else(|_| Err("Download did not start".into()))
+}
+
+fn complete_desktop_download(state: &RuntimeState, result: Result<(), (&str, &str)>) {
+    let mut guard = state.update.lock().unwrap();
+    if let Some(update) = guard.as_mut() {
+        match result {
+            Ok(()) => {
+                update.percent.store(10000, Ordering::Relaxed);
+                update.opened.store(true, Ordering::Relaxed);
+            }
+            Err((message, code)) => {
+                update.error = message.into();
+                update.error_code = code.into();
+            }
+        }
+        update.downloading.store(false, Ordering::Relaxed);
+    }
+}
+
+fn stage_legacy_dmg(
+    path: &Path,
+    expected: &str,
+    download: impl FnOnce(&mut File) -> Result<(), &'static str>,
+    attach: impl FnOnce(&Path) -> bool,
+) -> Result<(), (&'static str, &'static str)> {
+    const EXISTS: &str = "A download with this name already exists";
+    const CANNOT_WRITE: &str = "Cannot write download";
+    const CANNOT_READ: &str = "Cannot read existing installer";
+
+    // Previous versions may have published a verified image before attach failed.
+    // Open that image defensively and mount a fresh private copy after rechecking it.
+    let existing = match path.symlink_metadata() {
+        Ok(_) => Some(
+            native_update::open_bounded_file(path, native_update::MAX_PACKAGE as u64)
+                .map_err(|_| (EXISTS, ""))?,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => return Err((CANNOT_WRITE, "")),
+    };
+    let already_published = existing.is_some();
+    let download_dir = path.parent().ok_or((CANNOT_WRITE, ""))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".adaptive-rsi-")
+        .tempdir_in(download_dir)
+        .map_err(|_| (CANNOT_WRITE, ""))?;
+    let mut staged = tempfile::Builder::new()
+        .suffix(".dmg")
+        .tempfile_in(staging.path())
+        .map_err(|_| (CANNOT_WRITE, ""))?;
+    if let Some((file, size)) = existing {
+        let count = io::copy(&mut file.take(size + 1), &mut staged).map_err(|_| (CANNOT_READ, ""))?;
+        if count != size {
+            return Err((CANNOT_READ, ""));
+        }
+    } else {
+        download(staged.as_file_mut()).map_err(|message| (message, ""))?;
+    }
+    staged.flush().map_err(|_| (CANNOT_WRITE, ""))?;
+
+    let digest = Command::new("/usr/bin/shasum")
+        .arg("-a")
+        .arg("256")
+        .arg(staged.path())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| text.split_whitespace().next().map(str::to_lowercase))
+        .unwrap_or_default();
+    if digest != expected {
+        return Err(("Checksum verification failed", "checksum"));
+    }
+    if !attach(staged.path()) {
+        return Err(("Cannot open installer", ""));
+    }
+    if !already_published {
+        staged.persist_noclobber(path).map_err(|error| {
+            if error.error.kind() == io::ErrorKind::AlreadyExists {
+                (EXISTS, "")
+            } else {
+                (CANNOT_WRITE, "")
+            }
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn attach_legacy_dmg(path: &Path) -> bool {
+    let Ok(mut child) = Command::new("/usr/bin/hdiutil").arg("attach").arg(path).spawn() else {
+        return false;
+    };
+    if !wait_for_child(&mut child, Duration::from_secs(60)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    }
+    child.wait().is_ok_and(|status| status.success())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn attach_legacy_dmg(_: &Path) -> bool {
+    true
 }
 
 struct PendingChild(Option<Child>);
@@ -507,29 +534,48 @@ fn handshake_stream<R: Read + Send + 'static>(
     const MAX_HANDSHAKE_LINE: usize = 64 * 1024;
     let (sender, receiver) = std::sync::mpsc::sync_channel(4);
     std::thread::spawn(move || {
-        let mut reader = BufReader::new(reader);
+        let mut reader = reader;
+        let mut pending = vec![0; MAX_HANDSHAKE_LINE + 1];
+        let mut len = 0;
         loop {
-            let mut bytes = Vec::new();
-            match (&mut reader).take((MAX_HANDSHAKE_LINE + 1) as u64).read_until(b'\n', &mut bytes) {
-                Ok(0) => break,
-                Ok(_) if bytes.len() > MAX_HANDSHAKE_LINE => {
-                    let _ = sender.send(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "runtime handshake line exceeds bound",
-                    )));
+            // Pass the remaining allowance directly to Read, including one byte
+            // to distinguish a full line from an oversized line without waiting for EOF.
+            let count = match reader.read(&mut pending[len..]) {
+                Ok(0) => {
+                    if len != 0 {
+                        let _ = sender.send(Ok(String::from_utf8_lossy(&pending[..len]).into_owned()));
+                    }
                     break;
                 }
-                Ok(_) => {
-                    let line = String::from_utf8_lossy(&bytes).into_owned();
-                    if sender.send(Ok(line)).is_err() {
-                        break;
-                    }
-                }
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => {
                     let _ = sender.send(Err(error));
                     break;
                 }
+            };
+            let mut start = 0;
+            let end = len + count;
+            for index in len..end {
+                if index - start == MAX_HANDSHAKE_LINE {
+                    let _ = sender.send(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "runtime handshake line exceeds bound",
+                    )));
+                    return;
+                }
+                if pending[index] == b'\n' {
+                    let line = String::from_utf8_lossy(&pending[start..=index]).into_owned();
+                    if sender.send(Ok(line)).is_err() {
+                        return;
+                    }
+                    start = index + 1;
+                }
             }
+            if start != 0 {
+                pending.copy_within(start..end, 0);
+            }
+            len = end - start;
         }
     });
     receiver
@@ -933,7 +979,34 @@ fn bootstrap_local(app: &tauri::AppHandle, select: bool) -> Result<(), String> {
         .stderr(Stdio::from(log))
         .spawn()
         .map_err(|_| "Cannot start bundled runtime")?;
-    let mut child = PendingChild::new(child);
+    let desktop_version = app.package_info().version.to_string();
+    let (mut child, connection, service_pid, receiver) =
+        handshake_local_runtime(PendingChild::new(child), &desktop_version, health_deadline)?;
+    let state = app.state::<RuntimeState>();
+    startup_budget(health_deadline)?;
+    let generation = publish_local_runtime(&state, child.take(), connection, select);
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        while let Ok(Ok(line)) = receiver.recv() {
+            let Ok(session) = serde_json::from_str::<Session>(&line) else {
+                continue;
+            };
+            if session.rotated {
+                let state = handle.state::<RuntimeState>();
+                let _ = publish_runtime_session(&state, generation, service_pid, session);
+            }
+        }
+    });
+    Ok(())
+}
+
+type HandshakeLines = std::sync::mpsc::Receiver<io::Result<String>>;
+
+fn handshake_local_runtime(
+    mut child: PendingChild,
+    desktop_version: &str,
+    health_deadline: std::time::Instant,
+) -> Result<(PendingChild, Connection, u32, HandshakeLines), String> {
     let stdout = child
         .get_mut()
         .stdout
@@ -992,10 +1065,10 @@ fn bootstrap_local(app: &tauri::AppHandle, select: bool) -> Result<(), String> {
                 }
                 let version = health["api_version"].as_u64().unwrap_or(0);
                 if connection.owned {
-                    if version != 2 || health["version"].as_str() != Some(app.package_info().version.to_string().as_str()) {
+                    if version != LOCAL_API_VERSION || health["version"].as_str() != Some(desktop_version) {
                         return Err("Bundled runtime version or API is incompatible".into());
                     }
-                } else if !supported_remote_api(version) {
+                } else if version != LOCAL_API_VERSION {
                     return Err("Existing local runtime API is incompatible".into());
                 }
                 if connection.owned {
@@ -1031,22 +1104,7 @@ fn bootstrap_local(app: &tauri::AppHandle, select: bool) -> Result<(), String> {
                 .min(health_deadline.saturating_duration_since(std::time::Instant::now())),
         );
     }
-    let state = app.state::<RuntimeState>();
-    startup_budget(health_deadline)?;
-    let generation = publish_local_runtime(&state, child.take(), connection, select);
-    let handle = app.clone();
-    std::thread::spawn(move || {
-        while let Ok(Ok(line)) = receiver.recv() {
-            let Ok(session) = serde_json::from_str::<Session>(&line) else {
-                continue;
-            };
-            if session.rotated {
-                let state = handle.state::<RuntimeState>();
-                let _ = publish_runtime_session(&state, generation, service_pid, session);
-            }
-        }
-    });
-    Ok(())
+    Ok((child, connection, service_pid, receiver))
 }
 #[tauri::command]
 fn backup_download_status(cancel: bool) -> Value {
@@ -1239,6 +1297,7 @@ fn quit_gracefully(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 const MAX_CONNECTION_URL_BYTES: usize = 8192;
+const REMOTE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const SSH_TUNNEL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(12);
 const SSH_TUNNEL_STDIN_TIMEOUT: Duration = Duration::from_secs(15);
 const SSH_TUNNEL_STDIN_ARG: &str = "--connect-ssh-tunnel-stdin";
@@ -1359,24 +1418,19 @@ fn parse_remote_url(input: &str) -> Result<reqwest::Url, String> {
 
 fn remote_connection(target: RemoteTarget) -> Result<(Connection, Value), String> {
     let RemoteTarget { url, ssh_tunnel } = target;
+    let timeout = if ssh_tunnel { SSH_TUNNEL_HANDSHAKE_TIMEOUT } else { REMOTE_HANDSHAKE_TIMEOUT };
+    let deadline = std::time::Instant::now() + timeout;
     let origin = url.origin().ascii_serialization();
     let (client, transport) = transport::clients()?;
-    let deadline = std::time::Instant::now() + SSH_TUNNEL_HANDSHAKE_TIMEOUT;
-    let handshake_timeout = || -> Result<Option<Duration>, String> {
-        if !ssh_tunnel {
-            return Ok(None);
-        }
+    let handshake_timeout = || -> Result<Duration, String> {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return Err("SSH tunnel handshake timed out".into());
+            return Err(if ssh_tunnel { "SSH tunnel handshake timed out" } else { "Server connection failed" }.into());
         }
-        Ok(Some(remaining))
+        Ok(remaining)
     };
-    let mut request = client.get(url);
-    if let Some(timeout) = handshake_timeout()? {
-        request = request.timeout(timeout);
-    }
-    let response = request
+    let response = client.get(url)
+        .timeout(handshake_timeout()?)
         .send()
         .map_err(|_| "Server connection failed".to_string())?;
     let mut tunnel_cookie = None;
@@ -1408,7 +1462,7 @@ fn remote_connection(target: RemoteTarget) -> Result<(Connection, Value), String
         name: origin,
         owned: false,
     };
-    let (health, _) = call_with_session(&connection, "health", None, handshake_timeout()?)?;
+    let (health, _) = call_with_session(&connection, "health", None, Some(handshake_timeout()?))?;
     if health.status != 200 {
         return Err(format!("Runtime health check failed (HTTP {})", health.status));
     }
@@ -1423,7 +1477,7 @@ fn remote_connection(target: RemoteTarget) -> Result<(Connection, Value), String
         "capabilities": value.get("capabilities").cloned().unwrap_or_else(|| json!([])),
     });
     let (response, _) =
-        call_with_session(&connection, "state?sections=core", None, handshake_timeout()?)?;
+        call_with_session(&connection, "state?sections=core", None, Some(handshake_timeout()?))?;
     if response.status != 200 {
         return Err(format!("Runtime state check failed (HTTP {})", response.status));
     }
@@ -1470,7 +1524,7 @@ async fn switch_runtime_locked(state: &RuntimeState, remote: Option<RemoteTarget
             };
             reply.status == 200 && serde_json::from_str::<Value>(&reply.body).ok()
                 .and_then(|health| health["api_version"].as_u64())
-                .is_some_and(supported_remote_api)
+                == Some(LOCAL_API_VERSION)
         }).await.map_err(|_| "Local runtime check interrupted")?;
         if !healthy {
             return Err("Local runtime is unavailable".into());
@@ -1885,7 +1939,26 @@ mod regression_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{net::TcpListener, sync::Arc};
+    use std::{io::BufReader, net::TcpListener, sync::Arc};
+
+    static BACKUP_TEST_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct BackupTestActivity;
+
+    impl BackupTestActivity {
+        fn begin() -> Self {
+            BACKUP_ACTIVITY.store(BACKUP_DOWNLOADING, Ordering::SeqCst);
+            BACKUP_BYTES.store(0, Ordering::Relaxed);
+            BACKUP_TOTAL.store(0, Ordering::Relaxed);
+            Self
+        }
+    }
+
+    impl Drop for BackupTestActivity {
+        fn drop(&mut self) {
+            BACKUP_ACTIVITY.store(BACKUP_IDLE, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn startup_log_keeps_only_current_and_previous_runs() {
@@ -2105,6 +2178,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ordinary_remote_handshake_shares_one_deadline_across_root_health_and_state() {
+        let steps = [
+            ("/?token=fixture", ""),
+            ("/api/health", r#"{"api_version":1}"#),
+            ("/api/state?sections=core", r#"{"csrf":"fixture"}"#),
+        ];
+        for (stall_at, expected_error) in ["Server connection failed", "Cannot read response", "Cannot read response"].into_iter().enumerate() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            // Loopback HTTP exercises the ordinary remote handshake without a TLS fixture.
+            let target = RemoteTarget {
+                url: reqwest::Url::parse(&format!("http://{}/?token=fixture", listener.local_addr().unwrap())).unwrap(),
+                ssh_tunnel: false,
+            };
+            let worker = std::thread::spawn(move || {
+                for &(path, body) in &steps[..stall_at] {
+                    let (stream, _) = receive_request(&listener, path);
+                    std::thread::sleep(Duration::from_millis(1500));
+                    answer_request(stream, 200, "", body);
+                }
+                let (mut stream, _) = receive_request(&listener, steps[stall_at].0);
+                if stall_at != 0 {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{").unwrap();
+                }
+                stream.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+                assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+            });
+            let started = std::time::Instant::now();
+            let error = remote_connection(target).err().unwrap();
+            assert_eq!(error, expected_error);
+            assert!((Duration::from_secs(5)..Duration::from_secs(6)).contains(&started.elapsed()));
+            worker.join().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn remote_switch_validates_handshake_before_cancelling_or_replacing_the_target() {
         const HEALTH: &str = r#"{"api_version":2,"capabilities":["fixture"]}"#;
@@ -2118,6 +2226,7 @@ mod tests {
             ((200, HEALTH), Some((200, r#"{"csrf":" "}"#)), Some("Missing runtime authentication")),
             ((200, HEALTH), Some((200, r#"{"csrf":"bad\nvalue"}"#)), Some("Missing runtime authentication")),
             ((200, HEALTH), Some((200, STATE)), None),
+            ((200, r#"{"api_version":1,"capabilities":["fixture"]}"#), Some((200, STATE)), None),
         ] {
             let old = TcpListener::bind("127.0.0.1:0").unwrap();
             let old_origin = format!("http://{}", old.local_addr().unwrap());
@@ -2196,7 +2305,8 @@ mod tests {
             } else {
                 let snapshot = result.unwrap();
                 assert_eq!(snapshot["scope"], candidate_origin);
-                assert_eq!(snapshot["api_version"], 2);
+                let health: Value = serde_json::from_str(health.1).unwrap();
+                assert_eq!(snapshot["api_version"], health["api_version"]);
                 assert_eq!(snapshot["capabilities"], json!(["fixture"]));
                 assert_eq!(runtime_snapshot(&state), snapshot);
                 assert_eq!(slow.await.unwrap().err().as_deref(), Some("Request cancelled"));
@@ -2271,7 +2381,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let worker = std::thread::spawn(move || {
-            for (status, body) in [(503, "{}"), (200, r#"{"api_version":2}"#)] {
+            for (status, body) in [(503, "{}"), (200, r#"{"api_version":1}"#), (200, r#"{"api_version":2}"#)] {
                 let (stream, headers) = receive_request(&listener, "/api/health");
                 assert!(headers.contains("cookie: rsi_fixture=local\r\n"));
                 answer_request(stream, status, "", body);
@@ -2290,8 +2400,10 @@ mod tests {
         });
         *state.remote_meta.lock().unwrap() = json!({"scope":"ssh:fixture","api_version":2});
         let before = runtime_snapshot(&state);
-        assert_eq!(switch_runtime(&state, None).await.unwrap_err(), "Local runtime is unavailable");
-        assert_eq!(runtime_snapshot(&state), before);
+        for _ in 0..2 {
+            assert_eq!(switch_runtime(&state, None).await.unwrap_err(), "Local runtime is unavailable");
+            assert_eq!(runtime_snapshot(&state), before);
+        }
         let after = switch_runtime(&state, None).await.unwrap();
         assert_eq!(after["kind"], "local");
         assert_eq!(after["name"], "local");
@@ -2353,13 +2465,16 @@ mod tests {
 
     #[tokio::test]
     async fn backup_validates_response_cancels_stalled_bodies_and_preserves_existing_files() {
+        let _gate = BACKUP_TEST_GATE.lock().await;
+        let _activity = BackupTestActivity::begin();
+        let persist = |staging: tempfile::NamedTempFile, path: &Path| staging.persist_noclobber(path);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let (stalled, ready) = tokio::sync::oneshot::channel();
         let (finish, stop) = std::sync::mpsc::channel();
-        let valid = format!("SQLite format 3\0\x02\0\x01\x01\0\x40\x20\x20{}", "\0".repeat(488));
+        let valid = backup_fixture(512);
         let body = valid.clone();
-        let large_length = (1_u64 << 30) + 512;
+        let large_length = 1_u64 << 30;
         let worker = std::thread::spawn(move || {
             for (status, mime, data) in [
                 (204, "application/vnd.sqlite3", ""),
@@ -2370,14 +2485,15 @@ mod tests {
                 let (stream, _) = receive_request(&listener, "/api/backup?id=fixture");
                 answer_request(stream, status, &format!("Content-Type: {mime}\r\n"), data);
             }
+            let (mut stream, _) = receive_request(&listener, "/api/backup?id=fixture");
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.sqlite3\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", large_length + 512).unwrap();
+            drop(stream);
             for data in [&body[..0], &body[..0], body.as_str()] {
                 let (mut stream, _) = receive_request(&listener, "/api/backup?id=fixture");
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.sqlite3\r\nContent-Length: {large_length}\r\nConnection: close\r\n\r\n{data}").unwrap();
             }
-            for _ in 0..2 {
-                let (stream, _) = receive_request(&listener, "/api/backup?id=fixture");
-                answer_request(stream, 200, "Content-Type: application/vnd.sqlite3\r\n", &body);
-            }
+            let (stream, _) = receive_request(&listener, "/api/backup?id=fixture");
+            answer_request(stream, 200, "Content-Type: application/vnd.sqlite3\r\n", &body);
             let (mut stream, _) = receive_request(&listener, "/api/backup?id=fixture");
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.sqlite3\r\nContent-Length: {large_length}\r\n\r\n{body}").unwrap();
             stalled.send(()).unwrap();
@@ -2390,20 +2506,19 @@ mod tests {
         };
         let folder = tempfile::tempdir().unwrap();
         let destination = folder.path().join("backup.sqlite3");
-        for error in ["Invalid backup response", "Invalid backup response", "Invalid backup size", "Backup response is not a SQLite database"] {
+        for error in ["Invalid backup response", "Invalid backup response", "Invalid backup size", "Backup response is not a SQLite database", "Invalid backup size"] {
             assert_eq!(transport::save_backup(&connection, "fixture", &destination).await.unwrap_err(), error);
             assert_eq!(folder.path().read_dir().unwrap().count(), 0);
         }
-        BACKUP_ACTIVITY.store(BACKUP_DOWNLOADING, Ordering::SeqCst);
         for (free, expected) in [
             (Ok(large_length - 1), "Not enough disk space for backup"),
             (Err(std::io::ErrorKind::PermissionDenied.into()), "Cannot check available backup disk space"),
             (Ok(large_length), "Cannot read backup"),
         ] {
-            let error = transport::save_backup_with_available_space(&connection, "fixture", &destination, |path| {
+            let error = transport::save_backup_with(&connection, "fixture", &destination, |path| {
                 assert_eq!(path, folder.path());
                 free
-            }).await.unwrap_err();
+            }, persist).await.unwrap_err();
             assert_eq!(error, expected);
             assert_eq!(folder.path().read_dir().unwrap().count(), 0);
         }
@@ -2414,7 +2529,7 @@ mod tests {
         std::fs::write(&destination, b"existing").unwrap();
         BACKUP_ACTIVITY.store(BACKUP_DOWNLOADING, Ordering::SeqCst);
         assert_eq!(transport::save_backup(&connection, "fixture", &destination).await.unwrap_err(),
-            "Cannot publish backup; choose a new filename");
+            "Choose a new backup filename");
         assert_eq!(std::fs::read(&destination).unwrap(), b"existing");
 
         let cancelled_destination = folder.path().join("cancelled.sqlite3");
@@ -2424,7 +2539,7 @@ mod tests {
             tokio::select! {
                 biased;
                 _ = backup_cancelled() => true,
-                _ = transport::save_backup_with_available_space(&connection, "fixture", &cancelled_destination, |_| Ok(large_length)) => false,
+                _ = transport::save_backup_with(&connection, "fixture", &cancelled_destination, |_| Ok(large_length), persist) => false,
             }
         };
         let cancel = async {
@@ -2442,6 +2557,159 @@ mod tests {
         worker.join().unwrap();
         assert!(result.unwrap().0);
         assert_eq!(folder.path().read_dir().unwrap().count(), 1);
+    }
+
+    fn backup_fixture(size: usize) -> String {
+        format!("SQLite format 3\0\x02\0\x01\x01\0\x40\x20\x20{}", "\0".repeat(size - 24))
+    }
+
+    async fn backup_connection(listener: &TcpListener) -> Connection {
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (client, transport) = tauri::async_runtime::spawn_blocking(transport::clients).await.unwrap().unwrap();
+        Connection {
+            client, transport, origin: origin.clone(), csrf_origin: origin,
+            cookie: None, csrf: String::new(), name: "fixture".into(), owned: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_refuses_existing_destination_before_sending_a_request() {
+        let _gate = BACKUP_TEST_GATE.lock().await;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let connection = backup_connection(&listener).await;
+        let folder = tempfile::tempdir().unwrap();
+        let destination = folder.path().join("existing.sqlite3");
+        fs::write(&destination, b"existing").unwrap();
+        assert_eq!(transport::save_backup(&connection, "fixture", &destination).await.unwrap_err(),
+            "Choose a new backup filename");
+        assert_eq!(fs::read(&destination).unwrap(), b"existing");
+        #[cfg(unix)]
+        {
+            let link = folder.path().join("link.sqlite3");
+            std::os::unix::fs::symlink(folder.path().join("missing"), &link).unwrap();
+            assert_eq!(transport::save_backup(&connection, "fixture", &link).await.unwrap_err(),
+                "Choose a new backup filename");
+        }
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(listener.accept().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        tauri::async_runtime::spawn_blocking(move || drop(connection)).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backup_publication_falls_back_on_link_errors_and_cleans_staging() {
+        use io::ErrorKind;
+
+        let _gate = BACKUP_TEST_GATE.lock().await;
+        let cases = [
+            (Some(ErrorKind::Unsupported), false, false, true),
+            (Some(ErrorKind::CrossesDevices), false, false, true),
+            (Some(ErrorKind::PermissionDenied), false, false, true),
+            (Some(ErrorKind::Unsupported), true, false, false),
+            (None, true, false, false),
+            (Some(ErrorKind::Other), false, false, false),
+            (Some(ErrorKind::Unsupported), false, true, false),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let connection = backup_connection(&listener).await;
+        let valid = backup_fixture(512);
+        let body = valid.clone();
+        let worker = std::thread::spawn(move || {
+            for _ in cases {
+                let (stream, _) = receive_request(&listener, "/api/backup?id=fixture");
+                answer_request(stream, 200, "Content-Type: application/vnd.sqlite3\r\n", &body);
+            }
+        });
+        for (link_error, claimed, unreadable, succeeds) in cases {
+            let _activity = BackupTestActivity::begin();
+            let folder = tempfile::tempdir().unwrap();
+            let destination = folder.path().join("backup.sqlite3");
+            let result = transport::save_backup_with(&connection, "fixture", &destination, |_| Ok(4096), |staging, path| {
+                if claimed {
+                    fs::write(path, b"claimed during download").unwrap();
+                }
+                let staging = if unreadable {
+                    let file = fs::OpenOptions::new().write(true).open(staging.path()).unwrap();
+                    let (_, temp_path) = staging.into_parts();
+                    tempfile::NamedTempFile::from_parts(file, temp_path)
+                } else {
+                    staging
+                };
+                match link_error {
+                    Some(error) => Err(tempfile::PersistError { error: error.into(), file: staging }),
+                    None => staging.persist_noclobber(path),
+                }
+            }).await;
+            if succeeds {
+                result.unwrap();
+                assert_eq!(fs::read(&destination).unwrap(), valid.as_bytes());
+            } else {
+                assert_eq!(result.unwrap_err(), "Cannot publish backup; choose a new filename");
+                if claimed {
+                    assert_eq!(fs::read(&destination).unwrap(), b"claimed during download");
+                }
+            }
+            assert_eq!(folder.path().read_dir().unwrap().count(), usize::from(succeeds || claimed));
+        }
+        worker.join().unwrap();
+        tauri::async_runtime::spawn_blocking(move || drop(connection)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backup_with_progress_can_finish_after_120_seconds() {
+        let _gate = BACKUP_TEST_GATE.lock().await;
+        let _activity = BackupTestActivity::begin();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let connection = backup_connection(&listener).await;
+        let body = backup_fixture(8 * 1024 * 1024);
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = receive_request(&listener, "/api/backup?id=fixture");
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.sqlite3\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
+            let started = std::time::Instant::now();
+            stream.write_all(&body.as_bytes()[..512]).unwrap();
+            for index in 1..=5 {
+                let next = started + Duration::from_secs(25 * index);
+                std::thread::sleep(next.saturating_duration_since(std::time::Instant::now()));
+                let offset = (index as usize) * 512;
+                let end = if index == 5 { body.len() } else { offset + 512 };
+                stream.write_all(&body.as_bytes()[offset..end]).unwrap();
+            }
+            body
+        });
+        let folder = tempfile::tempdir().unwrap();
+        let destination = folder.path().join("backup.sqlite3");
+        let started = std::time::Instant::now();
+        transport::save_backup(&connection, "fixture", &destination).await.unwrap();
+        assert!(started.elapsed() > Duration::from_secs(120));
+        assert_eq!(fs::read(&destination).unwrap(), worker.join().unwrap().as_bytes());
+        assert_eq!(folder.path().read_dir().unwrap().count(), 1);
+        tauri::async_runtime::spawn_blocking(move || drop(connection)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backup_idle_timeout_removes_staging_when_progress_stops() {
+        let _gate = BACKUP_TEST_GATE.lock().await;
+        let _activity = BackupTestActivity::begin();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let connection = backup_connection(&listener).await;
+        let (release, hold) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = receive_request(&listener, "/api/backup?id=fixture");
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.sqlite3\r\nContent-Length: 1024\r\n\r\n{}", backup_fixture(512)).unwrap();
+            hold.recv_timeout(Duration::from_secs(40)).unwrap();
+        });
+        let folder = tempfile::tempdir().unwrap();
+        let destination = folder.path().join("backup.sqlite3");
+        let started = std::time::Instant::now();
+        let result = transport::save_backup(&connection, "fixture", &destination).await;
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        assert_eq!(result.unwrap_err(), "Backup response stalled");
+        assert!((Duration::from_secs(30)..Duration::from_secs(40)).contains(&elapsed));
+        assert_eq!(BACKUP_BYTES.load(Ordering::Relaxed), 512);
+        assert_eq!(folder.path().read_dir().unwrap().count(), 0);
+        worker.join().unwrap();
+        tauri::async_runtime::spawn_blocking(move || drop(connection)).await.unwrap();
     }
 
     #[test]
@@ -2516,6 +2784,91 @@ mod tests {
             200
         );
         worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn fake_local_runtime(listener: &TcpListener, owned: bool) -> (PendingChild, u32) {
+        let script = r#"
+            printf '{"origin":"%s","cookie":"rsi_fixture","token":"fixture","csrf":"fixture","owned":%s,"pid":%s}\n' "$1" "$2" "$$"
+            exec /bin/sleep 30
+        "#;
+        let child = Command::new("/bin/sh")
+            .args(["-c", script, "fixture-runtime"])
+            .arg(format!("http://{}", listener.local_addr().unwrap()))
+            .arg(owned.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn().unwrap();
+        let pid = child.id();
+        (PendingChild::new(child), pid)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_startup_requires_v2_and_checks_the_owned_runtime_version_exactly() {
+        for (owned, api, version, expected_error) in [
+            (false, 1, "1.2.3", Some("Existing local runtime API is incompatible")),
+            (false, 2, "1.2.2", None),
+            (true, 1, "1.2.3", Some("Bundled runtime version or API is incompatible")),
+            (true, 2, "1.2.2", Some("Bundled runtime version or API is incompatible")),
+            (true, 2, "1.2.3", None),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let (child, pid) = fake_local_runtime(&listener, owned);
+            let worker = std::thread::spawn(move || {
+                let (stream, headers) = receive_request(&listener, "/api/health");
+                assert!(headers.contains("cookie: rsi_fixture=fixture\r\n"));
+                answer_request(stream, 200, "", &json!({"api_version":api,"version":version,"pid":pid}).to_string());
+                if owned && expected_error.is_none() {
+                    let (stream, _) = receive_request(&listener, "/api/desktop-update");
+                    answer_request(stream, 200, "", "{}");
+                }
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(4);
+            let result = handshake_local_runtime(child, "1.2.3", deadline);
+            assert_eq!(result.err().as_deref(), expected_error);
+            worker.join().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_startup_reaps_the_child_when_update_status_or_completion_stalls() {
+        for stall_on_complete in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let (child, pid) = fake_local_runtime(&listener, true);
+            let (release, hold) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let (stream, _) = receive_request(&listener, "/api/health");
+                if !stall_on_complete {
+                    std::thread::sleep(Duration::from_millis(600));
+                }
+                answer_request(stream, 200, "", &json!({"api_version":2,"version":"1.2.3","pid":pid}).to_string());
+                let (stream, headers) = receive_request(&listener, "/api/desktop-update");
+                assert!(headers.contains("x-rsi-csrf: fixture\r\n"));
+                let mut stalled = if stall_on_complete {
+                    std::thread::sleep(Duration::from_millis(600));
+                    answer_request(stream, 200, "", r#"{"barrier":{"version":"1.2.3","lease":"fixture"}}"#);
+                    receive_request(&listener, "/api/desktop-update").0
+                } else {
+                    stream
+                };
+                if stall_on_complete {
+                    stalled.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{").unwrap();
+                }
+                hold.recv_timeout(Duration::from_secs(3)).unwrap();
+            });
+            let started = std::time::Instant::now();
+            let result = handshake_local_runtime(child, "1.2.3", started + Duration::from_secs(1));
+            let elapsed = started.elapsed();
+            release.send(()).unwrap();
+            worker.join().unwrap();
+            let expected = if stall_on_complete { "Cannot read response" } else { "Cannot connect to the selected runtime" };
+            assert_eq!(result.err().as_deref(), Some(expected));
+            assert!((Duration::from_secs(1)..Duration::from_millis(1500)).contains(&elapsed), "startup took {elapsed:?}");
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        }
     }
 
     #[cfg(unix)]

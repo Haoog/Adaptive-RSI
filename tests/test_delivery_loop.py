@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from adaptive_rsi.acceptance import seal
+from adaptive_rsi.acceptance import seal, unique_check_names
 from adaptive_rsi.adapters import test_path
 from adaptive_rsi.config import DEFAULTS, merge
 from adaptive_rsi.delivery import (CHECK_DETAIL_LIMIT, MERGE_ATTEMPT_LIMIT, MERGE_RETRY_INITIAL,
@@ -106,6 +106,33 @@ class DeliveryLoopTest(unittest.TestCase):
             edit(spec)
             with self.assertRaises((RuntimeError, ValueError)):
                 seal(spec, ["correct sum"], self.root / str(time.time_ns()))
+
+    def test_independent_acceptance_rejects_duplicate_names_before_writing_files(self):
+        directory = self.root / "duplicate-acceptance"
+        spec = copy.deepcopy(SPEC)
+        spec["checks"].append({**spec["checks"][0], "criteria": [1]})
+        with self.assertRaisesRegex(RuntimeError, "check names must be unique"):
+            seal(spec, ["first criterion", "second criterion"], directory)
+        self.assertFalse(directory.exists())
+
+    def test_cached_duplicate_acceptance_specs_are_regenerated(self):
+        from adaptive_rsi.recovery import cached
+
+        spec = copy.deepcopy(SPEC)
+        spec["checks"].append({**spec["checks"][0], "criteria": [1]})
+        task = self.runtime.goal(self.project, "Check unique acceptance names")
+        self.store.execute("INSERT INTO runs(id,task,project) VALUES ('old',?,?)", (task, self.project))
+        self.store.execute("INSERT INTO stages(run,stage,signature,data,created) VALUES "
+                           "('old','acceptance','inputs',?,?)", (encode(spec), time.time()))
+        run = {"id": "new", "task": task, "project": self.project}
+        self.assertIsNone(cached(self.runtime, run, "acceptance", "inputs", accept=unique_check_names))
+
+        evaluator = self.runtime.evaluator
+        name, inputs = "acceptance:" + self.project, {"plan": "same"}
+        evaluator.seal_checkpoint(name, inputs, spec, effect="read_only")
+        fresh = evaluator.execute_stage(name, inputs, lambda: SPEC, enabled=True, accept=unique_check_names)
+        self.assertEqual(fresh, SPEC)
+        self.assertEqual(evaluator.reuse_checkpoint(name, inputs), SPEC)
 
     def test_generated_python_alias_is_normalized_before_sealing_without_mutating_input(self):
         spec = copy.deepcopy(SPEC)

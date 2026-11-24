@@ -2,6 +2,7 @@ import {spawnSync} from 'node:child_process';
 import {mkdirSync, readFileSync, writeFileSync} from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {buildConfig} from './build-config.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const desktop = path.join(root, 'desktop');
@@ -30,25 +31,8 @@ function runTauri(args, childEnv) {
   run(process.execPath, ['-e', tauriRunner, '--', tauri, ...args], desktop, childEnv, 'node');
 }
 
-const version = readFileSync(path.join(root, 'adaptive_rsi', '__init__.py'), 'utf8')
-  .match(/__version__ = "([^"]+)"/)[1];
-const config = {version};
-const updaterPublicKey = env.RSI_UPDATER_PUBLIC_KEY;
-if (updaterPublicKey) {
-  if (!env.TAURI_SIGNING_PRIVATE_KEY) throw new Error('Signed updater builds require TAURI_SIGNING_PRIVATE_KEY');
-  config.bundle = {createUpdaterArtifacts: true};
-  config.plugins = {updater: {pubkey: updaterPublicKey}};
-}
-
-const signingIdentity = env.APPLE_SIGNING_IDENTITY;
-const developerId = signingIdentity && signingIdentity !== '-';
-if (developerId) {
-  if (process.platform !== 'darwin') throw new Error('Apple signing requires macOS');
-  const account = env.APPLE_ID && env.APPLE_PASSWORD && env.APPLE_TEAM_ID;
-  const api = env.APPLE_API_KEY && env.APPLE_API_ISSUER && env.APPLE_API_KEY_PATH;
-  if (!account && !api) throw new Error('Developer ID builds require complete notarization credentials');
-  config.bundle = {...config.bundle, macOS: {signingIdentity, hardenedRuntime: true}};
-}
+const {config, updaterPublicKey, developerId} = buildConfig(
+  readFileSync(path.join(root, 'adaptive_rsi', '__init__.py'), 'utf8'), env, process.platform);
 
 const generated = path.join(desktop, '.generated');
 mkdirSync(generated, {recursive: true});

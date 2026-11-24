@@ -23,7 +23,7 @@ REFERENCE_SOURCE = "completed_calls_same_project_kind_role_model_before_window"
 
 _COUNTS = "(c.input_tokens+c.output_tokens+c.cache_read_tokens+c.cache_write_tokens)"
 _KNOWN = "coalesce(c.usage_known,0)"
-_COMPONENT = ("(" + _KNOWN + "=1 AND " + _COUNTS + "=c.tokens AND "
+_COMPONENT = ("(" + _KNOWN + "=1 AND coalesce(c.usage_components_known,1)=1 AND " + _COUNTS + "=c.tokens AND "
               "(c.input_price IS NOT NULL OR c.output_price IS NOT NULL OR "
               "c.cache_read_price IS NOT NULL OR c.cache_write_price IS NOT NULL) AND "
               "(c.input_tokens=0 OR c.input_price IS NOT NULL) AND "
@@ -316,7 +316,7 @@ def report(store, params):
     if task:
         result["calls"] = store.query("SELECT c.id,c.run,c.role,c.provider,c.model,c.effort,c.state,c.created,c.unit,"
                                       "c.tokens,c.input_tokens,c.output_tokens,c.cache_read_tokens,c.cache_write_tokens,"
-                                      "c.usage_known,c.seconds,c.unit_price,c.input_price,c.output_price,"
+                                      "c.usage_known,c.usage_components_known,c.seconds,c.unit_price,c.input_price,c.output_price,"
                                       "c.cache_read_price,c.cache_write_price,c.price_basis," +
                                       _COST + " AS estimated_usd," + _PRICED + " AS priced" + JOIN + scope +
                                       " ORDER BY c.created DESC,c.id LIMIT ? OFFSET ?", [*args, limit, offset])
@@ -381,7 +381,7 @@ def policy_history(db, start, end, project=None):
                       'SELECT t.id AS task,t.project,t.source,t.state AS task_state,t.created AS task_created,'
                       't.updated AS task_updated,r.id AS run,r.started,r.ended,r.calls AS recorded_calls,r.result,'
                       'c.id AS call,c.state AS call_state,c.created AS call_created,c.role,c.provider,c.model,c.effort,'
-                      'c.unit,c.usage_known,c.tokens,c.unit_price,' +
+                      'c.unit,c.usage_known,c.usage_components_known,c.tokens,c.unit_price,' +
                       ','.join('c.' + field + suffix for suffix in ('_price', '_tokens') for field in PRICE_FIELDS) +
                       ' FROM selected s JOIN tasks t ON t.id=s.task JOIN runs r ON r.task=t.id '
                       'LEFT JOIN calls c ON c.run=r.id ORDER BY t.id,r.id,c.id', args)

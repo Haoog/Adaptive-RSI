@@ -2,9 +2,8 @@
 import json
 import re
 import time
-from pathlib import PurePosixPath
 
-from .store import decode_evidence, decode_object
+from .store import decode_object
 
 
 def safe_excerpt(value, limit=1200):
@@ -32,7 +31,10 @@ def failure_excerpt(value, limit=1000):
 
 
 def retry_feedback(row, protected=()):
-    result = decode_evidence(row["result"])
+    result = decode_object(row["result"])
+    review, failure, evaluation = (result.get(key) for key in ("review", "failure", "evaluation"))
+    findings = review.get("findings") if isinstance(review, dict) else None
+    checks = evaluation.get("checks") if isinstance(evaluation, dict) else None
     feedback = {key: row.get(key) for key in ["id", "base", "state"]}
     variants = {variant for value in protected for variant in
                 (value, json.dumps(value, ensure_ascii=True)[1:-1], repr(value)[1:-1]) if variant}
@@ -56,20 +58,31 @@ def retry_feedback(row, protected=()):
     for key in ["summary", "patch_hash"]:
         if key in result:
             feedback[key] = excerpt(result[key])
-    if result.get("failure"):
-        feedback["failure"] = {k: excerpt(result["failure"].get(k)) for k in ["code", "action"]}
-    feedback["review_findings"] = [{k: excerpt(finding.get(k)) for k in
-                                  ["severity", "path", "line", "title", "reason", "suggestion"]}
-                                 for finding in result.get("review", {}).get("findings", [])[:8]
-                                 if ".rsi-acceptance" not in PurePosixPath(str(finding.get("path", ""))).parts
-                                 and not any(".rsi-acceptance" in str(v) for v in finding.values())]
+    if isinstance(failure, dict) and failure:
+        feedback["failure"] = {k: excerpt(failure.get(k)) for k in ["code", "action"]}
+    feedback["review_findings"] = []
+    for finding in findings if isinstance(findings, list) else []:
+        if not isinstance(finding, dict) or any(".rsi-acceptance" in str(v) for v in finding.values()):
+            continue
+        feedback["review_findings"].append({k: excerpt(finding.get(k)) for k in
+                                           ["severity", "path", "line", "title", "reason", "suggestion"]})
+        if len(feedback["review_findings"]) == 8:
+            break
     # Sealed acceptance files, commands, logs and protected samples never enter retry prompts.
-    checks = result.get("evaluation", {}).get("checks", {})
-    feedback["failed_regression_checks"] = [{"stage": stage, "name": excerpt(c.get("name"), 200),
-                                             "exit_code": c.get("exit_code"),
-                                             "stderr": failure_excerpt(excerpt(c.get("stderr"), 20000))}
-                                            for stage in ["candidate", "candidate_full"]
-                                            for c in checks.get(stage, []) if not c.get("passed")][:5]
+    feedback["failed_regression_checks"] = []
+    for stage in ["candidate", "candidate_full"]:
+        rows = checks.get(stage) if isinstance(checks, dict) else None
+        for check in rows if isinstance(rows, list) else []:
+            if not isinstance(check, dict) or check.get("passed"):
+                continue
+            exit_code = check.get("exit_code")
+            feedback["failed_regression_checks"].append({
+                "stage": stage, "name": excerpt(check.get("name"), 200),
+                "exit_code": exit_code if type(exit_code) is int else None,
+                "stderr": failure_excerpt(excerpt(check.get("stderr"), 20000)),
+            })
+            if len(feedback["failed_regression_checks"]) == 5:
+                return feedback
     return feedback
 
 

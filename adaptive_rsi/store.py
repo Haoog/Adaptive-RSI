@@ -1575,13 +1575,15 @@ class Store:
                 rejected.append("tokens")
         else:
             tokens = sum(counts.values())
+        # 任一计数超出可记账范围时，这笔记账的用量不再可信，费用估算同样按未知处理。
+        known = not rejected and bool(raw.get("usage_known"))
         values = {
             "tokens": tokens,
             **counts,
-            # 任一计数超出可记账范围时，这笔记账的用量不再可信，费用估算同样按未知处理。
-            "usage_known": 0 if rejected or not raw.get("usage_known", False) else 1,
+            "usage_known": int(known),
+            "usage_components_known": int(known and raw.get("usage_components_known", True)),
         }
-        fields = ["tokens", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "usage_known"]
+        fields = list(values)
         from .usage import PRICE_FIELDS, estimate, unit_prices
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")

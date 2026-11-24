@@ -79,12 +79,15 @@ fn valid_receipt(value: &Value) -> bool {
                 && url.username().is_empty() && url.password().is_none())
         && value["authorization_revision"].as_u64().is_some_and(|revision| revision > 0)
         && matches!(value["install_window"].as_str(), Some("any" | "night" | "weekend"))
-        && bounded(value["platform"].as_str(), 32)
-        && bounded(value["arch"].as_str(), 32)
+        && matches!((value["platform"].as_str(), value["arch"].as_str()),
+            (Some("macos" | "linux" | "windows"), Some("aarch64" | "x86_64")))
         && value["created_at"].is_u64()
         && value["updated_at"].is_u64()
-        && value.get("error_code").is_some()
-        && (value["error_code"].is_null() || bounded(value["error_code"].as_str(), 128))
+        && match value["state"].as_str() {
+            Some("pending" | "succeeded") => value.get("error_code") == Some(&Value::Null),
+            Some("failed") => bounded(value["error_code"].as_str(), 128),
+            _ => false,
+        }
 }
 
 pub(super) fn read_receipt(path: &Path) -> Result<Value, String> {
@@ -240,11 +243,11 @@ pub(super) fn transition(path: &Path, state: &str, error_code: Option<&str>,
     // Validate the requested outcome before reading, so a caller error is not
     // reported as a state conflict with an existing document.
     let error_code = match (state, error_code) {
-        ("succeeded", _) => {
+        ("succeeded", None) => {
             if current_version.is_none() { return Err("update_receipt_invalid".into()); }
             None
         }
-        (_, Some(code)) if !code.is_empty() && code.len() <= 128 => Some(code),
+        ("failed", Some(code)) if !code.is_empty() && code.len() <= 128 => Some(code),
         _ => return Err("update_receipt_invalid".into()),
     };
     let mut record = read_receipt(path)?;
@@ -310,7 +313,11 @@ pub(super) fn reconcile_app(app: &tauri::AppHandle, current_version: &str, healt
 /// from polled state, so the exported file cannot claim an install that was not
 /// recorded on disk.
 pub(super) fn export(app: &tauri::AppHandle) -> Value {
-    match app_receipt_path(app).and_then(|path| read_receipt(&path)) {
+    export_result(app_receipt_path(app).and_then(|path| read_receipt(&path)))
+}
+
+fn export_result(result: Result<Value, String>) -> Value {
+    match result {
         Ok(receipt) => json!({"available": true, "receipt": receipt}),
         Err(error) => json!({"available": false, "error": error}),
     }
@@ -633,4 +640,73 @@ mod receipt_tests {
         assert_eq!(transition(&path, "failed", None, None).unwrap_err(), "update_receipt_invalid");
         assert_eq!(read_receipt(&path).unwrap()["state"], json!("failed"));
     }
+    #[test]
+    fn receipts_reject_invalid_provenance_and_inconsistent_terminal_results() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = receipt_path(folder.path());
+        let pending = begin_pending(&path, &transaction("11111111", "1.2.4")).unwrap();
+        let assert_invalid = |record: &Value| {
+            write_receipt(&path, record).unwrap();
+            assert_eq!(read_receipt(&path).unwrap_err(), "update_receipt_invalid");
+            assert_eq!(reconcile(&path, "1.2.4", true).unwrap_err(), "update_receipt_invalid");
+            assert_eq!(export_result(read_receipt(&path)),
+                json!({"available": false, "error": "update_receipt_invalid"}));
+        };
+        for (field, wrong_type, outside_allowed_values) in [
+            ("artifact_url", json!(4), json!("http://example.test/package")),
+            ("authorization_revision", json!("7"), json!(0)),
+            ("install_window", json!(false), json!("morning")),
+            ("platform", json!(4), json!("unknown")),
+            ("arch", json!(4), json!("unknown")),
+        ] {
+            let mut broken = pending.clone();
+            broken.as_object_mut().unwrap().remove(field);
+            assert_invalid(&broken);
+            for value in [wrong_type, outside_allowed_values] {
+                broken[field] = value;
+                assert_invalid(&broken);
+            }
+        }
+        let mut broken = pending.clone();
+        broken["signature_verified"] = json!(false);
+        write_receipt(&path, &broken).unwrap();
+        assert_eq!(transition(&path, "succeeded", None, Some("1.2.4")).unwrap_err(), "update_receipt_state");
+        broken["state"] = json!("succeeded");
+        assert_invalid(&broken);
+        broken["signature_verified"] = json!(true);
+        broken["error_code"] = json!("update_health_failed");
+        assert_invalid(&broken);
+        broken["state"] = json!("failed");
+        for error_code in [Value::Null, json!(""), json!("x".repeat(129))] {
+            broken["error_code"] = error_code;
+            assert_invalid(&broken);
+        }
+    }
+
+    #[test]
+    fn retry_keeps_installed_success_and_failed_attempt_retrievable() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = receipt_path(folder.path());
+        let exportable = |path: &Path, receipt: &Value| {
+            assert_eq!(export_result(read_receipt(path)), json!({"available": true, "receipt": receipt}));
+        };
+        let pending = begin_pending(&path, &transaction("11111111", "1.2.4")).unwrap();
+        exportable(&path, &pending);
+        let success = reconcile(&path, "1.2.4", true).unwrap();
+        exportable(&path, &success);
+
+        let success_history = folder.path().join("update-receipt-11111111.json");
+        let later = begin_pending(&path, &transaction("22222222", "1.2.5")).unwrap();
+        exportable(&path, &later);
+        exportable(&success_history, &success);
+        let failed = reconcile(&path, "1.2.4", true).unwrap();
+        assert_eq!(failed["state"], "failed");
+        exportable(&path, &failed);
+        exportable(&success_history, &success);
+
+        begin_pending(&path, &transaction("33333333", "1.2.5")).unwrap();
+        exportable(&folder.path().join("update-receipt-22222222.json"), &failed);
+        exportable(&success_history, &success);
+    }
+
 }

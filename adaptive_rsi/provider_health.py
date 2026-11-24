@@ -137,6 +137,15 @@ class ProviderPaused(RuntimeError):
     failure_code = "provider"
 
 
+def _health_state(db, key):
+    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    try:
+        state = json.loads(row[0]) if row and row[0] else {}
+    except (TypeError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
 class ProviderHealth:
     def __init__(self, store):
         self.store = store
@@ -192,21 +201,11 @@ class ProviderHealth:
                    "detail_key": key + ":" + fingerprint({"model": model}) if model else None}
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-            try:
-                state = json.loads(row[0]) if row and row[0] else {"paused": False}
-            except (TypeError, ValueError):
-                state = {"paused": False}
-            if not isinstance(state, dict):
-                state = {"paused": False}
-            shared = db.execute("SELECT value FROM settings WHERE key=?", (attempt["account_key"],)).fetchone()
-            if shared:
-                try:
-                    retry_at = json.loads(shared[0]).get("retry_at", 0) if shared[0] else 0
-                except (TypeError, ValueError, AttributeError):
-                    retry_at = 0
-                if retry_at > state.get("retry_at", 0):
-                    state["retry_at"] = retry_at
+            state = _health_state(db, key)
+            shared = _health_state(db, attempt["account_key"])
+            attempt["account_reset_id"] = shared.get("reset_id")
+            if shared.get("retry_at", 0) > state.get("retry_at", 0):
+                state["retry_at"] = shared["retry_at"]
             if state.get("retry_at", 0) > now:
                 error = ModelFailure("Provider Retry-After cooldown is pending", "rate_limit")
                 error.retry_after = state["retry_at"] - now
@@ -242,13 +241,7 @@ class ProviderHealth:
             return
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT value FROM settings WHERE key=?", (attempt["key"],)).fetchone()
-            try:
-                value = json.loads(row[0]) if row and row[0] else {}
-            except (TypeError, ValueError):
-                value = {}
-            if not isinstance(value, dict):
-                value = {}
+            value = _health_state(db, attempt["key"])
             if value.get("half_open_owner") == attempt["id"]:
                 value.pop("half_open_owner", None)
                 value.pop("half_open_until", None)
@@ -270,17 +263,13 @@ class ProviderHealth:
             if error and code not in ["auth", "rate_limit", "timeout", "connection"]:
                 return
             # 多项目执行线程的计数更新必须在同一事务内完成。
-            import json
+            account_key = (attempt.get("account_key") if attempt else None) or self.account_key(config, provider)
             with self.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-                try:
-                    old = json.loads(row[0]) if row and row[0] else {}
-                except (TypeError, ValueError):
-                    old = {}
-                if not isinstance(old, dict):
-                    old = {}
-                if attempt is not None and attempt.get("reset_id") != old.get("reset_id"):
+                old = _health_state(db, key)
+                shared = _health_state(db, account_key)
+                if attempt is not None and (attempt.get("reset_id") != old.get("reset_id") or
+                                            attempt.get("account_reset_id") != shared.get("reset_id")):
                     return
                 if not error:
                     # A late success from an older attempt cannot clear a newer failure.
@@ -303,15 +292,9 @@ class ProviderHealth:
                         value["reset_id"] = old["reset_id"]
                     db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(value)))
                     if code == "rate_limit" and value.get("retry_at"):
-                        shared_key = attempt.get("account_key") if attempt else self.account_key(config, provider)
-                        prior = db.execute("SELECT value FROM settings WHERE key=?", (shared_key,)).fetchone()
-                        try:
-                            prior_retry = json.loads(prior[0]).get("retry_at", 0) if prior and prior[0] else 0
-                        except (TypeError, ValueError, AttributeError):
-                            prior_retry = 0
-                        retry_at = max(value["retry_at"], prior_retry)
+                        shared.update(retry_at=max(value["retry_at"], shared.get("retry_at", 0)), at=time.time())
                         db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
-                                   (shared_key, json.dumps({"retry_at": retry_at, "at": time.time()})))
+                                   (account_key, json.dumps(shared)))
             if model and value is not None:
                 # 明细写入只是诊断视图：准入状态已在上面的事务里提交，这里失败既不能
                 # 丢掉已完成的模型结果，也不能改变调用前的暂停/冷却判定。
@@ -341,4 +324,5 @@ class ProviderHealth:
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(reset)))
-            db.execute("DELETE FROM settings WHERE key=?", (account_key,))
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                       (account_key, json.dumps({"reset_id": reset["reset_id"]})))

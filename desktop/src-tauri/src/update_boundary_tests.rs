@@ -359,7 +359,9 @@ fn authorization_revisions_only_move_forward_and_are_validated() {
     assert!(updater.authorize(Authorization::parse(1, "automatic", "minor", "night").unwrap()).unwrap());
     assert_eq!(updater.authorization().window, "night");
     // 重复或倒退的版本号来自并发/过期的前端调用，不能回滚已生效的授权。
-    assert!(!updater.authorize(Authorization::parse(1, "manual", "patch", "any").unwrap()).unwrap());
+    assert!(!updater.authorize(Authorization::parse(1, "automatic", "minor", "night").unwrap()).unwrap());
+    assert_eq!(updater.authorize(Authorization::parse(1, "download", "minor", "night").unwrap()).unwrap_err(),
+        "update_authorization_changed");
     assert!(!updater.authorize(Authorization::parse(0, "manual", "patch", "any").unwrap()).unwrap());
     assert_eq!(updater.authorization().policy, "automatic");
     assert_eq!(updater.authorization().revision, 1);
@@ -487,5 +489,15 @@ fn only_feed_transport_failures_unlock_the_offline_install_fallback() {
     for code in ["update_cancelled", "updater_key_missing", "invalid_update_feed",
                  "invalid_update_configuration", "update_cache_unavailable"] {
         assert!(!offline_check_failure(code), "{code}");
+    }
+}
+#[test]
+fn update_redirects_require_https_non_loopback_destination_and_bounded_hops() {
+    let approved = reqwest::Url::parse("https://release-assets.githubusercontent.com/package").unwrap();
+    assert!(update_redirect_allowed(&approved, 5));
+    assert!(!update_redirect_allowed(&approved, 6));
+    for location in ["http://example.test/package", "https://127.0.0.1/package",
+                     "https://[::1]/package", "https://localhost./package"] {
+        assert!(!update_redirect_allowed(&reqwest::Url::parse(location).unwrap(), 1));
     }
 }

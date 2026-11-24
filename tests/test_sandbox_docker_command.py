@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from adaptive_rsi.config import DEFAULTS
+from adaptive_rsi.native import WorkspaceTools
 from adaptive_rsi.process import Cancelled, Sandbox
 
 
@@ -67,6 +68,32 @@ class DockerCheckCommandTest(unittest.TestCase):
             f"type=bind,src={parent},dst=/workspace/output",
         ])
         self.assertFalse(missing.exists())
+
+    def test_native_write_file_prepares_missing_regression_directory_for_scoped_command(self):
+        (self.workspace / ".git").mkdir()
+        tools = WorkspaceTools(self.workspace, "implementation", self.workspace / "state", self.config, None, ())
+        tools.scope = ["tests"]
+        args = {"argv": ["true"], "cwd": "."}
+        with patch("adaptive_rsi.process.run_process") as run:
+            with self.assertRaisesRegex(ValueError, "no approved writable directory: tests"):
+                tools.execute("run_command", args)
+            run.assert_not_called()
+        self.assertFalse((self.workspace / "tests").exists())
+
+        tools.execute("write_file", {"path": "tests/test_example.py", "content": "assert True\n"})
+        self.assertEqual((self.workspace / "tests/test_example.py").read_text(), "assert True\n")
+        result = {"exit_code": 0, "error": None, "stdout": "", "stderr": ""}
+        with patch("adaptive_rsi.process.run_process", return_value=result) as run:
+            self.assertEqual(tools.execute("run_command", args)["exit_code"], 0)
+        command = run.call_args.args[0]
+        mounts = [command[index + 1] for index, arg in enumerate(command) if arg == "--mount"]
+        self.assertEqual(mounts, [
+            f"type=bind,src={self.workspace},dst=/workspace,readonly",
+            f"type=bind,src={self.workspace / 'tests'},dst=/workspace/tests",
+            f"type=bind,src={self.workspace / '.rsi-home'},dst=/workspace/.rsi-home",
+            f"type=bind,src={self.workspace / '.rsi-tmp'},dst=/workspace/.rsi-tmp",
+            f"type=bind,src={self.workspace / '.git'},dst=/workspace/.git,readonly",
+        ])
 
     def test_missing_writable_target_under_protected_directory_fails_closed(self):
         parent = self.workspace / "output"

@@ -1,4 +1,5 @@
 use super::*;
+use std::io::BufReader;
 
 fn proxy_request(state: &RuntimeState, path: &str, body: Option<Value>) -> Result<Reply, String> {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
@@ -214,6 +215,82 @@ fn update_state(downloading: bool, percent: u64) -> DesktopUpdate {
     }
 }
 
+#[cfg(target_os = "macos")]
+const LEGACY_DMG_FIXTURE: &[u8] = b"fixture DMG";
+#[cfg(target_os = "macos")]
+const LEGACY_DMG_SHA256: &str = "eac5da462cb16554774d722fa4093739ffc9ade2f4c6e8ee54041e71908f1408";
+
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_dmg_failed_open_can_be_retried_with_or_without_an_existing_image() {
+    for already_published in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("update.dmg");
+        if already_published {
+            fs::write(&path, LEGACY_DMG_FIXTURE).unwrap();
+        }
+        let state = RuntimeState::default();
+        *state.update.lock().unwrap() = Some(update_state(false, 0));
+        let gate = Mutex::new(());
+        let mut downloads = 0;
+        for opens in [false, true] {
+            let (_, _, _, _gate) = begin_desktop_download(&state, &gate).unwrap();
+            assert!(state.update.lock().unwrap().as_ref().unwrap().error.is_empty());
+            let mut staged_path = None;
+            let result = stage_legacy_dmg(
+                &path,
+                LEGACY_DMG_SHA256,
+                |file| {
+                    downloads += 1;
+                    file.write_all(LEGACY_DMG_FIXTURE).unwrap();
+                    Ok(())
+                },
+                |staged| {
+                    assert_ne!(staged, path);
+                    assert_eq!(fs::read(staged).unwrap(), LEGACY_DMG_FIXTURE);
+                    assert_eq!(path.exists(), already_published);
+                    staged_path = Some(staged.to_path_buf());
+                    opens
+                },
+            );
+            assert!(!staged_path.unwrap().parent().unwrap().exists());
+            complete_desktop_download(&state, result);
+            let guard = state.update.lock().unwrap();
+            let update = guard.as_ref().unwrap();
+            assert!(!update.downloading.load(Ordering::Relaxed));
+            assert_eq!(update.opened.load(Ordering::Relaxed), opens);
+            assert_eq!(update.error, if opens { "" } else { "Cannot open installer" });
+            if opens || already_published {
+                assert_eq!(fs::read(&path).unwrap(), LEGACY_DMG_FIXTURE);
+            } else {
+                assert!(!path.exists());
+            }
+        }
+        assert_eq!(downloads, if already_published { 0 } else { 2 });
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_dmg_does_not_replace_a_file_published_during_attach() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("update.dmg");
+    let result = stage_legacy_dmg(
+        &path,
+        LEGACY_DMG_SHA256,
+        |file| {
+            file.write_all(LEGACY_DMG_FIXTURE).unwrap();
+            Ok(())
+        },
+        |_| {
+            fs::write(&path, b"another writer's image").unwrap();
+            true
+        },
+    );
+    assert_eq!(result, Err(("A download with this name already exists", "")));
+    assert_eq!(fs::read(path).unwrap(), b"another writer's image");
+}
+
 #[test]
 fn force_recheck_never_replaces_an_inflight_download() {
     let mut update = update_state(true, 4200);
@@ -319,26 +396,57 @@ fn child_wait_deadline_does_not_wait_for_process_exit() {
 }
 
 #[test]
-fn private_handshake_stream_keeps_rotations_and_bounds_each_message() {
-    let receiver = handshake_stream(std::io::Cursor::new(b"first\nrotated\n".to_vec()));
+fn private_handshake_stream_keeps_rotations_and_partial_lines() {
+    let receiver = handshake_stream(io::Cursor::new(b"first\nrotated\n"));
     assert_eq!(receiver.recv().unwrap().unwrap(), "first\n");
     assert_eq!(receiver.recv().unwrap().unwrap(), "rotated\n");
     assert!(receiver.recv().is_err());
-    struct NoNewline { remaining: usize }
+
+    // The initial read ends inside the second line after consuming the first.
+    let longest = format!("{}\n", "x".repeat(65535));
+    let receiver = handshake_stream(io::Cursor::new(format!("first\n{longest}rotated\nlast")));
+    for line in ["first\n", &longest, "rotated\n", "last"] {
+        assert_eq!(receiver.recv().unwrap().unwrap(), line);
+    }
+    assert!(receiver.recv().is_err());
+}
+
+#[test]
+fn private_handshake_stream_reads_at_most_65537_bytes_of_an_oversized_line() {
+    use std::sync::{mpsc, Arc};
+    use std::sync::atomic::AtomicUsize;
+
+    struct NoNewline {
+        remaining: usize,
+        bytes_read: Arc<AtomicUsize>,
+        wait_for_eof: mpsc::Receiver<()>,
+    }
     impl Read for NoNewline {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
             if self.remaining == 0 {
-                return Err(std::io::ErrorKind::WouldBlock.into());
+                let _ = self.wait_for_eof.recv_timeout(Duration::from_secs(3));
+                return Ok(0);
             }
-            let count = self.remaining.min(buffer.len());
+            let count = self.remaining.min(buffer.len()).min(8192);
             buffer[..count].fill(b'x');
             self.remaining -= count;
+            self.bytes_read.fetch_add(count, Ordering::Relaxed);
             Ok(count)
         }
     }
-    let receiver = handshake_stream(NoNewline { remaining: 65537 });
-    let error = receiver.recv_timeout(Duration::from_secs(2)).unwrap().unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    for available in [1024 * 1024 + 8, 65537] {
+        let (_keep_open, wait_for_eof) = mpsc::channel();
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let receiver = handshake_stream(NoNewline { remaining: available, bytes_read: bytes_read.clone(), wait_for_eof });
+        let error = receiver.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(bytes_read.load(Ordering::Relaxed), 65537);
+        assert!(receiver.recv().is_err());
+    }
+
+    let receiver = handshake_stream(io::Cursor::new(format!("{}\n", "x".repeat(65536))));
+    assert_eq!(receiver.recv().unwrap().unwrap_err().kind(), io::ErrorKind::InvalidData);
 }
 
 #[test]

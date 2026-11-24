@@ -1,10 +1,14 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs');
+function appliedAuthorization(args){
+ return {authorization_revision:args.revision,
+  authorization:{policy:args.policy,scope:args.versionScope,window:args.installationWindow}};
+}
 function fixture(failStorage=false){
  let panel,now=100000000;
  const calls=[],saved=new Map();
  const el=(tag,text)=>({tag,textContent:text||'',children:[],append(...nodes){this.children.push(...nodes)},setAttribute(){},after(node){panel=node;}});
- const context={window:{RSIDesktop:{invoke:async(_,{action})=>{calls.push(action);if(action==='check')throw Error('offline');return{state:'idle'};}}},document:{activeElement:null,addEventListener(){}},el,$:()=>el('anchor'),t:x=>x,localRead:key=>saved.get(key),localStorage:{setItem(key,value){if(failStorage)throw Error('disabled');saved.set(key,value);}},safe:fn=>fn(),setTimeout(){},setInterval(){},Date:{now:()=>now},Math,Number,String,Error};
+ const context={window:{RSIDesktop:{invoke:async(_,args)=>{const {action}=args;calls.push(action);if(action==='authorize')return appliedAuthorization(args);if(action==='check')throw Error('offline');return{state:'idle'};}}},document:{activeElement:null,addEventListener(){}},el,$:()=>el('anchor'),t:x=>x,localRead:key=>saved.get(key),localStorage:{setItem(key,value){if(failStorage)throw Error('disabled');saved.set(key,value);}},safe:fn=>fn(),setTimeout(){},setInterval(){},Date:{now:()=>now},Math,Number,String,Error};
  vm.runInNewContext(fs.readFileSync('adaptive_rsi/web/native-update.js','utf8'),context);
  const api=context.window.RSINativeUpdate;
  const descendants=node=>[node,...node.children.flatMap(descendants)];
@@ -63,11 +67,11 @@ test('automatic installs forward the window while manual installs explicitly ove
  const f=fixture(),received=[];f.api.render();f.selects()[2].value='night';f.selects()[2].onchange();
  f.context.window.RSIDesktop.invoke=async(_,args)=>{received.push(args);return {state:'ready'};};
  await f.api.run('install',true);await f.api.run('install');
- assert.deepEqual(received.map(args=>args.installationWindow),['night','any']);
+ assert.deepEqual(received.filter(args=>args.action==='install').map(args=>args.installationWindow),['night','any']);
 });
 test('install failures do not force repeated feed checks after a successful check',async()=>{
  const f=fixture();f.saved.set('rsi-native-update-checked','100000000');
- f.context.window.RSIDesktop.invoke=async(_,{action})=>{f.calls.push(action);if(action==='install')throw Error('update_window_closed');return{state:action==='status'?'ready':'latest',current_version:'1.2.3',version:'1.2.4'};};
+ f.context.window.RSIDesktop.invoke=async(_,args)=>{const {action}=args;f.calls.push(action);if(action==='authorize')return appliedAuthorization(args);if(action==='install')throw Error('update_window_closed');return{state:action==='status'?'ready':'latest',current_version:'1.2.3',version:'1.2.4'};};
  await f.api.run('install');f.advance(5000);
  for(let i=0;i<3;i++){await f.api.tick();f.advance(1000);}
  assert.equal(f.calls.includes('check'),false);

@@ -802,17 +802,18 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                               plan["risk"] == "high" and change_type != "documentation" or
                               change_type == "performance" or test_first_requested and not test_first)
     if independent_acceptance:
-        from .acceptance import seal
+        from .acceptance import seal, unique_check_names
         acceptance_workspace = snapshot(source, directory / "acceptance-design", base)
         restore(seeds, acceptance_workspace, config)
         acceptance_key = (fingerprint({"plan_key": plan_key, "contract": contract})
                           if contract["kind"] == "performance" else plan_key)
-        spec = None if experiment else cached(runtime, run, "acceptance", acceptance_key)
+        spec = None if experiment else cached(runtime, run, "acceptance", acceptance_key,
+                                               accept=unique_check_names)
         if spec is None:
             def _invoke_acceptance():
                 return runtime.invoke("acceptance", "Independently design executable acceptance BEFORE implementation. Inspect baseline code. "
                     "Return files only beneath .rsi-acceptance/ and checks that exercise real public behavior. "
-                    "Map each check to zero-based acceptance criterion indexes; cover every criterion. "
+                    "Use a unique name for each check. Map checks to zero-based criterion indexes and cover every criterion. "
                     "Use python3 for Python checks; do not assume a python executable alias exists. "
                     "Checks must fail on incorrect behavior, avoid source-string assertions and test-count-only assertions. "
                     "For new APIs or modules, handle absence and assert the missing public behavior explicitly; import/setup errors alone are not improvement evidence. "
@@ -827,7 +828,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             spec = sealed(
                 "acceptance",
                 {"plan_key": plan_key, "plan": plan, "contract": contract},
-                _invoke_acceptance)
+                _invoke_acceptance, accept=unique_check_names)
         acceptance = seal(spec, plan["acceptance"], directory / "acceptance")
         if not experiment:
             save(runtime, run, "acceptance", spec, acceptance_key)

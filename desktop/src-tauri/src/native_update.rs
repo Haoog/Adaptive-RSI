@@ -127,11 +127,19 @@ pub(super) fn part_meta_path(cache: &Path) -> PathBuf { cache.join(PART_META_NAM
 
 const MAX_PART_IDENTITY: u64 = 16 * 1024;
 
-fn read_part_identity(path: &Path) -> Option<String> {
-    let (file, _) = open_bounded_file(path, MAX_PART_IDENTITY).ok()?;
+fn read_part_identity(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("update_cache_unavailable".into()),
+        Ok(_) => {}
+    }
+    let (file, _) = open_bounded_file(path, MAX_PART_IDENTITY).map_err(|_| "update_cache_unavailable")?;
     let mut value = String::new();
-    file.take(MAX_PART_IDENTITY + 1).read_to_string(&mut value).ok()?;
-    (value.len() as u64 <= MAX_PART_IDENTITY).then_some(value)
+    file.take(MAX_PART_IDENTITY + 1).read_to_string(&mut value).map_err(|_| "update_cache_unavailable")?;
+    if value.len() as u64 > MAX_PART_IDENTITY {
+        return Err("update_cache_unavailable".into());
+    }
+    Ok(Some(value))
 }
 
 /// A segment belongs to one exact feed artifact, never just to a byte count.
@@ -651,6 +659,9 @@ impl NativeUpdater {
     pub(super) fn authorize(&self, next: Authorization) -> Result<bool, String> {
         {
             let mut current = self.authorization.lock().unwrap();
+            if next.revision == current.revision && next != *current {
+                return Err("update_authorization_changed".into());
+            }
             if next.revision <= current.revision {
                 return Ok(false);
             }
@@ -928,13 +939,47 @@ mod cache_tests {
         std::fs::write(&path, b"signed fixture").unwrap();
         let (file, size) = open_bounded_file(&path, MAX_PACKAGE as u64).unwrap();
         assert_eq!(install_snapshot(file, size, folder.path()).unwrap().as_ref(), b"signed fixture");
-        File::options().write(true).open(&path).unwrap().set_len(MAX_PACKAGE as u64 + 1).unwrap();
-        assert_eq!(open_bounded_file(&path, MAX_PACKAGE as u64).unwrap_err(), "update_size_limit");
         #[cfg(unix)] {
             let link = folder.path().join("link");
             std::os::unix::fs::symlink(&path, &link).unwrap();
-            assert!(open_bounded_file(&link, MAX_PACKAGE as u64).is_err());
+            assert_eq!(open_bounded_file(&link, MAX_PACKAGE as u64).unwrap_err(), "update_cache_unavailable");
+            std::fs::remove_file(&link).unwrap();
+            std::fs::hard_link(&path, &link).unwrap();
+            assert_eq!(open_bounded_file(&path, MAX_PACKAGE as u64).unwrap_err(), "update_cache_unavailable");
+            std::fs::remove_file(&link).unwrap();
         }
+        File::options().write(true).open(&path).unwrap().set_len(MAX_PACKAGE as u64 + 1).unwrap();
+        assert_eq!(open_bounded_file(&path, MAX_PACKAGE as u64).unwrap_err(), "update_size_limit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn part_identity_reads_only_bounded_regular_single_link_files() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = part_meta_path(folder.path());
+        let regular = folder.path().join("regular");
+        let identity = part_identity("1.2.4", "https://example.test/package");
+        assert_eq!(read_part_identity(&path).unwrap(), None);
+        write_part_identity(&path, &identity).unwrap();
+        assert_eq!(read_part_identity(&path).unwrap(), Some(identity.clone()));
+        std::fs::rename(&path, &regular).unwrap();
+
+        std::os::unix::fs::symlink(&regular, &path).unwrap();
+        assert_eq!(read_part_identity(&path).unwrap_err(), "update_cache_unavailable");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&regular, &path).unwrap();
+        assert_eq!(read_part_identity(&path).unwrap_err(), "update_cache_unavailable");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&regular).unwrap(), identity);
+
+        std::fs::write(&path, vec![b'x'; MAX_PART_IDENTITY as usize + 1]).unwrap();
+        assert_eq!(read_part_identity(&path).unwrap_err(), "update_cache_unavailable");
+        std::fs::remove_file(&path).unwrap();
+        assert!(std::process::Command::new("mkfifo").arg(&path).status().unwrap().success());
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || send.send(read_part_identity(&path)).ok());
+        let result = receive.recv_timeout(Duration::from_secs(2)).expect("FIFO check must not block");
+        assert_eq!(result.unwrap_err(), "update_cache_unavailable");
     }
 
     #[cfg(unix)]
@@ -990,12 +1035,18 @@ mod cache_tests {
     #[test]
     fn cache_preflight_charges_only_the_pending_unix_snapshot() {
         let cache = Path::new("/cache");
-        let before_snapshot = cache_space_required(100, true);
-        let after_snapshot = cache_space_required(100, false);
-        assert_eq!(before_snapshot, if cfg!(unix) { 400 } else { 300 });
-        assert_eq!(after_snapshot, 300);
+        let package = 1024 * 1024;
+        let before_snapshot = cache_space_required(package, true);
+        let after_snapshot = cache_space_required(package, false);
+        assert_eq!(before_snapshot, if cfg!(unix) { 4 * package } else { 3 * package });
+        assert_eq!(after_snapshot, 3 * package);
         assert_eq!(require_space(&[cache], before_snapshot, |_| Ok(before_snapshot - 1)), Err("update_disk_space".into()));
-        assert!(require_space(&[cache], after_snapshot, |_| Ok(300)).is_ok());
+        assert!(require_space(&[cache], before_snapshot, |_| Ok(before_snapshot)).is_ok());
+        let just_over_three_copies = 3 * package + 1;
+        #[cfg(unix)]
+        assert_eq!(require_space(&[cache], before_snapshot, |_| Ok(just_over_three_copies)),
+            Err("update_disk_space".into()));
+        assert!(require_space(&[cache], after_snapshot, |_| Ok(just_over_three_copies)).is_ok());
     }
 }
 
@@ -1019,7 +1070,13 @@ pub fn snapshot(app: &tauri::AppHandle) -> Value {
     let mut state = updater.state.lock().unwrap().clone();
     describe_snapshot(&mut state, &app.package_info().version.to_string(), host_platform(), host_arch());
     // The panel binds every install to this revision, so it must always be present.
-    state["authorization_revision"] = json!(updater.authorization().revision);
+    let authorization = updater.authorization();
+    state["authorization_revision"] = json!(authorization.revision);
+    state["authorization"] = json!({
+        "policy": authorization.policy,
+        "scope": authorization.scope,
+        "window": authorization.window,
+    });
     state
 }
 
@@ -1027,13 +1084,7 @@ pub fn snapshot(app: &tauri::AppHandle) -> Value {
 /// revokes a waiting install instead of letting it replace under stale consent.
 pub fn authorize(app: &tauri::AppHandle, revision: u64, policy: &str, scope: &str, window: &str) -> Result<Value, String> {
     let next = Authorization::parse(revision, policy, scope, window)?;
-    let updater = app.state::<NativeUpdater>();
-    if !updater.authorize(next.clone())? {
-        let current = updater.authorization();
-        if current.revision == next.revision && current != next {
-            return Err("update_authorization_changed".into());
-        }
-    }
+    app.state::<NativeUpdater>().authorize(next)?;
     Ok(snapshot(app))
 }
 
@@ -1048,6 +1099,7 @@ pub async fn check(app: tauri::AppHandle, download: bool) -> Result<Value, Strin
 async fn transfer(updater: &NativeUpdater, update: &tauri_plugin_updater::Update, part: &Path,
                   mut offset: u64, total: &mut Option<u64>, version: &str, notes: &str) -> Result<u64, String> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .https_only(true)
         .redirect(update_redirect_policy())
         .connect_timeout(UPDATE_CONNECT_TIMEOUT)
@@ -1185,7 +1237,7 @@ async fn download_package(app: &tauri::AppHandle, updater: &NativeUpdater, updat
     let meta = part_meta_path(cache);
     let announced = announced_size(&update.raw_json);
     let url = update.download_url.as_str();
-    let stored = read_part_identity(&meta);
+    let stored = read_part_identity(&meta)?;
     if !identity_matches(stored.as_deref(), version, url) {
         // Never append a new release to a segment left by another artifact.
         discard_part(&part);
