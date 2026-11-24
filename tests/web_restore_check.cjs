@@ -12,7 +12,8 @@ function fixture(api, fetch) {
   let button, status, deadline;
   const toasts = [];
   const context = vm.createContext({
-    api, AbortController, Date, machine:'fixture', session:'fixture', visible: () => true, loadOperations() {}, saved: {id:'backup'}, restoreCheckTimeout: 600000,
+    api, AbortController, Date, controller: new AbortController(), machine:'fixture', session:'fixture',
+    visible: () => true, loadOperations() {}, saved: {id:'backup'}, restoreCheckTimeout: 600000,
     t: text => text,
     el: () => (status = {setAttribute() {}}),
     action: (_, handler) => (button = {handler, after() {}, disabled:false}),
@@ -388,7 +389,7 @@ function storageFixture(api, fetch) {
   const source = fs.readFileSync('adaptive_rsi/web/experience.js', 'utf8');
   const start = source.indexOf('  const restoreChecks = new Map();');
   const end = source.indexOf('  function desktopDownload', start);
-  const dialogs = [], downloads = [];
+  const dialogs = [], downloads = [], toasts = [];
   function el(tag, textContent) {
     const listeners = {};
     return {
@@ -396,23 +397,24 @@ function storageFixture(api, fetch) {
       classList:{add() {}}, setAttribute() {},
       append(...nodes) { this.children.push(...nodes); },
       replaceChildren() { this.children.length = 0; },
+      after(node) { this.status = node; },
+      remove() {},
       addEventListener(event, handler) { (listeners[event] ||= []).push(handler); },
       emit(event) { for (const handler of listeners[event] || []) handler(); },
-      click() { if (tag === 'a') downloads.push(this); },
+      click() {
+        if (tag === 'a') downloads.push(this);
+        if (tag === 'button' && !this.disabled) return this.handler();
+      },
+      showModal() { this.open = true; },
       close() { this.open = false; this.emit('close'); },
     };
   }
   const context = vm.createContext({
     api, el, AbortController, Blob, state:{csrf:'current'}, window:{__RSI_MACHINE_KEY__:'first'},
-    document:{createTextNode: text => text}, t: text => text, stamp: at => `stamp-${at}`,
-    URL:{createObjectURL: blob => blob, revokeObjectURL() {}}, toast() {}, desktopDownload() {},
-    setTimeout() { return 1; }, clearTimeout() {},
-    dialog: title => {
-      const box = el('dialog', title);
-      box.open = true;
-      dialogs.push(box);
-      return box;
-    },
+    document:{createTextNode: text => text, body:{append: box => dialogs.push(box)}},
+    t: text => text, stamp: at => `stamp-${at}`,
+    URL:{createObjectURL: blob => blob, revokeObjectURL() {}}, toast: (...args) => toasts.push(args), desktopDownload() {},
+    setTimeout(fn, ms) { if (ms === 300) queueMicrotask(fn); return 1; }, clearTimeout() {},
     action: (text, handler) => Object.assign(el('button', text), {handler}),
   });
   if (fetch) {
@@ -420,10 +422,11 @@ function storageFixture(api, fetch) {
     Object.assign(context, {fetch, structuredClone, $: () => null});
     vm.runInContext(app.slice(app.indexOf('let serviceCapabilities='), app.indexOf('const goalSubmissionLimit')), context);
   }
+  vm.runInContext(source.slice(source.indexOf('  function dialog('), source.indexOf('  async function openTask(')), context);
   vm.runInContext(source.slice(start, end), context);
   const find = (node, predicate) => predicate(node) ? node : node.children?.map(child =>
     typeof child === 'object' ? find(child, predicate) : null).find(Boolean);
-  return {open: () => vm.runInContext('storage()', context), context, dialogs, downloads, find};
+  return {open: () => vm.runInContext('storage()', context), context, dialogs, downloads, find, toasts};
 }
 
 test('data panel opens before usage, restores recent operations, and ignores late results after navigation', async () => {
@@ -469,6 +472,110 @@ test('data panel opens before usage, restores recent operations, and ignores lat
   assert.equal(findText(second, 'stamp-10'), undefined);
   assert.equal(findText(reopened, 'old-machine'), undefined);
   second.close();
+});
+
+function restorePanelFixture(request) {
+  const f = storageFixture(async (path, body, options) => {
+    if (path === 'storage?summary=true') return {backups:[{id:'backup', created:1}]};
+    if (path === 'storage?usage=true') return {bytes:{}, scanned_at:1};
+    if (path === 'operations' && !body) return {operations:[
+      {kind:'restore-check', state:'running', id:'op/1', backup_id:'backup', created:2},
+    ]};
+    return request(path, body, options);
+  });
+  return {...f, async openPanel() {
+    await f.open();
+    await new Promise(setImmediate);
+    const box = f.dialogs.at(-1);
+    return {
+      check: f.find(box, node => node.textContent === '验证恢复点'),
+      close: () => f.find(box, node => node.textContent === '关闭').click(),
+    };
+  }};
+}
+
+test('closing the data panel cancels restore polling and reopening resumes the same ID', async () => {
+  const staleMissing = deferred(), staleResult = deferred(), current = deferred();
+  const requests = [], polls = [staleMissing, staleResult, current];
+  const f = restorePanelFixture((path, body, {signal} = {}) => {
+    requests.push({path, body, signal});
+    if (body) return {id:'op/1'};
+    return polls.shift().promise;
+  });
+  const original = await f.openPanel();
+  const originalPoll = original.check.click();
+  await new Promise(setImmediate);
+  const oldSignal = requests[1].signal;
+  original.close();
+  assert.equal(oldSignal.aborted, true);
+
+  const intermediate = await f.openPanel();
+  const intermediatePoll = intermediate.check.click();
+  await new Promise(setImmediate);
+  assert.equal(requests[2].signal.aborted, false);
+  intermediate.close();
+  assert.equal(requests[2].signal.aborted, true);
+
+  const reopened = await f.openPanel();
+  const currentPoll = reopened.check.click();
+  await new Promise(setImmediate);
+  assert.deepEqual(requests.map(({path, body}) => [path, body?.kind]), [
+    ['operations', 'restore-check'], ['operation?id=op%2F1', undefined],
+    ['operation?id=op%2F1', undefined], ['operation?id=op%2F1', undefined],
+  ]);
+  assert.notEqual(requests[3].signal, oldSignal);
+  assert.equal(requests[3].signal.aborted, false);
+
+  // The old transport may settle after abort while the reopened query still owns the guard.
+  staleMissing.reject(Object.assign(Error('late missing operation'), {status:404, code:'operation_not_found'}));
+  await originalPoll;
+  await reopened.check.handler();
+  assert.equal(requests.length, 4);
+  assert.equal(reopened.check.status.textContent, '正在验证恢复点…');
+  assert.equal(reopened.check.disabled, true);
+
+  current.resolve({ended:1, state:'completed'});
+  await currentPoll;
+  staleResult.resolve({ended:1, state:'failed'});
+  await intermediatePoll;
+  assert.equal(reopened.check.status.textContent, '恢复点验证通过。');
+  assert.equal(reopened.check.disabled, false);
+  assert.deepEqual(f.toasts, [['恢复点验证通过。', false]]);
+  reopened.close();
+});
+
+test('closing before a restore receipt keeps the POST guard and isolates machines', async () => {
+  const post = deferred(), requests = [];
+  const f = restorePanelFixture((path, body) => {
+    requests.push([path, body?.kind]);
+    if (!body) return {ended:1, state:'completed'};
+    return requests.length === 1 ? post.promise : {id:'other-machine'};
+  });
+  const original = await f.openPanel();
+  const submission = original.check.click();
+  original.close();
+  const reopened = await f.openPanel();
+  await reopened.check.click();
+  assert.deepEqual(requests, [['operations', 'restore-check']]);
+  const history = f.find(f.dialogs.at(-1), node => node.textContent?.includes('backup · op/1'));
+  assert.ok(history);
+  reopened.close();
+
+  f.context.window.__RSI_MACHINE_KEY__ = 'second';
+  const other = await f.openPanel();
+  await other.check.click();
+  assert.deepEqual(requests.slice(1), [['operations', 'restore-check'], ['operation?id=other-machine', undefined]]);
+  post.resolve({id:'op/1'});
+  await submission;
+  assert.equal(requests.length, 3);
+  other.close();
+
+  f.context.window.__RSI_MACHINE_KEY__ = 'first';
+  const returned = await f.openPanel();
+  await returned.check.click();
+  assert.deepEqual(requests.slice(3), [['operation?id=op%2F1', undefined]]);
+  assert.equal(returned.check.status.textContent, '恢复点验证通过。');
+  returned.close();
 });
 
 test('an old service can create, poll and cancel operations without supporting the history list', async () => {

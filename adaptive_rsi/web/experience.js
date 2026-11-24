@@ -1279,10 +1279,10 @@ window.RSIExperience = (() => {
         const checkButton = action(t("验证恢复点"), async () => {
           if (!visible()) return;
           const key = JSON.stringify([machine, session, saved.id]);
-          const check = restoreChecks.get(key) ?? {id:null, checking:false};
-          // 即使弹窗已重新打开，同一备份也只允许一个查询或创建请求进行中。
-          if (check.checking) return;
-          check.checking = true;
+          const check = restoreChecks.get(key) ?? {id:null, owner:null};
+          if (check.owner) return;
+          const poll = new AbortController();
+          check.owner = poll;
           restoreChecks.set(key, check);
           checkButton.disabled = true;
           if (!status) {
@@ -1291,23 +1291,44 @@ window.RSIExperience = (() => {
             checkButton.after(status);
           }
           status.textContent = t("正在验证恢复点…");
-          const controller = new AbortController();
-          let timer, deadlineTimer;
+          let timer, deadlineTimer, wakePoll;
+          const release = () => {
+            if (check.owner !== poll) return;
+            check.owner = null;
+            if (!check.id) restoreChecks.delete(key);
+            checkButton.disabled = false;
+          };
+          const closePoll = () => {
+            // 未收到创建回执时继续保留 guard，避免重开面板后重复提交。
+            if (check.id) release();
+            clearTimeout(timer);
+            clearTimeout(deadlineTimer);
+            wakePoll?.();
+            poll.abort();
+          };
+          controller.signal.addEventListener("abort", closePoll, {once:true});
           try {
             if (!check.id) {
               const operation = await api("operations", {kind:"restore-check", parameters:{id:saved.id}, reuse_active:true});
               check.id = operation.id;
+              if (!visible()) return;
               void loadOperations();
             }
             const deadline = Date.now() + restoreCheckTimeout;
-            deadlineTimer = setTimeout(() => controller.abort(), restoreCheckTimeout);
+            deadlineTimer = setTimeout(() => poll.abort(), restoreCheckTimeout);
             let current;
             do {
-              await new Promise(resolve => { timer = setTimeout(resolve, 300); });
+              await new Promise(resolve => {
+                wakePoll = resolve;
+                timer = setTimeout(resolve, 300);
+              });
+              wakePoll = null;
               if (!visible()) return;
-              current = await api("operation?id=" + encodeURIComponent(check.id), undefined, {signal:controller.signal});
+              poll.signal.throwIfAborted();
+              current = await api("operation?id=" + encodeURIComponent(check.id), undefined, {signal:poll.signal});
+              if (!visible()) return;
+              poll.signal.throwIfAborted();
             } while (!current.ended && Date.now() < deadline);
-            if (!visible()) return;
             if (current.ended) {
               check.id = null;
               status.textContent = t(current.state === "completed" ? "恢复点验证通过。" : "恢复点验证未通过。");
@@ -1325,18 +1346,17 @@ window.RSIExperience = (() => {
               return;
             }
             status.textContent = t(check.id ? "无法获取验证状态。再次点击可继续查看原验证。" : "若未收到回执，请先查看近期操作。");
-            if (controller.signal.aborted) {
+            if (poll.signal.aborted) {
               toast(status.textContent, true);
               return;
             }
             throw error;
           } finally {
+            controller.signal.removeEventListener("abort", closePoll);
             clearTimeout(timer);
             clearTimeout(deadlineTimer);
-            check.checking = false;
-            if (!check.id) restoreChecks.delete(key);
-            checkButton.disabled = false;
-            void loadOperations();
+            release();
+            if (visible()) void loadOperations();
           }
         }, "text-button");
         summary.append(checkButton);
