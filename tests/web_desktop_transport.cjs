@@ -302,6 +302,52 @@ async function exitedLocalPage({requestError='Runtime connection changed',kind='
 }
 const disconnectedLocal={connected:false,connection_generation:8,error:'Local runtime exited'};
 const exitedAtPageGeneration={...disconnectedLocal,connection_generation:7};
+for(const [requestError,lateReply,settleLate] of [
+ ['Runtime unavailable','exit',resolve=>resolve(exitedAtPageGeneration)],
+ ['Runtime connection changed','replacement',resolve=>resolve({connected:true,connection_generation:9})],
+ ['Runtime connection changed','rejection',resolve=>resolve(Promise.reject(new Error('Late runtime snapshot failure')))],
+]){
+ test(`desktop runtime recheck times out after ${requestError} and ignores a late ${lateReply}`,async()=>{
+  const page=await exitedLocalPage({requestError});
+  const draft=page.node('goal-text');draft.value='待编辑内容';
+  let finished=false;
+  const click=page.clickInspect().then(()=>{finished=true;});
+  await page.tick();
+  assert.equal(page.probes.length,1);
+  const expired=page.probes.shift();
+  page.advance(4999);await page.tick();
+  assert.equal(finished,false);
+  page.advance(1);await page.tick();
+  assert.equal(finished,true,'the inspect action ends at the runtime snapshot deadline');
+  await click;
+  const assertUnconfirmed=()=>{
+   assert.equal(page.machine.textContent,'本机');
+   assert.equal(page.node('connection').textContent,'已连接');
+   assert.equal(page.window.RSIDesktop.isLocalDisconnected(),false);
+   assert.equal(page.dialog.open,false);
+   assert.equal(page.reloads(),0);
+   assert.equal(draft.value,'待编辑内容');
+  };
+  assertUnconfirmed();
+  const toast=page.node('toast');
+  assert.match(toast.textContent,/无法连接本地服务/);
+
+  page.advance(10000);await page.tick();
+  assert.equal(page.probes.length,1,'ordinary polling starts a fresh probe');
+  const polling=page.probes.shift();
+  const previousToast=toast.textContent;
+  settleLate(expired);await page.tick();
+  assertUnconfirmed();
+  assert.equal(toast.textContent,previousToast);
+  polling({kind:'local',scope:page.scope,connected:true,connection_generation:8});await page.tick();
+  assert.equal(page.reloads(),1);
+  assert.equal(page.routes.length,0);
+  assert.equal(page.calls.filter(call=>call.command==='connect').length,0);
+  assert.deepEqual(page.calls.filter(call=>call.command==='request'&&call.args.body!==null)
+   .map(({args})=>[args.path,args.connectionGeneration]),[['request',7]]);
+ });
+}
+
 test('desktop ordinary local process exit offers manual reconnection from the inspect button',async()=>{
  const page=await exitedLocalPage({requestError:'Runtime unavailable'});
  const draft=page.node('goal-text');draft.value='待编辑内容';

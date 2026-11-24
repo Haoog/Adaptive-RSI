@@ -3,22 +3,27 @@ if(window.__TAURI_INTERNALS__){
  const invoke=(command,args={})=>window.__TAURI_INTERNALS__.invoke(command,args);
  const originalFetch=window.fetch.bind(window);
  let remoteRuntime=false,sshTunnelConnected=false;
- const ready=(async()=>{
+ async function runtimeSnapshot(){
   let timer;
   try{
-   // Apply only the winning snapshot. Once startup falls back to the connection
-   // dialog, a late IPC reply cannot give this page a runtime or generation.
-   const info=await Promise.race([
+   return await Promise.race([
     invoke('runtime_info'),
     new Promise(resolve=>{timer=setTimeout(()=>resolve(null),5000);}),
    ]);
+  }catch{return null;}
+  finally{clearTimeout(timer);}
+ }
+ const ready=(async()=>{
+  try{
+   // Apply only the winning snapshot. Once startup falls back to the connection
+   // dialog, a late IPC reply cannot give this page a runtime or generation.
+   const info=await runtimeSnapshot();
    if(info===null)return null;
    window.__RSI_MACHINE_KEY__=info.scope||'disconnected';
    remoteRuntime=info.kind==='remote';
    sshTunnelConnected=remoteRuntime&&/^(?:ssh:|http:\/\/127\.0\.0\.1(?::|$))/.test(info.scope||'');
    return info;
   }catch{return null;}
-  finally{clearTimeout(timer);}
  })();
  let switching=false,switched=false,changing=false,remoteSessionExpired=false;
  let runtimeProbe=0,lastRuntimeReply=0,disconnectedGeneration=null,renderRuntimeConnection;
@@ -71,7 +76,7 @@ if(window.__TAURI_INTERNALS__){
     let obsolete=switching||changing;
     if(!obsolete){
      const probe=++runtimeProbe;
-     const next=await invoke('runtime_info').catch(()=>null);
+     const next=await runtimeSnapshot();
      if(localUnavailable&&options.signal?.aborted)throw aborted();
      obsolete=switching||changing||probe<=lastRuntimeReply;
      const generation=next?.connection_generation;
