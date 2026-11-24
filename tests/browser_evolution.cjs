@@ -63,6 +63,13 @@ async function checkEvolution(browser, url, errors) {
     assert.match(exhaustedText, /曝光次数已达上限/);
     assert.match(exhaustedText, /evolution\.max_holdout_uses/);
     assert.doesNotMatch(exhaustedText, /Validation or holdout exposure limit reached/);
+    const inconclusive = exhaustedCard.getByText('查看实验依据与分组结果', {exact: true});
+    const detailResponse = page.waitForResponse(response => new URL(response.url()).searchParams.get('id') === 'browser-exhausted');
+    await inconclusive.click();
+    const {comparison} = await (await detailResponse).json();
+    assert.equal(comparison.incomplete_trials, 1);
+    assert.deepEqual(comparison.cohorts, []);
+    await exhaustedCard.getByText('未计入胜负的配对试验 · 1', {exact: true}).waitFor();
 
     // ---------- 4) 英文界面对应文案：副标题、曝光提示、样本与启用按钮 ----------
     await page.locator('#language-select').selectOption('en');
@@ -74,6 +81,11 @@ async function checkEvolution(browser, url, errors) {
       has: page.locator('.badge', {hasText: 'Insufficient evidence'}),
     }).innerText(), /exposure is at its limit/);
     assert.equal(await page.getByRole('button', {name: 'Enable this strategy', exact: true}).count(), 1);
+    const englishCard = page.locator('#candidates .candidate-card').filter({
+      has: page.locator('.badge', {hasText: 'Insufficient evidence'}),
+    });
+    await englishCard.getByText('Inspect experiment evidence and cohorts', {exact: true}).click();
+    await englishCard.getByText('Paired trials excluded from win/loss counts · 1', {exact: true}).waitFor();
     await page.locator('#language-select').selectOption('zh-CN');
     await page.getByRole('button', {name: '启用这个策略', exact: true}).waitFor();
 

@@ -569,7 +569,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         return {"decision": "insufficient_evidence", "reason": reason, "failure": failure} if experiment else None
     from .context import code_map
     from .recovery import signature, cached, save, enforce_cached_review
-    from .discovery import related_work
+    from .discovery import evidence_anchors, related_work
     overlaps = related_work(runtime.store, project["id"], task)
     issue_comments = {"status": "not_issue", "comments": [], "warning": None, "updated_at": None}
     if task["source"] == "issue":
@@ -610,9 +610,18 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                             "skills": skill_evidence})
     saved_plan = None if experiment else cached(runtime, run, "planning", plan_key)
     saved_acceptance = None if experiment else cached(runtime, run, "acceptance", plan_key)
+    cited = []
+    for anchor in evidence_anchors(task["evidence"]):
+        path, quote = anchor.get("path"), anchor.get("quote")
+        if isinstance(path, str) and path:
+            cited.append((path, quote[:500] if isinstance(quote, str) else ""))
+            if len(cited) == 8:
+                break
+    search_text = "\n".join((task["title"], task["body"]))
     context = {"task": {k: task[k] for k in ["title", "body", "source", "evidence", "acceptance"]},
                "stable_strategies": strategies, "skills": skills,
-               "toolchains": detect(workspace), "code_map": code_map(workspace, task["body"], limit=12), "baseline": base,
+               "toolchains": detect(workspace),
+               "code_map": code_map(workspace, search_text, limit=12, evidence=cited), "baseline": base,
                "postmerge_outcomes": planning_outcomes,
                "open_prs": open_prs,
                "related_work": overlaps,
@@ -677,7 +686,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                            "Return change_kind explicitly: behavior, performance, refactor, documentation, configuration or ui. "
                            "Use measurable thresholds for performance; refactor requires behavior preservation and concrete maintainability evidence. "
                            "For performance_threshold return metric, unit, numeric target, nonnegative tolerance and direction lower/higher. "
-                           "For performance plans also return repetitions (3..100), at least one guardrail with the same threshold shape, and load_conditions (1..20 labels) when the benchmark depends on load. "
+                           "For performance plans also return repetitions (3..100), at least one guardrail with a distinct metric/unit pair, and load_conditions (1..20 unique nonblank labels) when the benchmark depends on load. "
                            "Return required_test_ids when exact runner-reported test identities are required, and check_dependencies as entries with name, paths, depends_on and checks when the checked package graph is known. "
                            "For other types return repetitions=1 and empty load_conditions and guardrails. "
                            "For behavior changes, name in required_test_ids the exact existing tests that must keep passing "

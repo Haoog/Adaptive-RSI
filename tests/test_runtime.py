@@ -806,7 +806,11 @@ class RuntimeTest(unittest.TestCase):
 
         def planning(role, prompt, *args, **kwargs):
             self.assertEqual(role, "planning")
-            seen.append(json.loads(prompt.split("\n")[-1])["task"])
+            context = json.loads(prompt.split("\n")[-1])
+            seen.append(context["task"])
+            cited = context["code_map"]["files"][0]
+            self.assertEqual(cited["path"], "calculator.py")
+            self.assertIn("return a - b", cited["anchors"][0]["declaration"])
             return {"decision": "deferred", "reason": "Fixture stops after planning", "scope": [],
                     "acceptance": [], "risk": "low", "value": {
                         "impact": "medium", "effort": "low", "confidence": "high", "benefit": "Fixture",
@@ -842,16 +846,30 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(invoke.call_count, 1)
         self.assertTrue(self.store.query("SELECT seq FROM events WHERE kind='inspection_skip'"))
 
-    def test_malformed_analysis_output_falls_back_to_empty_findings(self):
-        for malformed in [{}, {"findings": None}, None, "truncated"]:
-            with self.subTest(malformed=malformed):
-                # 相同上下文会命中 inspection_skip 短路；清掉巡检签名让每次都真正调用 invoke。
-                self.store.execute("DELETE FROM settings WHERE key LIKE 'inspection-head:%'", ())
-                with patch.object(self.runtime, "invoke", return_value=malformed):
-                    self.runtime.inspect(self.runtime.project(self.project), self.repo, "light",
-                                         {"id": "inspection", "config": encode(self.runtime.config(self.project))}, [])
-        # 畸形响应按空 findings 走完巡检并留下可诊断事件，不产生任何巡检任务。
-        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='inspection'")), 4)
+    def test_malformed_analysis_output_blocks_scan_and_can_be_rechecked(self):
+        self.runtime.pause(self.project, False)
+        config = self.runtime.config(self.project)
+        replies = [{}, {"findings": None}, None, "truncated", {"findings": []}]
+        with patch.object(self.runtime, "invoke", side_effect=replies) as invoke:
+            for malformed in replies[:-1]:
+                with self.subTest(malformed=malformed):
+                    task = self.runtime.request(self.project, "light")
+                    run = self.store.claim(self.project, config)
+                    self.runtime.process(run)
+                    failed = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+                    self.assertEqual(failed["state"], "blocked")
+                    self.assertEqual(json.loads(failed["result"])["failure"]["code"], "inspection_malformed")
+                    self.assertFalse(self.store.query("SELECT key FROM settings WHERE key LIKE 'inspection-head:%'"))
+                    self.runtime.request(self.project, "light", automatic=True)
+                    self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "blocked")
+                    self.assertIsNone(self.store.claim(self.project, config))
+            for _ in range(2):
+                self.runtime.request(self.project, "light")
+                run = self.store.claim(self.project, config)
+                self.runtime.process(run)
+                self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "completed")
+        self.assertEqual(invoke.call_count, 5)
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='inspection'")), 1)
         self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='inspection_malformed'")), 4)
         self.assertEqual(self.store.query("SELECT id FROM tasks WHERE source='inspection'"), [])
 

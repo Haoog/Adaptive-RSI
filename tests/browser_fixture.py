@@ -317,7 +317,9 @@ def main():
                     "dataset": {"version": 1, "manifest": sealed_manifest}})
                 exhausted_evidence = json.dumps({
                     "reason": "Validation or holdout exposure limit reached; import new cases or raise evolution.max_holdout_uses",
-                    "trials": []})
+                    "trials": [{"case": "browser-inconclusive", "split": "holdout", "source": "real",
+                                "stable": {"decision": "insufficient_evidence", "pass": False},
+                                "candidate": {"decision": "pass", "pass": True}}]})
                 content = json.dumps({"guidance": guidance, "triggers": ["add"]})
                 for candidate, parent, status, evidence, created in [
                         ("browser-stable", None, "stable", stable_evidence, now - 3000),

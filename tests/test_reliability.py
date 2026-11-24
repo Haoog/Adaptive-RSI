@@ -710,6 +710,24 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(_code_index.cache_info().misses, cached.misses + 1)
         self.assertEqual(_code_map_cached.cache_info().misses, mapping_cached.misses + 1)
 
+    def test_code_map_ranks_a_late_declaration_above_callers(self):
+        symbol = "locate_sealed_snapshot"
+        large = self.repo / "storage.py"
+        prefix = "def placeholder(): pass\n" * 10000
+        declaration = f"def {symbol}(workspace):"
+        large.write_text(prefix + declaration + "\n    return workspace\n")
+        for i in range(13):
+            (self.repo / f"caller_{i}.py").write_text(f"storage.{symbol}(workspace)\n")
+        result = code_map(self.repo, symbol, limit=12)
+        self.assertEqual(result["files"][0]["path"], "storage.py")
+        self.assertEqual(result["files"][0]["anchors"][0], {"line": 10001, "declaration": declaration})
+        explicit = code_map(self.repo, "unrelated", limit=1,
+                            evidence=(("caller_1.py", f"storage.{symbol}(workspace)"),))
+        self.assertEqual(explicit["files"][0], {"path": "caller_1.py", "anchors": [
+            {"line": 1, "declaration": f"storage.{symbol}(workspace)"}]})
+        large.write_text(prefix + "def updated_snapshot(): pass\n")
+        self.assertNotEqual(code_map(self.repo, symbol, limit=1)["files"][0]["path"], "storage.py")
+
     def test_evaluation_baseline_cache_is_project_and_config_scoped(self):
         base = git(self.repo, "rev-parse", "HEAD")
         candidate = snapshot(self.repo, self.root / "candidate")

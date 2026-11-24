@@ -1318,6 +1318,40 @@ class AuditEvaluationTest(unittest.TestCase):
         result = workflow.improvement({'acceptance_baseline': [row([10])], 'acceptance_candidate': [row([5])]}, {'change_kind': 'performance', 'contract': contract})
         self.assertEqual(result['decision'], 'insufficient_evidence')
 
+    def test_benchmark_contract_does_not_reuse_samples_across_duplicate_criteria(self):
+        task = {'source': 'goal', 'title': 'Reduce latency', 'body': ''}
+        threshold = {'metric': 'latency', 'unit': 'ms', 'direction': 'lower', 'target': 8, 'tolerance': 0}
+        guard = {**threshold, 'metric': 'memory', 'unit': 'MiB', 'target': 40}
+        plan = {'change_kind': 'performance', 'performance_threshold': threshold,
+                'load_conditions': ['idle', 'busy'], 'guardrails': [guard]}
+        contract = workflow.evidence_contract(task, plan)
+        self.assertEqual(contract['load_conditions'], ['idle', 'busy'])
+        for fields in ({'load_conditions': ['idle', 'idle']}, {'load_conditions': ['idle', ' idle ']},
+                       {'load_conditions': [' ']}, {'guardrails': [guard, {**guard, 'metric': ' memory '}]},
+                       {'guardrails': [{**guard, 'unit': '\t'}]}, {'guardrails': [threshold]}):
+            with self.subTest(fields=fields):
+                with self.assertRaises(ValueError):
+                    workflow.evidence_contract(task, {**plan, **fields})
+
+        def row(latency, memory, memory_loads=('idle', 'busy')):
+            values = [('latency', 'ms', latency, ('idle', 'busy')), ('memory', 'MiB', memory, memory_loads)]
+            return {'passed': True, 'stdout': '\n'.join(
+                json.dumps({'metric': metric, 'unit': unit, 'value': value, 'load': load})
+                for metric, unit, value, loads in values for load in loads for _ in range(3))}
+
+        def check(contract, candidate):
+            return workflow.improvement({'acceptance_baseline': [row(10, 40)], 'acceptance_candidate': [candidate]},
+                                        {'change_kind': 'performance', 'contract': contract})
+
+        candidate = row(5, 40)
+        self.assertEqual(check(contract, candidate)['decision'], 'pass')
+        self.assertEqual(check(contract, row(5, 40, ('idle',)))['decision'], 'insufficient_evidence')
+        self.assertEqual(check(contract, row(5, 40, ('idle', 'idle', 'busy')))['decision'], 'insufficient_evidence')
+        self.assertEqual(check({**contract, 'load_conditions': ['idle', 'idle']}, candidate)['basis'],
+                         'invalid_measurement_plan')
+        self.assertEqual(check({**contract, 'guardrails': [guard, guard]}, candidate)['basis'],
+                         'duplicate_guardrail_metric')
+
     def test_baseline_cache_write_failure_keeps_evaluation_result(self):
         # 缓存写失败（满盘、连接容量耗尽、只读状态目录）不能让已跑完检查的
         # 评估整体作废；失败必须写进报告，不能静默丢掉加速记录。

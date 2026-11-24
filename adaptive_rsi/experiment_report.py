@@ -1,15 +1,33 @@
 """Descriptive comparisons preserve unknown usage and independent case families."""
 import math
 
+from .evolution import CONCLUSIVE_DECISIONS, arm_decision
+
 
 def measurement(value):
     return value if type(value) in (int, float) and 0 <= value <= 10**15 and math.isfinite(value) else None
 
 
 def comparison(trials):
-    complete = [row for row in trials if isinstance(row, dict) and
-                all(isinstance(row.get(variant), dict) and type(row[variant].get('pass')) is bool
-                    for variant in ('stable', 'candidate'))]
+    complete = []
+    cohorts = {}
+    for row in trials:
+        if not isinstance(row, dict):
+            continue
+        stable, candidate = (row.get(variant) for variant in ('stable', 'candidate'))
+        decisions = (arm_decision(stable), arm_decision(candidate))
+        no_change = any(isinstance(arm, dict) and arm.get('no_change') for arm in (stable, candidate))
+        conclusive = all(decision in CONCLUSIVE_DECISIONS for decision in decisions)
+        if conclusive and not no_change:
+            complete.append(row)
+        if not isinstance(row.get('case'), str) or not row['case']:
+            continue
+        stratum = row.get('stratum')
+        size = stratum[1] if isinstance(stratum, list) and len(stratum) == 2 and isinstance(stratum[1], str) else 'unknown'
+        key = tuple(row.get(key) if isinstance(row.get(key), str) else 'unknown' for key in ('source', 'split')) + (size,)
+        families = cohorts.setdefault(key, {})
+        outcome = 'no_change' if no_change else decisions if conclusive else None
+        families.setdefault(row['case'], set()).add(outcome)
     totals = {}
     for variant in ('stable', 'candidate'):
         tokens = [measurement(row[variant].get('tokens')) if row[variant].get('usage_known') is True else None for row in complete]
@@ -20,25 +38,21 @@ def comparison(trials):
     latency_known = len(complete) == len(trials) and bool(complete) and all(totals[v]['seconds'] is not None for v in totals)
     token_ratio = totals['candidate']['tokens'] / totals['stable']['tokens'] if token_known and totals['stable']['tokens'] > 0 else None
     latency_ratio = totals['candidate']['seconds'] / totals['stable']['seconds'] if latency_known and totals['stable']['seconds'] > 0 else None
-    cohorts = {}
-    for row in complete:
-        if not isinstance(row.get('case'), str) or not row['case']:
-            continue
-        stratum = row.get('stratum')
-        size = stratum[1] if isinstance(stratum, list) and len(stratum) == 2 and isinstance(stratum[1], str) else 'unknown'
-        key = tuple(row.get(key) if isinstance(row.get(key), str) else 'unknown' for key in ('source', 'split')) + (size,)
-        families = cohorts.setdefault(key, {})
-        families.setdefault(row['case'], []).append(row)
     rows = []
     for (source, split, size), families in sorted(cohorts.items()):
-        wins = losses = 0
+        wins = losses = ties = 0
         for family in families.values():
-            lost = any(row['stable']['pass'] and not row['candidate']['pass'] for row in family)
-            won = not lost and any(not row['stable']['pass'] and row['candidate']['pass'] for row in family)
-            wins += won
-            losses += lost
-        rows.append({'source': source, 'split': split, 'size': size, 'families': len(families),
-                     'wins': wins, 'losses': losses, 'ties': len(families) - wins - losses})
+            if 'no_change' in family:
+                continue
+            if ('pass', 'fail') in family:
+                losses += 1
+            elif None not in family:
+                wins += ('fail', 'pass') in family
+                ties += ('fail', 'pass') not in family
+        counted = wins + losses + ties
+        if counted:
+            rows.append({'source': source, 'split': split, 'size': size, 'families': counted,
+                         'wins': wins, 'losses': losses, 'ties': ties})
     return {'unit': 'tokens_not_currency', 'trials': len(complete), 'incomplete_trials': len(trials) - len(complete),
             'totals': totals, 'token_ratio': token_ratio, 'latency_ratio': latency_ratio,
             'cost_state': 'unknown_usage' if not token_known else 'zero_baseline' if token_ratio is None else 'known',

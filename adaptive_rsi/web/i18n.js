@@ -252,6 +252,7 @@ const english = {
  "长任务": "Long tasks",
  "独立用例": "Independent cases",
  "胜 / 负 / 平": "Wins / losses / ties",
+ "未计入胜负的配对试验": "Paired trials excluded from win/loss counts",
  "分组结果仅描述已观察样本，不代表对其他任务的收益。": "Cohort results describe observed samples and do not establish benefits for other tasks.",
  "封存计划与输入清单": "Sealed plan and input manifest",
  "晋升评审：策略差异与适用边界": "Promotion review: strategy diff and applicability limits",
