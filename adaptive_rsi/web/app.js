@@ -729,11 +729,50 @@ function savedViewControls(){
  const input=el('input');input.type='file';input.accept='application/json,.json';input.setAttribute('aria-label',t('导入视图文件'));input.addEventListener('change',()=>safe(async()=>{const file=input.files[0];if(!file)return;if(file.size>4096)throw Error(t('视图文件无效或项目不可用。'));importSavedView(await file.text());input.value='';}));
  box.append(action(t('导出当前视图'),()=>{const url=URL.createObjectURL(new Blob([exportSavedView()],{type:'application/json'})),link=el('a');link.href=url;link.download='rsi-view.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);},'text-button'),input);$('tasks-page').after(box);
 }
+// 列表与详情只登记当前按钮，重绘时仍沿用同一笔未确认请求。
+const taskRetries=new Map(),listTaskRetryButtons=new Map(),detailTaskRetryButtons=new Map();
+function taskRetryKey(task){return JSON.stringify([window.__RSI_MACHINE_KEY__||'',task.project,task.id]);}
+function taskRetryButton(task,buttons,label,body,current,onAccepted,cls){
+ const key=taskRetryKey(task),machine=window.__RSI_MACHINE_KEY__,sameRuntime=()=>window.__RSI_MACHINE_KEY__===machine;
+ const updateButtons=update=>{
+  for(const registered of [listTaskRetryButtons,detailTaskRetryButtons]){
+   const visible=registered.get(key);
+   if(visible)update(visible,registered);
+  }
+ };
+ const button=action(label,async()=>{
+  if(button.disabled||!button.isConnected||buttons.get(key)!==button||!sameRuntime()||!current()||taskRetries.has(key))return;
+  const pending={accepted:false};
+  taskRetries.set(key,pending);
+  updateButtons(visible=>{visible.disabled=true;});
+  try{
+   await api('retry',body);
+   pending.accepted=true;
+  }catch(error){
+   if(sameRuntime()&&current())throw error;
+   return;
+  }finally{
+   taskRetries.delete(key);
+   updateButtons((visible,registered)=>{
+    if(pending.accepted){visible.remove();registered.delete(key);}
+    else visible.disabled=false;
+   });
+  }
+  if(sameRuntime())await onAccepted();
+ },cls);
+ button.disabled=taskRetries.has(key);
+ buttons.set(key,button);
+ return button;
+}
+function listTaskRetryButton(task,label,body){
+ return taskRetryButton(task,listTaskRetryButtons,t(label),body,()=>projectId===task.project,()=>refresh(),'text-button');
+}
 function renderTasks(){
  savedViewControls();
  const list=$('tasks-list'),filter=$('task-filter').value;
  const waitingRetries=scoped(state.tasks).filter(task=>task.state==='queued'&&task.wait_reason!=='working_hours'&&task.available>Date.now()/1000).map(task=>task.id);
- if(!changedList(list,[filter,$('show-system-tasks').checked,taskOffset,state.selected_project,state.pagination,scoped(state.tasks),scoped(state.runs),waitingRetries]))return;
+ if(!changedList(list,[filter,$('show-system-tasks').checked,taskOffset,state.selected_project,state.pagination,scoped(state.tasks),scoped(state.runs),waitingRetries,window.__RSI_MACHINE_KEY__]))return;
+ listTaskRetryButtons.clear();
  const focused=document.activeElement,focusedRow=focused?.closest?.('.task-row'),focusedTask=focusedRow?.dataset.taskId,focusIndex=focusedRow?[...focusedRow.querySelectorAll('button,input,a[href]')].indexOf(focused):-1;
  const oldIndex=focusedRow?[...list.children].indexOf(focusedRow):-1;
  list.replaceChildren();
@@ -761,9 +800,9 @@ function renderTasks(){
   const proof=[];if(latest?.evaluation_decision)proof.push(t('运行检查')+' '+t(statusNames[latest.evaluation_decision]||latest.evaluation_decision));if(latest?.review_decision)proof.push(t('代码评审')+' '+t(statusNames[latest.review_decision]||latest.review_decision));
   for(const [kind,label]of [['release','发布'],['deploy','部署']]){const operation=latest?.automation?.[kind];if(operation)proof.push(t(label)+' '+t(releaseStates[operation.state]||operation.state));}if(proof.length)title.append(el('p',proof.join(' · '),'task-meta'));
 
-  if(['waiting_budget','blocked','failed','interrupted','cancelled','insufficient_evidence','deferred','rejected','expired','obsolete'].includes(task.state))actions.append(action(t('重试'),async()=>{await api('retry',{task:task.id,force:task.source==='system_evolve'});await refresh();},'text-button'));
+  if(['waiting_budget','blocked','failed','interrupted','cancelled','insufficient_evidence','deferred','rejected','expired','obsolete'].includes(task.state))actions.append(listTaskRetryButton(task,'重试',{task:task.id,force:task.source==='system_evolve'}));
   // 仅自动退避（有未来 available）的排队任务可提前重试；普通排队任务没有可用操作。
-  else if(task.state==='queued'&&task.wait_reason!=='working_hours'&&task.available>Date.now()/1000)actions.append(action(t('立即重试'),async()=>{await api('retry',{task:task.id});await refresh();},'text-button'));
+  else if(task.state==='queued'&&task.wait_reason!=='working_hours'&&task.available>Date.now()/1000)actions.append(listTaskRetryButton(task,'立即重试',{task:task.id}));
   actions.append(action(t('查看详情'),()=>showTask(task),'text-button'));
   if(!task.source.startsWith('system_')&&window.RSIBatch)row.append(window.RSIBatch.row(task));
   const metrics=el('div',undefined,'task-metrics');
@@ -829,6 +868,7 @@ function valueFeedback(data){
  },form);});return form;
 }
 function runPageRows(page){return Array.isArray(page)?page:(Array.isArray(page?.runs)?page.runs:[]);}
+const pendingTaskSchedules=new Map();
 async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&$('detail-dialog').open&&detailTask?.id===task.id&&detailTask?.project===task.project&&projectId===task.project)queueDraft=window.RSIExperience?.queueDraft();const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));
  // A request can finish after the user closed the previous detail view.
  // Only show the dialog after checking that this exact request is still current.
@@ -926,38 +966,91 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
 
  if(ticket!==detailSequence||projectId!==project)return;
  // 与 runtime.cancel_task 的 cancellable 状态保持一致；待批准的候选取消前需确认后果。
- if(['queued','planning','executing','evaluating','blocked','waiting_budget','deferred','insufficient_evidence','failed','interrupted','awaiting_approval'].includes(task.state)){const secondary=el('details',undefined,'task-secondary-actions');secondary.append(el('summary',t('更多操作')),action(t('取消任务'),async()=>{
-  if(ticket!==detailSequence||projectId!==project)return;
-  const plan=await api('task-cancel-preview?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));
-  if(ticket!==detailSequence||projectId!==project)return;
-  const preview=el('div'),cascade=el('input'),reason=el('textarea');cascade.type='checkbox';reason.maxLength=2000;reason.rows=2;
-  preview.append(el('p',t('取消后待批准的候选将被撤销，需要重新验证才能再次交付；已创建的 PR 不受影响。确认取消？')));
-  if(plan.affected.length){preview.append(el('p',t('以下后继任务依赖本任务；默认只取消当前任务。')));for(const item of plan.affected)preview.append(el('p',item.title+' · '+t(statusNames[item.state]||item.state)));if(!plan.truncated){const label=el('label',t('同时取消可取消的后继任务'));label.prepend(cascade);preview.append(label);}}
-  if(plan.truncated)preview.append(el('p',t('后继过多，预览仅展示前 999 项；本次只能取消当前任务。')));
-  const reasonLabel=el('label',t('干预原因（可选，保留原文）'));reasonLabel.append(reason);preview.append(reasonLabel);
-  if(!(await uiConfirm(t('确认取消任务及所选后继？'),preview))||!stillCurrent())return;
-  await api('cancel',{task:task.id,cascade:cascade.checked,revision:plan.revision,reason:reason.value});if(stillCurrent())closeTaskDetail();await refresh();}));
+ if(['queued','planning','executing','evaluating','blocked','waiting_budget','deferred','insufficient_evidence','failed','interrupted','awaiting_approval'].includes(task.state)){
+  const secondary=el('details',undefined,'task-secondary-actions'),machine=window.__RSI_MACHINE_KEY__;
+  const sameScope=()=>projectId===project&&window.__RSI_MACHINE_KEY__===machine;
+  const cancelCurrent=()=>sameScope()&&stillCurrent();
+  const cancelButton=action(t('取消任务'),async()=>{
+   if(cancelButton.disabled||!cancelCurrent())return;
+   cancelButton.disabled=true;
+   try{
+    const plan=await api('task-cancel-preview?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));
+    if(!cancelCurrent())return;
+    const preview=el('div'),cascade=el('input'),reason=el('textarea');cascade.type='checkbox';reason.maxLength=2000;reason.rows=2;
+    preview.append(el('p',t('取消后待批准的候选将被撤销，需要重新验证才能再次交付；已创建的 PR 不受影响。确认取消？')));
+    if(plan.affected.length){preview.append(el('p',t('以下后继任务依赖本任务；默认只取消当前任务。')));for(const item of plan.affected)preview.append(el('p',item.title+' · '+t(statusNames[item.state]||item.state)));if(!plan.truncated){const label=el('label',t('同时取消可取消的后继任务'));label.prepend(cascade);preview.append(label);}}
+    if(plan.truncated)preview.append(el('p',t('后继过多，预览仅展示前 999 项；本次只能取消当前任务。')));
+    const reasonLabel=el('label',t('干预原因（可选，保留原文）'));reasonLabel.append(reason);preview.append(reasonLabel);
+    if(!(await uiConfirm(t('确认取消任务及所选后继？'),preview))||!cancelCurrent())return;
+    // 服务若为更新拒绝这次提交，必须重新预览和确认，不能在后台重放旧授权。
+    const result=await sendApi('cancel',{task:task.id,cascade:cascade.checked,revision:plan.revision,reason:reason.value});
+    if(result?.saved!==true||!Array.isArray(result.receipts)||!result.receipts.some(row=>row?.id===task.id&&row.state==='cancelled')){
+     throw Error(t('未收到取消回执，请先刷新列表确认任务状态。'));
+    }
+   }catch(error){
+    if(!cancelCurrent())return;
+    if(error.code==='update_in_progress'){toast(t('服务正在更新，请稍后重新预览并确认取消。'),true);return;}
+    throw error;
+   }finally{cancelButton.disabled=false;}
+   if(!sameScope())return;
+   const acceptedHere=cancelCurrent();
+   if(acceptedHere){closeTaskDetail();toast(t('已申请取消任务'));}
+   const feedbackTicket=detailSequence;
+   try{await refresh();}catch{
+    if(acceptedHere&&sameScope()&&feedbackTicket===detailSequence)toast(t('已申请取消任务，但列表刷新失败。'),true);
+   }
+  });
+  secondary.append(el('summary',t('更多操作')),cancelButton);
   if(task.state==='queued'){
    // 预约授权一个绝对时刻：时区与重复小时一起提交，由后端拒绝缺失/歧义时刻。
    const scheduleBox=el('div',undefined,'task-schedule-editor'),time=el('input'),zone=el('input'),repeat=el('select'),draft=draftStore.get('task-schedule',task.id);
+   const key=JSON.stringify([machine,project,task.id]);
+   const scheduleCurrent=()=>sameScope()&&$('detail-dialog').open&&detailTask?.id===task.id&&detailTask.project===task.project;
    time.type='datetime-local';
    zone.type='text';zone.value=draft?.zone??displayTz??Intl.DateTimeFormat().resolvedOptions().timeZone;
    for(const [value,text] of [['','时间唯一'],['0','第一次'],['1','第二次']]){const option=el('option',t(text));option.value=value;repeat.append(option);}
    // 详情轮询与语言切换会整块重建；按任务恢复未提交的预约输入。
    time.value=draft?.time??'';repeat.value=draft?.repeat??'';
-   const rememberSchedule=()=>draftStore.set('task-schedule',task.id,{time:time.value,zone:zone.value,repeat:repeat.value});
+   const scheduleValues=()=>({time:time.value,zone:zone.value,repeat:repeat.value});
+   const rememberSchedule=()=>{
+    if(!stillCurrent()||!sameScope())return;
+    const pending=pendingTaskSchedules.get(key);
+    if(pending)pending.edited=true;
+    draftStore.set('task-schedule',task.id,scheduleValues());
+   };
    time.addEventListener('input',rememberSchedule);zone.addEventListener('input',rememberSchedule);repeat.addEventListener('change',rememberSchedule);
    const localLabel=el('label',t('本地时间'));localLabel.append(time);
    const zoneLabel=el('label',t('时区'));zoneLabel.append(zone);
    const repeatLabel=el('label',t('重复小时'));repeatLabel.append(repeat);
-   scheduleBox.append(el('p',t('安排检查：此任务将在指定时刻开始运行。')),localLabel,zoneLabel,repeatLabel,
-    action(t('预约'),async()=>{if(!time.value||!zone.value.trim()){toast(t('请填写本地时间和时区。'),true);return;}
-     const submitted={time:time.value,zone:zone.value,repeat:repeat.value};
+   const scheduleButton=action(t('预约'),async()=>{
+    if(!stillCurrent()||!sameScope()||pendingTaskSchedules.has(key))return;
+    const submitted=scheduleValues();
+    if(!submitted.time||!submitted.zone.trim()){toast(t('请填写本地时间和时区。'),true);return;}
+    const pending={button:scheduleButton,edited:false};
+    pendingTaskSchedules.set(key,pending);scheduleButton.disabled=true;
+    try{
      await api('task/schedule-time',{task:task.id,local_time:submitted.time,timezone:submitted.zone.trim(),
       fold:submitted.repeat===''?undefined:Number(submitted.repeat)});
-     const saved=draftStore.get('task-schedule',task.id);
-     if(saved&&saved.time===submitted.time&&saved.zone===submitted.zone&&saved.repeat===submitted.repeat)draftStore.remove('task-schedule',task.id);
-     toast(t('预约已保存'));if(stillCurrent())closeTaskDetail();await refresh();},'button primary'));
+    }catch(error){
+     if(scheduleCurrent())throw error;
+     return;
+    }finally{pendingTaskSchedules.delete(key);pending.button.disabled=false;}
+    // 草稿按运行环境和任务隔离；回执提示还须属于当前项目。
+    if(window.__RSI_MACHINE_KEY__!==machine)return;
+    const saved=draftStore.get('task-schedule',task.id);
+    if(!pending.edited&&saved?.time===submitted.time&&saved.zone===submitted.zone&&saved.repeat===submitted.repeat)draftStore.remove('task-schedule',task.id);
+    if(!sameScope())return;
+    if(!pending.edited&&scheduleCurrent())closeTaskDetail();
+    toast(t('预约已保存'));
+    const feedbackTicket=detailSequence,receiptTimer=toastTimer;
+    try{await refresh();}catch{
+     if(sameScope()&&detailSequence===feedbackTicket&&toastTimer===receiptTimer)toast(t('预约已保存，但列表刷新失败。'),true);
+    }
+   },'button primary');
+   // 重绘或重开时，当前按钮沿用这笔请求的等待状态。
+   const pending=pendingTaskSchedules.get(key);
+   if(pending){pending.button=scheduleButton;scheduleButton.disabled=true;}
+   scheduleBox.append(el('p',t('安排检查：此任务将在指定时刻开始运行。')),localLabel,zoneLabel,repeatLabel,scheduleButton);
    secondary.append(el('summary',t('安排检查')),scheduleBox);}
   body.append(secondary);}
  restore?.(body);

@@ -996,7 +996,12 @@ test('out-of-order task details cannot attach cancellation for the previous task
     if (url.includes('run?id=ra')) return new Promise(resolve => { finishA = () => resolve(response(detail)); });
     if (url.includes('run?id=rb')) return response(detail);
     if (url.includes('task-cancel-preview?')) return response({affected: [], revision: 'preview-b'});
-    if (url.endsWith('/cancel')) { cancellations.push(JSON.parse(options.body)); return response({saved: true}); }
+    if (url.endsWith('/cancel')) {
+      const body = JSON.parse(options.body);
+      cancellations.push(body);
+      return response({saved: true, revision: body.revision, cascade: body.cascade, impact_truncated: false,
+        receipts: [{id: body.task, state: 'cancelled', previous_state: 'executing', candidates: [], publications: []}]});
+    }
     return response(snapshot());
   };
   const pendingA = page.context.showTask(a);
@@ -1008,6 +1013,198 @@ test('out-of-order task details cannot attach cancellation for the previous task
   assert.equal(buttons.length, 1);
   await buttons[0].handlers.click();
   assert.deepEqual(cancellations, [{task: 'b', cascade: false, revision: 'preview-b', reason: ''}]);
+});
+
+async function taskCancellationPage({preview, post, refresh} = {}) {
+  const page = browser(), task = fixtureTask('cancel-me', 'executing');
+  const previews = [], posts = [], refreshes = [];
+  page.document.body = page.node('fixture-body');
+  page.context.window.__RSI_MACHINE_KEY__ = 'runtime-a';
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.fetch = async (url, options) => {
+    const {pathname, searchParams} = new URL(url, 'http://fixture.test');
+    if (pathname === '/api/task-runs') return response([]);
+    if (pathname === '/api/task-cancel-preview') {
+      previews.push(Object.fromEntries(searchParams));
+      const plan = {task, revision: 'preview-' + previews.length, limit: 1000, truncated: false,
+        affected: [{id: 'child', title: 'Downstream task', state: 'queued', cancellable: true}]};
+      return preview ? preview(plan) : response(plan);
+    }
+    if (pathname === '/api/cancel') {
+      const body = JSON.parse(options.body);
+      posts.push(body);
+      const receipt = {saved: true, revision: body.revision, cascade: body.cascade, impact_truncated: false, receipts: [
+        {id: task.id, state: 'cancelled', previous_state: task.state, candidates: [], publications: []},
+        {id: 'child', state: body.cascade ? 'cancelled' : 'unchanged', previous_state: 'queued', candidates: [], publications: []},
+      ]};
+      return post ? post(receipt) : response(receipt);
+    }
+    assert.equal(pathname, '/api/state');
+    refreshes.push(searchParams.get('project'));
+    return refresh ? refresh() : response(snapshot());
+  };
+  await page.context.showTask(task);
+  const click = label => {
+    const button = buttonWith(page.node('detail-body'), label);
+    assert.ok(button && button.tagName === 'BUTTON');
+    return button.handlers.click();
+  };
+  const dialogs = () => descendants(page.document.body).filter(node => node.className === 'confirm-dialog' && node.open);
+  const choose = (dialog, label) => buttonWith(dialog, label).handlers.click();
+  async function navigate(scope) {
+    if (scope === 'task') await page.context.showTask(fixtureTask('other', 'failed'));
+    if (scope === 'project') {
+      const picker = page.node('project-select');
+      picker.value = 'b';
+      picker.handlers.change();
+      await page.context.lastAction;
+    }
+    if (scope === 'runtime') page.context.window.__RSI_MACHINE_KEY__ = 'runtime-b';
+    page.context.toast('当前界面');
+  }
+  return {page, previews, posts, refreshes, click, dialogs, choose, navigate, toast: page.node('toast')};
+}
+
+test('task cancellation rapid clicks open one preview and require a fresh confirmation after dismissal', async () => {
+  const replies = [];
+  const f = await taskCancellationPage({preview: plan => new Promise(resolve => replies.push(() => resolve(response(plan))))});
+  const pending = f.click('取消任务');
+  const duplicates = [f.click('取消任务'), f.click('取消任务')];
+  for (const reply of replies) reply();
+  await new Promise(setImmediate);
+  assert.deepEqual([f.previews.length, f.dialogs().length, f.posts.length], [1, 1, 0], 'preview, open confirmations, POSTs');
+  f.choose(f.dialogs()[0], '取消');
+  await Promise.all([pending, ...duplicates]);
+  assert.equal(f.posts.length, 0);
+  const confirmed = f.click('取消任务');
+  replies.at(-1)();
+  await waitFor(() => f.dialogs().length === 1);
+  const dialog = f.dialogs()[0], fields = descendants(dialog);
+  const cascade = fields.find(node => node.type === 'checkbox');
+  assert.equal(cascade.checked, false);
+  assert.ok(fields.some(node => node.textContent.includes('Downstream task')));
+  cascade.checked = true;
+  fields.find(node => node.tagName === 'TEXTAREA').value = '  原文\n保留  ';
+  f.choose(dialog, '确认');
+  await confirmed;
+  assert.deepEqual(f.posts, [{task: 'cancel-me', cascade: true, revision: 'preview-2', reason: '  原文\n保留  '}]);
+  assert.equal(f.toast.textContent, '已申请取消任务');
+});
+
+for (const scope of ['task', 'project', 'runtime']) {
+  for (const phase of ['preview', 'preview failure', 'confirm', 'POST failure', 'POST receipt']) {
+    test(`task cancellation ignores a stale ${phase} after switching ${scope}`, async () => {
+      let reply;
+      const rejected = response({}, 503);
+      const f = await taskCancellationPage({
+        preview: phase.startsWith('preview') ? plan => new Promise(resolve => {
+          reply = () => resolve(phase === 'preview' ? response(plan) : rejected);
+        }) : undefined,
+        post: phase.startsWith('POST') ? receipt => new Promise(resolve => {
+          reply = () => resolve(phase === 'POST receipt' ? response(receipt) : rejected);
+        }) : undefined,
+        refresh: phase === 'POST receipt' && scope === 'task' ? () => rejected : undefined,
+      });
+      const pending = f.click('取消任务');
+      if (!phase.startsWith('preview')) await waitFor(() => f.dialogs().length === 1);
+      if (phase.startsWith('POST')) {
+        f.choose(f.dialogs()[0], '确认');
+        await waitFor(() => f.posts.length === 1);
+      }
+      await f.navigate(scope);
+      const refreshCount = f.refreshes.length;
+      if (phase === 'confirm') f.choose(f.dialogs()[0], '确认');
+      else reply();
+      await new Promise(setImmediate);
+      assert.deepEqual([f.dialogs().length, f.posts.length, f.toast.textContent],
+        [0, phase.startsWith('POST') ? 1 : 0, '当前界面'], 'open confirmations, POSTs, toast');
+      await pending;
+      assert.equal(f.refreshes.length - refreshCount, phase === 'POST receipt' && scope === 'task' ? 1 : 0);
+      assert.equal(f.page.node('detail-dialog').open, scope !== 'project');
+      if (scope === 'task') assert.equal(f.page.node('detail-title').textContent, 'Task other');
+    });
+  }
+}
+
+test('task cancellation distinguishes a committed receipt from a refresh failure', async () => {
+  let failRefresh;
+  const f = await taskCancellationPage({refresh: () => new Promise(resolve => { failRefresh = () => resolve(response({}, 503)); })});
+  const pending = f.click('取消任务');
+  await waitFor(() => f.dialogs().length === 1);
+  f.choose(f.dialogs()[0], '确认');
+  await waitFor(() => Boolean(failRefresh));
+  const before = f.toast.textContent;
+  failRefresh();
+  await pending;
+  assert.deepEqual([f.posts.length, f.refreshes.length, before, f.toast.textContent, f.page.node('detail-dialog').open],
+    [1, 1, '已申请取消任务', '已申请取消任务，但列表刷新失败。', false]);
+});
+
+test('task cancellation keeps a later task open when a post-receipt refresh fails', async () => {
+  let failRefresh;
+  const f = await taskCancellationPage({refresh: () => new Promise(resolve => { failRefresh = () => resolve(response({}, 503)); })});
+  const pending = f.click('取消任务');
+  await waitFor(() => f.dialogs().length === 1);
+  f.choose(f.dialogs()[0], '确认');
+  await waitFor(() => Boolean(failRefresh));
+  await f.navigate('task');
+  failRefresh();
+  await pending;
+  assert.equal(f.toast.textContent, '当前界面');
+  assert.equal(f.page.node('detail-dialog').open, true);
+  assert.equal(f.page.node('detail-title').textContent, 'Task other');
+});
+
+for (const [post, message] of [
+  [() => response({saved: true}), '未收到取消回执，请先刷新列表确认任务状态。'],
+  [() => rejected(), '服务正在更新，请稍后重新预览并确认取消。'],
+]) {
+  test(`task cancellation keeps details open and reports ${message}`, async () => {
+    const f = await taskCancellationPage({post});
+    const pending = f.click('取消任务');
+    await waitFor(() => f.dialogs().length === 1);
+    f.choose(f.dialogs()[0], '确认');
+    await pending;
+    assert.equal(f.toast.textContent, message);
+    assert.equal(f.page.node('detail-dialog').open, true);
+    assert.deepEqual([f.posts.length, f.refreshes.length], [1, 0]);
+  });
+}
+
+test('task cancellation requires new confirmation after revision rejection', async () => {
+  let rejected = true;
+  const f = await taskCancellationPage({post: receipt => rejected
+    ? response({error: 'Cancellation preview changed; review it again', error_code: 'validation_error'}, 400)
+    : response(receipt)});
+  const first = f.click('取消任务');
+  await waitFor(() => f.dialogs().length === 1);
+  f.choose(f.dialogs()[0], '确认');
+  await first;
+  assert.equal(f.toast.textContent, '任务或依赖已变化，请重新查看取消预览。');
+  assert.equal(f.page.node('detail-dialog').open, true);
+  assert.deepEqual([f.posts.length, f.refreshes.length], [1, 0]);
+  rejected = false;
+  const second = f.click('取消任务');
+  await waitFor(() => f.dialogs().length === 1);
+  assert.equal(f.posts.length, 1, 'a newer preview still needs explicit confirmation');
+  f.choose(f.dialogs()[0], '确认');
+  await second;
+  assert.deepEqual(f.posts.map(post => [post.revision, post.cascade]), [['preview-1', false], ['preview-2', false]]);
+});
+
+test('task cancellation cannot replay an update-rejected confirmation after switching project', async () => {
+  const f = await taskCancellationPage({post: () => rejected()});
+  const pending = f.click('取消任务');
+  await waitFor(() => f.dialogs().length === 1);
+  f.choose(f.dialogs()[0], '确认');
+  await new Promise(setImmediate);
+  await f.navigate('project');
+  const retry = f.page.timers.find(timer => timer.active && timer.delay === 1000);
+  if (retry) {
+    f.page.fireTimer(1000);
+    await new Promise(setImmediate);
+  } else await pending;
+  assert.deepEqual([f.posts.length, f.toast.textContent], [1, '当前界面']);
 });
 
 test('task run history loads and appends earlier pages with a visible count', async () => {
@@ -2281,6 +2478,7 @@ test('schedule-time rejections are mapped and localized for both console languag
   assert.match(english[apiErrors['Scheduled local time is nonexistent']], /does not exist/);
   assert.match(english[apiErrors['Scheduled local time is ambiguous; specify fold']], /first or second/);
   assert.equal(english['已预约'], 'Reserved');
+  assert.equal(english['预约已保存，但列表刷新失败。'], 'Reservation saved, but the list failed to refresh.');
   assert.equal(english['安排检查：此任务将在指定时刻开始运行。'], 'Schedule check: this task starts at the chosen instant.');
 });
 
@@ -2343,10 +2541,11 @@ test('schedule form omits fold for a single-occurrence time and rejects empty in
   controls.find(node => node.tagName === 'BUTTON' && node.textContent === '预约').handlers.click();
   await page.context.lastAction;
   assert.equal(posts[0].body.fold, undefined, 'single occurrence must not send a fold');
-  // 空输入在本地拦截，不发请求。
-  time.value = '';
+  // 成功后原详情已关闭；从重新打开的正常入口检查空输入。
+  await page.context.showTask(task);
+  const reopened = detailDescendants(page.node('detail-body')).find(node => node.className === 'task-schedule-editor');
   page.node('toast').textContent = '';
-  controls.find(node => node.tagName === 'BUTTON' && node.textContent === '预约').handlers.click();
+  detailDescendants(reopened).find(node => node.tagName === 'BUTTON' && node.textContent === '预约').handlers.click();
   await page.context.lastAction;
   assert.equal(posts.length, 1, 'empty input must not reach the API');
   assert.match(page.node('toast').textContent, /请填写本地时间和时区/);
@@ -2493,6 +2692,198 @@ for (const kind of ['schedule', 'reason']) {
   }
 }
 
+function scheduleRequestPage() {
+  const page = experiencePage({realRefresh: true}), posts = [], refreshes = [];
+  const task = fixtureTask('reservation', 'queued');
+  let refreshFails = false;
+  page.context.location.hash = '';
+  page.context.window.__RSI_MACHINE_KEY__ = 'first';
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.fetch = async (url, options) => {
+    const machine = page.context.window.__RSI_MACHINE_KEY__;
+    if (url === '/api/task/schedule-time') {
+      const body = JSON.parse(options.body);
+      const receipt = {local_time: body.local_time, timezone: body.timezone, fold: body.fold ?? null,
+        at: Date.parse(body.local_time + 'Z') / 1000};
+      return new Promise(resolve => posts.push({machine, body, finish: (reply = response(receipt)) => resolve(reply)}));
+    }
+    if (url.includes('/state?')) {
+      const params = new URL(url, 'http://fixture.test').searchParams;
+      const project = params.get('project');
+      // The dependency editor independently reads candidates with a 200-row page.
+      if (params.get('limit') === '50') {
+        refreshes.push({machine, project});
+        if (refreshFails) throw new Error('offline during list refresh');
+      }
+      return response({...snapshot(), selected_project: project, tasks: [], runs: []});
+    }
+    if (url.includes('/task-runs?')) return response([]);
+    return response(task);
+  };
+  const editor = () => {
+    const box = descendants(page.node('detail-body')).find(node => node.className === 'task-schedule-editor');
+    const controls = descendants(box);
+    return {time: controls.find(node => node.type === 'datetime-local'), zone: controls.find(node => node.type === 'text'),
+      button: controls.find(node => node.tagName === 'BUTTON' && node.textContent === '预约')};
+  };
+  const fill = (time = '2035-01-01T12:00') => {
+    const fields = editor();
+    fields.time.value = time; fields.time.handlers.input();
+    fields.zone.value = 'UTC'; fields.zone.handlers.input();
+  };
+  const click = () => { editor().button.handlers.click(); return page.context.lastAction; };
+  const draft = () => page.context.window.RSIDraftStore.get('task-schedule', task.id);
+  return {page, task, posts, refreshes, editor, fill, click, draft, failRefresh: () => { refreshFails = true; }};
+}
+
+for (const trigger of ['redraw', 'reopen']) {
+  test(`schedule submission stays single across ${trigger} and permits a later reservation`, async () => {
+    const {page, task, posts, editor, fill, click, draft} = scheduleRequestPage();
+    await openExperienceTask(page, task);
+    fill();
+    const pending = click();
+    if (trigger === 'redraw') await changeDetailLanguage(page);
+    else {
+      page.node('detail-dialog').handlers.cancel({preventDefault() {}});
+      await page.context.showTask(task);
+    }
+    await new Promise(setImmediate);
+    const disabled = editor().button.disabled;
+    const duplicate = click();
+    const pendingCount = posts.length;
+    for (const post of posts) post.finish();
+    await Promise.all([pending, duplicate]);
+    assert.equal(pendingCount, 1, 'POST count while awaiting the first receipt');
+    assert.equal(disabled, true);
+    assert.equal(draft(), null);
+    await openExperienceTask(page, task);
+    fill('2035-01-02T13:00');
+    const next = click();
+    assert.equal(posts.length, 2);
+    assert.equal(posts[1].body.local_time, '2035-01-02T13:00');
+    posts[1].finish(); await next;
+  });
+}
+
+test('schedule receipt preserves continued editing in the current editor', async () => {
+  const {page, task, posts, editor, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const pending = click();
+  fill('2035-01-02T13:00');
+  posts[0].finish(); await pending;
+  assert.equal(posts.length, 1);
+  assert.equal(draft().time, '2035-01-02T13:00');
+  assert.equal(page.node('detail-dialog').open, true);
+  assert.equal(editor().button.disabled, false);
+  assert.equal(editor().time.value, '2035-01-02T13:00');
+  const next = click();
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].body.local_time, '2035-01-02T13:00');
+  posts[1].finish(); await next;
+});
+
+test('schedule receipt preserves a draft edited back to the submitted values', async () => {
+  const {page, task, posts, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const pending = click();
+  fill('2035-01-02T13:00');
+  fill();
+  posts[0].finish(); await pending;
+  assert.equal(draft()?.time, '2035-01-01T12:00');
+  assert.equal(page.node('detail-dialog').open, true);
+});
+
+test('schedule rejection after redraw unlocks the current button and keeps its draft', async () => {
+  const {page, task, posts, refreshes, editor, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const pending = click();
+  await changeDetailLanguage(page);
+  await new Promise(setImmediate);
+  posts[0].finish(response({error: 'Scheduled time must be in the future', error_code: 'validation_error'}, 400));
+  await pending;
+  assert.equal(posts.length, 1);
+  assert.equal(refreshes.length, 0);
+  assert.equal(page.node('toast').textContent, '预约时间必须晚于当前时间。');
+  assert.equal(draft()?.time, '2035-01-01T12:00');
+  assert.equal(editor().button.disabled, false);
+  fill('2035-01-02T13:00');
+  const next = click();
+  assert.equal(posts.length, 2);
+  posts[1].finish(); await next;
+});
+
+test('late schedule success in the same project still shows its receipt without closing another task', async () => {
+  const {page, task, posts, refreshes, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const pending = click();
+  const other = fixtureTask('other', 'queued');
+  await page.context.showTask(other);
+  posts[0].finish(); await pending;
+  assert.equal(posts.length, 1);
+  assert.equal(refreshes.length, 1);
+  assert.equal(draft(), null);
+  assert.equal(page.node('toast').textContent, '预约已保存');
+  assert.equal(page.node('detail-dialog').open, true);
+  assert.equal(page.node('detail-title').textContent, other.title);
+});
+
+test('late schedule success leaves the newly selected project alone', async () => {
+  const {page, task, posts, refreshes, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const pending = click();
+  const picker = page.node('project-select');
+  picker.value = 'b'; picker.handlers.change();
+  await page.context.lastAction;
+  const other = {...fixtureTask('other', 'queued'), project: 'b'};
+  await page.context.showTask(other);
+  page.context.toast('新项目反馈');
+  posts[0].finish(); await pending;
+  assert.deepEqual({toast: page.node('toast').textContent, refreshes},
+    {toast: '新项目反馈', refreshes: [{machine: 'first', project: 'b'}]});
+  assert.equal(draft(), null);
+  assert.equal(page.node('detail-dialog').open, true);
+  assert.equal(page.node('detail-title').textContent, other.title);
+});
+
+test('late schedule success cannot clear an identical draft or unlock a request on another runtime', async () => {
+  const {page, task, posts, refreshes, editor, fill, click, draft} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  const old = click();
+  page.context.window.__RSI_MACHINE_KEY__ = 'second';
+  await page.context.showTask(task);
+  fill();
+  const next = click();
+  page.context.toast('新运行环境反馈');
+  assert.deepEqual(posts.map(post => post.machine), ['first', 'second']);
+  posts[0].finish(); await old;
+  const observed = {draft: draft()?.time, toast: page.node('toast').textContent,
+    refreshes: refreshes.slice(), disabled: editor().button.disabled};
+  posts[1].finish(); await next;
+  assert.deepEqual(observed, {draft: '2035-01-01T12:00', toast: '新运行环境反馈', refreshes: [], disabled: true});
+  assert.equal(draft(), null);
+  assert.equal(page.node('toast').textContent, '预约已保存');
+  assert.deepEqual(refreshes, [{machine: 'second', project: 'a'}]);
+});
+
+test('schedule success remains explicit when the subsequent list refresh fails', async () => {
+  const {page, task, posts, refreshes, fill, click, draft, failRefresh} = scheduleRequestPage();
+  await openExperienceTask(page, task);
+  fill();
+  failRefresh();
+  const pending = click();
+  posts[0].finish(); await pending;
+  assert.equal(posts.length, 1);
+  assert.equal(refreshes.length, 1);
+  assert.equal(draft(), null);
+  assert.equal(page.node('toast').textContent, '预约已保存，但列表刷新失败。');
+});
+
 test('server schedule rejections reach the console with localized guidance', async () => {
   const page = browser();
   page.context.fetch = async () => ({...response({error: 'Scheduled local time is nonexistent',
@@ -2514,7 +2905,7 @@ test('non-queued task details offer no schedule form', async () => {
   assert.equal(detailDescendants(page.node('detail-body')).filter(node => node.className === 'task-schedule-editor').length, 0);
 });
 
-function experiencePage({navigation = false} = {}) {
+function experiencePage({navigation = false, realRefresh = false} = {}) {
   const page = browser(), ready = [], windowEvents = new Map();
   Object.assign(page.context, {
     URL, navigator: {}, history: {replaceState() {}, pushState() {}},
@@ -2531,7 +2922,7 @@ function experiencePage({navigation = false} = {}) {
   vm.runInContext(experienceSource, page.context);
   if (navigation) ready[0]();
   page.notify = task => windowEvents.get('rsi-notification-open')({detail: task});
-  page.context.refresh = async () => {};
+  if (!realRefresh) page.context.refresh = async () => {};
   return page;
 }
 
@@ -2557,6 +2948,261 @@ function revisionMetadataPage(task, metadata) {
   return page;
 }
 
+function taskRetryPage(...tasks) {
+  const page = experiencePage(), posts = [], metadata = new Map(tasks.map(task => [task.id, task]));
+  const offline = response({error: 'Invalid request', error_code: 'validation_error'}, 400);
+  let failDetailRead = false;
+  page.context.language = 'zh-CN';
+  vm.runInContext('Date.now=()=>1700000000000;safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.fetch = async (url, options) => {
+    if (url.endsWith('/api/retry')) {
+      const body = JSON.parse(options.body), task = metadata.get(body.task);
+      // Model runtime.retry's atomic change to plain queued and delay each reply independently.
+      const eligible = task.state === 'failed' || (task.state === 'queued' && task.available > 1700000000);
+      if (eligible) metadata.set(task.id, {...task, state: 'queued', available: 0});
+      const reply = eligible ? response({saved: true}) : response({error: 'This task cannot be retried', error_code: 'validation_error'}, 400);
+      return new Promise(resolve => posts.push({body, status: reply.status, finish: (result = reply) => resolve(result)}));
+    }
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({tasks: []});
+    const id = new URL(url, 'http://fixture.test').searchParams.get('id');
+    return failDetailRead ? offline : response(metadata.get(id));
+  };
+  const click = button => {
+    button.handlers.click();
+    return page.context.lastAction;
+  };
+  return {page, posts, metadata, click, offline, failDetailRead: value => { failDetailRead = value; }};
+}
+
+for (const direction of ['list → detail', 'detail → list', 'list redraw']) {
+  test(`task retry POST is shared across ${direction}`, async t => {
+    const task = direction === 'list redraw'
+      ? {...fixtureTask('child', 'queued'), available: 1700000100}
+      : {...fixtureTask(), source: 'system_evolve'};
+    const f = taskRetryPage(task), {page} = f;
+    page.context.listTask = task;
+    page.node('task-filter').value = 'all';
+    page.node('show-system-tasks').checked = true;
+    vm.runInContext('state={...state,tasks:[listTask],runs:[]};renderTasks()', page.context);
+    const row = () => page.node('tasks-list').children[0];
+    const listLabel = direction === 'list redraw' ? '立即重试' : '重试';
+    const open = async () => {
+      await f.click(buttonWith(row(), '查看详情'));
+      await page.context.lastAction;
+      return page.node('detail-body').children.find(node => node.className === 'task-controls');
+    };
+    const detailLabel = '基于当前输入重新检查';
+    const firstButton = direction === 'detail → list'
+      ? buttonWith(await open(), detailLabel) : buttonWith(row(), listLabel);
+    const pending = f.click(firstButton);
+    const firstDisabled = firstButton.disabled;
+    let secondButton;
+    if (direction === 'list → detail') {
+      const committed = f.metadata.get(task.id);
+      f.metadata.set(task.id, task); // A detail read can return the last retryable snapshot.
+      secondButton = buttonWith(await open(), detailLabel);
+      f.metadata.set(task.id, committed);
+    } else if (direction === 'detail → list') {
+      page.node('detail-dialog').handlers.cancel({preventDefault() {}});
+      secondButton = buttonWith(row(), listLabel);
+    } else {
+      vm.runInContext('state.tasks=[{...listTask,updated:1}];renderTasks()', page.context);
+      secondButton = buttonWith(row(), listLabel);
+      assert.notEqual(secondButton, firstButton);
+    }
+    const secondDisabled = secondButton.disabled;
+    const duplicate = f.click(secondButton);
+    f.posts.forEach(post => post.finish());
+    await Promise.all([pending, duplicate]);
+    t.diagnostic(JSON.stringify({posts: f.posts.length, statuses: f.posts.map(post => post.status)}));
+    assert.equal(f.posts.length, 1);
+    assert.deepEqual(f.posts[0].body, direction === 'list → detail'
+      ? {task: task.id, force: true} : {task: task.id});
+    assert.equal(firstDisabled, true);
+    assert.equal(secondDisabled, true);
+    assert.equal(secondButton.isConnected, false);
+  });
+}
+
+test('task retry POST rejection re-enables both list and detail controls', async () => {
+  const task = fixtureTask(), f = taskRetryPage(task), {page} = f;
+  page.context.listTask = task;
+  page.node('task-filter').value = 'all';
+  vm.runInContext('state={...state,tasks:[listTask],runs:[]};renderTasks()', page.context);
+  const detail = buttonWith(await openExperienceTask(page, task), '基于当前输入重新检查');
+  const list = buttonWith(page.node('tasks-list'), '重试');
+  const pending = f.click(detail);
+  assert.equal(list.disabled, true);
+  f.metadata.set(task.id, task);
+  f.posts[0].finish(f.offline);
+  await pending;
+  assert.equal(detail.disabled, false);
+  assert.equal(list.disabled, false);
+  page.node('detail-dialog').handlers.cancel({preventDefault() {}});
+  const later = f.click(list);
+  f.posts[1].finish();
+  await later;
+  assert.deepEqual(f.posts.map(post => post.body), [{task: task.id}, {task: task.id, force: false}]);
+});
+
+test('task retry POST keeps separate pending buttons for the same task in distinct runtime scopes', async () => {
+  const task = fixtureTask(), f = taskRetryPage(task), {page} = f;
+  page.context.listTask = task;
+  page.node('task-filter').value = 'all';
+  page.context.window.__RSI_MACHINE_KEY__ = 'local';
+  vm.runInContext('state={...state,tasks:[listTask],runs:[]};renderTasks()', page.context);
+  const local = f.click(buttonWith(page.node('tasks-list'), '重试'));
+  // Desktop reloads on a runtime switch. Exercise the scope keys directly in one VM.
+  page.context.window.__RSI_MACHINE_KEY__ = 'remote';
+  vm.runInContext('renderTasks()', page.context);
+  const remoteButton = buttonWith(page.node('tasks-list'), '重试');
+  assert.equal(remoteButton.disabled, false);
+  f.metadata.set(task.id, task);
+  const remote = f.click(remoteButton);
+  assert.equal(f.posts.length, 2);
+  page.context.toast('当前运行机器反馈');
+  f.posts[0].finish(f.offline);
+  await local;
+  assert.equal(remoteButton.disabled, true);
+  assert.equal(page.node('toast').textContent, '当前运行机器反馈');
+  f.posts[1].finish();
+  await remote;
+  assert.equal(remoteButton.isConnected, false);
+});
+
+for (const [state, label, navigation] of [
+  ['failed', '基于当前输入重新检查', 'task'],
+  ['queued', '立即重试', 'project'],
+]) {
+  test(`task retry POST is single-flight across repeated activation and ${navigation} navigation (${state})`, async t => {
+    const task = {...fixtureTask('child', state), available: 1700000100};
+    const other = {...fixtureTask('other'), project: navigation === 'project' ? 'b' : 'a'};
+    const f = taskRetryPage(task, other);
+    const switchProject = async project => {
+      f.page.node('project-select').value = project;
+      f.page.node('project-select').handlers.change();
+      await f.page.context.lastAction;
+    };
+    const firstButton = buttonWith(await openExperienceTask(f.page, task), label);
+    const first = f.click(firstButton), duplicate = f.click(firstButton);
+    const afterRepeat = f.posts.length;
+    const pendingDisabled = firstButton.disabled;
+    // Simulate a detail response read before the retry was committed, delivered on return.
+    const committed = f.metadata.get(task.id);
+    if (navigation === 'project') await switchProject('b');
+    await openExperienceTask(f.page, other);
+    if (navigation === 'project') await switchProject('a');
+    f.metadata.set(task.id, task);
+    const reopened = buttonWith(await openExperienceTask(f.page, task), label);
+    f.metadata.set(task.id, committed);
+    const afterReturn = f.click(reopened);
+    const reopenedDisabled = reopened.disabled;
+    if (navigation === 'project') await switchProject('b');
+    const otherControls = await openExperienceTask(f.page, other);
+    const draft = supplementForm(otherControls).children[0].children[0];
+    draft.value = '较新详情草稿';
+    draft.handlers.input();
+    const independent = f.click(buttonWith(otherControls, '基于当前输入重新检查'));
+    f.page.context.toast('较新详情反馈');
+    f.posts.filter(post => post.body.task === task.id).forEach(post => post.finish());
+    await Promise.all([first, duplicate, afterReturn]);
+    const afterLate = f.page.node('toast').textContent;
+    const firstTaskStatuses = f.posts.filter(post => post.body.task === task.id).map(post => post.status);
+    t.diagnostic(JSON.stringify({afterRepeat, firstTaskStatuses, afterLate}));
+    assert.equal(f.page.node('detail-title').textContent, other.title);
+    assert.equal(draft.value, '较新详情草稿');
+    const otherPost = f.posts.find(post => post.body.task === other.id);
+    assert.equal(otherPost.status, 200);
+    otherPost.finish();
+    await independent;
+    await f.page.context.lastAction;
+    const currentControls = f.page.node('detail-body').children.find(node => node.className === 'task-controls');
+    assert.equal(supplementForm(currentControls).children[0].children[0].value, draft.value);
+    assert.deepEqual(f.posts.map(post => post.body), [{task: task.id}, {task: other.id}]);
+    assert.equal(afterRepeat, 1);
+    assert.equal(firstTaskStatuses[0], 200);
+    assert.equal(afterLate, '较新详情反馈');
+    assert.equal(pendingDisabled, true);
+    assert.equal(reopenedDisabled, true);
+  });
+}
+
+test('task retry POST releases a rejected request and ignores its old feedback after reopening', async () => {
+  const task = fixtureTask(), f = taskRetryPage(task), label = '基于当前输入重新检查';
+  const first = f.click(buttonWith(await openExperienceTask(f.page, task), label));
+  f.metadata.set(task.id, task);
+  const reopened = buttonWith(await openExperienceTask(f.page, task), label);
+  const disabled = reopened.disabled;
+  f.page.context.toast('较新详情反馈');
+  f.posts[0].finish(f.offline);
+  await first;
+  assert.equal(f.page.node('toast').textContent, '较新详情反馈');
+  assert.equal(reopened.disabled, false);
+  const failed = f.click(reopened);
+  f.metadata.set(task.id, task);
+  f.posts[1].finish(f.offline);
+  await failed;
+  assert.equal(reopened.disabled, false);
+  assert.notEqual(f.page.node('toast').textContent, '较新详情反馈');
+  const later = f.click(reopened);
+  f.posts[2].finish();
+  await later;
+  assert.equal(disabled, true);
+  assert.deepEqual(f.posts.map(post => post.body), [{task: task.id}, {task: task.id}, {task: task.id}]);
+});
+
+test('task retry POST acknowledgement prevents a late metadata read from restoring the old button', async () => {
+  const task = fixtureTask(), f = taskRetryPage(task), label = '基于当前输入重新检查';
+  const pending = f.click(buttonWith(await openExperienceTask(f.page, task), label));
+  const fetch = f.page.context.fetch;
+  let finishRead;
+  f.page.context.fetch = (url, options) => {
+    if (!url.includes('/task?')) return fetch(url, options);
+    return new Promise(resolve => { finishRead = () => resolve(response(task)); });
+  };
+  const reopening = openExperienceTask(f.page, task);
+  await waitFor(() => finishRead);
+  f.posts[0].finish();
+  await pending;
+  finishRead();
+  const reopened = await reopening;
+  assert.equal(buttonWith(reopened, label), undefined);
+  f.page.context.fetch = fetch;
+  f.page.fireTimer(5000);
+  await new Promise(setImmediate);
+  assert.equal(vm.runInContext('detailTask.state', f.page.context), 'queued');
+  assert.deepEqual(f.posts.map(post => post.body), [{task: task.id}]);
+});
+
+test('task retry POST success with a failed detail read only offers to retry the read', async t => {
+  const task = {...fixtureTask('child', 'queued'), available: 1700000100};
+  const f = taskRetryPage(task);
+  const controls = await openExperienceTask(f.page, task);
+  const draft = supplementForm(controls).children[0].children[0];
+  draft.value = '重试后仍保留的草稿';
+  draft.handlers.input();
+  const retryButton = buttonWith(controls, '立即重试');
+  const pending = f.click(retryButton);
+  f.failDetailRead(true);
+  f.posts[0].finish();
+  await pending;
+  const status = f.page.node('detail-live-status');
+  t.diagnostic(JSON.stringify({retryStillAvailable: retryButton.isConnected && !retryButton.disabled, toast: f.page.node('toast').textContent}));
+  assert.equal(status.hidden, false);
+  assert.equal(retryButton.isConnected, false);
+  await f.click(retryButton);
+  assert.equal(f.posts.length, 1);
+  f.failDetailRead(false);
+  await f.click(buttonWith(status, '重试'));
+  await f.page.context.lastAction;
+  assert.equal(status.hidden, true);
+  const updated = f.page.node('detail-body').children.find(node => node.className === 'task-controls');
+  assert.equal(buttonWith(updated, '立即重试'), undefined);
+  assert.equal(supplementForm(updated).children[0].children[0].value, draft.value);
+  assert.deepEqual(f.posts.map(post => post.body), [{task: task.id}]);
+});
+
 test('an active task accepts a supplement and reports its pending application', async () => {
   for (const state of ['planning', 'executing', 'evaluating', 'awaiting_approval']) {
     const task = fixtureTask('active-' + state, state), posts = [];
@@ -2580,6 +3226,160 @@ test('an active task accepts a supplement and reports its pending application', 
     assert.match(page.node('toast').textContent,
       state === 'awaiting_approval' ? /已保存/ : /已收到.*下一轮/);
   }
+});
+
+function pendingSupplementPage(task = fixtureTask('supplement', 'executing')) {
+  const page = experiencePage(), posts = [], metadata = {...task};
+  const reads = {refresh: 0, detail: 0, fail: false};
+  page.context.language = 'zh-CN';
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.refresh = async () => { reads.refresh++; };
+  page.context.fetch = async (url, options) => {
+    if (url.endsWith('/task/revise')) {
+      return new Promise(resolve => posts.push({body: JSON.parse(options.body), finish: resolve}));
+    }
+    if (url.includes('/task-runs?')) return response([]);
+    assert.ok(url.includes('/task?'), url);
+    reads.detail++;
+    if (reads.fail) return response({error_code: 'internal_error'}, 500);
+    const query = new URL(url, 'http://fixture.test').searchParams;
+    return response({...metadata, id: query.get('id'), project: query.get('project')});
+  };
+  function editor() {
+    const form = supplementForm(page.node('detail-body'));
+    const [label, reasonLabel, button] = form.children;
+    const fields = [label.children[0], reasonLabel.children[0]];
+    return {
+      form, button, fields,
+      edit(index, value) { fields[index].value = value; page.input(fields[index].id, form.id); },
+      submit() { form.onsubmit({target: form, preventDefault() {}}); return page.context.lastAction; },
+    };
+  }
+  return {
+    page, task, posts, reads, metadata, editor,
+    async open(next = task) { await openExperienceTask(page, next); return editor(); },
+  };
+}
+
+for (const reopen of [false, true]) {
+  test(`supplement POST blocks repeat submits after ${reopen ? 'reopening' : 'rebuilding'} and keeps newer edits`, async t => {
+    const f = pendingSupplementPage(), original = await f.open();
+    original.edit(0, '原始需求'); original.edit(1, '原始原因');
+    const saving = original.submit();
+    if (reopen) {
+      f.page.context.closeTaskDetail();
+      await f.open();
+    } else {
+      f.metadata.title = '同步后的标题';
+      f.page.fireTimer(5000); await new Promise(setImmediate);
+      await f.page.context.lastAction;
+    }
+    const rebuilt = f.editor(), pendingDisabled = rebuilt.button.disabled;
+    assert.notEqual(rebuilt.form, original.form);
+    assert.deepEqual(rebuilt.fields.map(field => field.value), ['原始需求', '原始原因']);
+    if (reopen) {
+      rebuilt.edit(1, '中间修改'); rebuilt.edit(1, '原始原因');
+    } else {
+      rebuilt.edit(0, '较新需求');
+    }
+    const remaining = reopen ? ['', '原始原因'] : ['较新需求', ''];
+    const overlap = rebuilt.submit();
+    const overlapCount = f.posts.length;
+    f.page.context.toast('较新详情反馈');
+    f.posts[0].finish(response({saved: true, pending: true}));
+    if (overlapCount > 1) f.posts[1].finish(response({error_code: 'validation_error'}, 400));
+    await saving; await overlap;
+    t.diagnostic(JSON.stringify({overlapCount, pendingDisabled, toast: f.page.node('toast').textContent}));
+    assert.equal(overlapCount, 1);
+    assert.equal(pendingDisabled, true);
+    assert.equal(rebuilt.button.disabled, false);
+    assert.deepEqual(rebuilt.fields.map(field => field.value), remaining);
+    const store = f.page.context.window.RSIDraftStore;
+    assert.equal(store.get('task-supplement', f.task.id), remaining[0] || null);
+    assert.equal(store.get('task-reason', f.task.id), remaining[1] || null);
+    assert.equal(f.page.node('toast').textContent, '较新详情反馈');
+    assert.equal(f.reads.refresh, 0);
+    if (reopen) rebuilt.edit(0, '较新需求');
+    const later = rebuilt.submit();
+    assert.deepEqual(f.posts.map(post => post.body), [
+      {task: f.task.id, supplement: '原始需求', reason: '原始原因'},
+      {task: f.task.id, supplement: '较新需求', reason: remaining[1]},
+    ]);
+    f.posts[1].finish(response({saved: true, pending: true})); await later;
+    assert.match(f.page.node('toast').textContent, /已收到.*下一轮/);
+  });
+}
+
+for (const navigation of ['other task', 'other project', 'other runtime']) {
+  for (const accepted of [true, false]) {
+    test(`supplement POST ${accepted ? 'acknowledgement' : 'rejection'} leaves ${navigation} feedback and drafts alone`, async t => {
+      const f = pendingSupplementPage(), original = await f.open();
+      original.edit(0, '原始需求'); original.edit(1, '原始原因');
+      const saving = original.submit();
+      f.page.context.closeTaskDetail();
+      const next = {...f.task};
+      if (navigation === 'other task') next.id = 'other';
+      if (navigation === 'other project') {
+        next.id = 'other'; next.project = 'b';
+        const select = f.page.node('project-select');
+        select.value = 'b'; select.handlers.change();
+        await f.page.context.lastAction;
+      }
+      if (navigation === 'other runtime') f.page.context.window.__RSI_MACHINE_KEY__ = 'other-machine';
+      const current = await f.open(next);
+      current.edit(0, '原始需求'); current.edit(1, '原始原因');
+      f.page.context.toast('较新详情反馈');
+      const refreshes = f.reads.refresh;
+      f.posts[0].finish(accepted ? response({saved: true}) : response({error_code: 'validation_error'}, 400));
+      await saving;
+      const store = f.page.context.window.RSIDraftStore;
+      t.diagnostic(JSON.stringify({toast: f.page.node('toast').textContent, lateRefreshes: f.reads.refresh - refreshes,
+        supplement: store.get('task-supplement', next.id), reason: store.get('task-reason', next.id)}));
+      assert.equal(f.page.node('toast').textContent, '较新详情反馈');
+      assert.equal(f.reads.refresh, refreshes);
+      assert.equal(store.get('task-supplement', next.id), '原始需求');
+      assert.equal(store.get('task-reason', next.id), '原始原因');
+      assert.equal(supplementForm(f.page.node('detail-body')), current.form);
+      assert.equal(current.button.disabled, false);
+    });
+  }
+}
+
+test('supplement POST failure keeps newer input and allows a manual retry', async () => {
+  const f = pendingSupplementPage(), editor = await f.open();
+  editor.edit(0, '原始需求'); editor.edit(1, '原始原因');
+  const saving = editor.submit();
+  editor.edit(0, '较新需求'); editor.edit(1, '较新原因');
+  f.posts[0].finish(response({error_code: 'validation_error'}, 400)); await saving;
+  assert.equal(editor.button.disabled, false);
+  assert.notEqual(f.page.node('toast').className, '');
+  const rebuilt = await f.open();
+  assert.deepEqual(rebuilt.fields.map(field => field.value), ['较新需求', '较新原因']);
+  const retry = rebuilt.submit();
+  assert.deepEqual(f.posts[1].body, {task: f.task.id, supplement: '较新需求', reason: '较新原因'});
+  f.posts[1].finish(response({saved: true})); await retry;
+  assert.match(f.page.node('toast').textContent, /已保存.*重新评估/);
+});
+
+test('supplement POST success with a failed detail read preserves the receipt and retries only the read', async t => {
+  const f = pendingSupplementPage(), editor = await f.open();
+  editor.edit(0, '保留原文'); editor.edit(1, '原始原因');
+  const saving = editor.submit();
+  editor.edit(1, '较新原因');
+  f.reads.fail = true;
+  f.posts[0].finish(response({saved: true, pending: true})); await saving;
+  const status = f.page.node('detail-live-status');
+  t.diagnostic(JSON.stringify({toast: f.page.node('toast').textContent, readRetryVisible: !status.hidden,
+    fields: editor.fields.map(field => field.value)}));
+  assert.match(f.page.node('toast').textContent, /已收到.*下一轮/);
+  assert.equal(status.hidden, false);
+  assert.deepEqual(editor.fields.map(field => field.value), ['', '较新原因']);
+  const detailReads = f.reads.detail;
+  f.reads.fail = false;
+  buttonWith(status, '重试').handlers.click(); await f.page.context.lastAction;
+  assert.equal(status.hidden, true);
+  assert.equal(f.reads.detail, detailReads + 1);
+  assert.equal(f.posts.length, 1, 'the refresh retry does not resubmit the confirmed supplement');
 });
 
 test('detail retry is offered only for a queued task waiting on backoff', async () => {
@@ -3061,6 +3861,109 @@ for (const navigation of ['stay', 'close', 'project', 'other-task']) {
   });
 }
 
+async function liveRetryPage() {
+  const page = experiencePage(), task = fixtureTask('live-retry'), other = fixtureTask('other');
+  Object.assign(page.context, {language: 'zh-CN', tasksForRetry: [task, other]});
+  page.node('task-filter').value = 'all';
+  vm.runInContext('state={...state,tasks:tasksForRetry,runs:[]};renderTasks()', page.context);
+  let metadataReads = 0;
+  const offline = response({error: 'Fixture offline'}, 503);
+  let readMetadata = () => response(task), readHistory = () => response([]);
+  page.context.fetch = async url => {
+    if (url.includes('/task-runs?')) return readHistory();
+    if (url.includes('/task?id=other&')) return response(other);
+    assert.match(url, /\/task\?id=live-retry&/);
+    metadataReads++;
+    return readMetadata();
+  };
+  async function open(row) {
+    buttonWith(page.node('tasks-list').children[row], '查看详情').handlers.click();
+    await page.context.lastAction;
+    await new Promise(setImmediate);
+  }
+  let now = 1700000000000;
+  page.context.retryClock = () => now;
+  vm.runInContext('Date.now=retryClock', page.context);
+  await open(0);
+  // After boot settles, the detail's first poll is the active 5-second timer.
+  const backgroundTimers = new Set(page.timers.filter(timer => timer.delay !== 5000));
+  readMetadata = () => offline;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    now += 5000;
+    page.fireTimer(5000);
+    await new Promise(setImmediate);
+  }
+  const status = page.node('detail-live-status');
+  assert.equal(status.hidden, false);
+  assert.match(textOf(status), /详情可能不是最新/);
+  return {
+    page, status, open, offline,
+    get metadataReads() { return metadataReads; },
+    get pollDelays() { return page.timers.filter(timer => timer.active && !backgroundTimers.has(timer)).map(timer => timer.delay); },
+    holdMetadata() { return new Promise(resolve => { readMetadata = () => new Promise(done => resolve(done)); }); },
+    respondMetadata() { readMetadata = () => response(task); },
+    holdHistory() { return new Promise(resolve => { readHistory = () => new Promise(done => resolve(done)); }); },
+    clickRetry() {
+      buttonWith(status, '重试').handlers.click();
+      return page.context.lastAction;
+    }
+  };
+}
+
+test('live detail retry preserves stale feedback through failure until fresh history arrives', async () => {
+  const f = await liveRetryPage(), copy = textOf(f.status);
+  const started = f.holdMetadata(), reads = f.metadataReads;
+  const retry = buttonWith(f.status, '重试');
+  const failed = f.clickRetry();
+  const finish = await started;
+  assert.equal(f.status.hidden, false, '点击重试后，回包前仍显示详情可能不是最新');
+  assert.equal(textOf(f.status), copy, '重试期间保留上次成功更新时间');
+  assert.equal(retry.disabled, true);
+  await retry.handlers.click();
+  assert.equal(f.metadataReads, reads + 1, '重试进行中只发起一次请求');
+  finish(f.offline);
+  await failed;
+  assert.equal(f.status.hidden, false);
+  assert.equal(textOf(f.status), copy);
+  assert.equal(buttonWith(f.status, '重试').disabled, false);
+  assert.deepEqual(f.pollDelays, [20000]);
+
+  f.respondMetadata();
+  const historyStarted = f.holdHistory();
+  const recovered = f.clickRetry();
+  const finishHistory = await historyStarted;
+  assert.equal(f.status.hidden, false, '只收到未变的任务元数据时仍等待运行记录');
+  finishHistory(response({}));
+  await recovered;
+  assert.equal(f.status.hidden, false, '缺少运行记录的回包不算刷新成功');
+
+  const validHistoryStarted = f.holdHistory();
+  const successful = f.clickRetry();
+  const finishValidHistory = await validHistoryStarted;
+  finishValidHistory(response({runs: [], has_more: false}));
+  await successful;
+  assert.equal(f.status.hidden, true);
+  assert.equal(buttonWith(f.status, '重试'), undefined);
+  assert.deepEqual(f.pollDelays, [5000]);
+});
+
+for (const navigation of ['close', 'switch task']) {
+  test(`live detail retry ignores an in-flight failure after ${navigation}`, async () => {
+    const f = await liveRetryPage(), started = f.holdMetadata();
+    const pending = f.clickRetry();
+    const finish = await started;
+    if (navigation === 'close') f.page.node('detail-dialog').handlers.cancel({preventDefault() {}});
+    else await f.open(1);
+    assert.equal(f.status.hidden, true);
+    finish(f.offline);
+    await pending;
+    assert.equal(f.status.hidden, true, '旧重试失败不会恢复过期提示');
+    assert.equal(f.page.node('detail-dialog').open, navigation !== 'close');
+    if (navigation !== 'close') assert.equal(f.page.node('detail-title').textContent, 'Task other');
+    assert.deepEqual(f.pollDelays, navigation === 'close' ? [] : [5000]);
+  });
+}
+
 test('runless detail polling updates cancellation controls and preserves supplement drafts', async () => {
   const page = experiencePage(), task = fixtureTask('runless', 'queued');
   let metadata = task, reads = 0;
@@ -3262,6 +4165,137 @@ for (const navigation of ['close', 'project', 'other-task']) {
       const other = queueForm(page);
       assert.equal(other.children[0].children[0].value, '');
       assert.equal(other.children[1].children[0].checked, false);
+    }
+  });
+}
+
+for (const scenario of ['success', 'write failure', 'refresh failure', 'refresh failure with undo',
+  'refresh timeout', 'discarded refresh', 'refresh failure after reopen', 'refresh failure after switching task',
+  'write failure after reopen', 'write failure after switching task']) {
+  test(`queue submit separates confirmed saves from ${scenario}`, async t => {
+    const page = experiencePage({realRefresh: true}), posts = [];
+    page.context.location.hash = '';
+    page.context.language = 'zh-CN';
+    const task = {...fixtureTask('child', 'queued'), updated: 1}, other = fixtureTask('other', 'queued');
+    const candidates = [fixtureTask('parent'), fixtureTask('second-parent')];
+    let metadata = task, finishWrite, finishRefresh, refreshes = 0, detailReads = 0;
+    const writeFails = scenario.startsWith('write failure');
+    vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+    page.context.fetch = async (url, options) => {
+      const {pathname, searchParams} = new URL(url, 'http://fixture.test');
+      if (pathname === '/api/task/schedule') {
+        const submitted = JSON.parse(options.body);
+        posts.push(submitted);
+        return new Promise(resolve => {finishWrite = () => {
+          if (writeFails) return resolve(response({error: 'schedule write rejected'}, 400));
+          metadata = {...metadata, updated: metadata.updated + 1, urgency: submitted.urgency,
+            dependency: submitted.dependency ? {dependency: submitted.dependency} : null};
+          resolve(response({saved: true}));
+        };});
+      }
+      if (pathname === '/api/state') {
+        if (searchParams.get('limit') === '200') return response({tasks: candidates});
+        refreshes++;
+        return new Promise((resolve, reject) => {
+          options.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {once: true});
+          finishRefresh = (fails = false) => resolve(fails
+            ? response({error: 'state read failed'}, 503)
+            : response({...snapshot(), selected_project: 'a', tasks: [metadata]}));
+        });
+      }
+      if (pathname === '/api/task-runs') return response([]);
+      if (pathname === '/api/task') {
+        const id = searchParams.get('id');
+        if (id === task.id) {detailReads++; return response(metadata);}
+        return response(candidates.find(candidate => candidate.id === id) || other);
+      }
+      return response([]);
+    };
+    const submitQueue = () => {
+      const form = queueForm(page), button = buttonWith(form, '保存排队设置');
+      assert.equal(button.type, 'submit');
+      assert.equal(button.disabled, false);
+      // The VM has no default click actions. A submit button dispatches its form's submit event.
+      form.onsubmit({submitter: button, preventDefault() {}});
+      return page.context.lastAction;
+    };
+    const fields = () => {
+      const form = queueForm(page);
+      return [form.children[0].children[0], form.children[1].children[0]];
+    };
+    const values = () => fields().map(field => field.type === 'checkbox' ? field.checked : field.value);
+    const navigate = async () => {
+      if (scenario.endsWith('reopen')) page.context.closeTaskDetail();
+      await openExperienceTask(page, scenario.endsWith('reopen') ? task : other);
+      page.context.toast('当前详情提示');
+    };
+    await openExperienceTask(page, task);
+    fields()[0].value = 'parent'; fields()[1].checked = true;
+    const submitted = submitQueue();
+    if (writeFails && scenario.includes('after')) await navigate();
+    finishWrite();
+    if (!writeFails) {
+      await waitFor(() => finishRefresh);
+      if (scenario.includes('after')) await navigate();
+      if (scenario.endsWith('with undo')) fields()[1].checked = false;
+      if (scenario === 'discarded refresh') vm.runInContext('view="settings"', page.context);
+      if (scenario === 'refresh timeout') page.fireTimer(15000);
+      else finishRefresh(scenario.startsWith('refresh failure'));
+    }
+    await submitted;
+    const notice = page.node('detail-live-status'), toast = page.node('toast');
+    const error = queueForm(page).querySelector('[data-form-error]');
+    t.diagnostic(JSON.stringify({posts: posts.length, refreshes, saved: metadata.urgency === 1,
+      toast: toast.textContent, formError: error?.textContent, retry: !notice.hidden}));
+    assert.deepEqual(posts, [{task: task.id, dependency: 'parent', urgency: 1}]);
+    assert.equal(refreshes, writeFails ? 0 : 1);
+    assert.equal(buttonWith(queueForm(page), '保存排队设置').disabled, false);
+    if (scenario.includes('after')) {
+      assert.equal(toast.textContent, '当前详情提示');
+      assert.equal(notice.hidden, true);
+      assert.equal(error, undefined);
+      return;
+    }
+    if (writeFails) {
+      assert.equal(metadata, task);
+      assert.equal(error?.textContent, '操作未完成，请稍后重试。');
+      assert.equal(toast.className, 'error');
+      assert.equal(notice.hidden, true);
+      assert.deepEqual(values(), ['parent', true]);
+      return;
+    }
+    assert.equal(toast.textContent, '排队设置已保存');
+    assert.equal(toast.className, '');
+    assert.equal(error, undefined);
+    if (scenario === 'success') assert.equal(page.node('connection').textContent, '已连接');
+    if (scenario === 'refresh timeout') assert.equal(page.node('connection').textContent, '连接超时');
+    if (scenario === 'discarded refresh') assert.equal(vm.runInContext('state.tasks', page.context), undefined);
+    if (!scenario.startsWith('refresh failure')) {
+      assert.equal(notice.hidden, true);
+      assert.deepEqual(values(), ['parent', true]);
+      return;
+    }
+    assert.equal(notice.hidden, false);
+    assert.match(notice.children[0].textContent, /实时刷新中断/);
+    const readsBeforeRetry = detailReads, undo = scenario.endsWith('with undo');
+    if (undo) metadata = {...metadata, dependency: {dependency: 'second-parent'}, updated: 3};
+    buttonWith(notice, '重试').handlers.click();
+    await page.context.lastAction;
+    await new Promise(setImmediate);
+    assert.ok(detailReads > readsBeforeRetry);
+    assert.equal(posts.length, 1, 'detail recovery only reads');
+    assert.equal(notice.hidden, true);
+    assert.deepEqual(values(), [undo ? 'second-parent' : 'parent', !undo]);
+    if (undo) {
+      finishRefresh = null;
+      const later = submitQueue();
+      assert.deepEqual(posts[1], {task: task.id, dependency: 'second-parent', urgency: 0});
+      finishWrite();
+      await waitFor(() => finishRefresh);
+      finishRefresh();
+      await later;
+      assert.equal(metadata.urgency, 0);
+      assert.equal(toast.textContent, '排队设置已保存');
     }
   });
 }

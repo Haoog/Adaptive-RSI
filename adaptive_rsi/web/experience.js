@@ -19,8 +19,8 @@ window.RSIExperience = (() => {
     liveState = "",
     inboxBusy = false,
     inboxAt = 0;
-  const queueSaves = new Map();
-  let queueEditor, backoffRetry;
+  const queueSaves = new Map(), supplementSaves = new Map();
+  let queueEditor, backoffRetry, liveRetryButton;
   let usageButton;
   const queueKey = task => JSON.stringify([task.project, task.id]);
   function queueEditorCurrent(editor) {
@@ -384,14 +384,16 @@ window.RSIExperience = (() => {
       );
   }
   async function taskControls(task, body, ticket, queueDraft, editor) {
-    const project = projectId, baselineVersion = editor.version;
-    const current = () => projectId === project && ticket === detailSequence && body.isConnected;
+    const project = projectId, baselineVersion = editor.version, retryKey = taskRetryKey(task);
+    const sameRuntime = () => taskRetryKey(task) === retryKey;
+    const current = () => projectId === project && ticket === detailSequence && body.isConnected && sameRuntime();
     async function refreshTaskDetail() {
       await refresh();
       if (!current()) return;
       const updated = await api("task?id=" + encodeURIComponent(task.id) + "&project=" + encodeURIComponent(task.project));
       if (current()) await showTask(updated);
     }
+    const retryAtRead = taskRetries.get(retryKey);
     const metadata = await api(
       "task?id=" +
         encodeURIComponent(task.id) +
@@ -433,42 +435,26 @@ window.RSIExperience = (() => {
       causes.addEventListener('toggle',()=>{if(causes.open)safe(loadCauses);});reload.onclick=()=>safe(loadCauses);
     }
     controls.append(el("h3", t("下一步")));
-    if (
-      [
-        "failed",
-        "blocked",
-        "waiting_budget",
-        "interrupted",
-        "expired",
-        "insufficient_evidence",
-        "deferred",
-        "rejected",
-        "cancelled",
-        "obsolete",
-      ].includes(metadata.state)
-    )
-      controls.append(
-        action(
-          t("基于当前输入重新检查"),
-          async () => {
-            if (!current()) return;
-            await api("retry", { task: task.id });
+    const inBackoff = metadata.state === "queued" && Number(metadata.available) > Date.now() / 1000;
+    const canRecheck = [
+      "failed", "blocked", "waiting_budget", "interrupted", "expired",
+      "insufficient_evidence", "deferred", "rejected", "cancelled", "obsolete",
+    ].includes(metadata.state);
+    // A metadata read started during a write may still describe the old retryable state.
+    if ((canRecheck || inBackoff) && !retryAtRead?.accepted) {
+      const retry = taskRetryButton(task, detailTaskRetryButtons,
+        canRecheck ? t("基于当前输入重新检查") : t("立即重试"), {task: task.id}, current, async () => {
+          try {
             await refreshTaskDetail();
-          },
-          "button",
-        ),
-      );
-    else if (metadata.state === "queued" && Number(metadata.available) > Date.now() / 1000) {
-      backoffRetry = action(
-        t("立即重试"),
-        async () => {
-          if (!current()) return;
-          await api("retry", { task: task.id });
-          await refreshTaskDetail();
-        },
-        "button",
-      );
-      controls.append(backoffRetry);
+          } catch {
+            if (!current()) return;
+            toast(t("已安排重试"));
+            liveFailures += 1;
+            liveNotice();
+          }
+        });
+      if (inBackoff) backoffRetry = retry;
+      controls.append(retry);
     }
     if (
       [
@@ -498,38 +484,73 @@ window.RSIExperience = (() => {
       input.maxLength = 10000;
       // 空白补充由下面的显式校验拦下；HTML required 会放过纯空白并产生未本地化的原生提示。
       input.setAttribute("aria-required", "true");
-        input.value = draftStore.get('task-supplement', task.id) || '';
-        supplement.open = !!input.value;
-        input.addEventListener('input', () => draftStore.set('task-supplement', task.id, input.value));
       label.append(input);
       const reasonLabel = el("label", t("干预原因（可选，保留原文）")), reason = el("textarea");
       reason.rows = 2;reason.maxLength = 2000;reasonLabel.append(reason);
-      // 详情轮询与语言切换会整块重建；按任务恢复未提交的审计原文，提交成功后清除。
-      reason.value = draftStore.get('task-reason', task.id) || '';
-      if (reason.value) supplement.open = true;
-      reason.addEventListener('input', () => draftStore.set('task-reason', task.id, reason.value));
+      const fields = {'task-supplement': input, 'task-reason': reason};
+      for (const [kind, field] of Object.entries(fields)) {
+        field.value = draftStore.get(kind, task.id) || '';
+        field.addEventListener('input', () => {
+          if (!current()) return;
+          supplementSaves.get(retryKey)?.edited.add(kind);
+          draftStore.set(kind, task.id, field.value);
+        });
+      }
+      supplement.open = !!(input.value || reason.value);
       const submit = el("button", t("保存补充并重新评估"), "button");
       submit.type = "submit";
+      const formView = {
+        clear(kind, value) {
+          if (current() && fields[kind].value === value) fields[kind].value = '';
+        },
+        unlock() { submit.disabled = false; },
+      };
+      const pending = supplementSaves.get(retryKey);
+      if (pending) {
+        pending.view = formView;
+        submit.disabled = true;
+      }
       form.append(label, reasonLabel, submit);
       form.onsubmit = (event) => {
         event.preventDefault();
+        if (!current() || supplementSaves.has(retryKey)) return;
         safe(async () => {
-          if (!current()) return;
           const value = input.value, submittedReason = reason.value;
           if (!value.trim()) throw Error(t("补充需求不能为空，请输入需要保留或补充的要求。"));
+          const save = {edited: new Set(), view: formView};
+          supplementSaves.set(retryKey, save);
           submit.disabled = true;
           try {
-            const receipt = await api("task/revise", {
-              task: task.id,
-              supplement: value,
-              reason: submittedReason,
-            });
-            if (draftStore.get('task-supplement', task.id) === value) draftStore.remove('task-supplement', task.id);
-            if (draftStore.get('task-reason', task.id) === submittedReason) draftStore.remove('task-reason', task.id);
+            let receipt;
+            try {
+              receipt = await api("task/revise", {
+                task: task.id,
+                supplement: value,
+                reason: submittedReason,
+              });
+            } catch (error) {
+              if (current()) throw error;
+              return;
+            }
+            // draftStore resolves its namespace against the active runtime at each call.
+            if (!sameRuntime()) return;
+            for (const [kind, submitted] of [['task-supplement', value], ['task-reason', submittedReason]]) {
+              if (save.edited.has(kind)) continue;
+              if (draftStore.get(kind, task.id) === submitted) draftStore.remove(kind, task.id);
+              save.view.clear(kind, submitted);
+            }
+            if (!current()) return;
             toast(t(receipt.pending ? "补充已收到，将在当前阶段结束后带入下一轮。" : "补充已保存，将重新评估。"));
-            await refreshTaskDetail();
+            try {
+              await refreshTaskDetail();
+            } catch {
+              if (!current()) return;
+              liveFailures += 1;
+              liveNotice();
+            }
           } finally {
-            submit.disabled = false;
+            supplementSaves.delete(retryKey);
+            save.view.unlock();
           }
         }, form);
       };
@@ -637,10 +658,17 @@ window.RSIExperience = (() => {
         safe(async () => {
           if (!current() || queueSaves.has(editor.key)) return;
           const parents = selection(), submitted = {task: task.id, ...(parents.length > 1 ? {dependencies: parents} : {dependency: parents[0] || null}), urgency: urgency.checked ? 1 : 0};
+          const ownsFeedback = () => sameRuntime() && queueEditorCurrent(editor);
           queueSaves.set(editor.key, submitted);
           submit.disabled = true;
           try {
-            await api("task/schedule", submitted);
+            try {
+              await api("task/schedule", submitted);
+            } catch (error) {
+              if (ownsFeedback()) throw error;
+              return;
+            }
+            if (!sameRuntime()) return;
             // Rebase even if this form was rebuilt. Its editor still owns newer edits.
             editor.baseline = {dependencies: parents, urgency: !!submitted.urgency};
             editor.version++;
@@ -649,9 +677,15 @@ window.RSIExperience = (() => {
               queueEditor.baseline = {dependencies: parents, urgency: !!submitted.urgency};
               queueEditor.version++;
             }
-            if (!queueEditorCurrent(editor)) return;
-            await refresh();
-            if (queueEditorCurrent(editor)) toast(t("排队设置已保存"));
+            if (!ownsFeedback()) return;
+            toast(t("排队设置已保存"));
+            try {
+              await refresh();
+            } catch {
+              if (!ownsFeedback()) return;
+              liveFailures += 1;
+              liveNotice();
+            }
           } finally {
             queueSaves.delete(editor.key);
             if (queueEditor?.key === editor.key && queueEditor.submit)
@@ -816,6 +850,7 @@ window.RSIExperience = (() => {
   }
   function taskOpened(task, queueDraft) {
     const key = queueKey(task);
+    detailTaskRetryButtons.clear();
     if (queueEditor?.key !== key)
       queueEditor = {key, project: task.project, task: task.id, version: 0};
     queueEditor.draft = queueDraft;
@@ -874,6 +909,7 @@ window.RSIExperience = (() => {
   function liveNotice() {
     const node = liveStatusNode();
     if (!liveFailures) {
+      liveRetryButton = null;
       node.hidden = true;
       node.replaceChildren();
       return;
@@ -881,12 +917,12 @@ window.RSIExperience = (() => {
     const copy = liveLastSuccess
       ? t("实时刷新中断 · 上次成功更新 {time}。详情可能不是最新，可立即重试。").replace("{time}", stamp(liveLastSuccess / 1000))
       : t("实时刷新中断 · 尚未成功更新。详情可能不是最新，可立即重试。");
-    node.replaceChildren(document.createTextNode(copy), action(t("重试"), () => {
-      liveFailures = 0;
-      liveNotice();
-      clearTimeout(liveTimer);
-      return liveDetail();
-    }, "text-button"));
+    const retry = action(t("重试"), () => {
+      if (retry === liveRetryButton) return liveDetail();
+    }, "text-button");
+    retry.disabled = liveBusy;
+    liveRetryButton = retry;
+    node.replaceChildren(document.createTextNode(copy), retry);
     node.hidden = false;
   }
   // 隐藏页面或连续失败时退避；已结束的稳定交付仍保留 10 秒轮询，交付状态与价值反馈可以继续变化。
@@ -899,6 +935,8 @@ window.RSIExperience = (() => {
   async function liveDetail() {
     if (liveBusy || !detailTask || !$("detail-dialog").open) return;
     liveBusy = true;
+    clearTimeout(liveTimer);
+    if (liveRetryButton) liveRetryButton.disabled = true;
     const task = detailTask,
       ticket = detailSequence;
     const current = () => ticket === detailSequence && projectId === task.project && $("detail-dialog").open;
@@ -907,6 +945,9 @@ window.RSIExperience = (() => {
         "task?id=" + task.id + "&project=" + task.project,
       );
       if (!current()) return;
+      if (metadata?.id !== task.id || metadata.project !== task.project ||
+          typeof metadata.title !== "string" || typeof metadata.state !== "string")
+        throw Error("Invalid live task metadata");
       liveState = metadata.state || liveState;
       // Issue sync may revise title, body or evidence while the task stays queued.
       // Rebuild only when the visible input changed so unchanged polls keep drafts and DOM.
@@ -930,11 +971,15 @@ window.RSIExperience = (() => {
       );
       if (!current()) return;
       // `/api/task-runs` returns a page envelope; keep accepting the old bare array.
-      const history = Array.isArray(page) ? page : (Array.isArray(page?.runs) ? page.runs : []);
+      const history = Array.isArray(page) ? page : page?.runs;
+      if (!Array.isArray(history) || (history.length && !history[0]?.id))
+        throw Error("Invalid live task history");
       const latest = history[0];
       if (latest) {
         const data = await api("run?id=" + latest.id);
         if (!current()) return;
+        if (!data?.result || typeof data.result !== "object" || Array.isArray(data.result))
+          throw Error("Invalid live run result");
         liveEnded = data.ended != null;
         const signature = JSON.stringify([
           latest.id,
@@ -970,6 +1015,7 @@ window.RSIExperience = (() => {
       }
     } finally {
       liveBusy = false;
+      if (liveRetryButton) liveRetryButton.disabled = false;
       if (detailTask && $("detail-dialog").open) {
         clearTimeout(liveTimer);
         liveTimer = setTimeout(liveDetail, liveDelay());
@@ -1476,7 +1522,7 @@ window.RSIExperience = (() => {
     if (!window.RSIDesktop && "serviceWorker" in navigator && isSecureContext)
       navigator.serviceWorker.register("/sw.js").catch(() => {});
   });
-  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { queueEditor = null; liveFailures = 0; liveNotice(); clearTimeout(liveTimer); }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时");const inbox=$("attention-inbox");if(inbox)inbox.textContent=t("所有项目待办")+(inbox.textContent.match(/ · \d+$/)?.[0]||''); } };
+  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { detailTaskRetryButtons.clear(); queueEditor = null; liveFailures = 0; liveNotice(); clearTimeout(liveTimer); }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时");const inbox=$("attention-inbox");if(inbox)inbox.textContent=t("所有项目待办")+(inbox.textContent.match(/ · \d+$/)?.[0]||''); } };
 })();
 
 'use strict';
