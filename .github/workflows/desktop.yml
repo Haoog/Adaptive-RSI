@@ -178,7 +178,7 @@ jobs:
       - name: 验证应用并生成完整安装包
         if: needs.changes.outputs.mode == 'full'
         run: |
-          python3 scripts/test_updater_signing.py
+          python3 scripts/test_updater_signing.py --measure-verification-rss
           python3 -B scripts/upgrade_harness.py --stage receipt authorization isolation --app "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app"
           codesign --verify --deep --strict "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app"
           "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app/Contents/MacOS/adaptive-rsi-engine" --version

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Verify updater signatures with disposable local test keys, never release credentials."""
+import argparse
+import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import zipfile
 import email.parser
@@ -55,7 +58,53 @@ def check_signed_cross_version_upgrade(folder, key, current, command, env):
         raise RuntimeError("cross-version fixtures are identical")
 
 
+def verify_stream_rss(folder, key, env):
+    """Measure only the process running the production cache verifier."""
+    mib = 1024 * 1024
+    build = subprocess.run([cargo(), "build", "--locked", "--manifest-path", MANIFEST,
+                            "--bin", "verify_updater", "--message-format=json"],
+                           cwd=ROOT, env=env, stdout=subprocess.PIPE, text=True, check=True, timeout=180)
+    binary = next(event["executable"] for event in map(json.loads, build.stdout.splitlines())
+                  if event.get("reason") == "compiler-artifact"
+                  and event["target"]["name"] == "verify_updater" and event.get("executable"))
+    if sys.platform == "darwin":
+        timer = ["/usr/bin/time", "-l"]
+    elif sys.platform == "linux":
+        timer = ["/usr/bin/time", "-f", "max_rss_kib %M"]
+    else:
+        raise RuntimeError("verification RSS measurement requires macOS or Linux")
+    rss = []
+    for size in (8 * mib, 128 * mib):
+        fixture = folder / "verification-fixture.tar.gz"
+        signature = fixture.with_suffix(".gz.sig")
+        with fixture.open("wb") as package:
+            package.truncate(size)
+        run([CLI, "signer", "sign", "-f", key, "-p", "", "--app-version", "1.2.3", fixture], env)
+        command = [binary, fixture, signature, "1.2.3", "--stream"]
+        result = subprocess.run([*timer, *command], cwd=ROOT, env={**env, "LC_ALL": "C"},
+                                capture_output=True, text=True, check=True, timeout=120)
+        for line in result.stderr.splitlines():
+            if sys.platform == "darwin" and line.strip().endswith("maximum resident set size"):
+                peak = int(line.split()[0])
+                break
+            if sys.platform == "linux" and line.startswith("max_rss_kib "):
+                peak = int(line.split()[1]) * 1024
+                break
+        else:
+            raise RuntimeError("the process timer did not report peak RSS")
+        rss.append(peak)
+        print(f"cache_verification package_bytes={size} peak_rss_bytes={peak}")
+        fixture.unlink()
+        signature.unlink()
+    if rss[1] - rss[0] > 16 * mib:
+        raise RuntimeError("cache verification RSS grew by more than 16 MiB")
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--measure-verification-rss", action="store_true",
+                        help="measure peak RSS of the cache verifier on two signed fixture sizes")
+    args = parser.parse_args()
     env = {key: value for key, value in os.environ.items() if not key.startswith("TAURI_SIGNING_")}
     with tempfile.TemporaryDirectory(prefix="rsi-signature-test-") as directory:
         folder = Path(directory)
@@ -67,10 +116,15 @@ def main():
         command = [cargo(), "run", "--quiet", "--locked", "--manifest-path", MANIFEST,
                    "--bin", "verify_updater", "--", archive, str(archive) + ".sig"]
         run([*command, "1.2.3"], env)
+        run([*command, "1.2.3", "--stream"], env)
         run([*command, "1.2.4"], env, expect=1)
+        run([*command, "1.2.4", "--stream"], env, expect=1)
         check_signed_cross_version_upgrade(folder, key, archive, command, env)
         archive.write_bytes(b"altered artifact")
         run([*command, "1.2.3"], env, expect=1)
+        run([*command, "1.2.3", "--stream"], env, expect=1)
+        if args.measure_verification_rss:
+            verify_stream_rss(folder, key, env)
     with tempfile.TemporaryDirectory(prefix="rsi-sbom-") as directory:
         wheel = Path(directory) / "adaptive_rsi-0.0.0-py3-none-any.whl"
         with zipfile.ZipFile(wheel, "w") as package:

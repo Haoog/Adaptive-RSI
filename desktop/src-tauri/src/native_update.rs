@@ -5,7 +5,7 @@ use tauri_plugin_updater::UpdaterExt;
 
 const FEED: &str = "https://github.com/Haoog/Adaptive-RSI/releases/latest/download/desktop-latest.json";
 pub(super) static REPLACEMENT_GATE: Mutex<()> = Mutex::new(());
-pub(super) const MAX_PACKAGE: usize = 512 * 1024 * 1024;
+pub(super) use crate::updater_signature::MAX_PACKAGE;
 #[cfg(unix)]
 const EXTRACTION_SPACE_MULTIPLIER: u64 = 2;
 
@@ -882,34 +882,10 @@ fn install_snapshot(mut file: File, size: u64, _cache: &Path) -> Result<impl AsR
 }
 
 fn verify_cached_package(update: &tauri_plugin_updater::Update, path: &Path) -> Result<(), String> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    use minisign_verify::{PublicKey, Signature};
-
     let (file, size) = open_bounded_file(path, MAX_PACKAGE as u64)?;
-    let invalid = "update_download_or_signature_failed";
-    let decode = |value: &str| -> Result<String, String> {
-        let bytes = STANDARD.decode(value).map_err(|_| invalid)?;
-        String::from_utf8(bytes).map_err(|_| invalid.into())
-    };
-    let key = PublicKey::decode(&decode(option_env!("RSI_UPDATER_PUBLIC_KEY").unwrap_or(""))?)
-        .map_err(|_| invalid)?;
-    let signature = Signature::decode(&decode(&update.signature)?).map_err(|_| invalid)?;
-    let mut verifier = key.verify_stream(&signature).map_err(|_| invalid)?;
-    let mut reader = file.take(size + 1);
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let count = reader.read(&mut buffer).map_err(|_| "update_cache_unavailable")?;
-        if count == 0 { break; }
-        verifier.update(&buffer[..count]);
-    }
-    if reader.limit() != 1 { return Err("update_cache_unavailable".into()); }
-    verifier.finalize().map_err(|_| invalid)?;
-    // Tauri signs the version as a tab-separated field in the trusted comment.
-    let signed = signature.trusted_comment().split('\t').find_map(|field| field.strip_prefix("version:"));
-    if signed.map(|version| version.trim_start_matches('v')) != Some(update.version.as_str()) {
-        return Err(invalid.into());
-    }
-    Ok(())
+    super::updater_signature::verify_stream(
+        file, size, option_env!("RSI_UPDATER_PUBLIC_KEY").unwrap_or(""), &update.signature, &update.version,
+    ).map_err(str::to_string)
 }
 
 #[cfg(test)]

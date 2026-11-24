@@ -23,6 +23,7 @@ use tauri_plugin_opener::OpenerExt;
 
 mod native_update;
 mod update_receipt;
+mod updater_signature;
 #[cfg(test)]
 mod update_boundary_tests;
 mod transport;
