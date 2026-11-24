@@ -1,4 +1,5 @@
 use super::*;
+use std::io::BufReader;
 
 fn proxy_request(state: &RuntimeState, path: &str, body: Option<Value>) -> Result<Reply, String> {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
@@ -395,26 +396,57 @@ fn child_wait_deadline_does_not_wait_for_process_exit() {
 }
 
 #[test]
-fn private_handshake_stream_keeps_rotations_and_bounds_each_message() {
-    let receiver = handshake_stream(std::io::Cursor::new(b"first\nrotated\n".to_vec()));
+fn private_handshake_stream_keeps_rotations_and_partial_lines() {
+    let receiver = handshake_stream(io::Cursor::new(b"first\nrotated\n"));
     assert_eq!(receiver.recv().unwrap().unwrap(), "first\n");
     assert_eq!(receiver.recv().unwrap().unwrap(), "rotated\n");
     assert!(receiver.recv().is_err());
-    struct NoNewline { remaining: usize }
+
+    // The initial read ends inside the second line after consuming the first.
+    let longest = format!("{}\n", "x".repeat(65535));
+    let receiver = handshake_stream(io::Cursor::new(format!("first\n{longest}rotated\nlast")));
+    for line in ["first\n", &longest, "rotated\n", "last"] {
+        assert_eq!(receiver.recv().unwrap().unwrap(), line);
+    }
+    assert!(receiver.recv().is_err());
+}
+
+#[test]
+fn private_handshake_stream_reads_at_most_65537_bytes_of_an_oversized_line() {
+    use std::sync::{mpsc, Arc};
+    use std::sync::atomic::AtomicUsize;
+
+    struct NoNewline {
+        remaining: usize,
+        bytes_read: Arc<AtomicUsize>,
+        wait_for_eof: mpsc::Receiver<()>,
+    }
     impl Read for NoNewline {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
             if self.remaining == 0 {
-                return Err(std::io::ErrorKind::WouldBlock.into());
+                let _ = self.wait_for_eof.recv_timeout(Duration::from_secs(3));
+                return Ok(0);
             }
-            let count = self.remaining.min(buffer.len());
+            let count = self.remaining.min(buffer.len()).min(8192);
             buffer[..count].fill(b'x');
             self.remaining -= count;
+            self.bytes_read.fetch_add(count, Ordering::Relaxed);
             Ok(count)
         }
     }
-    let receiver = handshake_stream(NoNewline { remaining: 65537 });
-    let error = receiver.recv_timeout(Duration::from_secs(2)).unwrap().unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    for available in [1024 * 1024 + 8, 65537] {
+        let (_keep_open, wait_for_eof) = mpsc::channel();
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let receiver = handshake_stream(NoNewline { remaining: available, bytes_read: bytes_read.clone(), wait_for_eof });
+        let error = receiver.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(bytes_read.load(Ordering::Relaxed), 65537);
+        assert!(receiver.recv().is_err());
+    }
+
+    let receiver = handshake_stream(io::Cursor::new(format!("{}\n", "x".repeat(65536))));
+    assert_eq!(receiver.recv().unwrap().unwrap_err().kind(), io::ErrorKind::InvalidData);
 }
 
 #[test]

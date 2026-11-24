@@ -86,6 +86,7 @@ impl Drop for Lease<'_> {
 }
 
 const BACKUP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_BACKUP_BYTES: u64 = 1 << 30;
 const SQLITE_SIGNATURE: &[u8] = b"SQLite format 3\0";
 const SQLITE_HEADER_BYTES: usize = 100;
 
@@ -107,16 +108,24 @@ fn backup_transfer_budget(bytes: u64) -> Duration {
     Duration::from_secs(120 + bytes.div_ceil(512 * 1024))
 }
 
-pub(super) async fn save_backup(connection: &Connection, id: &str, destination: &std::path::Path) -> Result<(), String> {
-    save_backup_with_available_space(connection, id, destination, |folder| fs2::available_space(folder)).await
+pub(super) async fn save_backup(connection: &Connection, id: &str, destination: &Path) -> Result<(), String> {
+    save_backup_with(connection, id, destination, |folder| fs2::available_space(folder), |staging, path| {
+        staging.persist_noclobber(path)
+    }).await
 }
 
-pub(super) async fn save_backup_with_available_space(
+pub(super) async fn save_backup_with(
     connection: &Connection,
     id: &str,
-    destination: &std::path::Path,
-    available_space: impl FnOnce(&std::path::Path) -> std::io::Result<u64>,
+    destination: &Path,
+    available_space: impl FnOnce(&Path) -> io::Result<u64>,
+    persist: impl FnOnce(tempfile::NamedTempFile, &Path) -> Result<File, tempfile::PersistError>,
 ) -> Result<(), String> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => return Err("Choose a new backup filename".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err("Cannot create backup destination".into()),
+    }
     let mut request = connection.transport.0.get(format!("{}/api/backup?id={id}", connection.origin));
     if let Some(cookie) = &connection.cookie {
         request = request.header("Cookie", cookie);
@@ -131,7 +140,7 @@ pub(super) async fn save_backup_with_available_space(
     }
     let length = response.headers().get(reqwest::header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok()?.parse::<u64>().ok())
-        .filter(|&length| length >= 512 && response.content_length() == Some(length))
+        .filter(|&length| (512..=MAX_BACKUP_BYTES).contains(&length) && response.content_length() == Some(length))
         .ok_or("Invalid backup size")?;
     let folder = destination.parent().filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -178,8 +187,37 @@ pub(super) async fn save_backup_with_available_space(
     ).is_err() {
         return Err("Backup download cancelled".into());
     }
-    staging.persist_noclobber(destination).map_err(|_| "Cannot publish backup; choose a new filename")?;
-    Ok(())
+    match persist(staging, destination) {
+        Ok(_) => Ok(()),
+        #[cfg(unix)]
+        Err(error) if matches!(error.error.kind(), io::ErrorKind::Unsupported
+            | io::ErrorKind::CrossesDevices | io::ErrorKind::PermissionDenied) => {
+            copy_backup_noclobber(error.file, destination)
+                .map_err(|_| "Cannot publish backup; choose a new filename".into())
+        }
+        Err(_) => Err("Cannot publish backup; choose a new filename".into()),
+    }
+}
+
+#[cfg(unix)]
+fn copy_backup_noclobber(mut staging: tempfile::NamedTempFile, destination: &Path) -> io::Result<()> {
+    use std::io::Seek;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    staging.as_file_mut().rewind()?;
+    // Filesystems without a no-clobber rename or hard links require a copy.
+    // Exclusive creation still refuses any name claimed during the download.
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(destination)?;
+    let result = io::copy(staging.as_file_mut(), &mut file).and_then(|_| file.sync_all());
+    if result.is_err() {
+        let same_file = |(opened, named): (fs::Metadata, fs::Metadata)| {
+            (opened.dev(), opened.ino()) == (named.dev(), named.ino())
+        };
+        if file.metadata().ok().zip(fs::symlink_metadata(destination).ok()).is_some_and(same_file) {
+            let _ = fs::remove_file(destination);
+        }
+    }
+    result
 }
 
 pub(super) fn request_timeout(path: &str) -> Duration {
