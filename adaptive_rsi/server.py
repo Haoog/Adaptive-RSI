@@ -28,6 +28,7 @@ from .config import BUILTIN_PROVIDERS
 from .contracts import API_VERSION, descriptor
 from .evolution import Evolution
 from .maintenance import MAINTENANCE_INTERVAL
+from .operations import OperationNotFound
 from .release import ReconciliationRejected
 from .updates import UpdateInProgress, atomic_json
 
@@ -89,6 +90,7 @@ POST /api/model-center/routes
 POST /api/models
 GET /api/monitoring-feedback
 GET /api/operation
+GET /api/operations
 POST /api/operations
 POST /api/operations/cancel
 GET /api/patch
@@ -344,6 +346,8 @@ class Server(ThreadingHTTPServer):
         self.csrf = secrets.token_urlsafe(32)
         self._connection_gate = threading.BoundedSemaphore(self.max_connections)
         self._session_lock = threading.RLock()
+        self._diagnostic_snapshots = {}
+        self._storage_usage_gate = threading.Lock()
         self._backup_gate = threading.BoundedSemaphore(2)
         self._security_lock = threading.Lock()
         self._failure_window = 0.0
@@ -422,7 +426,30 @@ class Server(ThreadingHTTPServer):
                        "url": url, "pid": os.getpid()}
             atomic_json(path, session)
             self.token, self.csrf, self.url = token, csrf, url
+            self._diagnostic_snapshots.clear()
             return {"url": url, "csrf": csrf}
+
+
+    def diagnostic_snapshot(self, token, snapshot=None):
+        if snapshot is None:
+            from .storage_tools import diagnostic_preview
+            body = json.dumps(diagnostic_preview(self.runtime.store), ensure_ascii=False,
+                              sort_keys=True, indent=2, allow_nan=False)
+        with self._session_lock:
+            if not hmac.compare_digest(token, self.token):
+                return None
+            now = time.monotonic()
+            if snapshot is not None:
+                expiry, body = self._diagnostic_snapshots.get(snapshot, (0, None))
+                return {"body": body} if expiry > now else None
+            expired = [key for key, (expiry, _) in self._diagnostic_snapshots.items() if expiry <= now]
+            for key in expired:
+                del self._diagnostic_snapshots[key]
+            if len(self._diagnostic_snapshots) >= 64:
+                del self._diagnostic_snapshots[next(iter(self._diagnostic_snapshots))]
+            snapshot = secrets.token_hex(16)
+            self._diagnostic_snapshots[snapshot] = (now + 600, body)
+            return {"snapshot": snapshot, "body": body}
 
 
 def _start_response(handler, code, headers=None, content_type=None, length=None):
@@ -707,6 +734,7 @@ class Handler(BaseHTTPRequestHandler):
             token = ""
         if not self._token_matches(token, self.server.token):
             return self.authentication_failure()
+        self._authenticated_token = token
         return True
 
     def _dispatch_GET(self):
@@ -787,8 +815,15 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/health":
                 self.respond({"version": __version__, "build": BUILD_ID, "pid": os.getpid(),
                               **descriptor()})
+            elif parsed.path == "/api/operations":
+                self.respond({"operations": runtime.operations.recent_backups()})
             elif parsed.path == "/api/operation":
-                self.respond(runtime.operations.get(params.get("id", [""])[0]))
+                try:
+                    operation = runtime.operations.get(params.get("id", [""])[0])
+                except OperationNotFound:
+                    self.respond({"error": "Operation not found", "error_code": "operation_not_found"}, 404)
+                else:
+                    self.respond(operation)
             elif parsed.path == "/api/contract":
                 if params.get("format", [""])[0] == "openapi":
                     self.respond(openapi_document(self.server.origin, self.server.local_origin,
@@ -829,14 +864,31 @@ class Handler(BaseHTTPRequestHandler):
                 data["notifications"] = store.query("SELECT t.id,t.project,t.title,t.state,t.display_state,t.updated,r.id AS run,r.result FROM " + TASKS + " t LEFT JOIN runs r ON r.id=(SELECT id FROM runs WHERE task=t.id ORDER BY started DESC,rowid DESC LIMIT 1) WHERE t.source NOT LIKE 'system_%' ORDER BY t.updated DESC LIMIT 200")
                 self.respond(data)
             elif parsed.path == "/api/storage":
-                from .storage_tools import overview
-                self.respond(overview(store, refresh=params.get("refresh", ["false"])[0] == "true"))
+                from .storage_tools import overview, storage_summary, storage_usage
+                refresh = params.get("refresh") == ["true"]
+                if params.get("summary") == ["true"]:
+                    self.respond(storage_summary(store))
+                elif params.get("usage") == ["true"]:
+                    if not self.server._storage_usage_gate.acquire(blocking=False):
+                        self.respond({"error": "Storage scan in progress", "error_code": "storage_scan_in_progress"}, 503)
+                    else:
+                        try:
+                            self.respond(storage_usage(store, refresh=refresh))
+                        finally:
+                            self.server._storage_usage_gate.release()
+                else:
+                    self.respond(overview(store, refresh=refresh))
             elif parsed.path == "/api/diagnostics":
                 from .storage_tools import diagnostics
                 self.respond(diagnostics(store))
             elif parsed.path == "/api/diagnostics/preview":
                 from .storage_tools import diagnostic_preview
-                self.respond(diagnostic_preview(store))
+                if params.get("snapshot") == ["true"]:
+                    preview = self.server.diagnostic_snapshot(self._authenticated_token)
+                    self.respond(preview if preview is not None else {"error": "Session changed"},
+                                 200 if preview is not None else 401)
+                else:
+                    self.respond(diagnostic_preview(store))
             elif parsed.path == "/api/shutdown-status":
                 self.respond(runtime.shutdown_status())
             elif parsed.path == "/api/backup":
@@ -1343,21 +1395,30 @@ class Handler(BaseHTTPRequestHandler):
                     raise RequestError(field + " must be " + name)
             response_code, response_headers, response_lock = 200, None, None
             if path == "/api/operations":
-                self.respond(runtime.operations.start(body.get("kind"), body.get("parameters", {})))
+                options = {"reuse_active": True} if body.get("reuse_active") is True else {}
+                self.respond(runtime.operations.start(body.get("kind"), body.get("parameters", {}), **options))
                 return
             if path == "/api/operations/cancel":
                 self.respond(runtime.operations.cancel(body.get("id")))
                 return
             if path == "/api/diagnostics/export":
-                # Recompute the minimal preview instead of trusting client content;
-                # only an explicit consent flag is accepted from the caller.
-                if body.get("consent") is not True or set(body) != {"consent"}:
+                if body.get("consent") is not True or set(body) not in ({"consent"}, {"consent", "snapshot"}):
                     raise RequestError("Diagnostic export requires explicit consent")
-                from .storage_tools import diagnostic_preview
-                import json as json_module
-                preview = diagnostic_preview(runtime.store)
-                encoded = json_module.dumps(preview, ensure_ascii=False, sort_keys=True,
-                                            allow_nan=False)
+                if "snapshot" in body:
+                    key = body["snapshot"]
+                    if not isinstance(key, str) or not re.fullmatch(r"[a-f0-9]{32}", key):
+                        raise RequestError("Invalid diagnostic preview")
+                    preview = self.server.diagnostic_snapshot(self._authenticated_token, key)
+                    if preview is None:
+                        self.respond({"error": "Diagnostic preview unavailable",
+                                      "error_code": "diagnostic_preview_expired"}, 409)
+                        return
+                    encoded = preview["body"]
+                else:
+                    # The original export contract still supports consent-only clients.
+                    from .storage_tools import diagnostic_preview
+                    encoded = json.dumps(diagnostic_preview(runtime.store), ensure_ascii=False,
+                                         sort_keys=True, allow_nan=False)
                 self.respond({"format": 1, "filename": "adaptive-rsi-diagnostics.json",
                               "body": encoded, "bytes": len(encoded.encode("utf-8"))})
                 return

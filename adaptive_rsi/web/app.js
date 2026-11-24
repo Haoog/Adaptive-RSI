@@ -238,9 +238,10 @@ function lazyEvidence(label,produce){
 }
 function toast(message,error=false){ $('toast').textContent=message; $('toast').className=error?'error':''; $('toast').hidden=false; clearTimeout(toastTimer); if(!error)toastTimer=setTimeout(()=>$('toast').hidden=true,6500);else{const close=el('button','×','toast-close');close.type='button';close.setAttribute('aria-label',t('关闭'));close.addEventListener('click',()=>$('toast').hidden=true);$('toast').append(close);} }
 let serviceCapabilities=null,serviceContractPromise=null;
-function featureForPath(path){
+function featureForPath(path,body){
  const route=path.split('?')[0];
  if(/^(?:tasks\/batch(?:es)?|task-batch(?:\/.*)?)$/.test(route))return 'task-batch';
+ if(route==='operations'&&body===undefined)return 'operation-history';
  if(/^(?:operations?|operations\/.*)$/.test(route))return 'operations';
  if(route==='config-history'||route==='config/undo')return 'config-history';
  if(route==='diagnostics/preview'||route==='diagnostics/export')return 'diagnostics-preview';
@@ -265,7 +266,7 @@ async function negotiateCapabilities(){
  return serviceContractPromise;
 }
 async function sendApi(path,body,signal,{text=false,current}={}){
- const feature=featureForPath(path);
+ const feature=featureForPath(path,body);
  // A failed probe returns null: let the real fetch surface the connectivity error
  // instead of misreporting it as an old service. Only a negotiated descriptor decides support.
  if(feature){const supported=await negotiateCapabilities();signal?.throwIfAborted();if(supported!==null&&!supported.has(feature)){const error=Error(t('当前服务不支持此功能，请升级服务后重试。'));error.code='unsupported_capability';error.feature=feature;throw error;}}
@@ -696,6 +697,7 @@ function writeNavigation(name){
 function showView(name,recordHistory=true){
  if(!state){toast(t('正在连接本地服务，请稍候再提交。'));return;}
  if(!['overview','tasks','evolution','settings','models','usage'].includes(name))return;
+ document.querySelector?.('.storage-dialog[open]')?.close?.();
  const models=name==='models';name=name==='tasks'?'overview':name;
  if(view==='models'&&!models)window.RSIModelCenter?.leave?.();
  navigationSequence++;view=name;if(models)window.RSIModelCenter?.connections(false);document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+name);

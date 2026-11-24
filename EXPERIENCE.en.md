@@ -54,7 +54,9 @@ Metrics also report average time to PR and merge with sample counts, repeated fa
 
 ## Backups and retention
 
-**Data and diagnostics** provides storage totals, consistent online SQLite backups, downloads and diagnostic previews. Backups contain private task content and configuration; keep them private. Diagnostic summaries include only version, counts, failure codes and storage size, excluding credentials, paths, code, task text and full prompts.
+**Data and diagnostics** provides storage totals, consistent online SQLite backups, downloads and diagnostic previews. Backups contain private task content and configuration; keep them private. Diagnostic summaries contain only the version, row counts, invalid evidence count and SQLite version. After consent, the download contains the exact preview shown. If the preview expires, generate and confirm it again.
+
+The panel opens immediately and loads backups and approvals, recent operations, and storage usage independently. Usage figures show the scan time and remain visible if a refresh fails. After a reload or a lost receipt, look for the original operation under Recent backups and restore checks on this machine. Entries show the time, status and operation ID. New restore checks also show the associated backup ID. The panel shows up to 30 entries, and terminal records follow the existing maintenance retention rules.
 
 Backups remain absent from the download list while being generated. They become downloadable only after copying, portability preparation and file closure, preventing incomplete snapshots from being exported as successful backups. Failures remove staging files without overwriting existing backups. The pending-approval count in **Data and diagnostics** includes only candidates that can still be approved; approved, delivering and cancelled candidates are excluded, and in-progress deliveries are reported separately.
 

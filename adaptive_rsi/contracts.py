@@ -3,6 +3,7 @@
 API_VERSION = 2
 
 CAPABILITIES = {
+    "operation-history": "list recent backup and restore-check receipts",
     "operations": "background operation receipts, progress and safe cancellation",
     "desktop-update-drain": "serialized application replacement after runtime work drains",
     "task-batch": "preview, approval and restore of grouped tasks",
