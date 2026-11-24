@@ -315,9 +315,18 @@ def _valid_loads(loads):
                                and len({load.strip() for load in loads}) == len(loads))
 
 
-def _planned_measurements(rows, keys):
-    samples = {key: [] for key in keys}
+HOST_REPETITIONS = "host_repetitions"
+
+
+def _planned_measurements(rows, keys, host_repeats=None):
+    rounds = range(1, host_repeats + 1) if host_repeats is not None else (None,)
+    samples = {repetition: {key: [] for key in keys} for repetition in rounds}
     for row in rows:
+        repetition = row.get("performance_repetition") if host_repeats is not None else None
+        if host_repeats is not None and (type(repetition) is not int or repetition not in samples
+                                        or row.get("exit_code") != 0 or row.get("error")):
+            return None
+        measurements = samples[repetition]
         for line in row.get("stdout", "").splitlines():
             try:
                 sample = json.loads(line)
@@ -326,10 +335,14 @@ def _planned_measurements(rows, keys):
             if not isinstance(sample, dict):
                 continue
             key = sample.get("metric"), sample.get("unit"), sample.get("load")
-            if all(part is None or isinstance(part, str) for part in key) and key in samples:
+            if all(part is None or isinstance(part, str) for part in key) and key in measurements:
                 value = sample.get("value")
-                samples[key].append(value if _finite_measurement(value) else None)
-    return samples
+                measurements[key].append(value if _finite_measurement(value) else None)
+    if host_repeats is None:
+        return samples[None]
+    if any(len(values) != 1 for measurements in samples.values() for values in measurements.values()):
+        return None
+    return {key: [measurements[key][0] for measurements in samples.values()] for key in keys}
 
 
 def improvement(results, acceptance):
@@ -377,7 +390,10 @@ def improvement(results, acceptance):
         repeats = contract.get("repetitions", 1)
         loads = contract.get("load_conditions", [None])
         secondary = contract.get("guardrails", [])
-        if type(repeats) is not int or not 1 <= repeats <= 100 or not _valid_loads(loads):
+        mode = contract.get("measurement_mode")
+        minimum = 3 if mode == HOST_REPETITIONS else 1
+        if ("measurement_mode" in contract and mode != HOST_REPETITIONS
+                or type(repeats) is not int or not minimum <= repeats <= 100 or not _valid_loads(loads)):
             return {"decision": "insufficient_evidence", "kind": kind, "basis": "invalid_measurement_plan"}
         if not isinstance(secondary, list) or len(secondary) > 20:
             return {"decision": "insufficient_evidence", "kind": kind, "basis": "invalid_guardrail"}
@@ -391,8 +407,12 @@ def improvement(results, acceptance):
         if len(set(identities)) != len(identities):
             return {"decision": "insufficient_evidence", "kind": kind, "basis": "duplicate_guardrail_metric"}
         keys = [(rule["metric"], rule["unit"], load) for rule in rules for load in loads]
-        baseline = _planned_measurements(before, keys)
-        candidate = _planned_measurements(after, keys)
+        host_repeats = repeats if mode == HOST_REPETITIONS else None
+        baseline = _planned_measurements(before, keys, host_repeats)
+        candidate = _planned_measurements(after, keys, host_repeats)
+        if baseline is None or candidate is None:
+            return {"decision": "insufficient_evidence", "kind": kind,
+                    "basis": "one_measurement_required_per_host_repetition"}
         guardrails, estimates, passed = [], [], True
         for index, rule in enumerate(rules):
             for load in loads:
@@ -415,7 +435,7 @@ def improvement(results, acceptance):
                         "before": statistics.mean(old), "after": statistics.mean(new),
                         "before_range": [min(old), max(old)], "after_range": [min(new), max(new)],
                         "before_stdev": statistics.stdev(old) if repeats > 1 else None,
-                        "after_stdev": statistics.stdev(new) if repeats > 1 else None, "samples": repeats}
+                        "after_stdev": statistics.stdev(new) if repeats > 1 else None, "samples": len(old)}
                 (guardrails if index else estimates).append(item)
         return {"decision": "pass" if passed else "insufficient_evidence", "kind": kind,
                 "before": estimates[0]["before"], "after": estimates[0]["after"], "threshold": threshold,
@@ -441,7 +461,7 @@ def evidence_contract(task, plan, require_preserved=False):
             raise ValueError("Behavior plan must name the existing tests that pin the behavior it must not change")
     requirements = {
         "behavior": "Reproduce the reported behavior before the change and demonstrate it works afterward.",
-        "performance": "Emit one JSON measurement line per version, repetition, load condition and guardrail metric: metric, unit, value and the load label when declared. Use the frozen targets and tolerances.",
+        "performance": "The host reruns the sealed checks for each repetition of each version. In one round of checks, emit exactly one stdout JSON measurement per primary or guardrail metric and load: metric, unit, value and the load label when declared. Use the frozen targets and tolerances.",
         "refactor": "Preserve passing behavior and verify concrete maintainability criteria in independent review.",
         "documentation": "Execute documentation examples, validate local links and demonstrate the requested information is present.",
         "configuration": "Check effective configuration, defaults, invalid inputs and compatibility through public behavior.",
@@ -479,6 +499,7 @@ def evidence_contract(task, plan, require_preserved=False):
             raise ValueError("Performance guardrails must measure a secondary metric distinct from the primary threshold")
         if len(set(identities)) != len(identities):
             raise ValueError("Performance guardrails must have unique metric and unit identities")
+        contract["measurement_mode"] = HOST_REPETITIONS
         contract["threshold"] = copy.deepcopy(threshold)
         contract["repetitions"] = repetitions
         contract["load_conditions"] = copy.deepcopy(loads)
