@@ -26,7 +26,9 @@ Alternatively, install directly from the verified release bundle without cloning
 curl -fsSL https://raw.githubusercontent.com/Haoog/Adaptive-RSI/main/scripts/remote-install.sh | bash
 ```
 
-Both installers report the systemd user service state, a bounded health check, and the account's linger status. If the process has started but health is still unavailable, the installer exits with a nonzero status and leaves the service configuration in place. When persistent operation is needed and linger is disabled, follow the printed command to enable it.
+Before reinstalling manually, back up state, pause scheduling, let running tasks and background operations finish, and stop the user service. The installers exit before making changes if the service is running, a systemd job is queued, or the default runtime directory is in use. Continue using the built-in updater for installations it manages, and complete any pending update recovery first.
+
+Both installers report the systemd user service state, a bounded health check, and the account's linger status. The health check verifies the build served by a process belonging to the user service. If it cannot confirm the installed build, the installer exits with a nonzero status and leaves the service configuration in place. When persistent operation is needed and linger is disabled, follow the printed command to enable it.
 
 The service listens on loopback only. A source install defaults to port `6090`. For a release install, find the actual port in the service journal's authenticated URL. On your personal computer, substitute the actual port for `6090` below:
 

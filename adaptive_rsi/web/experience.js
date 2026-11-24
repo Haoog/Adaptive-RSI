@@ -1370,7 +1370,7 @@ window.RSIExperience = (() => {
     box.addEventListener("close", () => clearTimeout(historyTimer));
     history.append(el("h3", t("当前机器的近期备份与恢复验证")), refreshHistory, historyStatus, historyRows);
     async function loadOperations() {
-      if (!visible() || refreshHistory.disabled) return;
+      if (!visible() || refreshHistory.disabled || refreshHistory.hidden) return;
       clearTimeout(historyTimer);
       refreshHistory.disabled = true;
       historyStatus.textContent = t("正在查询近期操作…");
@@ -1383,7 +1383,8 @@ window.RSIExperience = (() => {
           const label = t(row.kind === "backup" ? "一致性备份" : "恢复点验证");
           const states = {queued:t("排队中"), running:t("运行中"), completed:t("已完成"), cancelled:t("已取消"),
                           failed:t("失败"), interrupted:t("已中断，结果未知")};
-          const item = el("li", [label, stamp(row.created), states[row.state] || t("未知"), row.backup_id, row.id]
+          const backup = row.backup_id || (row.kind === "restore-check" ? t("备份标识未知") : null);
+          const item = el("li", [label, stamp(row.created), states[row.state] || t("未知"), backup, row.id]
             .filter(Boolean).join(" · "));
           if (row.progress?.pages_total) item.append(" · " + Math.round(100 * row.progress.pages_done / row.progress.pages_total) + "%");
           if (row.cancellable) {
@@ -1407,8 +1408,11 @@ window.RSIExperience = (() => {
           historyRows.append(item);
         }
         if (operations.some(row => !row.ended)) historyTimer = setTimeout(loadOperations, 2000);
-      } catch {
-        if (visible()) historyStatus.textContent = t("近期操作查询未完成，可重新刷新。");
+      } catch (error) {
+        if (!visible()) return;
+        const unsupported = error.code === "unsupported_capability" && error.feature === "operation-history";
+        refreshHistory.hidden = unsupported;
+        historyStatus.textContent = t(unsupported ? "当前服务版本不支持近期操作列表。" : "近期操作查询未完成，可重新刷新。");
       } finally {
         refreshHistory.disabled = false;
       }

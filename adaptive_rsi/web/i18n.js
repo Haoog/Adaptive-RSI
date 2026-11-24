@@ -135,6 +135,8 @@ const english = {
  "一致性备份": "Consistent backup",
  "恢复点验证": "Restore point check",
  "已中断，结果未知": "Interrupted, outcome unknown",
+ "备份标识未知": "Backup ID unknown",
+ "当前服务版本不支持近期操作列表。": "This service version does not support listing recent operations.",
  "近期操作查询未完成，可重新刷新。": "Recent operations could not be loaded. You can refresh them.",
  "刷新备份与审批摘要": "Refresh backups and approval summary",
  "正在读取备份与审批摘要…": "Loading backups and approval summary…",

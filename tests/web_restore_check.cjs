@@ -384,7 +384,7 @@ test('only the explicit missing-operation response allows a fresh restore-check 
   ]);
 });
 
-function storageFixture(api) {
+function storageFixture(api, fetch) {
   const source = fs.readFileSync('adaptive_rsi/web/experience.js', 'utf8');
   const start = source.indexOf('  const restoreChecks = new Map();');
   const end = source.indexOf('  function desktopDownload', start);
@@ -415,6 +415,11 @@ function storageFixture(api) {
     },
     action: (text, handler) => Object.assign(el('button', text), {handler}),
   });
+  if (fetch) {
+    const app = fs.readFileSync('adaptive_rsi/web/app.js', 'utf8');
+    Object.assign(context, {fetch, structuredClone, $: () => null});
+    vm.runInContext(app.slice(app.indexOf('let serviceCapabilities='), app.indexOf('const goalSubmissionLimit')), context);
+  }
   vm.runInContext(source.slice(start, end), context);
   const find = (node, predicate) => predicate(node) ? node : node.children?.map(child =>
     typeof child === 'object' ? find(child, predicate) : null).find(Boolean);
@@ -435,9 +440,13 @@ test('data panel opens before usage, restores recent operations, and ignores lat
   assert.ok(findText(first, '恢复命令'));
   assert.deepEqual(requests.map(row => row.path), ['storage?summary=true', 'operations', 'storage?usage=true']);
   requests[0].resolve({backups:[], expiring_count:2});
-  requests[1].resolve({operations:[{kind:'restore-check', state:'completed', id:'lost-receipt', created:2, ended:3}]});
+  requests[1].resolve({operations:[
+    {kind:'restore-check', state:'completed', id:'lost-receipt', created:2, ended:3},
+    {kind:'restore-check', state:'completed', id:'new-receipt', backup_id:'known-backup', created:2, ended:3},
+  ]});
   await new Promise(setImmediate);
-  assert.ok(findText(first, 'lost-receipt'));
+  assert.ok(findText(first, '备份标识未知 · lost-receipt'));
+  assert.ok(findText(first, 'known-backup · new-receipt'));
   assert.ok(findText(first, '正在统计存储占用'));
   requests[2].resolve({scanned_at:10, bytes:{runs:1048576}});
   await new Promise(setImmediate);
@@ -460,6 +469,36 @@ test('data panel opens before usage, restores recent operations, and ignores lat
   assert.equal(findText(second, 'stamp-10'), undefined);
   assert.equal(findText(reopened, 'old-machine'), undefined);
   second.close();
+});
+
+test('an old service can create, poll and cancel operations without supporting the history list', async () => {
+  const calls = [];
+  const f = storageFixture(undefined, async (path, options) => {
+    const method = options.method || 'GET';
+    calls.push([method, path]);
+    const respond = data => new Response(JSON.stringify(data));
+    if (path === '/api/contract') return respond({descriptor:{capabilities:['operations']}});
+    if (path === '/api/storage?summary=true') return respond({backups:[]});
+    if (path === '/api/storage?usage=true') return respond({bytes:{}, scanned_at:1});
+    if (method === 'POST' && path === '/api/operations') return respond({id:'legacy-op'});
+    if (path === '/api/operation?id=legacy-op') return respond({id:'legacy-op', state:'running'});
+    if (path === '/api/operations/cancel') return respond({id:'legacy-op', state:'cancelled'});
+    throw Error(path);
+  });
+  await f.open();
+  await new Promise(setImmediate);
+  const box = f.dialogs[0];
+  assert.ok(f.find(box, node => node.textContent === '当前服务版本不支持近期操作列表。'));
+  assert.equal(f.find(box, node => node.textContent === '刷新近期操作').hidden, true);
+  assert.ok(f.find(box, node => node.textContent === '创建一致性备份'));
+  const operation = await vm.runInContext('api("operations", {kind:"backup", parameters:{}})', f.context);
+  assert.equal(operation.id, 'legacy-op');
+  const running = await vm.runInContext('api("operation?id=legacy-op")', f.context);
+  assert.equal(running.state, 'running');
+  const cancelled = await vm.runInContext('api("operations/cancel", {id:"legacy-op"})', f.context);
+  assert.equal(cancelled.state, 'cancelled');
+  assert.ok(!calls.some(([method, path]) => method === 'GET' && path === '/api/operations'));
+  box.close();
 });
 
 test('data panel downloads exactly the consented preview and clears consent when regenerated', async () => {
