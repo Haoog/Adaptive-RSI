@@ -452,7 +452,7 @@ window.RSIExperience = (() => {
     );
     if (!current()) return;
     const controls = el("section", undefined, "task-controls");
-    const recovery = el("section", undefined, "detail-section");
+    const recovery = el("section");
     recovery.id = "task-recovery";
     renderTaskRecovery(recovery, metadata.recovery);
     controls.append(recovery);
