@@ -155,7 +155,7 @@ const {chromium}=require('playwright');
   assert.equal(await dialog.locator('.usage-call').filter({hasText:'page-25'}).count(),0,'old pagination must not overwrite a reopened dialog');
   assert.equal(await dialog.isVisible(),true);
   await dialog.locator('.close-dialog').click();
-  // 延迟失败也必须遵守相同的生命周期；有效请求的错误仍交给全局提示。
+  // 弹窗关闭或重开后丢弃迟到失败；当前弹窗的翻页失败可以就地重试。
   for(const [failure,reopen] of [['503',false],['503',true],['json',true],['network',true]]){
    await page.evaluate(()=>document.getElementById('toast').hidden=true);
    holdPage=false;await openDetail.click();await dialog.locator('.usage-call').filter({hasText:'page-0'}).waitFor();
@@ -170,9 +170,16 @@ const {chromium}=require('playwright');
   }
   holdPage=false;await openDetail.click();await dialog.locator('.usage-call').filter({hasText:'page-0'}).waitFor();
   pageFailure='503';holdPage=true;const currentStarted=new Promise(resolve=>pageStarted=resolve);await nextPage.click();await currentStarted;
-  releasePage();await page.locator('#toast').filter({hasText:'操作未完成'}).waitFor();
+  releasePage();
+  const pageError=dialog.locator('[data-form-error]').filter({hasText:'无法加载此页用量明细，仍显示上次加载的记录。'});
+  await pageError.waitFor();
   assert.equal(await dialog.isVisible(),true,'current failure must leave the dialog open');
-  await dialog.locator('.close-dialog').click();await page.locator('#toast .toast-close').click();await page.unroute('**/api/usage?*',paginationRoute);
+  assert.equal(await dialog.locator('.usage-call').filter({hasText:'page-0'}).count(),1,'current failure must preserve the visible page');
+  assert.equal(await page.locator('#toast').isHidden(),true,'inline feedback must not also show a global toast');
+  holdPage=false;await pageError.getByRole('button',{name:'重试',exact:true}).click();
+  await dialog.locator('.usage-call').filter({hasText:'page-25'}).waitFor();
+  assert.equal(await pageError.count(),0,'successful retry must clear the error');
+  await dialog.locator('.close-dialog').click();await page.unroute('**/api/usage?*',paginationRoute);
   assert.deepEqual(errors,[]);
   const dstContext=await browser.newContext({timezoneId:'America/New_York'}),dstPage=await dstContext.newPage();const requests=[];
   dstPage.on('pageerror', error => errors.push(error.message));

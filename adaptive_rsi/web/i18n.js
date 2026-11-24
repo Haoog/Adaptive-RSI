@@ -1790,7 +1790,8 @@ const english = {
  "实时刷新中断 · 尚未成功更新。详情可能不是最新，可立即重试。": "Live refresh interrupted · No successful update yet. Details may be out of date. Retry now.",
  "用量刷新失败：当前显示「{range}」的数据（最后成功更新 {time}）。本次筛选尚未加载。": "Usage refresh failed: showing data for “{range}” (last successful update {time}). The current filters have not loaded.",
  "用量加载失败：{message}。当前没有可显示的数据，请重试。": "Usage could not load: {message}. No data is available yet. Retry.",
- "用量加载失败。当前没有可显示的数据，请重试。": "Usage could not load. No data is available yet. Retry."
+ "用量加载失败。当前没有可显示的数据，请重试。": "Usage could not load. No data is available yet. Retry.",
+ "无法加载此页用量明细，仍显示上次加载的记录。": "This page of usage details could not load. The last loaded records are still shown."
 };
 let language = (()=>{try{return localStorage.getItem('rsi-language') === 'en' ? 'en' : 'zh-CN';}catch{return 'zh-CN';}})();
 function t(text){ return language === 'en' ? (english[text] ?? text) : text; }

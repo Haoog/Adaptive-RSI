@@ -4425,9 +4425,16 @@ function usagePage() {
   page.node('usage-sort').value = 'recent';
   vm.runInContext('view="usage"', page.context);
   page.context.fetch = url => new Promise(resolve => {
-    requests.push({params: new URLSearchParams(url.split('?')[1]), finish(title, status = 200, callTotal = 0) {
-      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [], calls: [], call_total: callTotal,
-        tasks: [{task: title, title, project: 'a', state: 'failed', tokens: 100, attempts: 1}], total: 60}, status));
+    const params = new URLSearchParams(url.split('?')[1]);
+    requests.push({params, finish(title, status = 200, callTotal = 0, total = 60) {
+      const tasks = Number(params.get('offset')) < total
+        ? [{task: title, title, project: 'a', state: 'failed', tokens: 100, attempts: 1}] : [];
+      const offset = Number(params.get('offset')), limit = Number(params.get('limit'));
+      const calls = params.has('task') ? Array.from({length: Math.max(0, Math.min(limit, callTotal - offset))},
+        (_, index) => ({role: 'triage', model: `${title} ${offset + index + 1}`, provider: 'fixture',
+          effort: 'high', state: 'done', created: 1700000000 - offset - index, unit: 'http_request'})) : [];
+      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [], calls, call_total: callTotal,
+        tasks, total}, status));
     }});
   });
   return Object.assign(page, {
@@ -4484,6 +4491,139 @@ test('usage details retain the visible report time window after a filter refresh
   assert.equal(page.requests[2].params.get('end'), originalEnd);
   page.requests[2].finish('Details'); await detail;
   assert.equal(page.node('usage-detail').open, true);
+});
+
+test('usage details recover when the call total shrinks during pagination', async () => {
+  const page = usagePage();
+  let now = 1700000000000;
+  page.context.Date = class extends Date { static now() { return now; } };
+  page.node('usage-period').value = '7';
+  page.search('fixture task');
+  page.fireTimer(350);
+  const report = page.context.lastAction;
+  page.requests[0].finish('fixture task'); await report;
+  const content = page.node('usage-detail-content');
+  const dialog = page.node('usage-detail');
+  const button = label => descendants(content).find(node => node.tagName === 'BUTTON' && node.textContent === label);
+  const calls = () => descendants(content).filter(node => node.className === 'usage-call');
+  const open = page.node('usage-tasks').children[0].children.at(-1);
+  assert.equal(open.textContent, '查看用量明细');
+  assert.equal(page.requests[0].params.get('q'), 'fixture task');
+  const expectedScope = new URLSearchParams(page.requests[0].params);
+  expectedScope.delete('q');
+  expectedScope.set('task', 'fixture task');
+  expectedScope.delete('offset');
+  function checkRequest(request, offset) {
+    const scope = new URLSearchParams(request.params);
+    assert.equal(scope.get('offset'), String(offset));
+    scope.delete('offset');
+    assert.deepEqual(Object.fromEntries(scope), Object.fromEntries(expectedScope));
+  }
+  function startPage(node, offset) {
+    const index = page.requests.length;
+    assert.ok(node);
+    node.handlers.click();
+    const request = page.requests[index];
+    checkRequest(request, offset);
+    return {pending: page.context.lastAction, request};
+  }
+  async function lastRequest(offset) {
+    const count = page.requests.length;
+    await new Promise(setImmediate);
+    assert.equal(page.requests.length, count + 1);
+    const request = page.requests[count];
+    checkRequest(request, offset);
+    return request;
+  }
+  async function loadPage(node, offset, label, total) {
+    const {pending, request} = startPage(node, offset);
+    request.finish(label, 200, total); await pending;
+  }
+
+  await loadPage(open, 0, 'First', 60);
+  assert.equal(calls().length, 25);
+  await loadPage(button('下一页'), 25, 'Second', 60);
+  assert.match(textOf(calls()[0]), /Second 26/);
+  now += 120000;
+  const next = startPage(button('下一页'), 50);
+  next.request.finish('Out of range', 200, 36);
+  await new Promise(setImmediate);
+  assert.equal(calls().length, 25, 'an empty out-of-range response must not replace the visible calls');
+  assert.equal(page.requests.length, 5);
+  checkRequest(page.requests[4], 25);
+  page.requests[4].finish('Last', 200, 36); await next.pending;
+  assert.equal(calls().length, 11);
+  assert.match(textOf(calls()[0]), /Last 26/);
+  assert.match(textOf(content.children.at(-1)), /36 次调用/);
+  assert.equal(button('下一页'), undefined);
+  assert.ok(button('上一页'));
+
+  dialog.close();
+  await loadPage(open, 0, 'First', 60);
+  await loadPage(button('下一页'), 25, 'Visible', 60);
+  const visibleRows = calls(), visibleSelection = content.children[2];
+  const shrinking = startPage(button('下一页'), 50);
+  shrinking.request.finish('Out of range', 200, 36);
+  const secondFallback = await lastRequest(25);
+  secondFallback.finish('Shrank again', 200, 25);
+  const firstFallback = await lastRequest(0);
+  assert.deepEqual(calls(), visibleRows);
+  firstFallback.finish('Unavailable', 503); await shrinking.pending;
+  assert.deepEqual(calls(), visibleRows);
+  const notice = content.querySelector('[data-form-error]');
+  assert.equal(notice.attributes.role, 'status');
+  assert.match(textOf(notice), /仍显示上次加载的记录/);
+  await loadPage(button('重试'), 0, 'Retried', 26);
+  assert.ok(!content.querySelector('[data-form-error]'));
+  assert.equal(content.children[2].textContent, visibleSelection.textContent);
+  assert.match(textOf(calls()[0]), /Retried 1/);
+  assert.equal(button('上一页'), undefined);
+
+  const exhausted = startPage(button('下一页'), 25);
+  const zeroRequestCount = page.requests.length;
+  exhausted.request.finish('No calls', 200, 0); await exhausted.pending;
+  assert.equal(page.requests.length, zeroRequestCount);
+  assert.equal(calls().length, 0);
+  assert.match(textOf(content.children.at(-1)), /0 次调用/);
+  assert.equal(button('上一页'), undefined);
+  assert.equal(button('下一页'), undefined);
+
+  const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')), page.context);
+  page.context.translateStatic = () => {};
+  for (const trigger of ['newer page', 'close', 'language', 'project']) {
+    if (dialog.open) dialog.close();
+    await loadPage(open, 0, 'First', 60);
+    await loadPage(button('下一页'), 25, 'Visible', 60);
+    const next = startPage(button('下一页'), 50);
+    next.request.finish('Out of range', 200, 36);
+    const fallback = await lastRequest(25);
+    if (trigger === 'newer page') {
+      await loadPage(button('上一页'), 0, 'Newer', 60);
+    } else if (trigger === 'close') {
+      dialog.close();
+    } else if (trigger === 'language') {
+      page.node('language-select').value = 'en';
+      page.node('language-select').handlers.change(); await page.context.lastAction;
+      assert.equal(page.context.t('无法加载此页用量明细，仍显示上次加载的记录。'),
+        'This page of usage details could not load. The last loaded records are still shown.');
+    } else {
+      vm.runInContext('projectId="b"', page.context);
+      page.node('project-select').handlers.change();
+      const project = page.context.lastAction;
+      assert.equal(page.requests.at(-1).params.get('project'), 'b');
+      page.requests.at(-1).finish('New project'); await project;
+    }
+    const visibleContent = [...content.children], requestCount = page.requests.length;
+    fallback.finish('Stale', trigger === 'language' ? 503 : 200, 12); await next.pending;
+    assert.equal(page.requests.length, requestCount, trigger);
+    assert.deepEqual(content.children, visibleContent, trigger);
+    assert.equal(dialog.open, trigger === 'newer page', trigger);
+    if (trigger === 'language') {
+      page.node('language-select').value = 'zh-CN';
+      page.node('language-select').handlers.change(); await page.context.lastAction;
+    }
+  }
 });
 
 test('usage coalesces repeated input, resets pagination and refreshes the latest query', async () => {
@@ -4554,28 +4694,142 @@ test('usage clamps an offset beyond the total and reloads the clamped page', asy
   page.requests[1].finish('Page two'); await second;
   page.node('usage-next').onclick(); const third = page.context.lastAction;
   page.requests[2].finish('Page three'); await third;
-  const shrunk = [];
-  const textOf = node => [node.textContent, ...(node.children || []).map(textOf)].filter(Boolean).join(' ');
-  page.context.fetch = url => new Promise(resolve => {
-    const params = new URLSearchParams(url.split('?')[1]);
-    shrunk.push({params, finish(total) {
-      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [],
-        tasks: [{task: 'Clamped', title: 'Clamped', project: 'a', state: 'failed', tokens: 100, attempts: 1}],
-        total}));
-    }});
-  });
-  page.node('usage-refresh').onclick();
-  await waitFor(() => shrunk.length >= 1);
-  assert.equal(shrunk[0].params.get('offset'), '50');
-  shrunk[0].finish(36);
-  await waitFor(() => shrunk.length >= 2 && shrunk[1].params.get('offset') === '25');
-  shrunk[1].finish(36);
-  await new Promise(setImmediate);
+  page.node('usage-refresh').onclick(); const refresh = page.context.lastAction;
+  assert.equal(page.requests[3].params.get('offset'), '50');
+  page.requests[3].finish('Out of range', 200, 0, 36); await refresh;
+  const clamped = page.context.lastAction;
+  assert.equal(page.requests[4].params.get('offset'), '25');
+  page.requests[4].finish('Clamped', 200, 0, 36); await clamped;
   assert.equal(page.node('usage-page').textContent, '36 条记录 · 26–36');
-  assert.equal(textOf(page.node('usage-tasks')).includes('Clamped'), true, 'the clamped page must render its own rows');
+  assert.equal(page.title(), 'Clamped', 'the clamped page must render its own rows');
   assert.equal(page.node('usage-next').disabled, true, 'next must be disabled after clamping to the last page');
   assert.equal(page.node('usage-prev').disabled, false);
 });
+
+test('usage retains the visible report when offset recovery fails after a filter change', async () => {
+  const page = usagePage();
+  const lastSuccess = 1700000000000;
+  let now = lastSuccess;
+  page.context.Date = class extends Date { static now() { return now; } };
+  const stamp = time => vm.runInContext(`stamp(${time / 1000})`, page.context);
+  const initial = page.show();
+  page.requests[0].finish('Page one'); await initial;
+  page.node('usage-next').onclick(); const second = page.context.lastAction;
+  page.requests[1].finish('Page two'); await second;
+  page.node('usage-next').onclick(); const third = page.context.lastAction;
+  page.requests[2].finish('Visible task'); await third;
+  const visibleEnd = page.requests[2].params.get('end');
+
+  now += 60000;
+  page.node('usage-period').value = '7';
+  page.node('usage-period').handlers.change(); const filtered = page.context.lastAction;
+  assert.equal(page.requests[3].params.get('offset'), '0');
+  page.requests[3].finish('Unavailable', 503); await filtered;
+  const notice = page.node('usage-totals').staleNotice;
+  const visibleWarning = notice.children[0].textContent;
+  assert.match(visibleWarning, /全部时间/);
+  assert.ok(visibleWarning.includes(stamp(lastSuccess)));
+
+  now += 60000;
+  page.node('usage-refresh').onclick(); const refresh = page.context.lastAction;
+  assert.equal(page.requests[4].params.get('offset'), '50');
+  page.requests[4].finish('Out of range', 200, 0, 36); await refresh;
+  const clamped = page.context.lastAction;
+  assert.equal(page.requests[5].params.get('offset'), '25');
+  assert.equal(page.title(), 'Visible task');
+  assert.equal(notice.hidden, false, 'an out-of-range response must keep the existing stale warning visible');
+
+  page.node('usage-tasks').children[0].children.at(-1).handlers.click();
+  const detail = page.context.lastAction;
+  assert.equal(page.requests[6].params.get('task'), 'Visible task');
+  assert.equal(page.requests[6].params.get('start'), '0');
+  assert.equal(page.requests[6].params.get('end'), visibleEnd);
+  page.requests[6].finish('Details'); await detail;
+  assert.ok(textOf(page.node('usage-detail-content')).includes('全部时间'));
+  assert.ok(textOf(page.node('usage-detail-content')).includes(stamp(lastSuccess)));
+
+  page.requests[5].finish('Unavailable', 503); await clamped;
+  assert.equal(page.title(), 'Visible task');
+  assert.equal(page.node('usage-page').textContent, '60 条记录 · 51–60');
+  assert.equal(notice.hidden, false);
+  assert.equal(notice.children[0].textContent, visibleWarning);
+});
+
+for (const status of [200, 503]) {
+  test(`usage language changes preserve visible pagination while loading (recovery ${status})`, async () => {
+    const page = usagePage();
+    const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+    vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')), page.context);
+    page.context.translateStatic = () => {};
+    async function changeLanguage(language) {
+      page.node('language-select').value = language;
+      page.node('language-select').handlers.change();
+      await page.context.lastAction;
+    }
+    function pagination() {
+      return {title: page.title(), label: page.node('usage-page').textContent,
+        disabled: ['usage-prev', 'usage-next', 'usage-refresh'].map(id => page.node(id).disabled)};
+    }
+    async function checkDetail(requestIndex, reportRequest, title, at) {
+      page.node('usage-tasks').children[0].children.at(-1).handlers.click();
+      const detail = page.context.lastAction, request = page.requests[requestIndex];
+      assert.equal(request.params.get('task'), title);
+      assert.equal(request.params.get('start'), reportRequest.params.get('start'));
+      assert.equal(request.params.get('end'), reportRequest.params.get('end'));
+      assert.equal(request.params.get('offset'), '0');
+      request.finish('Details'); await detail;
+      const stamp = vm.runInContext(`stamp(${at / 1000})`, page.context);
+      assert.equal(page.node('usage-detail-content').children[2].textContent, `All time · A · ${stamp}`);
+    }
+
+    let now = 1700000000000;
+    page.context.Date = class extends Date { static now() { return now; } };
+    const initial = page.show();
+    page.requests[0].finish('First page'); await initial;
+    page.node('usage-next').onclick(); const second = page.context.lastAction;
+    await changeLanguage('en');
+    const ordinary = pagination();
+    page.requests[1].finish('Second page'); await second;
+    const loaded = pagination();
+    page.node('usage-next').onclick(); const third = page.context.lastAction;
+    page.requests[2].finish('Visible last page'); await third;
+    const visibleAt = now;
+    await changeLanguage('zh-CN');
+
+    now += 60000;
+    page.node('usage-refresh').onclick(); const refresh = page.context.lastAction;
+    assert.equal(page.requests[3].params.get('offset'), '50');
+    page.requests[3].finish('Out of range', 200, 0, 36); await refresh;
+    const recovery = page.context.lastAction;
+    assert.equal(page.requests[4].params.get('offset'), '25');
+    await changeLanguage('en');
+    const recovering = pagination();
+    await checkDetail(5, page.requests[2], 'Visible last page', visibleAt);
+
+    page.requests[4].finish('Recovered page', status, 0, 36); await recovery;
+    const settled = pagination();
+    const notice = page.node('usage-totals').staleNotice;
+    if (status === 200) {
+      assert.equal(notice.hidden, true);
+      await checkDetail(6, page.requests[4], 'Recovered page', now);
+    } else {
+      assert.equal(notice.hidden, false);
+      await checkDetail(6, page.requests[2], 'Visible last page', visibleAt);
+      notice.children[1].handlers.click(); const retry = page.context.lastAction;
+      assert.equal(page.requests[7].params.get('offset'), '50');
+      page.requests[7].finish('Retried last page'); await retry;
+      assert.equal(page.title(), 'Retried last page');
+    }
+    assert.deepEqual({ordinary, loaded, recovering, settled}, {
+      ordinary: {title: 'First page', label: '60 records · 1–25', disabled: [true, true, true]},
+      loaded: {title: 'Second page', label: '60 records · 26–50', disabled: [false, false, false]},
+      recovering: {title: 'Visible last page', label: '60 records · 51–60', disabled: [true, true, true]},
+      settled: status === 200
+        ? {title: 'Recovered page', label: '36 records · 26–36', disabled: [false, true, false]}
+        : {title: 'Visible last page', label: '60 records · 51–60', disabled: [false, true, false]}
+    });
+  });
+}
 
 test('usage detail roles fall back to the usage role names for triage and acceptance', async () => {
   const page = usagePage(), initial = page.show();

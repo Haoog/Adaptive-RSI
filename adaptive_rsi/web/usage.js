@@ -3,8 +3,9 @@ window.RSIUsage=(()=>{
  let offset=0,sequence=0,detailSequence=0,report=null,renderedOffset=0,searchTimer=null,refreshTimer=null,reportMeta=null,lastError=null,staleNotice=null;
  function clearTimers(){clearTimeout(searchTimer);clearTimeout(refreshTimer);searchTimer=refreshTimer=null;}
  function cancel(){clearTimers();sequence++;$('usage-refresh').disabled=false;pageBar();clearDetail();}
- function pageBar(){if(!report)return;offset=Math.min(offset,Math.max(0,Math.ceil(report.total/25)-1)*25);
-  $('usage-page').textContent=number(report.total)+' '+t('条记录')+' · '+number(report.total?offset+1:0)+'–'+number(Math.min(offset+25,report.total));$('usage-prev').disabled=offset===0;$('usage-next').disabled=offset+25>=report.total;}
+ function pageBar(){if(!report)return;const loading=$('usage-refresh').disabled;
+  $('usage-page').textContent=number(report.total)+' '+t('条记录')+' · '+number(report.total?renderedOffset+1:0)+'–'+number(Math.min(renderedOffset+25,report.total));
+  $('usage-prev').disabled=loading||renderedOffset===0;$('usage-next').disabled=loading||renderedOffset+25>=report.total;}
  const usageRoleNames={triage:'价值初筛',acceptance:'验收设计'};
  const number=value=>Number(value||0).toLocaleString(language);
  const token=value=>value.unknown_calls?(Number(value.tokens)>0?number(value.tokens)+' + '+t('部分未知'):t('用量未知')):number(value.tokens);
@@ -26,10 +27,11 @@ window.RSIUsage=(()=>{
   clearTimers();const ticket=++sequence,requested=offset;let unsupported=false;$('usage-refresh').disabled=$('usage-prev').disabled=$('usage-next').disabled=true;
   const choice=selection();let params;
   try{params=parameters();}catch(error){offset=renderedOffset;lastError={message:error.message,invalidRange:true};renderNotice();$('usage-refresh').disabled=false;pageBar();return;}
-  try{const result=await api('usage?'+params);if(ticket!==sequence||view!=='usage')return;report=result;reportMeta={choice,params:params.toString(),at:Date.now()};lastError=null;renderNotice();
-   const last=Math.max(0,Math.ceil((report.total||0)/25)-1)*25;
-   if(offset>last){offset=last;safe(load);return;}
-   renderedOffset=requested;render();}
+  try{const result=await api('usage?'+params);if(ticket!==sequence||view!=='usage')return;
+   const last=Math.max(0,Math.ceil((result.total||0)/25)-1)*25;
+   if(requested>last){offset=last;safe(load);return;}
+   report=result;reportMeta={choice,params:params.toString(),at:Date.now()};lastError=null;
+   renderedOffset=requested;render();renderNotice();}
   catch(error){
    if(ticket!==sequence||view!=='usage')return;
    if(error.status!==404){offset=renderedOffset;lastError={message:error.message||''};renderNotice();return;}
@@ -47,7 +49,34 @@ window.RSIUsage=(()=>{
   const list=$('usage-tasks');list.replaceChildren();for(const row of report.tasks){const article=el('article',undefined,'usage-task'),title=el('div');title.append(el('strong',taskTitle(row)),el('small',(state.projects.find(p=>p.id===row.project)?.name||t('通用'))+' · '+t(statusNames[row.state]||row.state||'后台检查')));const metrics=el('div',undefined,'usage-task-numbers');metrics.append(el('strong',token(row)),el('small',seconds(row.model_seconds)+' · '+row.attempts+' '+t('轮尝试')));article.append(title,metrics);if(row.task)article.append(action(t('查看用量明细'),()=>detail(row.task,taskTitle(row)),'text-button'));else article.append(el('small',row.models||'','muted'));list.append(article);}if(!report.tasks.length)list.append(el('p',t('所选时间没有用量记录。'),'muted'));
   pageBar();
  }
- async function detail(task,title,page=0,meta=reportMeta,pagination=false){if(!meta)return;const ticket=++detailSequence,params=new URLSearchParams(meta.params);params.set('task',task);params.set('offset',page);params.delete('q');const dialog=$('usage-detail'),current=()=>ticket===detailSequence&&view==='usage'&&(!pagination||dialog.open);let data;try{data=await api('usage?'+params);}catch(error){if(!current())return;throw error;}if(!current())return;const content=$('usage-detail-content');content.replaceChildren(el('h2',title||task),el('p',t('所选时间内累计，包含失败调用与所有重试。'),'muted'),el('p',describeSelection(meta.choice)+' · '+stamp(meta.at/1000),'muted'));
+ async function detail(task,title,page=0,meta=reportMeta,pagination=false){
+  if(!meta)return;
+  const ticket=++detailSequence,params=new URLSearchParams(meta.params),chunk=Number(params.get('limit'));
+  params.set('task',task);params.delete('q');
+  const dialog=$('usage-detail'),content=$('usage-detail-content');
+  const current=()=>ticket===detailSequence&&view==='usage'&&(!pagination||dialog.open);
+  let data;
+  try{
+   while(true){
+    params.set('offset',page);
+    data=await api('usage?'+params);
+    if(!current())return;
+    if(!data.call_total){page=0;break;}
+    if(data.calls.length||page<data.call_total)break;
+    // The last valid offset is strictly smaller, even if calls keep disappearing.
+    page=Math.floor((data.call_total-1)/chunk)*chunk;
+   }
+  }catch(error){
+   if(!current())return;
+   if(!pagination)throw error;
+   let notice=content.querySelector('[data-form-error]');
+   if(!notice){
+    notice=el('p',undefined,'form-error');notice.dataset.formError='';notice.setAttribute('role','status');content.append(notice);
+   }
+   notice.replaceChildren(document.createTextNode(t('无法加载此页用量明细，仍显示上次加载的记录。')),action(t('重试'),()=>detail(task,title,page,meta,true),'text-button'));
+   return;
+  }
+  content.replaceChildren(el('h2',title||task),el('p',t('所选时间内累计，包含失败调用与所有重试。'),'muted'),el('p',describeSelection(meta.choice)+' · '+stamp(meta.at/1000),'muted'));
   const roles=el('div',undefined,'usage-role-list');for(const row of data.roles){const line=el('div',undefined,'usage-task');line.append(el('span',t(usageRoleNames[row.role]||roleNames[row.role]||row.role)),el('small',row.provider+' / '+row.model+' · '+row.effort),el('strong',token(row)));roles.append(line);}content.append(roles);
   for(const row of data.runs||[]){const line=el('p',undefined,'usage-run');line.textContent=row.id+' · '+token(row)+' tokens · '+seconds(row.model_seconds)+' · '+t('阶段内额外调用')+' '+number(row.retry_calls)+' · '+t('复用已验证阶段')+' '+number(row.recovered_stages);content.append(line);}
   if(data.runs_truncated||data.stages_truncated||data.retries_truncated)content.append(el('p',t('分组明细已达到显示上限，汇总仍包含全部调用。'),'muted'));
@@ -56,7 +85,7 @@ window.RSIUsage=(()=>{
   if(data.references?.groups?.length)content.append(el('p',t('参考为窗口前同项目、任务类型、阶段与模型的每次调用中间一半范围，不是任务费用预测。'),'muted'));
   if(data.summary?.priced_calls!=null)content.append(el('p',t('已计价调用')+' '+number(data.summary.priced_calls)+' · '+t('未计价调用')+' '+number(data.summary.unpriced_calls),'muted'));
   for(const row of data.calls){const line=el('div',undefined,'usage-call');line.append(el('strong',t(usageRoleNames[row.role]||roleNames[row.role]||row.role)+' · '+row.model),el('small',stamp(row.created)+' · '+row.provider+' · '+row.effort+' · '+t(row.state==='done'?'已完成':row.state==='reserved'?'等待返回用量':statusNames[row.state]||row.state)),el('p',t('输入')+' '+(row.usage_known?number(row.input_tokens):t('未知'))+' / '+t('输出')+' '+(row.usage_known?number(row.output_tokens):t('未知'))+' / '+t('缓存读取')+' '+(row.usage_known?number(row.cache_read_tokens):t('未知'))+' / '+t('缓存写入')+' '+(row.usage_known?number(row.cache_write_tokens):t('未知'))),el('small',(row.usage_known?number(row.tokens):t('用量未知'))+' tokens · '+seconds(row.seconds)+' · '+t(({http_request:'API 请求',codex_session:'Codex 会话',opencode_session:'OpenCode 会话',unknown:'计量单位未知'})[row.unit]||row.unit)));content.append(line);}
-  const pages=el('div',undefined,'task-pagination');if(page)pages.append(action(t('上一页'),()=>detail(task,title,Math.max(0,page-25),meta,true)));pages.append(el('span',number(data.call_total)+' '+t('次调用')));if(page+25<data.call_total)pages.append(action(t('下一页'),()=>detail(task,title,page+25,meta,true)));content.append(pages);if(!dialog.open){const previousFocus=document.activeElement;dialog.addEventListener('close',()=>previousFocus?.focus?.(),{once:true});dialog.showModal();}
+  const pages=el('div',undefined,'task-pagination');if(page)pages.append(action(t('上一页'),()=>detail(task,title,Math.max(0,page-chunk),meta,true)));pages.append(el('span',number(data.call_total)+' '+t('次调用')));if(page+chunk<data.call_total)pages.append(action(t('下一页'),()=>detail(task,title,page+chunk,meta,true)));content.append(pages);if(!dialog.open){const previousFocus=document.activeElement;dialog.addEventListener('close',()=>previousFocus?.focus?.(),{once:true});dialog.showModal();}
  }
  function clearDetail(){detailSequence++;const dialog=$('usage-detail');if(dialog.open)dialog.close();}
  function show(){cancel();offset=0;safe(load);}
