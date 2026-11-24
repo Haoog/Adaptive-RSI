@@ -26,7 +26,7 @@ from adaptive_rsi.process import Cancelled, ProcessError, Sandbox, checked, run_
 from adaptive_rsi.recovery import BudgetExhausted, FAILURE_ACTIONS, failure
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store
-from adaptive_rsi.usage import opencode_usage
+from adaptive_rsi.usage import estimate, native_usage, opencode_usage
 from adaptive_rsi.usage_report import report
 from tests.test_runtime import FakeAgent, fixture
 
@@ -323,6 +323,23 @@ class AuditUsageBoundariesTest(unittest.TestCase):
                 self.assertEqual((summary["unknown_calls"], summary["unpriced_calls"]), (6, 6))
                 self.assertEqual((summary["component_priced_calls"], summary["unit_price_priced_calls"]), (1, 2))
                 self.assertAlmostEqual(summary["estimated_usd"], (12 + (12 + 17) * 3) / 1_000_000)
+
+    def test_total_only_zero_cannot_be_priced_by_components(self):
+        prices = {"input": 1, "output": 2}
+        for protocol, payload in (
+                ("responses", {"total_tokens": 0}),
+                ("chat_completions", {"prompt_tokens": 0, "total_tokens": 0}),
+                ("gemini", {"totalTokenCount": 0})):
+            with self.subTest(protocol=protocol):
+                usage = native_usage(protocol, self.finish_response(protocol, payload))
+                self.assertEqual((usage["tokens"], usage["usage_known"], usage["usage_components_known"]),
+                                 (0, True, False))
+                self.assertEqual(estimate(usage, prices), (None, "unknown"))
+                self.assertEqual(estimate(usage, prices, 3), (0, "mixed"))
+        complete = native_usage("responses", {"usage": {"input_tokens": 0, "output_tokens": 0}})
+        self.assertEqual(estimate(complete, prices), (0, "components"))
+        combined = opencode_usage([{"input": 1, "output": 0}, {"total": 0}])
+        self.assertEqual(estimate(combined, prices), (None, "unknown"))
 
     def test_codex_partial_turn_marks_session_usage_unknown(self):
         with tempfile.TemporaryDirectory() as directory:

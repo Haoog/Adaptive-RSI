@@ -43,7 +43,7 @@ def estimate(details, prices=None, unit_price=None):
         return None, "unknown"
     prices = prices or {}
     # 分量口径只在归一化后的四类计数与 tokens 对账时使用，避免缓存重复或漏计。
-    if prices and sum(counts.values()) == tokens and all(
+    if details.get("usage_components_known") != 0 and prices and sum(counts.values()) == tokens and all(
             counts[field + "_tokens"] == 0 or field in prices for field in PRICE_FIELDS):
         return sum(counts[field + "_tokens"] * prices.get(field, 0)
                    for field in PRICE_FIELDS) / 1000000.0, "components"
@@ -100,7 +100,7 @@ def _reported_usage(data, input_name, output_name, *, cache_read=0, cache_write=
         if total < input_tokens + output_tokens + cache_read + cache_write:
             return None
         if input_name not in data or output_name not in data:
-            return usage(total=total)
+            return {**usage(total=total), "usage_components_known": False}
     return usage(input_tokens, output_tokens, cache_read, cache_write, total)
 
 
@@ -155,6 +155,8 @@ def opencode_usage(steps):
                                   cache_write=_tolerated(cache.get("write", 0)))
         if current is None:
             return None
+        if current.get("usage_components_known") is False:
+            result["usage_components_known"] = False
         for key in ["tokens", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"]:
             result[key] += current[key]
     return result
