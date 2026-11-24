@@ -834,6 +834,209 @@ test('local project form keeps the confirmed existing-project feedback when the 
   assert.equal(node('connection').textContent, '连接中断');
 });
 
+function pathRestorePage() {
+  const page = projectAddPage('local'), {node, context, document} = page;
+  const posts = [], reads = [], path = '/archived/project';
+  const receipt = {project: 'restored', archived: false, paused: true, name: 'Restored project'};
+  let restore = () => response(receipt), read = () => response(projectList('restored'));
+  document.body = node('body');
+  context.window.scrollTo = () => {};
+  context.window.__RSI_MACHINE_KEY__ = 'local';
+  const draft = () => {
+    node('project-source').value = 'local';
+    node('project-path').value = path;
+    node('project-name').value = 'draft name';
+    node('project-enabled').checked = true;
+  };
+  draft();
+  context.fetch = async (url, options) => {
+    if (/^\/api\/state(?:\?|$)/.test(url)) {
+      assert.equal(options.method, undefined);
+      reads.push(url);
+      return read(url);
+    }
+    assert.equal(options.method, 'POST');
+    posts.push([url, JSON.parse(options.body)]);
+    if (url === '/api/projects') return response({id: receipt.project, existing: true, archived: true, paused: true, name: 'Old name'});
+    assert.equal(url, '/api/project/restore');
+    return restore();
+  };
+  const confirmations = () => document.body.children.filter(box => box.className === 'confirm-dialog' && box.open);
+  const start = async () => {
+    const pending = page.submit('project-form');
+    await waitFor(() => confirmations().length);
+    return {pending, click: yes => confirmations()[0].children.at(-1).children[Number(yes)].handlers.click()};
+  };
+  return {...page, posts, reads, receipt, path, draft, start,
+    onRestore(handler) { restore = handler; }, onRead(handler) { read = handler; },
+    restorePosts: () => posts.filter(([url]) => url === '/api/project/restore'),
+    move(view) { vm.runInContext(`showView(${JSON.stringify(view)})`, context); }};
+}
+
+for (const [reason, invalidate] of [
+  ['form edit', page => { page.node('project-path').value = '/new/draft'; page.input('project-path', 'project-form'); }],
+  ['dialog reopen', page => { page.node('close-project-dialog').handlers.click(); page.node('add-project').handlers.click(); }],
+  ['project switch', page => { page.node('project-select').value = 'b'; page.node('project-select').handlers.change(); }],
+  ['navigation round trip', page => { page.move('settings'); page.move('overview'); }],
+  ['runtime switch', page => { page.context.window.__RSI_MACHINE_KEY__ = 'remote'; }],
+]) {
+  test(`path restore ignores confirmation after ${reason}`, async t => {
+    const page = pathRestorePage(), {pending, click} = await page.start();
+    invalidate(page);
+    click(true);
+    await pending;
+    t.diagnostic(`restore POST ${page.restorePosts().length}`);
+    assert.equal(page.restorePosts().length, 0);
+    assert.equal(page.node('project-dialog').open, true);
+    assert.equal(page.node('project-name').value, 'draft name');
+  });
+}
+
+test('path restore cancellation leaves the local form intact', async () => {
+  const page = pathRestorePage(), {pending, click} = await page.start();
+  click(false);
+  await pending;
+  assert.equal(page.restorePosts().length, 0);
+  assert.equal(page.node('project-dialog').open, true);
+  assert.equal(page.node('project-path').value, page.path);
+});
+
+test('path restore update rejection requires a new manual confirmation', async t => {
+  const page = pathRestorePage();
+  page.onRestore(() => rejected());
+  const {pending, click} = await page.start();
+  click(true);
+  await new Promise(setImmediate);
+  const replayTimer = page.timers.some(timer => timer.active && timer.delay === 1000);
+  if (replayTimer) {
+    page.onRestore(() => response(page.receipt));
+    await page.resume();
+  }
+  await pending;
+  t.diagnostic(`restore POST ${page.restorePosts().length}, automatic wait ${replayTimer}`);
+  assert.equal(page.restorePosts().length, 1);
+  assert.equal(replayTimer, false);
+  assert.match(page.node('toast').textContent, /服务正在更新.*重试/);
+  assert.equal(page.node('project-path').value, page.path);
+  page.onRestore(() => response(page.receipt));
+  const retry = await page.start();
+  retry.click(true);
+  await retry.pending;
+  assert.deepEqual(page.restorePosts().map(([, body]) => body), Array(2).fill({project: 'restored', confirmation: 'restore-project'}));
+});
+
+for (const [reason, change] of [
+  ['wrong project', {project: 'b'}], ['missing archive flag', {archived: undefined}],
+  ['missing pause flag', {paused: undefined}], ['unpaused project', {paused: false}], ['missing name', {name: undefined}],
+]) {
+  test(`path restore rejects ${reason} in a successful HTTP response`, async t => {
+    const page = pathRestorePage();
+    page.onRestore(() => response({...page.receipt, ...change}));
+    const {pending, click} = await page.start();
+    click(true);
+    await pending;
+    t.diagnostic(`selected ${vm.runInContext('projectId', page.context)}, list GET ${page.reads.length}`);
+    assert.equal(page.restorePosts().length, 1);
+    assert.equal(vm.runInContext('projectId', page.context), 'a');
+    assert.equal(page.reads.length, 0);
+    assert.equal(page.node('project-dialog').open, true);
+    assert.equal(page.node('project-name').value, 'draft name');
+    assert.match(page.node('toast').textContent, /恢复结果未确认/);
+  });
+}
+
+test('path restore reports the confirmed paused receipt and keeps a failed list check read-only on retry', async t => {
+  const page = pathRestorePage();
+  page.onRead(() => { throw new TypeError('list unavailable'); });
+  const {pending, click} = await page.start();
+  click(true);
+  await pending;
+  t.diagnostic(`feedback: ${page.node('toast').textContent}`);
+  assert.match(page.node('toast').textContent, /已恢复.*保持暂停.*Restored project|Restored project.*已恢复.*保持暂停/);
+  assert.equal(page.node('connection').textContent, '连接中断');
+  assert.match(page.node('toast').textContent, /重新提交相同路径，仅刷新列表/);
+  page.node('add-project').handlers.click();
+  page.draft();
+  const writes = page.posts.length;
+  page.onRead(() => response(projectList('restored')));
+  await page.submit('project-form');
+  assert.equal(page.posts.length, writes);
+  assert.equal(page.reads.length, 2);
+  assert.equal(page.node('project-dialog').open, false);
+  assert.equal(vm.runInContext('projectId', page.context), 'restored');
+});
+
+test('path restore keeps a late valid receipt for an explicit read without taking over the new project', async () => {
+  const page = pathRestorePage();
+  let finish;
+  page.onRestore(() => new Promise(resolve => { finish = () => resolve(response(page.receipt)); }));
+  const {pending, click} = await page.start();
+  click(true);
+  await waitFor(() => finish);
+  page.onRead(() => response(snapshot()));
+  page.node('project-select').value = 'b';
+  page.node('project-select').handlers.change();
+  await page.context.lastAction;
+  page.node('toast').textContent = 'new project feedback';
+  finish();
+  await pending;
+  assert.equal(vm.runInContext('projectId', page.context), 'b');
+  assert.equal(page.node('project-dialog').open, true);
+  assert.equal(page.node('project-name').value, 'draft name');
+  assert.equal(page.node('toast').textContent, 'new project feedback');
+  assert.equal(page.reads.length, 1);
+  page.onRead(() => response(projectList('restored')));
+  await page.submit('project-form');
+  assert.equal(page.posts.length, 2);
+  assert.equal(page.reads.length, 2);
+  assert.equal(vm.runInContext('projectId', page.context), 'restored');
+});
+
+test('path restore reports the receipt in English and preserves the outgoing goal draft', async () => {
+  const page = pathRestorePage();
+  const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')) + ';language="en"', page.context);
+  page.node('goal-text').value = 'outgoing goal';
+  vm.runInContext('goalDrafts.set("restored","restored goal")', page.context);
+  const {pending, click} = await page.start();
+  click(true);
+  await pending;
+  assert.equal(page.node('toast').textContent, 'Project restored and kept paused: Restored project');
+  assert.equal(page.node('goal-text').value, 'restored goal');
+  page.node('project-select').value = 'a';
+  page.node('project-select').handlers.change();
+  await page.context.lastAction;
+  assert.equal(page.node('goal-text').value, 'outgoing goal');
+});
+
+for (const outcome of ['failure', 'snapshot']) {
+  test(`path restore ignores late list ${outcome} after a navigation round trip and a reopened draft`, async t => {
+    const page = pathRestorePage();
+    vm.runInContext('view="settings"', page.context);
+    let finish;
+    page.onRead(() => new Promise((resolve, reject) => { finish = () => outcome === 'failure'
+      ? reject(new TypeError('late disconnect')) : resolve(response(snapshot())); }));
+    const {pending, click} = await page.start();
+    click(true);
+    await waitFor(() => finish);
+    page.move('models');
+    page.move('settings');
+    page.node('add-project').handlers.click();
+    page.node('project-path').value = '/current/draft';
+    page.input('project-path', 'project-form');
+    page.node('connection').textContent = 'new connection feedback';
+    page.node('toast').textContent = 'new form feedback';
+    finish();
+    await pending;
+    t.diagnostic(`selected ${vm.runInContext('projectId', page.context)}, connection ${page.node('connection').textContent}`);
+    assert.equal(vm.runInContext('projectId', page.context), 'restored');
+    assert.equal(page.node('connection').textContent, 'new connection feedback');
+    assert.equal(page.node('toast').textContent, 'new form feedback');
+    assert.equal(page.node('project-path').value, '/current/draft');
+    assert.equal(page.node('project-dialog').open, true);
+  });
+}
+
 function pausePage() {
   const page = browser(), {context, node} = page;
   const paused = {a: 0, b: 1}, posts = [], reads = [];

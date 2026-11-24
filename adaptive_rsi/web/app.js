@@ -23,6 +23,7 @@ let configurationRepairBusy=false;
 const pauseRequests=new Map();
 const archiveRequests=new Map();
 function archiveRequestKey(id,runtime=window.__RSI_MACHINE_KEY__){return JSON.stringify([runtime,id]);}
+const pathRestoreReceipts=new Map();
 let pauseFeedback=null;
 let refreshSequence=0,refreshPromise=null,refreshController=null,refreshProject=null,refreshKey=null,refreshQueued=false,refreshForce=false,refreshWaiters=[],refreshPollTimer=null,lastUpdateToast='',sessionExpired=false,lastRefreshAt=0;
 let capabilitySequence=0,scopeChosen=false,scopeInitialized=false,taskOffset=0;
@@ -498,14 +499,15 @@ async function refresh(options={}){
  if(sessionExpired)return;
  const runtime=window.__RSI_MACHINE_KEY__;
  const force=!!options.force,requestedProject=projectId,requestedView=view,sections=requestedStateSections(force),taskView=['overview','tasks'].includes(view),filter=taskView?$('task-filter').value:'all',system=taskView?String($('show-system-tasks').checked):'true',offset=taskView?taskOffset:0;
- const key=JSON.stringify([runtime,requestedProject,view,offset,filter,system,sections]);
+ const key=JSON.stringify([runtime,requestedProject,view,offset,filter,system,sections,options.restoredProject]);
  if(refreshPromise){if(!force&&refreshKey===key&&!refreshController?.signal.aborted)return refreshPromise;refreshQueued=true;refreshForce=refreshForce||force;refreshSequence++;refreshController?.abort();return new Promise((resolve,reject)=>refreshWaiters.push({resolve,reject}));}
  const ticket=++refreshSequence;clearTimeout(refreshPollTimer);
+ const ownsRestoreCheck=options.ownsRestoreCheck||(()=>true);
  const controller=new AbortController(),query=new URLSearchParams({project:requestedProject,limit:'50',offset:String(offset),filter,system,sections:sections.join(',')});
  refreshController=controller;refreshProject=requestedProject;refreshKey=key;let timedOut=false;const timeout=setTimeout(()=>{timedOut=true;controller.abort();},15000);
  const operation=(async()=>{
   try{
-   const current=()=>!controller.signal.aborted&&ticket===refreshSequence&&runtime===window.__RSI_MACHINE_KEY__&&requestedProject===projectId&&requestedView===view&&(!taskView||(taskOffset===offset&&$('task-filter').value===filter&&String($('show-system-tasks').checked)===system));
+   const current=()=>ownsRestoreCheck()&&!controller.signal.aborted&&ticket===refreshSequence&&runtime===window.__RSI_MACHINE_KEY__&&requestedProject===projectId&&requestedView===view&&(!taskView||(taskOffset===offset&&$('task-filter').value===filter&&String($('show-system-tasks').checked)===system));
    let next=await api('state?'+query,undefined,{signal:controller.signal});if(!current())return;
    // A shrinking group can strand the last page. Retry its first page once, under the same cancellation guard.
    const correctPage=taskView&&next.selected_project===requestedProject&&offset>0&&next.pagination?.offset===offset&&offset>=next.pagination.total;
@@ -515,6 +517,8 @@ async function refresh(options={}){
     if(next.selected_project!==requestedProject||next.pagination?.offset!==0)return;
     taskOffset=0;
    }
+   // A list that has not caught up with a confirmed restore cannot replace its selection.
+   if(options.restoredProject&&!next.projects?.some(project=>project.id===options.restoredProject&&project.archived!==true))return;
    if(bootBuild&&next.build&&bootBuild!==next.build)$('reload-ui').hidden=false;if(state&&state.version!==next.version&&next.version!==lastUpdateToast){lastUpdateToast=next.version;toast(t('后台已更新，当前输入已保留。刷新页面可加载新版界面。'));}
    const firstState=!state,previousProject=state?.selected_project,returned=new Set(Array.isArray(next.sections)?next.sections:[]);
    if(!next.sections){if(Object.hasOwn(next,'candidates'))returned.add('candidates');if(['cases','quality','usage','model_usage'].every(key=>Object.hasOwn(next,key)))returned.add('analytics');}
@@ -529,6 +533,9 @@ async function refresh(options={}){
    for(const [key,request] of archiveRequests){
     if(request.runtime===runtime&&ticket>request.savedAfter)archiveRequests.delete(key);
    }
+   for(const [key,entry] of pathRestoreReceipts){
+    if(entry.runtime===runtime&&ticket>entry.savedAfter&&next.projects?.some(project=>project.id===entry.receipt.project&&project.archived!==true))pathRestoreReceipts.delete(key);
+   }
    if(returned.has('analytics')){loadedStateSections.analyticsProject=next.selected_project??null;loadedStateSections.analyticsAt=Date.now();}
    if(returned.has('candidates')){loadedStateSections.candidatesProject=next.selected_project??null;loadedStateSections.candidatesAt=Date.now();}
    lastRefreshAt=Date.now();$('connection').textContent=t('已连接');$('version').textContent='Adaptive RSI '+state.version;
@@ -537,7 +544,7 @@ async function refresh(options={}){
    if(projectId&&!scopeChosen&&!scopeInitialized){stashSettings();$('config-scope').value='project';settingsBaseline=null;scopeInitialized=true;}
    select.value=projectId;rememberNavigationHome();if(old!==projectId){stashSettings();closeTaskDetail();settingsBaseline=null;localWrite('rsi-project',projectId);goalDraftRestoredProject=projectId;}if(goalDraftRestoredProject!==projectId){restoreGoalDraft();goalDraftRestoredProject=projectId;}
    render();if(firstState&&view==='usage')window.RSIUsage?.show();window.RSIExperience?.refreshed();
-  }catch(error){if(runtime!==window.__RSI_MACHINE_KEY__)return;if(controller.signal.aborted){if(timedOut&&requestedProject===projectId)$('connection').textContent=t('连接超时');return;}throw error;}
+  }catch(error){if(!ownsRestoreCheck()||runtime!==window.__RSI_MACHINE_KEY__)return;if(controller.signal.aborted){if(timedOut&&requestedProject===projectId)$('connection').textContent=t('连接超时');return;}throw error;}
   finally{clearTimeout(timeout);}
  })();refreshPromise=operation;
  try{return await operation;}catch(error){
@@ -1325,7 +1332,7 @@ $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(
  const importCurrent=()=>current()&&importRevision===projectImportRevision&&project===projectId;
  $('project-submit').disabled=true;
  try{
-  let addedProject,existingProject=null,retryUrls=[];
+  let addedProject,existingProject=null,retryUrls=[],restored,restoreKey;
   if(github){
    const urls=$('project-urls').value.split(/\s+/).filter(Boolean),directory=$('project-directory').value||null;
    if(!urls.length||urls.length>10)throw Error(t('一次请输入 1 至 10 个仓库链接'));
@@ -1349,19 +1356,59 @@ $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(
     status.textContent=[t('已确认接入 {count} 个链接。其余链接已保留，可检查项目列表后手动重试。').replace('{count}',urls.length-retryUrls.length),...details].join('\n');
    }
   }else{
-   try{
-    const added=await api('projects',{path:$('project-path').value,name:$('project-name').value||null,enabled:$('project-enabled').checked});addedProject=added.id;
-    if(added.existing)existingProject=added;
+   const path=$('project-path').value,runtime=window.__RSI_MACHINE_KEY__;
+   restoreKey=JSON.stringify([runtime,path]);
+   const restoreCurrent=()=>importCurrent()&&runtime===window.__RSI_MACHINE_KEY__&&!sessionExpired;
+   restored=pathRestoreReceipts.get(restoreKey)?.receipt;
+   if(!restored){
+    try{
+     const added=await api('projects',{path,name:$('project-name').value||null,enabled:$('project-enabled').checked});addedProject=added.id;
+     if(added.existing)existingProject=added;
+    }catch(error){if(current())throw error;return;}
     if(existingProject?.archived){
-     if(!current()||!(await uiConfirm(t('该项目已归档。恢复后保持暂停，不会重新执行已取消的任务。确认恢复？')))||!current())return;
-     await api('project/restore',{project:existingProject.id,confirmation:'restore-project'});
-     existingProject.paused=true;
+     if(!restoreCurrent()||!(await uiConfirm(t('该项目已归档。恢复后保持暂停，不会重新执行已取消的任务。确认恢复？')))||!restoreCurrent())return;
+     let receipt;
+     try{
+      // An update refusal requires a new confirmation. Never replay a restore.
+      receipt=await sendApi('project/restore',{project:addedProject,confirmation:'restore-project'});
+     }catch(error){
+      if(!restoreCurrent())return;
+      if(error.status===503&&error.code==='update_in_progress')error.message=t('服务正在更新，请稍后重试。');
+      throw error;
+     }
+     if(!receipt||receipt.project!==addedProject||receipt.archived!==false||receipt.paused!==true||typeof receipt.name!=='string'){
+      if(restoreCurrent())throw Error(t('恢复结果未确认。请先检查项目列表，再决定是否重试。'));
+      return;
+     }
+     pathRestoreReceipts.set(restoreKey,{receipt,runtime,savedAfter:refreshSequence});
+     restored=receipt;
     }
-   }catch(error){if(current())throw error;return;}
+   }
+   if(restored){
+    if(!restoreCurrent())return;
+    addedProject=restored.project;
+    if(addedProject!==projectId)stashGoalDraft();
+   }
   }
   if(github?importCurrent()&&!retryUrls.length:current()){
    stashSettings();closeTaskDetail();projectId=addedProject;localWrite('rsi-project',projectId);writeNavigation(view);settingsBaseline=null;dialog.close();$('project-form').reset();$('project-source').dispatchEvent(new Event('change'));$('import-status').textContent='';
-   toast(existingProject?t('该路径已接入')+t('：')+(existingProject.name||t('未命名项目'))+' · '+t(existingProject.paused?'已暂停':'运行中')+' · '+t('未修改名称或启用状态'):t('项目已接入'));
+   const restoreMessage=restored?t('项目已恢复并保持暂停：')+(restored.name||t('未命名项目')):'';
+   toast(restoreMessage||(existingProject?t('该路径已接入')+t('：')+(existingProject.name||t('未命名项目'))+' · '+t(existingProject.paused?'已暂停':'运行中')+' · '+t('未修改名称或启用状态'):t('项目已接入')));
+   if(restored){
+    restoreGoalDraft();goalDraftRestoredProject=projectId;
+    const runtime=window.__RSI_MACHINE_KEY__,revision=projectImportRevision;
+    const ownsRestoreCheck=()=>!sessionExpired&&runtime===window.__RSI_MACHINE_KEY__&&revision===projectImportRevision&&addedProject===projectId;
+    // Wait for any earlier read without letting it stand in for this receipt check.
+    while(ownsRestoreCheck()&&refreshPromise){try{await refreshPromise;}catch{}}
+    if(!ownsRestoreCheck())return;
+    try{await refresh({ownsRestoreCheck,restoredProject:addedProject});}catch{
+     if(ownsRestoreCheck())$('connection').textContent=t('连接中断');
+    }
+    if(ownsRestoreCheck()&&$('toast').textContent===restoreMessage&&pathRestoreReceipts.get(restoreKey)?.receipt===restored){
+     toast(restoreMessage+' · '+t('项目列表暂未确认。可重新提交相同路径，仅刷新列表。'));
+    }
+    return;
+   }
   }
   // 接入结果与后续只读刷新分别反馈。
   const refreshNavigation=navigationSequence,refreshingProject=projectId;
