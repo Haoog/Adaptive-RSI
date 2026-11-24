@@ -868,6 +868,61 @@ class ReliabilityTest(unittest.TestCase):
         # stage must never receive a scheduled check subset.
         self.assertEqual(stage_run_checks, [None, None])
 
+    def test_performance_pipeline_runs_each_sealed_repetition(self):
+        from adaptive_rsi.delivery_replay_checks import _acceptance
+
+        class BenchmarkAgent(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                if role == "acceptance":
+                    self.prompt = prompt
+                    return {"files": [{"path": ".rsi-acceptance/benchmark.py", "content": (
+                        "import json, secrets\n"
+                        "from calculator import add\n"
+                        "print(secrets.token_hex(16))\n"
+                        "for load in ('idle', 'busy'):\n"
+                        "    print(json.dumps(dict(metric='latency', unit='ms', load=load, "
+                        "value=4 if add(2, 3) == 5 else 10, repetition=99)))\n"
+                        "    print(json.dumps(dict(metric='memory', unit='MiB', load=load, value=1)))\n"
+                    )}], "checks": [{"name": "benchmark", "criteria": [0], "argv": [
+                        "python3", "-c", "exec(open('.rsi-acceptance/benchmark.py').read())"]}]}
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == "planning":
+                    result.update(change_kind="performance", repetitions=3, load_conditions=["idle", "busy"],
+                                  performance_threshold={"metric": "latency", "unit": "ms", "target": 5,
+                                                         "tolerance": 0, "direction": "lower"},
+                                  guardrails=[{"metric": "memory", "unit": "MiB", "target": 2,
+                                               "tolerance": 0, "direction": "lower"}])
+                return result
+
+        agent = BenchmarkAgent()
+        self.runtime.agent = agent
+        _, run = self.claim("Reduce addition latency")
+        self.runtime.process(run)
+        saved = self.store.one("SELECT state,result,path FROM runs WHERE id=?", (run["id"],))
+        outcome = json.loads(saved["result"])
+        self.assertEqual("awaiting_approval", saved["state"], outcome)
+        self.assertIn("the host reruns all sealed checks", agent.prompt)
+        directory = Path(saved["path"])
+        report = json.loads((directory / "evaluation/report.json").read_text())
+        receipt = json.loads(self.store.one("SELECT data FROM stages WHERE run=? AND stage='evaluation'",
+                                           (run["id"],))["data"])
+        self.assertEqual(receipt["contract"], _acceptance(directory, receipt, receipt["source"])["contract"])
+        tokens = set()
+        for label in ("acceptance_baseline", "acceptance_candidate"):
+            rows = report["checks"][label]
+            fields = ("performance_repetition", "argv", "stdout", "exit_code")
+            self.assertEqual([{key: row[key] for key in fields} for row in receipt["checks"][label]],
+                             [{key: row[key] for key in fields} for row in rows])
+            self.assertEqual([1, 2, 3], [row["performance_repetition"] for row in rows])
+            for row in rows:
+                token, *samples = row["stdout"].splitlines()
+                tokens.add(token)
+                self.assertEqual(4, len(samples))
+        self.assertEqual(6, len(tokens))
+        gate = report["improvement"]
+        self.assertEqual("pass", gate["decision"])
+        self.assertEqual([3, 3, 3, 3], [row["samples"] for row in gate["uncertainty"] + gate["guardrails"]])
+
     def test_baseline_cache_invalidates_when_same_tag_image_id_changes(self):
         base = git(self.repo, "rev-parse", "HEAD")
         candidate = snapshot(self.repo, self.root / "candidate")
