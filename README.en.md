@@ -166,6 +166,8 @@ Automatic deployment rollback also requires an explicit backward-data-compatibil
 
 Execution resources queue model calls, commands and exclusive benchmarks by priority. Requests waiting at least 30 seconds take FIFO precedence; diagnostics include bounded wait samples and cancellation receipts.
 
+Workflow quality and timing shows first independent acceptance and review passes, first confirmed delivery merges, and time to first start for newly created tasks over the last 30 days. Timing includes sample counts. Remote waits enter the window when they end. Run details surface concrete evidence requests from additional high-risk review. A first-round evidence gap still requires verification with new evidence.
+
 Stage budgets accumulate per task across attempts: when a run is interrupted by a crash, upgrade or service stop, consumed preparation and evaluation time is kept, and the next attempt after recovery — including a manual retry — only gets the remainder. Only non-interruption endings such as completion, failure or a stage-deadline block clear it, so a manual retry after those starts with a full budget. Consumed time is checkpointed every 15 seconds, so a hard kill loses at most one interval.
 
 Optional disk and memory low-water admission keeps new tasks queued until resources recover. Both checks default to disabled; when configured, unavailable measurements also defer admission with an explicit reason.

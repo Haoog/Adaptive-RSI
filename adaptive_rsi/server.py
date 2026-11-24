@@ -1231,7 +1231,9 @@ class Handler(BaseHTTPRequestHandler):
                 run = store.one("SELECT * FROM runs WHERE id=?", (params.get("id", [""])[0],))
                 if not run:
                     raise RequestError("Run not found")
+                from .review import risk_review_evidence_requests
                 run["result"] = decode_evidence(run["result"])
+                run["risk_review_evidence_requests"] = risk_review_evidence_requests(run["result"].get("risk_review"))
                 run["config"] = decode_object(run["config"])
                 run["stages"] = store.query("SELECT stage,created,data FROM stages WHERE run=? ORDER BY created", (run["id"],))
                 run["phases"] = store.query("SELECT phase,started,ended FROM phase_times WHERE run=? ORDER BY id", (run["id"],))

@@ -1167,9 +1167,11 @@ class ExperienceTest(unittest.TestCase):
             },
             "review": {"decision": "pass"},
         }
+        now = time.time()
+        self.store.execute("UPDATE tasks SET created=? WHERE id=?", (now - 10, task))
         for index, (state, evidence) in enumerate([("assessed", {}), ("awaiting_approval", passed)]):
             self.store.execute("INSERT INTO runs(id,task,project,state,result,started,ended) VALUES (?,?,?,?,?,?,?)",
-                ("first-pass-" + str(index), task, self.project, state, encode(evidence), time.time() + index, time.time() + index + 1))
+                ("first-pass-" + str(index), task, self.project, state, encode(evidence), now - 5 + index, now - 4 + index))
         self.assertEqual(1, workflow_metrics(self.store, self.project)["first_pass"])
 
     def test_cancel_during_infrastructure_failure_cannot_be_requeued(self):

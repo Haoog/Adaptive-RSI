@@ -1835,6 +1835,9 @@ class Evaluator:
                     "nonce": time.time_ns()})[:12]
             stages["acceptance_baseline"] = lambda: self._acceptance_stage(
                 physical, baseline, baseline, acceptance, directory, execution_config, cancel, seeds, hidden)
+        contract = acceptance.get("contract") if acceptance else None
+        graph = contract.get("check_dependencies") if isinstance(contract, dict) else None
+        replay_started = time.monotonic() if graph else None
         stages["candidate"] = lambda: self._standard_stage(
             "candidate", candidate, baseline, candidate, scheduled if scheduled is not None else checks,
             directory, execution_config, cancel, overlay, seeds, hidden,
@@ -1857,6 +1860,10 @@ class Evaluator:
             if "setup" in stage_outcome:
                 return
             results[label] = stage_outcome["rows"]
+            if replay_started is not None and label in {"candidate", "candidate_full"}:
+                available = time.monotonic() - replay_started
+                for row in results[label]:
+                    row["verdict_available_seconds"] = available
             if "test_first_rows" in stage_outcome:
                 results["test_first_" + label] = stage_outcome["test_first_rows"]
             try:
@@ -1926,12 +1933,11 @@ class Evaluator:
         if seeds:
             from .process import scrub_tree
             scrub_tree(seeds)
-        contract = acceptance.get("contract") if acceptance else None
-        graph = contract.get("check_dependencies") if isinstance(contract, dict) else None
         if graph:
             data["check_dependency_analysis"] = {
                 "affected": [row["name"] for row in affected_checks(changed_files, full_checks, graph)],
                 "scheduled": [row["name"] for row in scheduled] if scheduled is not None else None,
+                "time_basis": "shared_evaluation_dispatch_monotonic_seconds",
                 "execution": "full_checks_retained_until_graph_is_independently_validated"}
         if acceptance:
             from .workflow import improvement

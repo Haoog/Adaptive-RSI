@@ -1101,6 +1101,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                     "Review the concrete sensitive paths and patch lines supplied; do not broaden the review merely "
                     "because the planner marked the task high risk. "
                     "Missing negative-path verification must be reported as insufficient evidence. "
+                    "For each evidence gap, name the affected path or boundary, the missing check or observation, "
+                    "and the expected result in that area's assessment reason. "
                     "Do not rely on another reviewer's assessment.\n" + encode(risk_context), workspace, run), config)
             risk_review = sealed(
                 "risk_review",

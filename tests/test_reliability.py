@@ -682,6 +682,38 @@ class ReliabilityTest(unittest.TestCase):
         self.assertFalse(self.store.query("SELECT * FROM stages WHERE run=? AND stage='validated_candidate'", (run["id"],)))
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
+    def test_passing_high_risk_rereview_keeps_first_round_evidence_gap(self):
+        from adaptive_rsi.review import risk_review_evidence_requests
+
+        class HighRisk(FakeAgent):
+            reviews = 0
+
+            def invoke(self, role, *args, **kwargs):
+                result = super().invoke(role, *args, **kwargs)
+                if role == "planning":
+                    result["risk"] = "high"
+                if role == "review":
+                    self.reviews += 1
+                    if self.reviews == 1:
+                        result["assessments"][1]["decision"] = "insufficient_evidence"
+                    else:
+                        result["findings"].append({"area": "security", "severity": "low", "path": "calculator.py",
+                            "line": 1, "title": "Boundary coverage", "reason": "An error path lacks a check",
+                            "suggestion": "Add a regression check asserting denial leaves state unchanged"})
+                return result
+
+        self.runtime.agent = HighRisk()
+        task, run = self.claim()
+        self.runtime.process(run)
+        result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+        self.assertEqual(self.runtime.agent.reviews, 2)
+        self.assertEqual(result["review"]["decision"], "insufficient_evidence")
+        self.assertEqual(result["risk_review"]["decision"], "pass")
+        self.assertEqual(risk_review_evidence_requests(result["risk_review"])[0]["suggestion"],
+                         "Add a regression check asserting denial leaves state unchanged")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "insufficient_evidence")
+
+    @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_ordinary_high_risk_does_not_force_a_second_review(self):
         class HighRisk(FakeAgent):
             def invoke(self, role, *args, **kwargs):

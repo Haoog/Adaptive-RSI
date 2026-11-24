@@ -1182,7 +1182,7 @@ class AuditEvaluationTest(unittest.TestCase):
         return source, checks, acceptance
 
     def run_scheduled_evaluation(self, root, source, checks, acceptance, changed_files, scheduling=True,
-                                 detected=True, evaluation='evaluation'):
+                                 detected=True, evaluation='evaluation', failures=()):
         from adaptive_rsi.config import DEFAULTS, merge
         from adaptive_rsi.store import Store
         from unittest.mock import patch
@@ -1193,8 +1193,9 @@ class AuditEvaluationTest(unittest.TestCase):
                                          'exit_code': 0, 'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}]}
         calls = []
         def execute(_sandbox, check, workspace, *args, **kwargs):
-            calls.append((Path(workspace).name, check['name']))
-            return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0,
+            stage = Path(workspace).name
+            calls.append((stage, check['name']))
+            return {'name': check['name'], 'argv': check['argv'], 'exit_code': int((stage, check['name']) in failures),
                     'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}
         store = Store(root / ('state-' + evaluation))
         self.addCleanup(store.close)
@@ -1223,6 +1224,38 @@ class AuditEvaluationTest(unittest.TestCase):
         self.assertFalse(result['candidate_full_reused'])
         self.assertEqual(result['check_dependency_analysis']['scheduled'], ['check_a', 'check_b'])
         self.assertEqual(result['decision'], 'pass')
+
+    def test_scheduling_replay_reports_outside_failure_and_unknown_legacy_timing(self):
+        from unittest.mock import patch
+        from scripts.replay_check_scheduling import main, replay
+        graph = {'pa': {'paths': ['pkg_a/'], 'depends_on': [], 'checks': ['check_a']},
+                 'pb': {'paths': ['pkg_b/'], 'depends_on': ['pa'], 'checks': ['check_b']},
+                 'pc': {'paths': ['pkg_c/'], 'depends_on': [], 'checks': ['check_c']}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, checks, acceptance = self.scheduling_fixtures(root, graph)
+            result, _ = self.run_scheduled_evaluation(root, source, checks, acceptance, ['pkg_a/value.py'],
+                failures={('candidate_full', 'check_c')})
+            self.assertEqual(result['decision'], 'fail')
+            report = root / 'evaluation' / 'report.json'
+            saved = json.loads(report.read_text())
+            with patch('sys.argv', ['replay_check_scheduling.py', str(report)]), patch('builtins.print') as output:
+                main()
+            compared, = json.loads(output.call_args.args[0])
+        self.assertEqual(compared['gate_decision'], 'fail')
+        self.assertEqual(compared['priority']['checks'], 2)
+        self.assertEqual(compared['priority']['first_failure_timing'], 'no_failure')
+        self.assertEqual(compared['full']['checks'], 4)
+        self.assertEqual(compared['outside_priority']['failures'], [{'name': 'check_c', 'cwd': '.', 'full_index': 2}])
+        self.assertEqual(compared['full']['first_failure_timing'], 'observed')
+        self.assertGreaterEqual(compared['full']['first_failure_seconds'], 0)
+        self.assertEqual(compared['full']['first_failure_seconds'], compared['outside_priority']['first_failure_seconds'])
+        for row in saved['checks']['candidate_full']:
+            row.pop('verdict_available_seconds')
+        legacy = replay(saved)
+        self.assertIsNone(legacy['full']['first_failure_seconds'])
+        self.assertEqual(legacy['full']['first_failure_timing'], 'unknown')
+        self.assertEqual(legacy['outside_priority']['failures'], compared['outside_priority']['failures'])
 
     def test_affected_check_scheduling_runs_prerequisite_closure_in_candidate_stage(self):
         graph = {'pa': {'paths': ['pkg_a/'], 'depends_on': [], 'checks': ['check_a']},
