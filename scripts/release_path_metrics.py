@@ -48,13 +48,24 @@ def gh_get(endpoint, key=None, **query):
     return rows
 
 
-def describe_job(run, job, step_names):
+def attempt_origin(run, run_created_at, prior_runs):
+    if run['run_attempt'] == 1:
+        return run_created_at if seconds(run_created_at, run_created_at) is not None else None
+    started = run.get('run_started_at')
+    prior_starts = [previous.get('run_started_at') for previous in prior_runs]
+    if (seconds(run_created_at, started) or 0) > 0 and all(
+            (seconds(previous, started) or 0) > 0
+            for previous in prior_starts if seconds(previous, previous) is not None):
+        return started
+    return None
+
+
+def describe_job(job, step_names, rerun_start):
     result = {key: job.get(key) for key in ('id', 'html_url', 'conclusion', 'runner_id', 'created_at',
                                             'started_at', 'completed_at')}
-    attempt_start = run.get('run_started_at') or run.get('created_at')
     # Selective reruns can get a new job ID and created_at while carrying the
     # previous attempt's completed/started timestamps and step results.
-    inherited = run['run_attempt'] > 1 and (seconds(result['completed_at'], attempt_start) or 0) > 0
+    inherited = (seconds(result['completed_at'], rerun_start) or 0) > 0
     timed = not inherited and result['conclusion'] != 'skipped'
     result['inherited'] = inherited
     result['queue_seconds'] = (seconds(result['created_at'], result['started_at'])
@@ -74,9 +85,15 @@ def describe_job(run, job, step_names):
     return result
 
 
-def measure(workflow, run, jobs):
+def measure(workflow, run, jobs, prior_runs=()):
+    # The exact-attempt endpoint may return a refreshed created_at on reruns.
+    first = run if run['run_attempt'] == 1 else next(
+        (previous for previous in prior_runs if previous['run_attempt'] == 1), {})
+    run_created_at = first.get('created_at')
+    origin = attempt_origin(run, run_created_at, prior_runs)
+    rerun_start = origin if run['run_attempt'] > 1 else None
     step_names = {'reuse': REUSE_STEPS, 'build': PACKAGE_STEPS, 'verify': PACKAGE_STEPS}
-    by_name = {job['name']: describe_job(run, job, step_names.get(job['name'])) for job in jobs}
+    by_name = {job['name']: describe_job(job, step_names.get(job['name']), rerun_start) for job in jobs}
     conclusions = {name: job['conclusion'] for name, job in by_name.items() if not job['inherited']}
     verify = workflow == 'release-verify.yml'
     publish = by_name.get('publish') or {}
@@ -110,15 +127,17 @@ def measure(workflow, run, jobs):
             trigger = prepare if path == 'no_reusable_artifact_rebuild' else reuse
             fallback_seconds = seconds(trigger.get('completed_at'), critical['completed_at'])
     gate = by_name.get('gate' if verify else 'prepare') or {}
+    entry_start = gate['started_at'] if gate.get('job_window_seconds') is not None else None
     candidate = re.search(r'@([a-f0-9]{40})$', run.get('display_title') or '') if verify else None
     return {
         'run_id': run['id'], 'attempt': run['run_attempt'], 'workflow': workflow,
         'url': run['html_url'] + '/attempts/' + str(run['run_attempt']),
         'workflow_head': run['head_sha'], 'candidate_head_in_title': candidate.group(1) if candidate else None,
         'attempt_created_at': run.get('created_at'), 'attempt_started_at': run.get('run_started_at'),
+        'run_created_at': run_created_at, 'attempt_origin_at': origin,
         'conclusion': run['conclusion'], 'path': path, 'jobs': by_name,
-        'attempt_to_entry_seconds': seconds(run.get('created_at'), gate.get('started_at'))
-        if gate.get('job_window_seconds') is not None else None,
+        'attempt_to_entry_seconds': seconds(origin, entry_start),
+        'run_to_entry_seconds': seconds(run_created_at, entry_start),
         'prepare_to_publish_seconds': seconds(prepare.get('started_at'), publish.get('completed_at'))
         if prepare.get('job_window_seconds') is not None and publish.get('job_seconds') is not None else None,
         'rebuild_critical_job': next((name for name in REBUILD_JOBS if by_name.get(name) is critical), None)
@@ -127,17 +146,25 @@ def measure(workflow, run, jobs):
     }
 
 
-def fetch_attempt(repo, workflow, run_id, attempt):
-    endpoint = f'repos/{repo}/actions/runs/{run_id}/attempts/{attempt}'
+def fetch_run(endpoint, workflow, run_id, attempt):
     run = gh_get(endpoint)
     observed_workflow = run['path'].split('@', 1)[0].rsplit('/', 1)[-1]
     if (run['status'] != 'completed' or run['run_attempt'] != attempt or run['id'] != run_id or
             observed_workflow not in WORKFLOWS or workflow not in (None, observed_workflow)):
         raise ValueError(f'Unusable attempt record {run_id}/{attempt}')
+    return observed_workflow, run
+
+
+def fetch_attempt(repo, workflow, run_id, attempt):
+    base = f'repos/{repo}/actions/runs/{run_id}/attempts'
+    endpoint = f'{base}/{attempt}'
+    observed_workflow, run = fetch_run(endpoint, workflow, run_id, attempt)
     jobs = gh_get(endpoint + '/jobs', 'jobs')
     if any(job['run_attempt'] != attempt or job['run_id'] != run_id for job in jobs):
         raise ValueError(f'Mixed job attempts in {run_id}/{attempt}')
-    return measure(observed_workflow, run, jobs)
+    prior_runs = [fetch_run(f'{base}/{previous}', observed_workflow, run_id, previous)[1]
+                  for previous in range(1, attempt)]
+    return measure(observed_workflow, run, jobs, prior_runs)
 
 
 def distribution(values):
@@ -153,7 +180,8 @@ def summarize(rows):
             'reuse_success', 'no_reusable_artifact_rebuild', 'revalidation_failed_rebuild', 'exact_head_verify'}):
         group = [row for row in rows if row['path'] == path]
         metrics = {'runs': len({row['run_id'] for row in group}), 'attempts': len(group)}
-        for key in ('attempt_to_entry_seconds', 'prepare_to_publish_seconds', 'rebuild_gate_seconds'):
+        for key in ('attempt_to_entry_seconds', 'run_to_entry_seconds',
+                    'prepare_to_publish_seconds', 'rebuild_gate_seconds'):
             metrics[key] = distribution([row[key] for row in group])
         for name in sorted({name for row in group for name, job in row['jobs'].items()
                             if job['conclusion'] != 'skipped'}):

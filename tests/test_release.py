@@ -1928,6 +1928,8 @@ class ReleasePathMetricsTest(unittest.TestCase):
                 self.assertEqual(result['rebuild_gate_seconds'], duration)
                 self.assertEqual(result['rebuild_critical_job'], 'tests' if duration else None)
                 self.assertEqual(result['prepare_to_publish_seconds'], 56)
+                self.assertEqual(result['attempt_to_entry_seconds'], 3)
+                self.assertEqual(result['run_to_entry_seconds'], 3)
         result = release_path_metrics.measure(workflow, run, [prepare] + deps)
         self.assertEqual(result['path'], 'incomplete_path_evidence')
         self.assertIsNone(result['rebuild_gate_seconds'])
@@ -1935,13 +1937,37 @@ class ReleasePathMetricsTest(unittest.TestCase):
         self.assertEqual(empty['attempts'], 0)
         self.assertIsNone(empty['rebuild_gate_seconds']['median'])
 
+    def test_rerun_entry_wait_excludes_twenty_minutes_since_workflow_creation(self):
+        created = '2026-11-23T09:40:00Z'
+        run = dict(id=1, run_attempt=2, html_url='https://github.com/example/project/actions/runs/1',
+                   head_sha=TRUSTED, conclusion='success', created_at=created)
+        previous = dict(run, run_attempt=1, run_started_at='2026-11-23T09:40:01Z')
+        for workflow, entry_name in (('release-verify.yml', 'gate'), ('release.yml', 'prepare')):
+            entry = self.job(entry_name, 'success', 1, 3, 5)
+            for started, expected in [('2026-11-23T10:00:00Z', 3), (None, None),
+                                      ('invalid', None), (created, None), (previous['run_started_at'], None),
+                                      ('2026-11-23T09:39:59Z', None), ('2026-11-23T10:00:04Z', None)]:
+                with self.subTest(workflow=workflow, started=started):
+                    for raw_created in (created, '2026-11-23T10:00:02Z'):
+                        result = release_path_metrics.measure(
+                            workflow, dict(run, created_at=raw_created, run_started_at=started),
+                            [entry], [previous])
+                        self.assertEqual(result['attempt_to_entry_seconds'], expected)
+                        self.assertEqual(result['run_to_entry_seconds'], 1203)
+
     def test_partial_rerun_preserves_inherited_result_without_counting_timing(self):
         run = dict(id=1, run_attempt=2, html_url='https://github.com/example/project/actions/runs/1',
                    head_sha=TRUSTED, display_title=f'Release verification PR #1 @{MERGED}', conclusion='success',
-                   created_at='2026-11-23T10:00:30Z', run_started_at='2026-11-23T10:00:29Z')
+                   created_at='2026-11-23T10:00:00Z', run_started_at='2026-11-23T10:00:29Z')
+        first = dict(run, run_attempt=1, created_at='2026-11-23T10:00:00Z',
+                     run_started_at='2026-11-23T10:00:01Z')
+        gate = self.job('gate', 'success', 30, 2, 5)
         verify = self.job('verify', 'success', 32, 6, 27)
         tests = self.job('tests', 'success', 30, 32, 50)
-        result = release_path_metrics.measure('release-verify.yml', run, [verify, tests])
+        result = release_path_metrics.measure('release-verify.yml', run, [gate, verify, tests], [first])
+        self.assertTrue(result['jobs']['gate']['inherited'])
+        self.assertIsNone(result['attempt_to_entry_seconds'])
+        self.assertIsNone(result['run_to_entry_seconds'])
         self.assertEqual(result['path'], 'no_new_verify')
         self.assertEqual(result['candidate_head_in_title'], MERGED)
         self.assertTrue(result['jobs']['verify']['inherited'])
@@ -1950,7 +1976,7 @@ class ReleasePathMetricsTest(unittest.TestCase):
         smoke = dict(name='最终安装与升级 smoke', conclusion='skipped',
                      started_at='2026-11-23T10:00:50Z', completed_at='2026-11-23T10:00:50Z')
         verify = self.job('verify', 'failure', 30, 32, 50, [smoke])
-        result = release_path_metrics.measure('release-verify.yml', run, [verify])
+        result = release_path_metrics.measure('release-verify.yml', run, [verify], [first])
         self.assertEqual(result['jobs']['verify']['job_seconds'], 18)
         self.assertIsNone(result['jobs']['verify']['steps']['install_upgrade_smoke']['seconds'])
 
