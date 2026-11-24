@@ -559,6 +559,22 @@ class DiscoveryHardeningTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertGreater(after.hits, before.hits)
 
+    def test_related_work_keeps_valid_overlaps_with_malformed_historical_shapes(self):
+        self.add_related("array-result", "Array", ["client.py"], [])
+        self.add_related("mixed-anchors", "Mixed", [], {"summary": "valid result"})
+        self.add_related("null-anchors", "Null", [], [])
+        self.store.execute("UPDATE tasks SET evidence=? WHERE id='mixed-anchors'",
+                           ('[{"path":"client.py"},null]',))
+        self.store.execute("UPDATE tasks SET evidence='[null]' WHERE id='null-anchors'")
+        self.store.execute("UPDATE runs SET result='null' WHERE task='null-anchors'")
+        task = {"id": "subject", "title": "Subject", "body": "",
+                "evidence": '[null,{"path":"client.py"}]'}
+        related = related_work(self.store, "p", task)
+        self.assertEqual({row["id"]: (row["shared_paths"], row["summary"]) for row in related},
+                         {"array-result": (["client.py"], ""),
+                          "mixed-anchors": (["client.py"], "valid result")})
+        self.assertEqual(related_work(self.store, "p", {**task, "evidence": "[null]"}), [])
+
     def test_related_work_returns_history_connection_to_pool_after_invalid_evidence(self):
         self.add_related("broken", "Handle client response", ["client.py"])
         self.add_related("valid", "Handle client response", ["client.py"])
