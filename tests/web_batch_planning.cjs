@@ -12,7 +12,7 @@ function element(tag,text,cls){
  const node={tag,className:cls,textContent:text===undefined?'':text,children:[],dataset:{},listeners:{},disabled:false,open:false,isConnected:true,id:'',
   append(...items){node.children.push(...items);},
   replaceChildren(...items){for(const child of node.children)child.isConnected=false;node.children=items;},
-  setAttribute(){},remove(){},focus(){},showModal(){node.open=true;},close(){node.open=false;node.onclose?.();},
+  setAttribute(){},remove(){},focus(){},showModal(){node.open=true;},close(){if(node.open){node.open=false;node.onclose?.();node.dispatch('close');}},
   addEventListener(type,fn){(node.listeners[type]??=[]).push(fn);},
   dispatch(type,extra){let result;for(const fn of node.listeners[type]||[])result=fn({type,target:node,...extra});return result;},
   click(){if(!node.disabled)return node.onclick?.()??node.dispatch('click');}};
@@ -51,6 +51,7 @@ function harness(api,{confirm=true,clickConfirm=false,capabilities,asyncDialogCl
  }
  const app=fs.readFileSync('adaptive_rsi/web/app.js','utf8');
  vm.createContext(context);
+ vm.runInContext(app.slice(app.indexOf('function openOperationsDialog('),app.indexOf('async function showActivityHistory(')),context);
  const confirmDialog=vm.runInContext('('+app.slice(app.indexOf('function uiConfirm('),app.indexOf('function elapsedCopy('))+')',context);
  if(capabilities){
   Object.assign(context,{structuredClone,setTimeout,clearTimeout,state:{csrf:'test'},featureForPath:()=> 'task-batch',

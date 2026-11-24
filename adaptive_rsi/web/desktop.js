@@ -175,7 +175,7 @@ if(window.__TAURI_INTERNALS__){
     if(args.url!==null)showProgress(args.sshTunnel?'正在通过 SSH 隧道连接…':'正在连接 HTTPS 服务…');
     const next=await invoke('connect',args);
     input.value='';
-    if(args.url===null&&next?.connected&&next.connection_generation===info.connection_generation){
+    if(args.url===null&&info?.kind==='local'&&info.connected&&!isLocalDisconnected()&&next?.connected&&next.connection_generation===info.connection_generation){
      switching=false;
      dialog.close();
      return;

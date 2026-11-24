@@ -143,13 +143,19 @@ window.RSIModelCenter = (() => {
     const viewVersion=connectionViewVersion;
     return ()=>viewVersion===connectionViewVersion&&scope===project&&active===provider&&tab==='providers'&&!$('view-models').hidden;
   }
+  const pendingModelEnables=new Map();
+  const modelPreferenceKey=(project,provider,model)=>JSON.stringify([project,provider,model]);
   async function saveModelPreference(provider,model,checkbox){
     const project=scope,ownsFeedback=connectionFeedbackOwner(provider,project);
-    if(checkbox)checkbox.disabled=true;
+    const key=modelPreferenceKey(project,provider,model.id);
+    if(checkbox){
+      if(pendingModelEnables.has(key))return;
+      pendingModelEnables.set(key,model.enabled);
+      checkbox.disabled=true;
+    }
     try{
       try{await api('model-center/model',{project,provider,model});}
       catch(error){
-        if(checkbox)checkbox.checked=!model.enabled;
         if(ownsFeedback()){
           error.message=message(error);setStatus(error.message,true);
           if(!checkbox)throw error;
@@ -166,9 +172,14 @@ window.RSIModelCenter = (() => {
       }
       try{await load({reportError:false});}
       catch{
-        if(scope===project&&data===snapshot&&data?.project===project&&active===provider&&!loading)renderModels();
+        if(!checkbox&&scope===project&&data===snapshot&&data?.project===project&&active===provider&&!loading)renderModels();
       }
-    }finally{if(checkbox)checkbox.disabled=false;}
+    }finally{
+      if(checkbox){
+        pendingModelEnables.delete(key);
+        if(scope===project&&data?.project===project&&active===provider&&!loading&&!$('view-models').hidden)renderModels();
+      }
+    }
   }
   async function resumeProvider(){
     const project=scope,provider=active,key=jobKey(provider,project);
@@ -317,7 +328,8 @@ window.RSIModelCenter = (() => {
       if(model.unit_price!=null)copy.append(el('small',t('估算价格')+' · $'+model.unit_price+' / 1M tokens'));
       if(model.prices)for(const [key,label] of [['input','输入'],['output','输出'],['cache_read','缓存读取'],['cache_write','缓存写入']])if(model.prices[key]!=null)copy.append(el('small',t(label)+' · $'+model.prices[key]+' / 1M tokens'));
       const controls=el('div',undefined,'mc-model-actions'),label=el('label',undefined,'mc-enable'),checkbox=el('input');
-      checkbox.type='checkbox';checkbox.checked=!!model.enabled;checkbox.disabled=!!model.kind;checkbox.setAttribute('aria-label',t('启用模型')+' '+model.name);
+      const pendingEnable=pendingModelEnables.get(modelPreferenceKey(scope,provider.id,model.id));
+      checkbox.type='checkbox';checkbox.checked=pendingEnable??!!model.enabled;checkbox.disabled=!!model.kind||pendingEnable!==undefined;checkbox.setAttribute('aria-label',t('启用模型')+' '+model.name);
       label.title=t('此开关只控制模型选择列表；已有角色配置和正在运行的任务继续使用原来的模型。');
       checkbox.addEventListener('change',()=>safe(()=>saveModelPreference(provider.id,{id:model.id,enabled:checkbox.checked},checkbox)));
       label.append(checkbox,document.createTextNode(t('启用')));

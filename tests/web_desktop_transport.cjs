@@ -103,7 +103,7 @@ test('selecting the current local runtime closes the dialog without reloading th
    return node;
   },
   addEventListener(name,handler){handlers[name]=handler;}};
- vm.runInNewContext(desktopSource,{window,document,t:value=>value,crypto:webcrypto,Response,DOMException,console,
+ vm.runInNewContext(desktopSource,{window,document,t:value=>value,crypto:webcrypto,Response,DOMException,console,setTimeout,clearTimeout,
   location:{reload(){reloads++;}}});
  await handlers.DOMContentLoaded();
  const local=form.children.find(node=>node.textContent==='使用本机');

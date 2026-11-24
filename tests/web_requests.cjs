@@ -6824,6 +6824,20 @@ async function modelPreferencePage(field){
   };
 }
 
+for(const fails of [false,true])test(`model enable keeps the pending value through local redraws and settles after ${fails?'failure':'success'}`,async()=>{
+  const page=await modelPreferencePage('enabled'),pending=page.save();
+  for(const [id,event] of [['mc-search','input'],['mc-model-filter','change']]){
+    page.node(id).handlers[event]();
+    assert.equal(page.control().checked,true);
+    assert.equal(page.control().disabled,true);
+  }
+  assert.equal(page.posts.length,1);
+  page.finish(fails?new Error('Enable request failed'):undefined);
+  await pending;
+  assert.equal(page.control().checked,!fails);
+  assert.equal(page.control().disabled,false);
+});
+
 const preferenceTransitions={
   'project switch':async page=>{page.project('b');await new Promise(setImmediate);},
   'project round trip':diagnosisTransitions['project round trip'],
