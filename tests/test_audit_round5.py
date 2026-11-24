@@ -18,7 +18,7 @@ from adaptive_rsi.native import Conversation, NativeAgent, ProviderInterrupted, 
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.storage_tools import _archive, diagnostics
 from adaptive_rsi.store import Store, uid
-from adaptive_rsi.lifecycle import readiness
+from adaptive_rsi.lifecycle import KEY, readiness
 from adaptive_rsi.batching import execute as batch, preserve_acceptance
 from adaptive_rsi.storage_tools import verify_backup, retain_backups, restore
 from scripts.package_desktop import package_updater
@@ -220,12 +220,22 @@ class AuditRound5Test(unittest.TestCase):
         self.assertTrue(runtime.updates.is_busy())
         with self.assertRaisesRegex(ValueError, "active"):
             readiness(runtime, "commit", lease=lease)
+        cancelled = readiness(runtime, "cancel", lease=lease)
+        self.assertIsNone(cancelled["barrier"])
+        self.assertFalse(cancelled["ready"])
+        self.assertEqual(cancelled["runs"][0]["id"], "run")
+        self.assertIsNone(self.store.setting(KEY))
+        self.assertIsNone(readiness(runtime, "cancel", lease=lease)["barrier"])
+
         self.store.execute("UPDATE runs SET ended=2 WHERE id='run'")
         runtime.updates.desktop_owner_pid = os.getpid()
-        self.assertEqual(readiness(runtime, "commit", lease=lease)["barrier"]["phase"], "installing")
+        new_lease = readiness(runtime, "prepare", "9.0.0")["barrier"]["lease"]
+        self.assertEqual(readiness(runtime, "commit", lease=new_lease)["barrier"]["phase"], "installing")
         with self.assertRaisesRegex(ValueError, "lease"):
-            readiness(runtime, "cancel", lease="incorrect")
-        self.assertIsNone(readiness(runtime, "cancel", lease=lease)["barrier"])
+            readiness(runtime, "cancel", lease=lease)
+        self.assertIsNone(readiness(runtime, "cancel", lease=new_lease)["barrier"])
+        self.assertIsNone(self.store.setting(KEY))
+        self.assertIsNone(readiness(runtime, "cancel", lease=new_lease)["barrier"])
         self.assertFalse(runtime.updates.is_busy())
 
     def test_batch_group_preserves_acceptance_and_overrides(self):

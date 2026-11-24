@@ -1366,7 +1366,6 @@ pub async fn install(app: tauri::AppHandle, window: String, revision: u64, autom
 
 fn cancel_update_lease(lease: &Value, mut cancel: impl FnMut(Value) -> bool,
                        mut pause: impl FnMut()) -> Result<(), String> {
-    // The engine expires the lease even if none of these attempts reaches it.
     for attempt in 0..3 {
         if cancel(json!({"action":"cancel","lease":lease})) { return Ok(()); }
         if attempt < 2 { pause(); }
@@ -1374,14 +1373,55 @@ fn cancel_update_lease(lease: &Value, mut cancel: impl FnMut(Value) -> bool,
     Err("update_barrier_release_failed".into())
 }
 
-fn release_update_barrier(runtime: &RuntimeState, lease: &Value) -> Result<(), String> {
-    cancel_update_lease(lease, |body| {
-        let connection = runtime.local.lock().unwrap().clone();
-        connection.as_ref().filter(|connection| connection.owned).is_some_and(|connection| {
-            call_with_session(connection, "desktop-update", Some(body), Some(Duration::from_secs(2)))
-                .is_ok_and(|(reply, _)| reply.status == 200)
-        })
-    }, || std::thread::sleep(Duration::from_millis(200)))
+const CANCEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const CANCEL_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+fn cancel_owned_barrier(connection: &Connection, body: Value, timeout: Duration) -> bool {
+    connection.owned && call_with_session(connection, "desktop-update", Some(body), Some(timeout))
+        .is_ok_and(|(reply, _)| reply.status == 200
+            && serde_json::from_str::<Value>(&reply.body).is_ok_and(|value| value.get("barrier") == Some(&Value::Null)))
+}
+
+fn cancel_local_barrier(runtime: &RuntimeState, body: Value) -> bool {
+    let connection = runtime.local.lock().unwrap().clone();
+    connection.as_ref().is_some_and(|connection| cancel_owned_barrier(connection, body, CANCEL_REQUEST_TIMEOUT))
+}
+
+pub(super) fn cancel_startup_barrier(connection: &Connection, lease: &Value, deadline: Instant) -> Result<(), String> {
+    let body = json!({"action":"cancel","lease":lease});
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { return Err("update_barrier_release_failed".into()); }
+        if cancel_owned_barrier(connection, body.clone(), remaining.min(CANCEL_REQUEST_TIMEOUT)) { return Ok(()); }
+        std::thread::sleep(CANCEL_RETRY_DELAY.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+fn release_update_barrier(app: &tauri::AppHandle, runtime: &RuntimeState, lease: &Value) -> Result<(), String> {
+    let result = cancel_update_lease(lease, |body| cancel_local_barrier(runtime, body),
+        || std::thread::sleep(CANCEL_RETRY_DELAY));
+    if result.is_err() {
+        // Keep the live engine available to its tasks. If it is replaced, its
+        // successor handles outstanding admission during the startup handshake.
+        let handle = app.clone();
+        let generation = runtime.generation.load(Ordering::SeqCst);
+        let body = json!({"action":"cancel","lease":lease});
+        std::thread::spawn(move || {
+            let runtime = handle.state::<RuntimeState>();
+            // Both barrier phases have a one-hour recovery window in the engine.
+            let deadline = Instant::now() + Duration::from_secs(3600);
+            while Instant::now() < deadline && !QUITTING.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_secs(2));
+                if let Ok(_local_start) = runtime.local_start_gate.try_lock() {
+                    if QUITTING.load(Ordering::SeqCst) || runtime.recovering.load(Ordering::SeqCst)
+                        || runtime.generation.load(Ordering::SeqCst) != generation
+                    { return; }
+                    if cancel_local_barrier(&runtime, body.clone()) { return; }
+                }
+            }
+        });
+    }
+    result
 }
 
 fn check_renewed_lease(lease: &mut Value, ready: &Value, version: &str) -> Result<(), String> {
@@ -1577,7 +1617,7 @@ fn install_in_operation(app: tauri::AppHandle, permit: InstallPermit, automatic:
                 }
             }
         } else if !runtime_state.recovering.load(Ordering::SeqCst) && lease.is_string() {
-            release_update_barrier(&runtime_state, &lease).err().unwrap_or(error)
+            release_update_barrier(&app, &runtime_state, &lease).err().unwrap_or(error)
         } else {
             error
         };

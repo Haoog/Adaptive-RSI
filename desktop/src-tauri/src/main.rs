@@ -1077,11 +1077,15 @@ fn handshake_local_runtime(
                     if status.status != 200 { return Err("Cannot inspect update admission".into()); }
                     let status: Value = serde_json::from_str(&status.body).map_err(|_| "Invalid update admission")?;
                     if status["barrier"].is_object() {
-                        let action = if status["barrier"]["version"] == health["version"] { "complete" } else { "cancel" };
-                        let (complete, _) = call_with_session(&connection, "desktop-update",
-                            Some(json!({"action":action,"lease":status["barrier"]["lease"]})),
-                            Some(startup_budget(health_deadline)?))?;
-                        if complete.status != 200 { return Err("Cannot complete desktop update".into()); }
+                        let lease = &status["barrier"]["lease"];
+                        if status["barrier"]["version"] == health["version"] {
+                            let (complete, _) = call_with_session(&connection, "desktop-update",
+                                Some(json!({"action":"complete","lease":lease})),
+                                Some(startup_budget(health_deadline)?))?;
+                            if complete.status != 200 { return Err("Cannot complete desktop update".into()); }
+                        } else {
+                            native_update::cancel_startup_barrier(&connection, lease, health_deadline)?;
+                        }
                     }
                 }
                 break;
@@ -2829,6 +2833,32 @@ mod tests {
             assert_eq!(result.err().as_deref(), expected_error);
             worker.join().unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_startup_retries_cancel_until_the_barrier_is_gone() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (child, pid) = fake_local_runtime(&listener, true);
+        let (done, completed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = receive_request(&listener, "/api/health");
+            answer_request(stream, 200, "", &json!({"api_version":2,"version":"1.2.3","pid":pid}).to_string());
+            let (stream, _) = receive_request(&listener, "/api/desktop-update");
+            let held = r#"{"barrier":{"version":"1.2.4","lease":"fixture"}}"#;
+            answer_request(stream, 200, "", held);
+            for (status, response) in [(503, "{}"), (200, held), (200, r#"{"barrier":null}"#)] {
+                let (stream, headers) = receive_request(&listener, "/api/desktop-update");
+                assert!(headers.contains("x-rsi-csrf: fixture\r\n"));
+                answer_request(stream, status, "", response);
+            }
+            done.send(()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        let result = handshake_local_runtime(child, "1.2.3", deadline);
+        assert!(result.is_ok());
+        completed.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
     }
 
     #[cfg(unix)]
