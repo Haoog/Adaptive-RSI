@@ -76,6 +76,9 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(result["evaluation"]["improvement"]["kind"], "configuration")
         self.assertEqual(result["evaluation"]["improvement"]["decision"], "pass")
         self.assertNotIn("acceptance", [role for role, _ in self.runtime.agent.roles])
+        scope = self.store.root / "runs" / run["id"] / "tool-scope.json"
+        self.assertEqual(json.loads(scope.read_text()), {"paths": ["calculator.py", "tests"],
+                                                       "directories": ["tests"]})
 
     def test_injected_transport_is_available_without_bypassing_real_codex_requirement(self):
         import shutil

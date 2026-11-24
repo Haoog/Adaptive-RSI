@@ -18,6 +18,7 @@ from adaptive_rsi.config import DEFAULTS, merge, validate
 from adaptive_rsi.credentials import Credentials
 from adaptive_rsi.discovery import sync
 from adaptive_rsi.gitops import git
+from adaptive_rsi.native import WorkspaceTools
 from adaptive_rsi.opencode import jsonc, parse_events, prepare_home, sync_oauth, check_provider_errors
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.server import Server
@@ -380,6 +381,27 @@ class DockerExecutionTest(unittest.TestCase):
         row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
         self.assertEqual(row["state"], "awaiting_approval", row["result"])
         self.assertIn("return a - b", (self.repo / "calculator.py").read_text())
+
+    def test_native_command_creates_file_in_new_approved_test_directory(self):
+        config = validate({"sandbox": {"backend": "docker", "image": "adaptive-rsi-worker:local"}})
+        workspace = self.root / "scoped-workspace"
+        (workspace / ".git").mkdir(parents=True)
+        (workspace / "calculator.py").write_text("value = 1\n")
+        tools = WorkspaceTools(workspace, "implementation", self.store.root, config, None, ())
+        tools.load_scope({"paths": ["tests"], "directories": ["tests"]})
+        self.assertFalse((workspace / "tests").exists())
+        script = "\n".join([
+            "import os",
+            "from pathlib import Path",
+            "for path in ('.', '.git', 'calculator.py', '/'):",
+            "    assert os.statvfs(path).f_flag & os.ST_RDONLY, path",
+            "test_dir = Path('tests')",
+            "assert test_dir.is_dir() and not list(test_dir.iterdir())",
+            "(test_dir / 'test_example.py').write_text('assert True\\n')",
+        ])
+        result = tools.execute("run_command", {"argv": ["python3", "-c", script], "cwd": "."})
+        self.assertEqual(result["exit_code"], 0, result)
+        self.assertEqual((workspace / "tests" / "test_example.py").read_text(), "assert True\n")
 
     def test_container_hides_controller_and_other_projects_and_enforces_readonly(self):
         config = validate({"sandbox": {"backend": "docker"}})

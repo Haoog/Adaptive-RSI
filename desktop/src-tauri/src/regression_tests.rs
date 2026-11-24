@@ -272,6 +272,69 @@ fn legacy_dmg_failed_open_can_be_retried_with_or_without_an_existing_image() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn legacy_dmg_resumes_an_interrupted_download_before_verifying_and_publishing() {
+    use legacy_dmg_download::{download, DownloadResponse};
+    use reqwest::{header, StatusCode};
+
+    struct Disconnected;
+    impl Read for Disconnected {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::ConnectionReset.into())
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("update.dmg");
+    let cache = directory.path().join("cache");
+    let total = LEGACY_DMG_FIXTURE.len() as u64;
+    let split = 4;
+    let result = stage_legacy_dmg(
+        &path,
+        LEGACY_DMG_SHA256,
+        |file| download(file, Some(&cache), LEGACY_DMG_SHA256, |range| {
+            assert_eq!(range, None);
+            Ok(DownloadResponse {
+                status: StatusCode::OK,
+                headers: header::HeaderMap::new(),
+                length: Some(total),
+                body: io::Cursor::new(&LEGACY_DMG_FIXTURE[..split]).chain(Disconnected),
+            })
+        }, |_, _| {}),
+        |_| panic!("an interrupted download must never be attached"),
+    );
+    assert_eq!(result, Err(("Download interrupted", "")));
+    assert!(!path.exists());
+
+    let mut progress = Vec::new();
+    stage_legacy_dmg(
+        &path,
+        LEGACY_DMG_SHA256,
+        |file| download(file, Some(&cache), LEGACY_DMG_SHA256, |range| {
+            assert_eq!(range, Some(format!("bytes={split}-")));
+            let mut headers = header::HeaderMap::new();
+            headers.insert(header::CONTENT_RANGE,
+                format!("bytes {split}-{}/{total}", total - 1).parse().unwrap());
+            Ok(DownloadResponse {
+                status: StatusCode::PARTIAL_CONTENT,
+                headers,
+                length: Some(total - split as u64),
+                body: io::Cursor::new(&LEGACY_DMG_FIXTURE[split..]),
+            })
+        }, |done, total| progress.push((done, total))),
+        |staged| {
+            assert!(!path.exists());
+            assert_eq!(fs::read(staged).unwrap(), LEGACY_DMG_FIXTURE);
+            true
+        },
+    ).unwrap();
+    assert_eq!(progress.first(), Some(&(split as u64, total)));
+    assert_eq!(progress.last(), Some(&(total, total)));
+    assert_eq!(fs::read(&path).unwrap(), LEGACY_DMG_FIXTURE);
+    assert!(!cache.join("legacy-dmg-download/image.part").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn legacy_dmg_does_not_replace_a_file_published_during_attach() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("update.dmg");

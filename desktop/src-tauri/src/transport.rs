@@ -190,8 +190,10 @@ pub(super) async fn save_backup_with(
     match persist(staging, destination) {
         Ok(_) => Ok(()),
         #[cfg(unix)]
-        Err(error) if matches!(error.error.kind(), io::ErrorKind::Unsupported
-            | io::ErrorKind::CrossesDevices | io::ErrorKind::PermissionDenied) => {
+        // Darwin can report ENOTSUP from FAT32/exFAT exclusive rename, distinct from EOPNOTSUPP.
+        Err(error) if error.error.raw_os_error() == Some(libc::ENOTSUP)
+            || matches!(error.error.kind(), io::ErrorKind::Unsupported
+                | io::ErrorKind::CrossesDevices | io::ErrorKind::PermissionDenied) => {
             copy_backup_noclobber(error.file, destination)
                 .map_err(|_| "Cannot publish backup; choose a new filename".into())
         }
