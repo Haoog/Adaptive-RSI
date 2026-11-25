@@ -1543,9 +1543,10 @@ mod lease_tests {
                 Instant::now() + Duration::from_secs(20)).unwrap()
         };
         let action = |connection: &Connection, body: Value| {
+            let name = body["action"].as_str().unwrap().to_owned();
             let (reply, _) = call_with_session(connection, "desktop-update", Some(body),
                 Some(Duration::from_secs(3))).unwrap();
-            assert_eq!(reply.status, 200, "{}", reply.body);
+            assert_eq!(reply.status, 200, "{name}: {}", reply.body);
             serde_json::from_str::<Value>(&reply.body).unwrap()
         };
         let stored_barrier = |root: &Path| {
@@ -1589,6 +1590,9 @@ with sqlite3.connect(Path(sys.argv[1]).as_uri() + '?mode=ro', uri=True) as db:
             assert!(retry_live_update_barrier(&state, lease, generation, Instant::now() + Duration::from_secs(6)));
         });
         assert!(stored_barrier(live.path()) == json!([]));
+        let status = action(&connection, json!({"action":"status"}));
+        assert_eq!(status["ready"], true);
+        assert!(status["barrier"].is_null());
         let (health, _) = call_with_session(&connection, "health", None, Some(Duration::from_secs(3))).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&health.body).unwrap()["pid"], live_pid);
         stop_child(live_child.get_mut(), Duration::from_secs(5));
@@ -1599,6 +1603,13 @@ with sqlite3.connect(Path(sys.argv[1]).as_uri() + '?mode=ro', uri=True) as db:
         let prepared = action(&old, json!({"action":"prepare","version":"99.99.99"}));
         let lease = &prepared["barrier"]["lease"];
         assert!(lease.is_string());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = action(&old, json!({"action":"status"}));
+            if status["ready"] == true { break; }
+            assert!(Instant::now() < deadline, "fixture did not drain: {}", status["reasons"]);
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let committed = action(&old, json!({"action":"commit","lease":lease}));
         assert_eq!(committed["barrier"]["phase"], "installing");
         let state = RuntimeState::default();
@@ -1613,7 +1624,9 @@ with sqlite3.connect(Path(sys.argv[1]).as_uri() + '?mode=ro', uri=True) as db:
         publish_local_runtime(&state, successor.take(), recovered.clone(), true);
         assert!(!state.recovering.load(Ordering::SeqCst));
         assert_eq!(fs::read_to_string(restarted.path().join("fixture-outages")).unwrap(), "status\ncancel\n");
-        assert!(action(&recovered, json!({"action":"status"}))["barrier"].is_null());
+        let status = action(&recovered, json!({"action":"status"}));
+        assert_eq!(status["ready"], true);
+        assert!(status["barrier"].is_null());
         assert!(stored_barrier(restarted.path()) == json!([]));
         let mut successor = shutdown_runtime(&state, Duration::from_secs(5)).unwrap();
         assert!(wait_for_child(&mut successor, Duration::from_secs(5)));

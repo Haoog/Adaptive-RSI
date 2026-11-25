@@ -5,11 +5,12 @@ import sys
 from threading import Lock
 
 from adaptive_rsi import lifecycle
-from adaptive_rsi.desktop import run
+from adaptive_rsi.desktop import installer_owner, run
 from adaptive_rsi.store import StoreBusy
 
 
 def main(root, restarting):
+    assert installer_owner() is not None, "fixture requires a visible desktop owner PID"
     readiness = lifecycle.readiness
     pending = {"status", "cancel"} if restarting else set()
     lock = Lock()
@@ -21,7 +22,12 @@ def main(root, restarting):
                 with (root / "fixture-outages").open("a") as log:
                     log.write(f"{action}\n")
                 raise StoreBusy("fixture endpoint temporarily unavailable")
-        return readiness(runtime, action, version, lease)
+        try:
+            return readiness(runtime, action, version, lease)
+        except ValueError as error:
+            # The fixture uses only synthetic leases and no production data.
+            print(f"fixture update action {action}: {error}", file=sys.stderr, flush=True)
+            raise
 
     lifecycle.readiness = guarded_readiness
     run(root)
