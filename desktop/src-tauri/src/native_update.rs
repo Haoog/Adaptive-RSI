@@ -1096,24 +1096,33 @@ pub async fn check(app: tauri::AppHandle, download: bool) -> Result<Value, Strin
     check_in_operation(&app, download).await
 }
 
-/// Streams the package into `staged-update.part`, resuming from the bytes that a
-/// previous run (or a cancelled run) left behind.
-async fn transfer(updater: &NativeUpdater, update: &tauri_plugin_updater::Update, part: &Path,
-                  mut offset: u64, total: &mut Option<u64>, version: &str, notes: &str) -> Result<u64, String> {
-    let client = reqwest::Client::builder()
+fn native_download_client() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
         .no_proxy()
         .https_only(true)
         .redirect(update_redirect_policy())
         .connect_timeout(UPDATE_CONNECT_TIMEOUT)
-        .build()
-        .map_err(|_| "update_check_failed")?;
+}
+
+/// Streams the package into `staged-update.part`, resuming from the bytes that a
+/// previous run (or a cancelled run) left behind.
+async fn transfer(updater: &NativeUpdater, update: &tauri_plugin_updater::Update, part: &Path,
+                  offset: u64, total: &mut Option<u64>, version: &str, notes: &str) -> Result<u64, String> {
+    let client = native_download_client().build().map_err(|_| "update_check_failed")?;
+    transfer_from(updater, || client.get(update.download_url.clone()).headers(update.headers.clone()),
+        part, offset, total, version, notes).await
+}
+
+async fn transfer_from(updater: &NativeUpdater, request: impl Fn() -> reqwest::RequestBuilder,
+                       part: &Path, mut offset: u64, total: &mut Option<u64>,
+                       version: &str, notes: &str) -> Result<u64, String> {
     let started = Instant::now();
     let mut restarted = false;
     let announced = *total;
     loop {
         if updater.cancel.load(Ordering::SeqCst) { return Err("update_cancelled".into()); }
         let request_started = Instant::now();
-        let mut request = client.get(update.download_url.clone()).headers(update.headers.clone());
+        let mut request = request();
         if let Some(range) = range_header(offset) {
             request = request.header(reqwest::header::RANGE, range);
         }
@@ -1411,7 +1420,9 @@ pub(super) fn reconcile_startup_barrier(connection: &Connection, version: &Value
     if barrier.is_null() { return Ok(()); }
     let lease = barrier.get("lease").filter(|lease| lease.as_str().is_some_and(|lease| !lease.is_empty()))
         .ok_or("Invalid update admission")?;
-    if barrier.get("version") == Some(version) {
+    let target = barrier.get("version").filter(|target| target.is_string())
+        .ok_or("Invalid update admission")?;
+    if target == version {
         let (complete, _) = call_with_session(connection, "desktop-update",
             Some(json!({"action":"complete","lease":lease})), Some(startup_budget(deadline)?))?;
         if complete.status != 200 { return Err("Cannot complete desktop update".into()); }
@@ -1542,7 +1553,7 @@ from pathlib import Path
 with sqlite3.connect(Path(sys.argv[1]).as_uri() + '?mode=ro', uri=True) as db:
     row = db.execute('SELECT value FROM settings WHERE key=?', ('desktop-update-barrier',)).fetchone()
     assert db.execute('SELECT count(*) FROM calls').fetchone() == (0,)
-    print(row[0] if row else json.dumps(None))
+    print(json.dumps([json.loads(row[0])] if row else []))
 "#]).arg(root.join("state.sqlite3")).output().unwrap();
             assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
             serde_json::from_slice::<Value>(&output.stdout).unwrap()
@@ -1554,15 +1565,15 @@ with sqlite3.connect(Path(sys.argv[1]).as_uri() + '?mode=ro', uri=True) as db:
         let prepared = action(&connection, json!({"action":"prepare","version":"99.99.99"}));
         let lease = &prepared["barrier"]["lease"];
         assert!(lease.is_string());
-        assert_eq!(stored_barrier(live.path())["lease"], *lease);
+        assert_eq!(stored_barrier(live.path())[0]["lease"], *lease);
         let state = RuntimeState::default();
         *state.local.lock().unwrap() = Some(connection.clone());
         let generation = state.generation.load(Ordering::SeqCst);
         let outage = live.path().join("fixture-unavailable");
         fs::write(&outage, b"unavailable").unwrap();
         assert_eq!(try_release_live_barrier(&state, lease), Err("update_barrier_release_failed".into()));
-        assert!(!retry_live_update_barrier(&state, lease, generation, Instant::now() + Duration::from_millis(500)));
-        assert_eq!(stored_barrier(live.path())["lease"], *lease);
+        assert!(!retry_live_update_barrier(&state, lease, generation, Instant::now() + Duration::from_secs(1)));
+        assert_eq!(stored_barrier(live.path())[0]["lease"], *lease);
         assert_eq!(fs::read_to_string(live.path().join("fixture-outages")).unwrap().lines().count(), 4);
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -1575,7 +1586,7 @@ with sqlite3.connect(Path(sys.argv[1]).as_uri() + '?mode=ro', uri=True) as db:
             });
             assert!(retry_live_update_barrier(&state, lease, generation, Instant::now() + Duration::from_secs(6)));
         });
-        assert!(stored_barrier(live.path()).is_null());
+        assert!(stored_barrier(live.path()) == json!([]));
         let (health, _) = call_with_session(&connection, "health", None, Some(Duration::from_secs(3))).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&health.body).unwrap()["pid"], live_pid);
         stop_child(live_child.get_mut(), Duration::from_secs(5));
@@ -1594,14 +1605,14 @@ with sqlite3.connect(Path(sys.argv[1]).as_uri() + '?mode=ro', uri=True) as db:
         assert!(wait_for_child(&mut exiting, Duration::from_secs(5)));
         assert!(exiting.wait().unwrap().success());
         assert!(state.recovering.load(Ordering::SeqCst));
-        assert_eq!(stored_barrier(restarted.path())["lease"], *lease);
+        assert_eq!(stored_barrier(restarted.path())[0]["lease"], *lease);
         let (mut successor, recovered, new_pid, _new_lines) = launch(restarted.path(), "restart");
         assert_ne!(old_pid, new_pid);
         publish_local_runtime(&state, successor.take(), recovered.clone(), true);
         assert!(!state.recovering.load(Ordering::SeqCst));
         assert_eq!(fs::read_to_string(restarted.path().join("fixture-outages")).unwrap(), "status\ncancel\n");
         assert!(action(&recovered, json!({"action":"status"}))["barrier"].is_null());
-        assert!(stored_barrier(restarted.path()).is_null());
+        assert!(stored_barrier(restarted.path()) == json!([]));
         let mut successor = shutdown_runtime(&state, Duration::from_secs(5)).unwrap();
         assert!(wait_for_child(&mut successor, Duration::from_secs(5)));
     }
@@ -1818,5 +1829,30 @@ mod window_tests {
         assert!(authorized_window("weekend", 7, 23));
         assert!(!authorized_window("weekend", 1, 0));
         assert!(!authorized_window("unknown", 7, 23));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod response_policy_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires the GitHub macOS HTTPS fixture"]
+    fn native_download_rejects_normal_missing_package_before_staging() {
+        let fixture = PathBuf::from(std::env::var_os("RSI_DMG_FIXTURE").unwrap());
+        let url = std::env::var("RSI_NATIVE_MISSING_PACKAGE_URL").unwrap();
+        let part = fixture.join(PART_NAME);
+        let certificate = reqwest::Certificate::from_pem(&fs::read(fixture.join("ca.pem")).unwrap()).unwrap();
+        let client = native_download_client().add_root_certificate(certificate).build().unwrap();
+        let updater = NativeUpdater::default();
+        let before = updater.state.lock().unwrap().clone();
+        let mut total = None;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result = runtime.block_on(transfer_from(&updater, || client.get(&url),
+            &part, 0, &mut total, "99.99.99", ""));
+        assert_eq!(result, Err("update_download_or_signature_failed".into()));
+        assert_eq!(total, None);
+        assert_eq!(*updater.state.lock().unwrap(), before);
+        assert!(!part.exists());
     }
 }

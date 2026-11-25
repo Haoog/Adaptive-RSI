@@ -18,9 +18,14 @@ def run(fixture, command):
     image = (fixture / "source.dmg").read_bytes()
     assert len(image) > SEGMENT_END
     requests = []
+    missing_packages = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path == "/missing-package":
+                missing_packages.append(self.headers.get("Range"))
+                self.send_error(404, "Package not found")
+                return
             position = len(requests)
             requested_range = self.headers.get("Range")
             requests.append(requested_range)
@@ -50,16 +55,25 @@ def run(fixture, command):
         server.socket = tls.wrap_socket(server.socket, server_side=True)
         worker = threading.Thread(target=server.serve_forever, daemon=True)
         worker.start()
+        origin = f"https://127.0.0.1:{server.server_port}"
+        env = {
+            **os.environ,
+            "RSI_DMG_FIXTURE": str(fixture),
+            "RSI_DMG_URL": f"{origin}/fixture.dmg",
+            "RSI_NATIVE_MISSING_PACKAGE_URL": f"{origin}/missing-package",
+        }
         try:
-            subprocess.run(command, env={
-                **os.environ,
-                "RSI_DMG_FIXTURE": str(fixture),
-                "RSI_DMG_URL": f"https://127.0.0.1:{server.server_port}/fixture.dmg",
-            }, check=True)
+            for test in (
+                "regression_tests::legacy_dmg_https_resume_and_real_mount",
+                "native_update::response_policy_tests::native_download_rejects_normal_missing_package_before_staging",
+            ):
+                subprocess.run([*command, test, "--", "--ignored", "--exact", "--nocapture"],
+                               env=env, check=True)
         finally:
             server.shutdown()
             worker.join()
     assert requests == EXPECTED_RANGES, requests
+    assert missing_packages == [None], missing_packages
     print(f"Verified HTTPS requests: {requests}; image size {len(image)} bytes", flush=True)
 
 

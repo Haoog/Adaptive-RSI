@@ -10,13 +10,13 @@ cleanup() {
   fi
   rm -rf "$fixture"
 }
-trap cleanup EXIT
+trap 'cleanup || exit 1' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
 mkdir "$fixture/payload"
 printf 'Adaptive RSI DMG fixture\n' > "$fixture/payload/marker.txt"
-hdiutil create -size 8m -fs HFS+ -format UDRW -srcfolder "$fixture/payload" \
+hdiutil create -size 16m -fs HFS+ -format UDRW -srcfolder "$fixture/payload" \
   -volname "$volume_name" "$fixture/writable.dmg"
 hdiutil convert "$fixture/writable.dmg" -format UDRO -o "$fixture/source.dmg"
 
@@ -39,5 +39,4 @@ openssl x509 -req -days 1 -sha256 -in "$fixture/server.csr" \
   -extfile "$fixture/server.ext" -out "$fixture/server.pem"
 
 python3 -B desktop/scripts/legacy_dmg_https_fixture.py "$fixture" \
-  cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop \
-  regression_tests::legacy_dmg_https_resume_and_real_mount -- --ignored --exact --nocapture
+  cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop
