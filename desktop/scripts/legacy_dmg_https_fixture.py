@@ -9,14 +9,12 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
-CUTOFF = 256 * 1024
-SEGMENT_END = 512 * 1024
-EXPECTED_RANGES = [None, f"bytes={CUTOFF}-", f"bytes={SEGMENT_END}-"]
-
-
 def run(fixture, command):
     image = (fixture / "source.dmg").read_bytes()
-    assert len(image) > SEGMENT_END
+    cutoff = len(image) // 3
+    segment_end = len(image) * 2 // 3
+    assert 0 < cutoff < segment_end < len(image)
+    expected_ranges = [None, f"bytes={cutoff}-", f"bytes={segment_end}-"]
     requests = []
     missing_packages = []
     release_missing_package_body = threading.Event()
@@ -40,18 +38,18 @@ def run(fixture, command):
             position = len(requests)
             requested_range = self.headers.get("Range")
             requests.append(requested_range)
-            if (self.path != "/fixture.dmg" or position >= len(EXPECTED_RANGES)
-                    or requested_range != EXPECTED_RANGES[position]
+            if (self.path != "/fixture.dmg" or position >= len(expected_ranges)
+                    or requested_range != expected_ranges[position]
                     or self.headers.get("Accept-Encoding") != "identity"):
                 self.send_error(400, "Unexpected fixture request")
                 return
             if position == 0:
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(image)))
-                body = image[:CUTOFF]
+                body = image[:cutoff]
             else:
-                start, end = ((CUTOFF, SEGMENT_END) if position == 1
-                              else (SEGMENT_END, len(image)))
+                start, end = ((cutoff, segment_end) if position == 1
+                              else (segment_end, len(image)))
                 self.send_response(206)
                 self.send_header("Content-Range", f"bytes {start}-{end - 1}/{len(image)}")
                 self.send_header("Content-Length", str(end - start))
@@ -84,7 +82,7 @@ def run(fixture, command):
             release_missing_package_body.set()
             server.shutdown()
             worker.join()
-    assert requests == EXPECTED_RANGES, requests
+    assert requests == expected_ranges, requests
     assert missing_packages == [None], missing_packages
     print(f"Verified HTTPS requests: {requests}; image size {len(image)} bytes", flush=True)
 

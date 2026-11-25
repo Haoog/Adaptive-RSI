@@ -116,9 +116,13 @@ jobs:
       - name: 验证更新取消在服务恢复后删除持久租约
         if: needs.changes.outputs.mode == 'full'
         timeout-minutes: 5
-        run: >-
-          cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop
-          native_update::lease_tests::update_cancel_removes_persisted_lease_after_service_recovery -- --ignored --exact --nocapture
+        shell: bash
+        run: |
+          name=native_update::lease_tests::update_cancel_removes_persisted_lease_after_service_recovery
+          result=$(cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop \
+            -- "$name" --ignored --exact --nocapture --format pretty)
+          printf '%s\n' "$result"
+          grep -Fx "test $name ... ok" <<< "$result"
       - name: 验证 FAT32 和 ExFAT 真卷备份
         if: needs.changes.outputs.mode == 'full'
         timeout-minutes: 5

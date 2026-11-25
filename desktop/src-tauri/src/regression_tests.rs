@@ -612,8 +612,8 @@ fn legacy_dmg_https_resume_and_real_mount() {
     let image = fs::read(fixture.join("source.dmg")).unwrap();
     let expected = update_receipt::sha256_hex(&image);
     let total = image.len() as u64;
-    let cutoff = 256 * 1024;
-    let segment_end = 512 * 1024;
+    let cutoff = total / 3;
+    let segment_end = total * 2 / 3;
     let certificate = reqwest::Certificate::from_pem(&fs::read(fixture.join("ca.pem")).unwrap()).unwrap();
     let client = update_client_builder().add_root_certificate(certificate).build().unwrap();
     let cache = fixture.join("cache");
