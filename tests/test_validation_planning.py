@@ -47,6 +47,7 @@ class CIMetricsTest(unittest.TestCase):
         allocated, unallocated = report['jobs']
         self.assertEqual(allocated['attempt'], 1)
         self.assertEqual(allocated['dependency_wait_seconds'], 60)
+        self.assertEqual(allocated['runner_start_seconds'], 1)
         self.assertEqual(allocated['runner_allocation_seconds'], 30)
         self.assertEqual(allocated['execution_seconds'], 90)
         self.assertEqual(allocated['steps'][1]['duration_seconds'], 90)
@@ -55,6 +56,28 @@ class CIMetricsTest(unittest.TestCase):
         self.assertIsNone(unallocated['runner_allocation_seconds'])
         self.assertNotIn('secret-log-not-for-report', json.dumps(report))
 
+
+    def test_feedback_uses_failed_step_and_exact_verify_from_current_attempt(self):
+        from scripts import ci_metrics
+
+        evidence = self.evidence()
+        first, rerun = evidence['attempts']
+        failed = first['jobs'][0]
+        failed.update(conclusion='failure')
+        failed['steps'][1].update(conclusion='failure', completed_at='2026-10-01T00:02:00Z')
+        verify = dict(failed, id=12, name='verify', steps=[], completed_at='2026-10-01T00:03:05Z')
+        first['jobs'].extend([verify, dict(verify, id=13, name='version_metadata_summary')])
+        rerun['run'] = {'run_attempt': 2, 'run_started_at': '2026-10-01T00:19:00Z'}
+        rerun['jobs'].append(verify)
+
+        old, new = ci_metrics.build_report(evidence)['attempts']
+        self.assertEqual(old['first_failure'], {'seconds': 120, 'job_id': 11, 'step': 'Run tests',
+                                                'completed_at': '2026-10-01T00:02:00Z'})
+        self.assertEqual(old['verify']['seconds'], 185)
+        self.assertEqual(old['verify']['conclusion'], 'failure')
+        self.assertEqual(new['first_failure']['seconds'], 3660)
+        self.assertIsNone(new['first_failure']['step'])
+        self.assertIsNone(new['verify'])
 
     def test_rerun_wait_uses_scoped_origin_or_stays_unknown_at_t_plus_20m(self):
         from scripts import ci_metrics

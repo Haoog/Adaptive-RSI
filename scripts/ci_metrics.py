@@ -43,6 +43,32 @@ def attempt_origin(run, batch, prior):
     return None, None
 
 
+def attempt_feedback(jobs, origin):
+    """Measure observable failure feedback and the required check for this attempt."""
+    failures = []
+    for job in jobs:
+        failed_steps = [step for step in job['steps'] if step['conclusion'] in ('failure', 'timed_out')
+                        and elapsed(origin, step['completed_at']) is not None]
+        if not failed_steps and job['conclusion'] in ('failure', 'timed_out'):
+            failed_steps = [{'completed_at': job['completed_at'], 'name': None}]
+        for step in failed_steps:
+            finished = step['completed_at']
+            seconds = elapsed(origin, finished)
+            if seconds is not None:
+                failures.append((seconds, job['id'], step['name'] or '', finished))
+    first = None
+    if failures:
+        seconds, job_id, step, finished = min(failures)
+        first = dict(seconds=seconds, job_id=job_id, step=step or None, completed_at=finished)
+    verify = [job for job in jobs if job['name'] == 'verify' and job['status'] == 'completed'
+              and job['conclusion'] not in (None, 'skipped')]
+    required = None
+    if len(verify) == 1:
+        job = verify[0]
+        required = dict(select(job, 'id conclusion completed_at'), seconds=elapsed(origin, job['completed_at']))
+    return dict(first_failure=first, verify=required)
+
+
 def build_report(evidence, release_path=None, reuse_reason=None):
     run = evidence['run']
     jobs = []
@@ -53,9 +79,7 @@ def build_report(evidence, release_path=None, reuse_reason=None):
                         for number, other in by_number.items() if number < batch['attempt']]
         prior_starts = [value for value in prior_starts if elapsed(value, value) is not None]
         started, source = attempt_origin(run, batch, prior_starts)
-        attempts.append(dict(select(batch.get('run', {}),
-            'head_sha status conclusion created_at run_started_at updated_at'), attempt=batch['attempt'],
-            wait_origin_at=started, wait_origin_source=source))
+        attempt_jobs = []
         for job in batch['jobs']:
             attempt = job.get('run_attempt') or batch['attempt']
             steps = [dict(select(step, 'name number status conclusion started_at completed_at'),
@@ -68,7 +92,7 @@ def build_report(evidence, release_path=None, reuse_reason=None):
             allocated = bool(job.get('runner_id') and first)
             messages = [str(item.get('message', '')) for item in job.get('annotations', [])]
             unavailable = any('not acquired by Runner' in message for message in messages)
-            jobs.append(dict(select(job, 'id name status conclusion created_at started_at completed_at runner_id runner_name labels'),
+            attempt_jobs.append(dict(select(job, 'id name status conclusion created_at started_at completed_at runner_id runner_name labels'),
                 attempt=attempt,
                 allocation=('not_requested' if job.get('conclusion') == 'skipped' else
                             'allocated' if allocated else 'unallocated'),
@@ -79,9 +103,15 @@ def build_report(evidence, release_path=None, reuse_reason=None):
                 first_real_step_at=first,
                 dependency_wait_seconds=elapsed(started, job.get('created_at')) if attempt == batch['attempt'] else None,
                 workflow_creation_to_job_seconds=elapsed(run.get('created_at'), job.get('created_at')),
+                runner_start_seconds=elapsed(job.get('created_at'), job.get('started_at')) if allocated else None,
                 runner_allocation_seconds=elapsed(job.get('created_at'), first) if allocated else None,
                 execution_seconds=elapsed(first, job.get('completed_at')) if allocated else None,
                 steps=steps))
+        feedback = attempt_feedback([job for job in attempt_jobs if job['attempt'] == batch['attempt']], started)
+        attempts.append(dict(select(batch.get('run', {}),
+            'head_sha status conclusion created_at run_started_at updated_at'), attempt=batch['attempt'],
+            wait_origin_at=started, wait_origin_source=source, **feedback))
+        jobs.extend(attempt_jobs)
     return {'schema_version': 2,
             'run': select(run, 'id name head_sha run_attempt status conclusion event created_at run_started_at updated_at html_url'),
             'attempts': attempts,
@@ -92,6 +122,9 @@ def build_report(evidence, release_path=None, reuse_reason=None):
             'timing_notes': [
                 'dependency_wait_seconds spans the attempt origin to job creation. Attempt 1 uses workflow creation; reruns use an evidenced attempt-scoped run_started_at.',
                 'workflow_creation_to_job_seconds preserves the schema v1 dependency_wait_seconds span across attempts.',
+                'first_failure is the earliest observed failed/timed-out step, or failed/timed-out job completion if no timestamped failed step exists. Cancellation is excluded.',
+                'verify measures completion of the exact verify job in the same attempt. Both feedback durations use the attempt origin.',
+                'runner_start_seconds spans job creation to reported job start for allocated jobs. It is a queue proxy.',
                 'runner_allocation_seconds is job creation to first real step; includes allocation and setup, not a direct runner queue measurement.',
                 'execution_seconds is first real step to job completion; missing runner or real steps means unallocated and unknown execution.',
                 'Missing job created_at leaves waiting metrics unknown. timeout-minutes is not assumed to include queueing.',
@@ -111,8 +144,16 @@ def markdown(report):
              'Run {} · SHA {} · attempt {} · {}'.format(*[
                  cell(report['run'][key]) for key in ('id', 'head_sha', 'run_attempt', 'conclusion')]), '',
              '等待包含依赖与调度；runner 分配估计包含启动准备，不等于纯排队时间。缺证据用 unknown，不据 timeout-minutes 推断排队。', '',
-             '| Attempt | Job | Result | Allocation | Attempt wait (s) | Since workflow creation (s) | Runner allocation + setup (s) | Execution (s) | Capacity / allocation reason |',
-             '| --- | --- | --- | --- | --- | --- | --- | --- | --- |']
+             '| Attempt | First observed failure (s) | Failed job ID | Failed step | verify (s) | verify result |',
+             '| --- | --- | --- | --- | --- | --- |']
+    for attempt in report['attempts']:
+        failure = attempt['first_failure'] or {}
+        verify = attempt['verify'] or {}
+        lines.append('| ' + ' | '.join(map(cell, [attempt['attempt'], failure.get('seconds'),
+            failure.get('job_id'), failure.get('step'), verify.get('seconds'), verify.get('conclusion')])) + ' |')
+    lines += ['',
+              '| Attempt | Job | Result | Allocation | Attempt wait (s) | Since workflow creation (s) | Job start (s) | Runner allocation + setup (s) | Execution (s) | Capacity / allocation reason |',
+              '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |']
     for job in report['jobs']:
         reasons = [job['allocation_failure_reason']] if job['allocation_failure_reason'] else []
         if job['capacity_warning']:
@@ -121,7 +162,7 @@ def markdown(report):
             reasons.append('annotation evidence unavailable')
         lines.append('| ' + ' | '.join(map(cell, [job[key] for key in (
             'attempt', 'name', 'conclusion', 'allocation', 'dependency_wait_seconds', 'workflow_creation_to_job_seconds',
-            'runner_allocation_seconds', 'execution_seconds')] + ['; '.join(reasons) or None])) + ' |')
+            'runner_start_seconds', 'runner_allocation_seconds', 'execution_seconds')] + ['; '.join(reasons) or None])) + ' |')
     lines += ['', '| Attempt | Job | Step | Result | Duration (s) |', '| --- | --- | --- | --- | --- |']
     for job in report['jobs']:
         for step in job['steps']:
