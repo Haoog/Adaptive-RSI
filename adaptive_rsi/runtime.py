@@ -989,10 +989,10 @@ class Runtime(Maintenance):
         from .task_lifecycle import cancel
         return cancel(self, task, cascade, expected, reason)
 
-    def deliver(self, run_id, automatic=False, reason=None):
+    def deliver(self, run_id, automatic=False, reason=None, revision=None, console=False):
         with self.dispatch_lock:
             try:
-                return self._deliver(run_id, automatic, reason)
+                return self._deliver(run_id, automatic, reason, revision, console)
             except IssueSyncCorruptPending as exc:
                 # _deliver 的拒绝随事务一起回滚；损坏进度事件必须在回滚之后用
                 # 独立连接补写，否则阻断没有持久诊断。阻断语义不变：原异常照抛，
@@ -1004,7 +1004,8 @@ class Runtime(Maintenance):
                         "Failed to record corrupt issue sync progress for %s", exc.project)
                 raise
 
-    def _deliver(self, run_id, automatic=False, reason=None):
+    def _deliver(self, run_id, automatic=False, reason=None, revision=None, console=False):
+        from .delivery_approval import APPROVAL_PREFIX, approval_version, setting
         from .task_lifecycle import intervention_reason
         intervention_reason(reason)
         now = time.time()
@@ -1015,7 +1016,7 @@ class Runtime(Maintenance):
                 raise ValueError("Only a verified candidate awaiting approval can be delivered")
             if db.execute("SELECT 1 FROM settings WHERE key=?", ("project-archived:" + original["project"],)).fetchone():
                 raise ValueError("Project is archived; restore it before starting work")
-            source = db.execute("SELECT state FROM tasks WHERE id=?", (original["task"],)).fetchone()
+            source = db.execute("SELECT * FROM tasks WHERE id=?", (original["task"],)).fetchone()
             if not source or source["state"] != "awaiting_approval":
                 # 历史数据或并发取消/重试后，候选的授权已失效；不得留下成功回执或发布任务。
                 raise ValueError("Source task is no longer awaiting approval; this candidate cannot be delivered")
@@ -1037,23 +1038,23 @@ class Runtime(Maintenance):
             evidence = [{"authorization": "project_policy" if automatic else "per_candidate"}]
             prior = db.execute("SELECT * FROM tasks WHERE project=? AND fingerprint=?",
                                (original["project"], "publish:" + run_id)).fetchone()
+            generation = setting(db, 'delivery-generation:' + run_id)
+            target = setting(db, 'run-baseline:' + run_id)
+            bound = approval_version(original, source, generation, target, self.config(original['project']))
+            if bound:
+                evidence[0]["version_bound"] = True
+            if revision is not None and (not bound or revision != fingerprint(bound)):
+                raise ValueError("Candidate version changed; reopen the task before approving")
+            if prior and (prior["state"] in ("planning", "executing", "evaluating") or
+                          (automatic and (prior["state"] == "queued" or generation))):
+                return prior["id"]
             if prior:
                 task = prior["id"]
-                if prior["state"] not in ["queued", "planning", "executing", "evaluating"]:
-                    if not automatic:
-                        # Explicit reapproval may rebuild an unpublished replay.
-                        # Keep its record/files; any uncertain push forbids retirement.
-                        generation_key = 'delivery-generation:' + run_id
-                        generation = db.execute('SELECT value FROM settings WHERE key=?', (generation_key,)).fetchone()
-                        if generation and not db.execute('SELECT 1 FROM settings WHERE key IN (?,?)',
-                                ('delivery-push:' + run_id, 'delivery-generation-pr:' + run_id)).fetchone():
-                            history_id = uid()
-                            db.execute('INSERT INTO settings(key,value) VALUES (?,?)',
-                                       ('delivery-generation-history:' + run_id + ':' + history_id, generation['value']))
-                            db.execute('INSERT INTO settings(key,value) VALUES (?,?)',
-                                       ('delivery-generation-history-proof:' + run_id + ':' + history_id,
-                                        encode({'unpublished': True, 'record': fingerprint(json.loads(generation['value']))})))
-                            db.execute('DELETE FROM settings WHERE key=?', (generation_key,))
+                if generation:
+                    # Recovery must still verify the original preparation snapshot.
+                    # The new receipt below authorizes the exact prepared generation.
+                    evidence = json.loads(prior["evidence"])
+                if prior["state"] != "queued":
                     db.execute("UPDATE tasks SET state='queued',available=0,evidence=?,updated=? WHERE id=?",
                                (encode(evidence), now, task))
                 elif not automatic and prior["state"] == "queued":
@@ -1064,10 +1065,21 @@ class Runtime(Maintenance):
                            "priority,overrides,created,updated) VALUES (?,?,?,?,?,?,?,'[]','queued',100,'{}',?,?)",
                            (task, original["project"], "system_publish", "publish:" + run_id,
                             "Publish approved candidate", run_id, encode(evidence), now, now))
+            receipt = None
+            if bound:
+                receipt = {"version": bound, "action": "publish_pr", "time": now, "job": task,
+                           "authorization": "project_policy" if automatic else "per_candidate",
+                           "role": "project_policy" if automatic else "console_operator" if console else None}
+                db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)",
+                           (APPROVAL_PREFIX + run_id, encode(receipt)))
+                if automatic:
+                    db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                               (original["project"], run_id, "delivery_policy_grant", "Project policy authorized candidate",
+                                encode(receipt), now))
             if not automatic:
                 publication = db.execute("SELECT state FROM tasks WHERE id=?", (task,)).fetchone()
                 data = {"task": original["task"], "candidate": run_id, "reason": reason,
-                        "before": {"candidate_state": original["state"]},
+                        "approval": receipt, "before": {"candidate_state": original["state"]},
                         "after": {"publication_task": task, "publication_state": publication["state"]}}
                 db.execute("INSERT INTO events(project,run,kind,message,data,created) "
                            "VALUES (?,?,'delivery_approved','Candidate approved by user',?,?)",

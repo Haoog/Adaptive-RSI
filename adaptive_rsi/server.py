@@ -274,7 +274,7 @@ _POST_FIELD_TYPES = {
     "/api/pause": {"project": str, "paused": bool},
     "/api/retry": {"task": str, "reason": str, "force": bool, "candidate_review": str},
     "/api/cancel": {"task": str, "cascade": bool, "reason": str},
-    "/api/deliver": {"run": str, "reason": str},
+    "/api/deliver": {"run": str, "reason": str, "revision": str},
     "/api/rollback": {"candidate": str},
     "/api/evolution/promote": {"candidate": str},
     "/api/revert-code": {"run": str},
@@ -953,12 +953,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(page(runtime, params.get("project", [""])[0] or None, before))
             elif parsed.path == "/api/candidate":
                 from .experiment_report import comparison
-                candidate = store.one("SELECT id,project,status,content,evidence FROM candidates WHERE id=? AND project=?",
+                from .observation import strategy_policy, strategy_view
+                candidate = store.one("SELECT id,project,status,content,evidence,created,promoted FROM candidates WHERE id=? AND project=?",
                                       (params.get("id", [""])[0], params.get("project", [""])[0]))
                 if not candidate:
                     raise RequestError("Candidate not found")
                 evidence = decode_evidence(candidate.pop("evidence"))
+                observation = evidence.get('observation_window')
+                if not observation and candidate['status'] == 'stable':
+                    observation = strategy_policy(candidate, runtime.config(candidate['project']))
                 candidate.update(content=decode_object(candidate["content"]), evidence=evidence,
+                                 observation=strategy_view(observation, time.time()),
                                  comparison=comparison(evidence.get("trials", [])))
                 self.respond(candidate)
             elif parsed.path == "/api/monitoring-feedback":
@@ -1289,8 +1294,15 @@ class Handler(BaseHTTPRequestHandler):
                 run = store.one("SELECT * FROM runs WHERE id=?", (params.get("id", [""])[0],))
                 if not run:
                     raise RequestError("Run not found")
+                from .delivery_approval import details as delivery_details
+                from .observation import delivery_window
                 from .review import risk_review_evidence_requests
+                project_exists = store.one('SELECT 1 FROM projects WHERE id=?', (run['project'],))
+                config = runtime.config(run['project'] if project_exists else None)
+                run["delivery_record"] = delivery_details(store, run, config)
                 run["result"] = decode_evidence(run["result"])
+                run["delivery_observation"] = delivery_window(run["result"], config, time.time(),
+                    store.setting("feedback-polled:" + run["id"]) if run["result"].get("merged_sha") else None)
                 run["risk_review_evidence_requests"] = risk_review_evidence_requests(run["result"].get("risk_review"))
                 run["config"] = decode_object(run["config"])
                 run["stages"] = store.query("SELECT stage,created,data FROM stages WHERE run=? ORDER BY created", (run["id"],))
@@ -1663,7 +1675,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/cancel":
                     result = runtime.cancel_task(body["task"], body.get("cascade", False), body.get("revision"), body.get("reason"))
                 elif path == "/api/deliver":
-                    result = {"id": runtime.deliver(body["run"], reason=body.get("reason"))}
+                    result = {"id": runtime.deliver(body["run"], reason=body.get("reason"),
+                                                    revision=body.get("revision"), console=True)}
                 elif path == "/api/rollback":
                     runtime.rollback_strategy(body["candidate"])
                     result = {"saved": True}

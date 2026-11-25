@@ -310,6 +310,7 @@ finally:
         self.assertEqual(self.store.one('SELECT * FROM runs WHERE id=?', (self.run['id'],)), self.before)
 
     def test_runtime_retry_refuses_changed_generation_baseline_and_keeps_original_evidence(self):
+        self.reapprove()
         self.store.execute("UPDATE tasks SET state='queued' WHERE id=?", (self.approval,))
         self.restart()
         job = self.store.claim(self.project_id, self.config)
@@ -574,6 +575,12 @@ class DefaultBranchGenerationTest(GenerationFixture):
         self.assertEqual(self.store.setting('run-baseline:' + self.run['id'])['branch'], 'main')
         self.restart()
         self.assertEqual(self.recover(), self.record)
+        with patch.object(delivery, 'checked') as remote, patch.object(delivery, 'github_git') as push:
+            with self.assertRaisesRegex(RuntimeError, 'Candidate version or verification changed'):
+                self.publish()
+        remote.assert_not_called()
+        push.assert_not_called()
+        self.reapprove()
         with patch.object(delivery, 'checked', return_value='[]') as remote, \
                 patch.object(delivery, 'baseline', return_value=(self.repo, self.current, 'release')), \
                 patch.object(delivery, 'github_git') as push:
@@ -618,23 +625,38 @@ class ReapprovedGenerationTest(GenerationFixture):
     reapprove_before_generation = True
 
     def test_failed_policy_attempt_then_manual_reapproval_keeps_historical_binding(self):
-        self.assertEqual(self.binding['authorization'], generations.fingerprint([{'authorization': 'project_policy'}]))
+        self.assertEqual(self.binding['authorization'], generations.fingerprint(
+            [{'authorization': 'project_policy', 'version_bound': True}]))
         approval = self.store.one('SELECT * FROM tasks WHERE id=?', (self.approval,))
-        self.assertEqual(json.loads(approval['evidence']), [{'authorization': 'per_candidate'}])
+        self.assertEqual(json.loads(approval['evidence']), [{'authorization': 'per_candidate', 'version_bound': True}])
         self.assertEqual(self.store.setting('delivery-candidate:' + self.run['id']), self.binding)
         self.restart()
         self.assertEqual(self.recover(), self.record)
 
-    def test_manual_reapproval_retires_only_unpublished_generation_and_keeps_history(self):
+    def test_reapproval_seals_current_generation_and_new_baseline_requires_another_approval(self):
         self.reapprove()
         self.restart()
-        self.assertIsNone(self.store.setting('delivery-generation:' + self.run['id']))
-        history = self.store.query("SELECT value FROM settings WHERE key LIKE ?",
+        approval = self.store.setting('delivery-approval:' + self.run['id'])
+        self.assertEqual(approval['version']['candidate']['generation'], self.record['generation'])
+        self.assertEqual(self.recover(), self.record)
+        (self.repo / 'advance.txt').write_text('advanced a second time')
+        git(self.repo, 'add', 'advance.txt')
+        git(self.repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost', 'commit', '-qm', 'advance again')
+        current = git(self.repo, 'rev-parse', 'HEAD')
+        with patch.object(delivery, 'checked', return_value='[]'), \
+                patch.object(delivery, 'baseline', return_value=(self.repo, current, 'main')), \
+                patch.object(delivery, 'github_git') as push:
+            with self.assertRaisesRegex(RuntimeError, 'approve the new candidate'):
+                self.publish()
+            push.assert_not_called()
+        replacement = self.store.setting('delivery-generation:' + self.run['id'])
+        self.assertNotEqual(replacement['generation'], self.record['generation'])
+        self.assertEqual(replacement['parent'], current)
+        history = self.store.query('SELECT value FROM settings WHERE key LIKE ?',
                                    ('delivery-generation-history:' + self.run['id'] + ':%',))
         self.assertEqual([json.loads(row['value']) for row in history], [self.record])
         self.assertTrue(Path(self.record['directory']).is_dir())
-        with self.assertRaises(generations.GenerationError):
-            self.recover()
+        self.assertEqual(self.store.setting('delivery-approval:' + self.run['id']), approval)
 
     def test_new_approval_after_push_intent_requires_reconciliation(self):
         self.store.put_setting('delivery-push:' + self.run['id'], self.push_binding())

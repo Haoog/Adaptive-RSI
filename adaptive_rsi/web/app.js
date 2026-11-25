@@ -211,6 +211,7 @@ const apiErrors={
  "Parallel project limit is a global setting; select global defaults": "并发项目限制是全局设置，请在全局通用设置中调整。",
  "Software updates are a global setting": "软件更新是全局通用设置，不能在项目级别单独覆盖。",
  "Only a verified candidate awaiting approval can be delivered": "只有通过验证且待批准的候选才能交付。",
+ "Candidate version changed; reopen the task before approving": "候选版本已变化，请重新打开任务后批准。",
  "Independent gates have not passed": "独立验证与审查门禁未全部通过，无法交付。",
  "No verified code candidate to revert": "没有可回滚的代码候选。",
  "Explicit confirmation is required to reset invalid project settings": "需要明确确认才能重置无效的项目配置。",
@@ -744,8 +745,10 @@ function valueReport(value,reason,scope){
 async function confirmCandidateApproval(data){
  const content=el('div'),reason=el('textarea'),label=el('label',t('干预原因（可选，保留原文）'));
  reason.maxLength=2000;reason.rows=2;label.append(reason);
- const summary=window.RSIProduct?.approval(data);if(summary)content.append(summary);content.append(label);
- return await uiConfirm(t('这会把待验证改动分支推送到关联 GitHub 仓库，并创建 PR。确认批准？'),content)?{reason:reason.value}:null;
+ const summary=window.RSIProduct?.approval(data);if(summary)content.append(summary);
+ const record=deliveryRecord(data.delivery_record);if(record)content.append(record);
+ content.append(label);
+ return await uiConfirm(t('这会把待验证改动分支推送到关联 GitHub 仓库，并创建 PR。确认批准？'),content)?{reason:reason.value,revision:data.delivery_record?.revision}:null;
 }
 let navigationHomeProject=typeof history!=='undefined'&&typeof history.state?.rsi_home_project==='string'?history.state.rsi_home_project:null;
 function rememberNavigationHome(){
@@ -922,6 +925,40 @@ function ciAttention(data){
  if(checks.childElementCount)panel.append(checks);
  return panel;
 }
+function observationPanel(observation){
+ if(!observation)return null;
+ const states={continue:t('可继续观察'),failed:t('实测未达阈值'),pending_evidence:t('待证据'),pending_attribution:t('待归因')};
+ const metrics={fixed_check_verdict:t('固定检查通过率'),verified_task_pass_ratio:t('已验证任务通过率')};
+ const scopes={none:t('无失败'),measured_version:t('实测版本'),single:t('单一策略'),shared:t('多个策略'),mixed:t('混合归因'),subsequent_mainline:t('后续主线变更'),unknown:t('未知')};
+ const panel=el('div',undefined,'task-observation');
+ const ratio=observation.pass_ratio==null?t('未知'):Math.round(observation.pass_ratio*100)+'%';
+ const interval=observation.interval_seconds===0?t('按任务完成采样'):observation.interval_seconds+' s';
+ panel.append(el('strong',t('观察窗口（仅演练）')+' · '+states[observation.state]),
+  el('p',metrics[observation.metric]+' · '+ratio+' / '+Math.round(observation.minimum_pass_ratio*100)+'% · '+t('样本数 / 最小样本')+' '+observation.samples+' / '+observation.minimum_samples,'muted'),
+  el('p',t('采样间隔')+' · '+interval+' · '+t('归因')+' · '+scopes[observation.attribution],'muted'),
+  el('p',t('观察截止时间')+' · '+(observation.deadline?stamp(observation.deadline):t('未知'))+(observation.expired?' · '+t('已到期'):''),'muted'));
+ if(observation.observed_version)panel.append(el('p',t('实测版本')+' · '+observation.observed_version,'muted'));
+ if(observation.checked_at)panel.append(el('p',t('最近实测时间')+' · '+stamp(observation.checked_at),'muted'));
+ return panel;
+}
+function deliveryRecord(record){
+ if(!record?.state)return null;
+ const states={awaiting_approval:t('待批准'),approved:t('批准已记录'),invalidated:t('旧批准已失效'),reconciliation:t('待核对远端回执'),recorded:t('交付回执已记录')};
+ const roles={console_operator:t('已认证控制台操作者'),project_policy:t('项目策略')};
+ const panel=el('div',undefined,'task-delivery-record'),candidate=record.state==='recorded'?record.approval?.version?.candidate:record.candidate;
+ panel.append(el('strong',t('交付记录')+' · '+states[record.state]));
+ if(candidate){
+  panel.append(el('p',t('候选版本')+' · '+(candidate.commit||candidate.patch),'muted'));
+  if(candidate.target?.repository)panel.append(el('p',t('交付目标')+' · '+candidate.target.repository+' / '+candidate.target.branch,'muted'));
+  panel.append(el('p',t('构建验证证据摘要')+' · '+candidate.verification,'muted'));
+ }
+ if(record.approval){
+  const grant=record.approval;
+  panel.append(el('p',t('批准推送并创建 PR')+' · '+(roles[grant.role]||t('身份未记录'))+' · '+stamp(grant.time),'muted'));
+ }
+ if(record.receipt?.head)panel.append(el('p',t('交付提交')+' · '+record.receipt.head+(record.receipt.time?' · '+stamp(record.receipt.time):''),'muted'));
+ return panel;
+}
 function taskOutcome(data){
  const result=data.result,outcome=el('section',undefined,'task-outcome');outcome.append(el('h3',t('这次的结果')));
  outcome.append(el('h4',t('改了什么')),el('p',result.summary||result.reason||t('还没有完成结果。')));
@@ -947,8 +984,7 @@ function taskOutcome(data){
  for(const [key,title]of [['evaluation','运行检查'],['review','代码评审']]){const row=el('p');row.append(el('strong',t(title)+' · '),result[key]?badge(result[key].decision):document.createTextNode(t('尚未完成')));outcome.append(row);}
  const next=result.delivery_status?t(deliveryNames[result.delivery_status]||result.delivery_status):t(statusNames[data.state]||data.state);
  outcome.append(el('p',t('交付状态')+' · '+next));
- const attention=ciAttention(data);
- if(attention)outcome.append(attention);
+ for(const panel of [ciAttention(data),deliveryRecord(data.delivery_record),observationPanel(data.delivery_observation)])if(panel)outcome.append(panel);
  const guidance={awaiting_approval:'修改保存在本机；确认后可推送并创建 PR。',pr_open:'可以打开 GitHub 查看合并进度。',merged:'修改已合并；合并后的运行情况会继续复查。',failed:'查看检查结果，解决问题后可以重试。',blocked:'按错误提示调整设置后重试。',insufficient_evidence:'需要补充能证明问题已解决的检查。'}[data.state];
  if(guidance)outcome.append(el('p',t(guidance),'muted'));
  if(result.failure&&result.failure.code!=='candidate_static_review'){const target=['credentials','provider'].includes(result.failure.code)?'models':'settings';outcome.append(el('p',t(failureNext[result.failure.code]||failureNext.execution),'muted'));outcome.append(action(t(target==='models'?'修复模型连接':'检查项目设置'),()=>{closeTaskDetail();showView(target);},'text-button'));}
@@ -1207,6 +1243,7 @@ function experimentEvidence(card,c){
    if(report.incomplete_trials>0)cohorts.append(el('p',t('未计入胜负的配对试验')+' · '+report.incomplete_trials,'muted'));
    cohorts.append(el('p',t('分组结果仅描述已观察样本，不代表对其他任务的收益。')));
    detail.append(cohorts);
+   const observation=observationPanel(data.observation);if(observation)detail.append(observation);
    const evidence=el('details'),raw=el('pre');evidence.append(el('summary',t('封存计划与输入清单')),raw);
    evidence.addEventListener('toggle',()=>{if(evidence.open&&!raw.textContent)raw.textContent=JSON.stringify({preregistered_plan:data.evidence.preregistered_plan||null,dataset:data.evidence.dataset||null,config_hash:data.evidence.config_hash||null},null,2);});
    const review=data.evidence.promotion_review;

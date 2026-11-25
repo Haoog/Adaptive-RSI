@@ -153,6 +153,7 @@ Automatic delivery must be explicitly enabled per project
 Parallel project limit is a global setting; select global defaults
 Software updates are a global setting
 Only a verified candidate awaiting approval can be delivered
+Candidate version changed; reopen the task before approving
 Independent gates have not passed
 No verified code candidate to revert
 Explicit confirmation is required to reset invalid project settings

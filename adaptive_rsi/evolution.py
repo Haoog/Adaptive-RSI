@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .config import BUILTIN_PROVIDERS, compatibility, fingerprint, merge, validate
 from .gitops import git, repository, snapshot
+from .observation import strategy_window, timestamp
 from .process import Cancelled, scrub_tree
 from .store import decode_object, encode, uid
 from .usage_report import one_snapshot
@@ -2417,7 +2418,8 @@ class Evolution:
         with (contextlib.nullcontext(db) if db is not None else self.store.connect()) as db:
             if not db.in_transaction:
                 db.execute("BEGIN IMMEDIATE")
-            recorded = db.execute("SELECT strategy,config FROM runs WHERE id=? AND project=?", (run["id"], project)).fetchone()
+            recorded = db.execute("SELECT strategy,config,started,ended FROM runs WHERE id=? AND project=?",
+                                  (run["id"], project)).fetchone()
             if not recorded:
                 return
             # 记录生成时间：候选可能被重新晋升成同 id 的新一代，回滚必须对得上具体一代。
@@ -2425,9 +2427,7 @@ class Evolution:
                       for c in json.loads(recorded["strategy"] or "[]")
                       if isinstance(c, dict) and c.get("id")}
             shared = len(active) > 1
-            if not passed and not attributable and not shared:
-                return
-            if not passed and len(active) != 1:
+            if not passed and (attributable or shared) and len(active) != 1:
                 event = {"strategies": sorted(active)}
                 if shared:
                     event["attribution"] = "shared"
@@ -2443,6 +2443,8 @@ class Evolution:
                 if not current:
                     continue
                 expected_created = active[row["id"]]
+                if expected_created is None and not (passed or attributable or shared):
+                    continue
                 if expected_created is not None and current["created"] != expected_created:
                     continue
                 try:
@@ -2458,6 +2460,22 @@ class Evolution:
                 if not isinstance(recorded_config, dict):
                     recorded_config = {}
                 if evidence.get("compatibility") and evidence["compatibility"] != compatibility(recorded_config):
+                    continue
+                # Only a terminal run tied to this exact generation can count in
+                # the window. Historical monitor counters remain readable.
+                start = row['promoted'] or row['created']
+                if (expected_created is not None and timestamp(start)
+                        and timestamp(recorded['started']) and timestamp(recorded['ended'])
+                        and recorded['started'] >= start
+                        and recorded['started'] <= recorded['ended'] <= time.time()):
+                    previous = evidence.get('observation_window')
+                    observation = strategy_window(previous, row, config, run['id'], recorded['ended'],
+                                                  passed, attributable, shared)
+                    if observation != previous:
+                        evidence['observation_window'] = observation
+                        db.execute("UPDATE candidates SET evidence=? WHERE id=? AND status='stable'",
+                                   (encode(evidence), row['id']))
+                if not passed and not attributable and not shared:
                     continue
                 monitor = evidence.setdefault("monitor", {"passed": 0, "failed": 0})
                 seen = monitor.setdefault("runs", [])

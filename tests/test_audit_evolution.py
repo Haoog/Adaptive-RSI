@@ -795,6 +795,28 @@ class AuditEvolutionTest(unittest.TestCase):
         event = self.store.one("SELECT data FROM events WHERE kind='strategy_inconclusive'")
         self.assertEqual(json.loads(event['data'])['attribution'], 'shared')
 
+    def test_dry_run_window_keeps_existing_single_strategy_rollback_gate(self):
+        from adaptive_rsi.observation import strategy_view
+
+        self.candidate()
+        self.store.execute("INSERT INTO candidates(id,project,kind,status,created) VALUES ('a','p','adapter','stable',2)")
+        strategy = {'id': 'c', '_candidate_created': 1}
+        adapter = {'id': 'a', '_candidate_created': 2}
+        for run_id, identities, attributable, target, status, verdict in (
+            ('legacy', [{'id': 'c'}], False, 'c', 'stable', None),
+            ('unverified', [strategy], False, 'c', 'stable', 'pending_evidence'),
+            ('shared', [strategy, adapter], True, 'a', 'stable', 'pending_attribution'),
+            ('single', [strategy], True, 'c', 'rolled_back', 'pending_evidence'),
+        ):
+            self.store.execute('INSERT INTO runs(id,project,strategy,config,started,ended) VALUES (?,?,?,?,?,?)',
+                               (run_id, 'p', encode(identities), '{}', 2, 3))
+            self.evolution.monitor('p', False, {'id': run_id}, attributable=attributable)
+            row = self.store.one('SELECT status,evidence FROM candidates WHERE id=?', (target,))
+            self.assertEqual(row['status'], status)
+            observation = strategy_view(json.loads(row['evidence']).get('observation_window'), 3)
+            self.assertEqual(observation and observation['state'], verdict)
+        self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='rollback'")), 1)
+
     def test_shared_failure_attribution_survives_later_single_success(self):
         self.candidate({'monitor': {'passed': 0, 'failed': 0}})
         self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
