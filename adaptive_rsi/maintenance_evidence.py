@@ -65,6 +65,57 @@ def _cursor(db, project):
     return decode_object(row["value"])["sha"] if row else None
 
 
+def _recent_review_paths(store, project, history, base):
+    # Only reuse cached paths for the preceding first-parent window on this main.
+    shas = history("rev-list", "--first-parent", f"--max-count={REVIEW_BATCH}", base).splitlines()
+    cached = {row["sha"]: decode_object(row["data"]) for row in store.query(
+        "SELECT sha,data FROM maintenance_reviews WHERE project=? AND sha IN (" +
+        ",".join("?" for _ in shas) + ")", (project, *shas))}
+    last_change = {}
+    for sha in reversed(shas):
+        paths = cached.get(sha, {}).get("paths")
+        if isinstance(paths, list):
+            for path in paths[:250]:
+                if isinstance(path, str):
+                    last_change[path] = sha
+    return shas, last_change
+
+
+def _review_clues(paths, message, prior_shas, last_change, evidence, rollbacks):
+    clues = []
+    reverted = {}
+    for target in re.findall(r"^This reverts commit ([0-9a-f]+)(?:\.|, reversing\nchanges made to [0-9a-f]+\.)$",
+                             message, re.MULTILINE):
+        if target in prior_shas:
+            reverted.setdefault(target, {})["git_message"] = True
+    for target, original_run in rollbacks.items():
+        if target in prior_shas:
+            reverted.setdefault(target, {})["delivery_runs"] = {"original": original_run, "rollback": evidence["run"]}
+    for target, sources in reverted.items():
+        clues.append({"kind": "explicit_revert", "source_sha": target, "sources": sources})
+
+    overlaps = {}
+    for path in paths:
+        previous = last_change.get(path)
+        if previous and previous not in reverted:
+            overlaps.setdefault(previous, []).append(path)
+    for previous, shared_paths in overlaps.items():
+        clues.append({"kind": "possible_followup", "source_sha": previous, "paths": shared_paths,
+                      "basis": "exact_path_overlap_only"})
+
+    evidence = evidence or {}
+    missing = []
+    if not evidence:
+        missing.append("linked_merged_run")
+    if not evidence.get("candidate_checks"):
+        missing.append("recorded_candidate_checks")
+    if evidence.get("postmerge_verification") not in ("verified", "regressed"):
+        missing.append("conclusive_version_matched_postmerge_record")
+    if missing:
+        clues.append({"kind": "validation_gap", "status": "insufficient_evidence", "missing": missing})
+    return clues
+
+
 def retrospective_preview(store, project, start=None):
     project_id, path = project["id"], project["path"]
     with store.connect() as db:
@@ -83,37 +134,57 @@ def retrospective_preview(store, project, start=None):
         raise ValueError("The review base is no longer on the first-parent history of main")
     end = history("rev-parse", "--verify", f"{head}~{max(distance - REVIEW_BATCH, 0)}")
     shas = history("rev-list", "--first-parent", "--reverse", end, "^" + base).splitlines()
-    evidence = {}
+    evidence, rollbacks = {}, {}
+    prior_shas, last_change = set(), {}
     if shas:
-        rows = store.query("SELECT id,result FROM runs WHERE project=? AND state='merged' AND json_valid(result) "
-                           "AND json_extract(result,'$.merged_sha') IN (" + ",".join("?" for _ in shas) + ") "
-                           "ORDER BY started DESC,id", (project_id, *shas))
+        recent_shas, last_change = _recent_review_paths(store, project_id, history, base)
+        prior_shas.update(recent_shas)
+        anchors = shas + recent_shas
+        batch_shas = set(shas)
+        rows = store.query("SELECT id,state,result FROM runs WHERE project=? AND state IN ('merged','reverted') "
+                           "AND CASE WHEN json_valid(result) THEN json_extract(result,'$.merged_sha') END IN (" +
+                           ",".join("?" for _ in anchors) + ") ORDER BY started DESC,id", (project_id, *anchors))
         for row in rows:
             result = decode_object(row["result"])
             if result.get("delivery_status") not in (None, "merged"):
+                continue
+            sha = result["merged_sha"]
+            reverted_by = result.get("reverted_by")
+            if row["state"] == "reverted" and isinstance(reverted_by, str) and reverted_by:
+                rollbacks.setdefault(reverted_by, {}).setdefault(sha, row["id"])
+            if sha not in batch_shas or sha in evidence:
                 continue
             evaluation = result.get("evaluation")
             evaluation = evaluation if isinstance(evaluation, dict) else {}
             checks = evaluation.get("checks")
             checks = checks if isinstance(checks, dict) else {}
-            groups = {label: {"total": len(checks[label]),
-                              "passed": sum(isinstance(check, dict) and check.get("passed") is True
-                                            for check in checks[label])}
-                      for label in ("candidate_full", "candidate", "acceptance_candidate", "test_first_candidate")
-                      if isinstance(checks.get(label), list) and checks[label]}
+            groups = {}
+            for label in ("candidate_full", "candidate", "acceptance_candidate", "test_first_candidate"):
+                if isinstance(checks.get(label), list):
+                    outcomes = [check["passed"] for check in checks[label]
+                                if isinstance(check, dict) and type(check.get("passed")) is bool]
+                    if outcomes:
+                        groups[label] = {"total": len(outcomes), "passed": sum(outcomes)}
             feedback = result.get("feedback")
             feedback = feedback if isinstance(feedback, dict) else {}
-            evidence.setdefault(result["merged_sha"], {"run": row["id"], "pr": result.get("pr"),
-                                "evaluation": evaluation.get("decision"), "candidate_checks": groups,
-                                "postmerge_verification": feedback.get("state") if feedback.get("head") == result["merged_sha"] else None})
+            evidence[sha] = {"run": row["id"], "pr": result.get("pr"),
+                             "evaluation": evaluation.get("decision"), "candidate_checks": groups,
+                             "postmerge_verification": feedback.get("state") if feedback.get("head") == sha else None}
     commits = []
     parent = base
     for sha in shas:
         paths = history("diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", parent, sha).split("\0")
         paths = list(filter(None, paths))
-        commits.append({"sha": sha, "subject": history("show", "-s", "--format=%s", sha)[:300],
-                        "paths": paths[:250], "paths_omitted": max(0, len(paths) - 250),
-                        "evidence": evidence.get(sha)})
+        shown_paths = paths[:250]
+        subject, _, message = history("show", "-s", "--no-notes", "--no-show-signature",
+                                      "--format=%s%n%b", sha).partition("\n")
+        linked = evidence.get(sha)
+        clues = _review_clues(shown_paths, message, prior_shas, last_change, linked,
+                              rollbacks.get(linked["run"], {}) if linked else {})
+        commits.append({"sha": sha, "subject": subject[:300], "paths": shown_paths,
+                        "paths_omitted": max(0, len(paths) - 250), "evidence": linked, "review_clues": clues})
+        prior_shas.add(sha)
+        last_change.update(dict.fromkeys(shown_paths, sha))
         parent = sha
     preview = {"project": project_id, "cursor": cursor, "base": base, "end": end, "main": head, "commits": commits}
     return {**preview, "token": fingerprint(preview)}

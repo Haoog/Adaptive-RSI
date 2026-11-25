@@ -194,8 +194,9 @@ class ServerExecutionTest(unittest.TestCase):
         task = self.runtime.goal(self.project, "record merged evidence")
         run = self.store.claim(self.project, self.runtime.config(self.project))
         self.assertEqual(run["task"], task)
-        self.store.transition(run["id"], "merged", {"merged_sha": reviewed, "pr": 42,
-                                                   "evaluation": {"decision": "pass"}}, True)
+        self.store.transition(run["id"], "merged", {"merged_sha": reviewed, "pr": 42, "evaluation": {
+            "decision": "pass", "checks": {"candidate": [{"label": "record without outcome"}]},
+        }}, True)
         query = "?project=" + self.project
         self.assertEqual(request({"schedule": True}, csrf="wrong")[1], 403)
         self.assertEqual(request({"schedule": True})[1], 400)
@@ -214,6 +215,10 @@ class ServerExecutionTest(unittest.TestCase):
         self.assertEqual(preview["commits"][0]["paths"], ["calculator.py"])
         self.assertEqual(preview["commits"][0]["evidence"]["run"], run["id"])
         self.assertEqual(preview["commits"][0]["evidence"]["pr"], 42)
+        self.assertEqual(preview["commits"][0]["review_clues"], [
+            {"kind": "validation_gap", "status": "insufficient_evidence",
+             "missing": ["recorded_candidate_checks", "conclusive_version_matched_postmerge_record"]},
+        ])
         self.assertEqual(pending["next_at"], due + REVIEW_WEEK)
         schedule_retrospectives(self.runtime, due + REVIEW_WEEK)
         self.assertEqual(request(query=query)[0]["schedule"]["summary"], pending["summary"])
@@ -223,6 +228,10 @@ class ServerExecutionTest(unittest.TestCase):
         schedule_retrospectives(self.runtime, due + 2 * REVIEW_WEEK)
         current = request(query=query)[0]["schedule"]
         self.assertEqual(current["summary"]["end"], head)
+        self.assertEqual(current["summary"]["commits"][0]["review_clues"][0], {
+            "kind": "possible_followup", "source_sha": reviewed, "paths": ["calculator.py"],
+            "basis": "exact_path_overlap_only",
+        })
         git(self.repo, "update-ref", "refs/heads/main", start)
         schedule_retrospectives(self.runtime, current["next_at"])
         failed = request(query=query)[0]
@@ -254,6 +263,59 @@ class ServerExecutionTest(unittest.TestCase):
         self.assertEqual(self.store.query("SELECT sha FROM maintenance_reviews"), [{"sha": reviewed}])
         self.assertEqual(self.store.query("SELECT id FROM maintenance_rules"), [])
         self.assertEqual(self.store.query("SELECT id FROM tasks"), [{"id": task}])
+
+    def test_retrospective_clues_require_exact_commit_and_run_anchors(self):
+        from adaptive_rsi.maintenance_evidence import retrospective_preview
+
+        def commit_git(*args):
+            git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", *args)
+            return git(self.repo, "rev-parse", "HEAD")
+
+        start = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "calculator.py").write_text("# changed\n")
+        git(self.repo, "add", "calculator.py")
+        unrelated = "f" * 40
+        original = commit_git("commit", "-m", "Revert in subject only", "-m", f"This reverts commit {unrelated}.")
+        rollback = commit_git("revert", "--no-edit", original)
+        self.store.execute("INSERT INTO maintenance_reviews VALUES (?,?,?,?)",
+                           (self.project, unrelated, encode({"paths": ["calculator.py"]}), 1))
+        project = self.runtime.project(self.project)
+        first, second = retrospective_preview(self.store, project, start)["commits"]
+        gap = {"kind": "validation_gap", "status": "insufficient_evidence",
+               "missing": ["linked_merged_run", "recorded_candidate_checks",
+                           "conclusive_version_matched_postmerge_record"]}
+        revert_clue = {"kind": "explicit_revert", "source_sha": original, "sources": {"git_message": True}}
+        self.assertEqual(first["review_clues"], [gap])
+        self.assertEqual(second["review_clues"], [revert_clue, gap])
+
+        def record_merge(sha, **evidence):
+            task = self.runtime.goal(self.project, sha)
+            run = self.store.claim(self.project, self.runtime.config(self.project))
+            self.assertEqual(run["task"], task)
+            self.store.transition(run["id"], "merged", {"merged_sha": sha, **evidence}, True)
+            return run["id"]
+
+        self.runtime.pause(self.project, False)
+        evaluation = {"checks": {"candidate_full": [{"passed": True}]}}
+        original_run = record_merge(original, evaluation=evaluation, feedback={"state": "verified", "head": rollback})
+        rollback_run = record_merge(rollback, evaluation=evaluation, feedback={"state": "regressed", "head": rollback})
+        self.store.execute("UPDATE runs SET state='reverted',result=json_set(result,'$.reverted_by',?) WHERE id=?",
+                           (rollback_run, original_run))
+        first, second = retrospective_preview(self.store, project, start)["commits"]
+        self.assertEqual(first["evidence"]["run"], original_run)
+        self.assertEqual(first["review_clues"], [{**gap, "missing": ["conclusive_version_matched_postmerge_record"]}])
+        self.assertEqual(second["review_clues"], [{**revert_clue, "sources": {
+            "git_message": True, "delivery_runs": {"original": original_run, "rollback": rollback_run},
+        }}])
+
+        self.store.execute("INSERT INTO maintenance_reviews VALUES (?,?,?,?)",
+                           (self.project, original, encode({"paths": ["calculator.py"]}), 2))
+        (self.repo / "calculator.py").write_text("# another change\n")
+        git(self.repo, "add", "calculator.py")
+        commit_git("commit", "-m", "another change")
+        with patch("adaptive_rsi.maintenance_evidence.REVIEW_BATCH", 1):
+            final = retrospective_preview(self.store, project, rollback)["commits"][0]
+        self.assertEqual(final["review_clues"], [gap])
 
     def test_fixed_check_signal_requires_exact_main_version(self):
         from adaptive_rsi.maintenance_evidence import fixed_check_signal
