@@ -1848,8 +1848,10 @@ mod response_policy_tests {
         let before = updater.state.lock().unwrap().clone();
         let mut total = None;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let result = runtime.block_on(transfer_from(&updater, || client.get(&url),
-            &part, 0, &mut total, "99.99.99", ""));
+        let result = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), transfer_from(&updater, || client.get(&url),
+                &part, 0, &mut total, "99.99.99", "")).await
+        }).expect("the native downloader waited for the missing package body");
         assert_eq!(result, Err("update_download_or_signature_failed".into()));
         assert_eq!(total, None);
         assert_eq!(*updater.state.lock().unwrap(), before);

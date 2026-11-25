@@ -19,12 +19,23 @@ def run(fixture, command):
     assert len(image) > SEGMENT_END
     requests = []
     missing_packages = []
+    release_missing_package_body = threading.Event()
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path == "/missing-package":
                 missing_packages.append(self.headers.get("Range"))
-                self.send_error(404, "Package not found")
+                body = b"Package not found\n"
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                # Release the ordinary error body only when the native test exits.
+                if release_missing_package_body.wait(timeout=45):
+                    try:
+                        self.wfile.write(body)
+                    except OSError:
+                        pass  # The downloader already closed the rejected response.
                 return
             position = len(requests)
             requested_range = self.headers.get("Range")
@@ -70,6 +81,7 @@ def run(fixture, command):
                 subprocess.run([*command, test, "--", "--ignored", "--exact", "--nocapture"],
                                env=env, check=True)
         finally:
+            release_missing_package_body.set()
             server.shutdown()
             worker.join()
     assert requests == EXPECTED_RANGES, requests

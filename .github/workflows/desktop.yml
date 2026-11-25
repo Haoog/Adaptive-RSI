@@ -109,7 +109,7 @@ jobs:
         run: |
           npm run --prefix desktop build
           cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
-      - name: 验证旧版 DMG 的 HTTPS 续传和真卷挂载
+      - name: 验证旧版 DMG 的 HTTPS 续传、真卷挂载和原生响应策略
         if: needs.changes.outputs.mode == 'full'
         timeout-minutes: 5
         run: bash desktop/scripts/test_legacy_dmg_https.sh
