@@ -10,11 +10,11 @@ def full_sha(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value) is not None
 
 
-def record_observation(db, task, observation, reason):
+def record_observation(db, task, observation, reason, *, state="queued"):
     signal = fingerprint(observation)
     return db.execute(
         "INSERT OR IGNORE INTO inspection_observations(task,signal,data,observed) VALUES (?,?,?,?)",
-        (task, signal, encode({**observation, "reason": reason}), time.time()),
+        (task, signal, encode({**observation, "reason": reason, "task_state": state}), time.time()),
     ).rowcount == 1
 
 
@@ -40,7 +40,7 @@ def main_head(project):
 
 def fixed_check_signal(store, project, repository, head):
     entry = store.setting("maintenance-ci:" + project, {})
-    if not isinstance(entry, dict) or entry.get("repository") != repository or not full_sha(head):
+    if not repository or not isinstance(entry, dict) or entry.get("repository") != repository or not full_sha(head):
         return {"status": "investigate", "source": "github_actions"}
     checks = entry.get("checks")
     matches = [check for check in checks if isinstance(check, dict) and check.get("headSha") == head
@@ -68,8 +68,12 @@ def retrospective_preview(store, project, start=None):
     if not full_sha(base) or (cursor and start and start != cursor):
         raise ValueError("Provide an initial full main SHA, or use the saved review cursor")
     history = lambda *args: git(path, "--no-replace-objects", *args)
-    distance = int(history("rev-list", "--first-parent", "--count", head, "^" + base))
-    if history("rev-parse", "--verify", f"{head}~{distance}") != base:
+    try:
+        distance = int(history("rev-list", "--first-parent", "--count", head, "^" + base))
+        on_main = history("rev-parse", "--verify", f"{head}~{distance}") == base
+    except RuntimeError as exc:
+        raise ValueError("The review base is no longer on the first-parent history of main") from exc
+    if not on_main:
         raise ValueError("The review base is no longer on the first-parent history of main")
     end = history("rev-parse", "--verify", f"{head}~{max(distance - REVIEW_BATCH, 0)}")
     shas = history("rev-list", "--first-parent", "--reverse", end, "^" + base).splitlines()
@@ -83,8 +87,19 @@ def retrospective_preview(store, project, start=None):
             if result.get("delivery_status") not in (None, "merged"):
                 continue
             evaluation = result.get("evaluation")
+            evaluation = evaluation if isinstance(evaluation, dict) else {}
+            checks = evaluation.get("checks")
+            checks = checks if isinstance(checks, dict) else {}
+            groups = {label: {"total": len(checks[label]),
+                              "passed": sum(isinstance(check, dict) and check.get("passed") is True
+                                            for check in checks[label])}
+                      for label in ("candidate_full", "candidate", "acceptance_candidate", "test_first_candidate")
+                      if isinstance(checks.get(label), list) and checks[label]}
+            feedback = result.get("feedback")
+            feedback = feedback if isinstance(feedback, dict) else {}
             evidence.setdefault(result["merged_sha"], {"run": row["id"], "pr": result.get("pr"),
-                                "evaluation": evaluation.get("decision") if isinstance(evaluation, dict) else None})
+                                "evaluation": evaluation.get("decision"), "candidate_checks": groups,
+                                "postmerge_verification": feedback.get("state") if feedback.get("head") == result["merged_sha"] else None})
     commits = []
     parent = base
     for sha in shas:
@@ -106,7 +121,7 @@ def _confirmed_rule(item, commits):
     paths = item.get("paths")
     commit = commits[item["sha"]]
     if not isinstance(paths, list) or not 1 <= len(paths) <= 8 or any(
-            not isinstance(path, str) or path not in commit["paths"] for path in paths):
+            not isinstance(path, str) or len(path) > 512 or path not in commit["paths"] for path in paths):
         raise ValueError("Choose 1..8 changed paths from the cited main commit")
     for path in paths:
         relative_path(path)

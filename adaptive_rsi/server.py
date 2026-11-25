@@ -37,7 +37,6 @@ from .server_validation import (SAFE_ERROR_CODES, SAFE_VALIDATION_MESSAGES, Requ
                                 project_display_name, configuration_error)
 
 
-PATCH_PREVIEW_LIMIT = 2 * 1024 * 1024
 PATCH_PREVIEW_TOO_LARGE = ("Candidate patch exceeds the 2 MiB UI size limit; "
                            "download it from the run directory instead")
 
@@ -77,6 +76,8 @@ GET /api/events
 POST /api/evolution/promote
 POST /api/goal
 GET /api/health
+GET /api/maintenance-review
+POST /api/maintenance-review
 GET /api/mobile
 GET /api/model-center
 POST /api/model-center/diagnose
@@ -314,13 +315,6 @@ def maintenance_status(store, running=False, now=None):
         next_due = last_success + MAINTENANCE_INTERVAL
     return {"running": bool(running), "last_success": last_success, "next_due": next_due,
             "failures": failures, "retry_at": retry_at, "degraded": None}
-
-
-def read_patch_preview(path):
-    """Read a patch for the console; return None when it exceeds the preview limit."""
-    with path.open("rb") as stream:
-        payload = stream.read(PATCH_PREVIEW_LIMIT + 1)
-    return payload if len(payload) <= PATCH_PREVIEW_LIMIT else None
 
 
 class Server(ThreadingHTTPServer):
@@ -1307,7 +1301,7 @@ class Handler(BaseHTTPRequestHandler):
                     stage["decision"] = decode_object(stage.pop("data")).get("decision")
                 self.respond(run)
             elif parsed.path == "/api/patch":
-                from .storage_tools import run_artifact_path
+                from .storage_tools import read_patch_preview, run_artifact_path
                 run = store.one("SELECT id,path FROM runs WHERE id=?", (params.get("id", [""])[0],))
                 if not run:
                     raise RequestError("Run has no artifacts")
@@ -1325,7 +1319,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise RequestError(PATCH_PREVIEW_TOO_LARGE, code="patch_too_large")
                 self.respond(payload, content_type="text/plain; charset=utf-8")
             elif parsed.path == "/api/diff-files":
-                from .storage_tools import run_artifact_path
+                from .storage_tools import read_patch_preview, run_artifact_path
                 run = store.one("SELECT id,path FROM runs WHERE id=?", (params.get("id", [""])[0],))
                 if not run:
                     raise RequestError("Run not found")
@@ -1414,9 +1408,11 @@ class Handler(BaseHTTPRequestHandler):
             response_code, response_headers, response_lock = 200, None, None
             if path == "/api/maintenance-review":
                 from .maintenance_evidence import confirm_retrospective
-                project = runtime.require_active_project(body.get("project", ""))
-                self.respond(confirm_retrospective(runtime.store, project, body.get("start"),
-                                                   body.get("token"), body.get("rules")))
+                with runtime.operations.guard("maintenance-review"):
+                    project = runtime.require_active_project(body.get("project", ""))
+                    result = confirm_retrospective(runtime.store, project, body.get("start"),
+                                                   body.get("token"), body.get("rules"))
+                self.respond(result)
                 return
             if path == "/api/operations":
                 options = {"reuse_active": True} if body.get("reuse_active") is True else {}
@@ -1661,8 +1657,8 @@ class Handler(BaseHTTPRequestHandler):
                     runtime.pause(body["project"], body["paused"])
                     result = {"saved": True}
                 elif path == "/api/retry":
-                    runtime.retry(body["task"], body.get("reason"), force=body.get("force", False),
-                                  candidate_review=body.get("candidate_review"))
+                    review = {"candidate_review": body["candidate_review"]} if "candidate_review" in body else {}
+                    runtime.retry(body["task"], body.get("reason"), force=body.get("force", False), **review)
                     result = {"saved": True}
                 elif path == "/api/cancel":
                     result = runtime.cancel_task(body["task"], body.get("cascade", False), body.get("revision"), body.get("reason"))

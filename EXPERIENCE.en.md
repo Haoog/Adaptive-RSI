@@ -64,6 +64,16 @@ Usage list searches update after typing stops. Earlier responses cannot cancel n
 
 Metrics also report average time to PR and merge with sample counts, repeated failure signatures, user interventions, tokens per accepted/delivered task, invalidation reasons and recorded CI/review waits. Missing historical wait durations are not fabricated. Preparation, model calls, checks and review are recorded separately.
 
+### Main retrospective and candidate review
+
+Open **Records and usage → Main retrospective and confirmed rules** to see main history and fixed check evidence. The retrospective reads the project's locally visible `origin/main`, falling back to `main`. Enter an exclusive full starting SHA on the first review. Each batch contains up to 20 first-parent commits, including ordinary commits and squash merges. Preview reads only. Confirmation checks the preview again and requires a new preview if main, the cursor, or its evidence changed. A failed save leaves the cursor in place.
+
+Confirm a rule by recording the practice, reason, actual changed paths, and test evidence or an acceptance gap. Each review records the commit and any PR and validation summary available from the existing merge record. Planning and review each receive up to three confirmed rules whose paths match exactly and whose evidence commits belong to the active baseline history. The read-only pilot uses existing Issue sync to read GitHub Actions results, matching completed `push` runs on `main` with the same full SHA. A missing match stays under investigation without creating a repair task.
+
+**Inspection observations** in task details shows the latest 50 observations, including the run, time, revision, path, source quote, and waiting or reopening reason. Matching uses the title, problem description, acceptance criteria, and code anchor. Distinct descriptions keep separate tasks.
+
+A candidate touching a sensitive path is blocked before host-run candidate checks. Open the latest blocked run, read the diff, enter a review reason, and select **Confirm review and verify again**. An ordinary retry faces the same gate. Approval is tied to the current state directory, exact patch, baseline, and task inputs. Existing validation and delivery gates still apply. Patches over 2 MiB and sensitive experiment candidates remain blocked.
+
 ## Backups and retention
 
 **Data and diagnostics** provides storage totals, consistent online SQLite backups, downloads and diagnostic previews. Backups contain private task content and configuration; keep them private. Diagnostic summaries contain only the version, row counts, invalid evidence count and SQLite version. After consent, the download contains the exact preview shown. If the preview expires, generate and confirm it again.

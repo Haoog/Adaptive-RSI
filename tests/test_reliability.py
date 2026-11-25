@@ -681,7 +681,14 @@ class ReliabilityTest(unittest.TestCase):
                         result["assessments"][1]["decision"] = "insufficient_evidence"
                 return result
         self.runtime.agent = HighRisk()
-        task, run = self.claim()
+        task, blocked_run = self.claim()
+        self.runtime.process(blocked_run)
+        blocked = self.store.one("SELECT state,result FROM runs WHERE id=?", (blocked_run["id"],))
+        self.assertEqual(blocked["state"], "blocked")
+        self.assertEqual(json.loads(blocked["result"])["candidate_static_review"]["paths"], ["auth.py"])
+        self.assertEqual(self.runtime.agent.reviews, 0)
+        self.runtime.retry(task, "Reviewed the fixture patch", candidate_review=blocked_run["id"])
+        run = self.store.claim(self.project, self.runtime.config(self.project))
         self.runtime.process(run)
         self.assertEqual(self.runtime.agent.reviews, 2)
         result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
@@ -1554,15 +1561,15 @@ class ReliabilityTest(unittest.TestCase):
         self.assertFalse((directory / "candidate.patch").exists())
 
     def high_risk_agent(self):
-        """高风险计划且补丁触及敏感路径：未修复时 review 与 risk_review 都会被付费调用。"""
+        """Use a patch that reaches evaluation and would otherwise require additional review."""
         class HighRisk(FakeAgent):
             def invoke(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):
                 result = super().invoke(role, prompt, workspace, project, run, config, cancel, protected)
                 if role == "planning":
                     result["risk"] = "high"
-                    result["scope"] = ["calculator.py", "auth.py", "tests"]
                 if role == "implementation":
-                    (workspace / "auth.py").write_text("PERMISSION_BOUNDARY = 'owner'\n")
+                    calculator = workspace / "calculator.py"
+                    calculator.write_text(calculator.read_text() + "# Preserve permissions for callers\n")
                 return result
         return HighRisk()
 
@@ -1587,7 +1594,7 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(outcome["review"]["reason"], "Candidate regressed on protected checks")
         self.assertEqual(outcome["review"]["evaluation"]["decision"], "fail")
         self.assertIsNone(outcome["risk_review"])
-        # 高风险计划 + 敏感文件本来会追加 risk_review；两个付费调用都必须未发生。
+        # The high-risk plan and permissions change would otherwise require another review.
         self.assertNotIn("review", [role for role, _ in self.runtime.agent.roles])
         self.assertEqual(self.store.query("SELECT * FROM calls WHERE role='review'"), [])
 

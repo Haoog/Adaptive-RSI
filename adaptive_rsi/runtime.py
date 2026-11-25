@@ -788,20 +788,27 @@ class Runtime(Maintenance):
                 raise ValueError("Wait for the active run to finish stopping before retrying or supplementing this task")
             if candidate_review is not None:
                 from .maintenance_evidence import full_sha
-                from .storage_tools import run_artifact_path
+                from .storage_tools import read_patch_preview, run_artifact_path
                 latest = db.execute("SELECT id,path,state,result FROM runs WHERE task=? "
                                     "ORDER BY started DESC,rowid DESC LIMIT 1", (task,)).fetchone()
                 outcome = decode_object(latest["result"]) if latest else {}
                 risk = outcome.get("candidate_static_review") or {}
                 if (not latest or latest["id"] != candidate_review or latest["state"] != "blocked" or
                         row["state"] != "blocked" or not reason or not reason.strip() or
-                        not full_sha(risk.get("approval"))):
+                        not isinstance(risk, dict) or not full_sha(risk.get("approval"))):
                     raise ValueError("Review the latest blocked candidate and enter a review reason")
-                patch = run_artifact_path(self.store, latest, "candidate.patch").read_text(encoding="utf-8")
-                if fingerprint(patch.removesuffix("\n")) != risk.get("patch_hash"):
-                    raise ValueError("The reviewed patch changed; approval was withheld")
+                try:
+                    path = run_artifact_path(self.store, latest, "candidate.patch")
+                    if path != self.store.root / "runs" / latest["id"] / "candidate.patch":
+                        raise ValueError("Unexpected candidate path")
+                    payload = read_patch_preview(path)
+                    patch = payload.decode("utf-8").removesuffix("\n") if payload is not None else None
+                except (ValueError, OSError, RuntimeError):
+                    raise ValueError("The candidate patch is unavailable") from None
+                if patch is None or fingerprint(patch) != risk.get("patch_hash"):
+                    raise ValueError("The reviewed patch changed or exceeds the preview limit")
                 db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
-                           ("candidate-risk-approved:" + task, encode(risk["approval"])))
+                           ("candidate-risk-approved:" + task, encode({"token": risk["approval"], "state": str(self.store.root)})))
             if force and row["source"] != "system_evolve":
                 raise ValueError("A forced retry is only available for evolution tasks")
             # 排队中的任务无论处于正常队列还是失败/额度退避期，都允许手动提前。
@@ -2929,11 +2936,10 @@ class Runtime(Maintenance):
 
     def inspect(self, project, workspace, kind, run, strategies):
         from .discovery import evidence_anchors, evidence_paths, finding_identity, related_task
-        from .maintenance_evidence import record_observation
+        from .maintenance_evidence import fixed_check_signal, record_observation
 
         head = git(workspace, "rev-parse", "HEAD")
         key = "inspection-head:" + project["id"] + ":" + kind
-        ci = self.store.setting("ci:" + project["id"], [])
         modules = detect(workspace)
         rotation = self.store.setting("rotation:" + project["id"], 0)
         if not isinstance(rotation, int) or isinstance(rotation, bool) or rotation < 0:
@@ -2943,6 +2949,8 @@ class Runtime(Maintenance):
             rotation = 0
         selected = modules["modules"][rotation % len(modules["modules"])] if modules["modules"] else None
         config = json.loads(run["config"] or "{}")
+        signal = fixed_check_signal(self.store, project["id"], config.get("github", {}).get("repository"), head)
+        ci = signal.get("checks", [])
         declared = {row["cwd"]: row["paths"] for row in config.get("inspection", {}).get("module_paths", [])}
         module_scope = (selected or {}).get("cwd", ".")
         if module_scope in declared:
@@ -3017,7 +3025,8 @@ class Runtime(Maintenance):
                                "or evidenced performance/maintenance problems. Do not turn every TODO/style preference into a task. "
                                "Use changed_paths as entry points and inspect immediate callers within the selected module or its declared dependency_paths. "
                                "On the initial scan, use that same scope. Treat related tasks and open PRs as hints and verify whether they cover the same defect and quote. "
-                               "Return every evidenced finding in scope. Each needs a literal existing-code quote and path, meaningful acceptance, priority 1..100.\n" +
+                               "Fixed check metadata is a clue for investigation; do not report a repair solely from a workflow result. "
+                               "Return each evidenced finding in scope with the specific cause in body, a literal existing-code quote and path, meaningful acceptance, and priority 1..100.\n" +
                                encode({"kind": kind, "selected_module": selected_context, "changed_paths": module_changes,
                                        "tasks": [{key: item[key] for key in ["id", "title", "state", "paths"]}
                                                  for item in backlog[:20]],
@@ -3093,7 +3102,7 @@ class Runtime(Maintenance):
                                 reason = "manual_review_wait"
                             else:
                                 reason = "environment_wait" if last and _environment_failure(last["result"]) else "rediscovered"
-                        if (record_observation(db, prior["id"], observation, reason) and
+                        if (record_observation(db, prior["id"], observation, reason, state=prior["state"]) and
                                 reason in ("reported_recurrence", "rediscovered")):
                             now = time.time()
                             db.execute("UPDATE tasks SET state='queued',available=0,attempts=0,infra_retries=0,"
@@ -3243,7 +3252,6 @@ class Runtime(Maintenance):
         try:
             ci = json.loads(checked(["gh", "run", "list", "--repo", repo, "--limit", "10",
                                      "--json", "databaseId,name,status,conclusion,headSha,headBranch,event,url"], timeout=60))
-            self.store.put_setting("ci:" + project["id"], ci)
             self.store.put_setting("maintenance-ci:" + project["id"],
                                    {"repository": repo, "observed": time.time(), "checks": ci})
         except RuntimeError as exc:

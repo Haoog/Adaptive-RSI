@@ -110,6 +110,51 @@ class RuntimeTest(unittest.TestCase):
         self.runtime.pause(self.project, False)
         return task, self.store.claim(self.project, self.runtime.config(self.project))
 
+    def test_sensitive_patch_is_held_before_evaluation_and_approval_binds_exact_patch(self):
+        class ManifestEdit(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                if role == "implementation":
+                    self.roles.append((role, {}))
+                    manifest = workspace / "pyproject.toml"
+                    manifest.write_text(manifest.read_text() + "# revised metadata\n")
+                    (workspace / "tests/test_metadata.py").write_text("# Regression fixture\n")
+                    return {"summary": "Update project metadata"}
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == "planning":
+                    result.update(scope=["pyproject.toml"], change_kind="configuration")
+                return result
+
+        self.runtime.agent = ManifestEdit()
+        task, run = self.claim("Update pyproject.toml metadata")
+        with patch.object(self.runtime.evaluator, "evaluate", side_effect=AssertionError("candidate executed")) as evaluate:
+            self.runtime.process(run)
+            self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "blocked")
+            self.runtime.retry(task, "Retry without approving the patch")
+            self.assertIsNone(self.store.setting("candidate-risk-approved:" + task))
+            run = self.store.claim(self.project, self.runtime.config(self.project))
+            self.runtime.process(run)
+        evaluate.assert_not_called()
+        blocked = self.store.one("SELECT state,result,path FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(blocked["state"], "blocked")
+        outcome = json.loads(blocked["result"])
+        self.assertIn("candidate_static_review", outcome, outcome)
+        risk = outcome["candidate_static_review"]
+        self.assertEqual(risk["paths"], ["pyproject.toml"])
+        artifact = Path(blocked["path"]) / "candidate.patch"
+        original = artifact.read_text()
+        artifact.write_text(original + "unexpected edit\n")
+        with self.assertRaisesRegex(ValueError, "patch changed"):
+            self.runtime.retry(task, "Reviewed metadata", candidate_review=run["id"])
+        self.assertIsNone(self.store.setting("candidate-risk-approved:" + task))
+        artifact.write_text(original)
+        self.runtime.retry(task, "Reviewed metadata", candidate_review=run["id"])
+        self.assertEqual(self.store.setting("candidate-risk-approved:" + task)["token"], risk["approval"])
+        next_run = self.store.claim(self.project, self.runtime.config(self.project))
+        with patch.object(self.runtime.evaluator, "evaluate", side_effect=RuntimeError("stop at evaluation")) as evaluate:
+            self.runtime.process(next_run)
+        evaluate.assert_called_once()
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("implementation"), 1)
+
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_green_tests_cannot_bypass_blocking_maintainability_review(self):
         class ContradictoryReviewer(FakeAgent):

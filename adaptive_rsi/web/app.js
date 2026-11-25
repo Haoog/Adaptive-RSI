@@ -61,6 +61,17 @@ const configReasonLabels={
  "config_invalid": "设置格式或字段无效，请检查配置后重试。"
 };
 const apiErrors={
+ "No local main or origin/main ref; refresh the repository first":"找不到本地 main 或 origin/main 引用，请先刷新仓库。",
+ "Provide an initial full main SHA, or use the saved review cursor":"请填写初始主线完整 SHA，已有进度时可直接使用复盘游标。",
+ "The review base is no longer on the first-parent history of main":"复盘起点已不在主线第一父提交历史中。",
+ "A confirmed rule must reference a commit in this review batch":"已确认规则必须引用本批复盘中的提交。",
+ "Choose 1..8 changed paths from the cited main commit":"请从引用的主线提交中选择 1 至 8 条实际改动路径。",
+ "Rule, reason and a test or acceptance gap are required (1..800 characters each)":"请填写规则、原因和测试证据或验收缺口，每项 1 至 800 字符。",
+ "The review preview changed; preview the range again":"复盘范围或证据已变化，请重新预览。",
+ "Main or the review cursor changed; preview the range again":"主线或复盘进度已变化，请重新预览。",
+ "Review the latest blocked candidate and enter a review reason":"请复核最新被阻塞的候选并填写原因。",
+ "The candidate patch is unavailable":"候选补丁不可用。",
+ "The reviewed patch changed or exceeds the preview limit":"候选补丁已变化或超出预览上限。",
  "session_required_rate_limited":"尝试过于频繁，请稍候再试。",
  "patch_too_large":"补丁超过 2 MiB 的界面预览上限，请到该运行的目录下载完整补丁。",
  "Grouped requirements changed; reconcile revisions before splitting":"任务组的需求已修订，请先核对新增要求的归属，暂不自动拆分。",
@@ -991,7 +1002,7 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
  const observations=lazyEvidence('巡检观测（最近 50 条）',()=>task.inspection_observations.map(row=>{
   const reasons={discovered:'首次发现',retained:'保留当前状态',environment_wait:'等待修复运行环境',manual_review_wait:'等待候选补丁人工复核',reported_recurrence:'疑似复发，重新验证',rediscovered:'上次未修复，重新验证'};
   return [new Date(row.observed*1000).toLocaleString(),row.source+' / '+row.kind+' / '+row.run,
-   t(reasons[row.reason]||row.reason),row.base,row.path,row.quote].join('\n');
+   t(reasons[row.reason]||row.reason)+(row.task_state?" · "+t(statusNames[row.task_state]||row.task_state):""),row.base,row.path,row.quote].join('\n');
  }).join('\n\n'));observations.className='detail-section';observations.hidden=!task.inspection_observations?.length;body.append(observations);
  if(partial)safe(async()=>{
   let detail;

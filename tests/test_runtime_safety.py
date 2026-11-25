@@ -758,6 +758,13 @@ class RuntimeSafetyTest(unittest.TestCase):
                 patch.object(self.runtime.evaluator, "evaluate", return_value={"decision": "pass", "checks": {}}), \
                 patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline", return_value={"decision": "fail"}):
             self.runtime.process(run)
+            blocked = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+            self.assertEqual(blocked["state"], "blocked")
+            self.assertEqual(json.loads(blocked["result"])["candidate_static_review"]["paths"], ["auth.py"])
+            self.assertNotIn("review", calls)
+            self.runtime.retry(task, "Reviewed the fixture patch", candidate_review=run["id"])
+            run = self.store.claim(self.project, self.runtime.config(self.project))
+            self.runtime.process(run)
         result = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
         self.assertEqual(calls.count("review"), 1, (calls, result))
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],)), {"state": "superseded"})

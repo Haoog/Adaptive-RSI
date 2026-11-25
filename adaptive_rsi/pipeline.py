@@ -1043,7 +1043,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             patch_hash = fingerprint(patch)
             approval = fingerprint({"version": 1, "candidate": candidate_key, "patch": patch_hash,
                                     "paths": sensitive_paths})
-            accepted = not experiment and runtime.store.setting("candidate-risk-approved:" + task["id"]) == approval
+            accepted = not experiment and runtime.store.setting("candidate-risk-approved:" + task["id"]) == {
+                "token": approval, "state": str(runtime.store.root)}
             if not accepted:
                 # Stop the unchanged acceptance baseline before returning. The
                 # candidate has not been prepared or executed by the evaluator.

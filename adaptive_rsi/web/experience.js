@@ -1027,7 +1027,7 @@ window.RSIExperience = (() => {
         backoffRetry.remove();
         backoffRetry = null;
       }
-      const snapshot = task => JSON.stringify([task.state, task.title, task.body, task.evidence, task.updated, task.available]);
+      const snapshot = task => JSON.stringify([task.state, task.title, task.body, task.evidence, task.updated, task.available, task.inspection_observations?.[0]?.observed]);
       if (snapshot(metadata) !== snapshot(task)) {
         const scroll = $("detail-dialog").scrollTop, restore = detailsSnapshot($("detail-body"));
         const queueDraft = readQueueDraft();
@@ -1701,12 +1701,20 @@ window.RSIExperience = (() => {
         raw("固定检查证据", data.signal), raw("已确认规则", data.rules), raw("近期复盘记录", data.reviews));
       const start = data.cursor ? null : field(content, "起始主线完整 SHA（不含该提交）");
       const previewPanel = el("section");
-      content.append(action(t("预览下一批主线提交"), async () => {
+      const previewButton = action(t("预览下一批主线提交"), async () => {
         previewPanel.replaceChildren();
         error.textContent = "";
         const startSha = start?.value.trim();
-        const preview = await api(endpoint + "&preview=1" + (startSha ? "&start=" + encodeURIComponent(startSha) : ""));
-        if (!current()) return;
+        previewButton.disabled = true;
+        let preview;
+        try {
+          preview = await api(endpoint + "&preview=1" + (startSha ? "&start=" + encodeURIComponent(startSha) : ""),
+            undefined, {current});
+        } catch (failure) {
+          if (current()) error.textContent = failure.message;
+          return;
+        } finally { previewButton.disabled = false; }
+        if (!current() || start?.value.trim() !== startSha) return;
         const {commits} = preview;
         if (!commits.length) {
           previewPanel.append(el("p", t("这批没有新增主线提交。")));
@@ -1728,14 +1736,16 @@ window.RSIExperience = (() => {
             const entered = [sha, paths, rule, reason, validation].some(input => input.value.trim());
             const rules = entered ? [{sha: sha.value.trim(), paths: paths.value.split(/\r?\n/).map(path => path.trim()).filter(Boolean),
               rule: rule.value, reason: reason.value, validation: validation.value}] : [];
-            await api("maintenance-review", {project, start: startSha || null, token: preview.token, rules});
+            await api("maintenance-review", {project, start: startSha || null, token: preview.token, rules}, {current});
             await load();
           } catch (failure) {
             if (current()) error.textContent = failure.message;
           } finally { confirm.disabled = false; }
         });
         previewPanel.append(fields, confirm);
-      }, "text-button"), previewPanel);
+      }, "text-button");
+      start?.addEventListener("input", () => previewPanel.replaceChildren());
+      content.append(previewButton, previewPanel);
     }
     try { await load(); }
     catch (failure) { if (current()) error.textContent = failure.message; }

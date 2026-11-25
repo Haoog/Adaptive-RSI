@@ -25,6 +25,17 @@ authorization_failed device_auth_unavailable auth_container_unavailable auth_wor
 
 # 精确匹配固定业务校验文案；不使用前缀匹配，也不携带用户提交的字段或值。
 SAFE_VALIDATION_MESSAGES = frozenset("""
+No local main or origin/main ref; refresh the repository first
+Provide an initial full main SHA, or use the saved review cursor
+The review base is no longer on the first-parent history of main
+A confirmed rule must reference a commit in this review batch
+Choose 1..8 changed paths from the cited main commit
+Rule, reason and a test or acceptance gap are required (1..800 characters each)
+The review preview changed; preview the range again
+Main or the review cursor changed; preview the range again
+Review the latest blocked candidate and enter a review reason
+The candidate patch is unavailable
+The reviewed patch changed or exceeds the preview limit
 Dependencies require up to 100 unique task IDs
 Dependency graph exceeds 1000 ancestors
 Cancellation impact exceeds 1000 tasks; split the operation
