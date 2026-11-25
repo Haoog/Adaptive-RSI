@@ -493,9 +493,13 @@ fn only_feed_transport_failures_unlock_the_offline_install_fallback() {
 }
 #[test]
 fn update_redirects_require_https_non_loopback_destination_and_bounded_hops() {
-    let approved = reqwest::Url::parse("https://release-assets.githubusercontent.com/package").unwrap();
-    assert!(update_redirect_allowed(&approved, 5));
-    assert!(!update_redirect_allowed(&approved, 6));
+    for location in ["https://github.com/Haoog/Adaptive-RSI/releases/latest",
+                     "https://release-assets.githubusercontent.com/package"] {
+        let destination = reqwest::Url::parse(location).unwrap();
+        assert!(update_redirect_allowed(&destination, 1));
+        assert!(update_redirect_allowed(&destination, 5));
+        assert!(!update_redirect_allowed(&destination, 6));
+    }
     for location in ["http://example.test/package", "https://127.0.0.1/package",
                      "https://[::1]/package", "https://localhost./package"] {
         assert!(!update_redirect_allowed(&reqwest::Url::parse(location).unwrap(), 1));
