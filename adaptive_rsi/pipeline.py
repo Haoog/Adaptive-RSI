@@ -669,6 +669,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     from .experience import protected_feedback_values, retry_feedback
     protected_feedback = protected_feedback_values(runtime.store, task["id"])
     context["previous_attempts"] = [retry_feedback(r, protected_feedback) for r in context["previous_attempts"]]
+    saved_plan = None
     if task["source"] == "rollback":
         try:
             task_evidence = json.loads(task["evidence"] or "[]")
