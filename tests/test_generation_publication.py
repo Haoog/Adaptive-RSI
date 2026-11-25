@@ -104,12 +104,34 @@ class PublicationFixture(GenerationFixture):
         self.remote.api.write_text(json.dumps({'pr': None, 'creates': 0}))
 
     def process_approval(self):
+        job = self.run_publication_job()
+        if 'Replay prepared on a new baseline' in job['result']:
+            self.assert_needs_reapproval(job)
+            self.runtime.deliver(self.run['id'], automatic=False)
+            job = self.run_publication_job()
+        return job
+
+    def run_publication_job(self):
         self.store.execute("UPDATE tasks SET state='queued',available=0 WHERE id=?", (self.approval,))
         job = self.store.claim(self.project_id, self.config)
         self.assertEqual(job['task'], self.approval)
         with self.remote.install():
             self.runtime.process(job)
         return self.store.one('SELECT * FROM runs WHERE id=?', (job['id'],))
+
+    def assert_needs_reapproval(self, job):
+        self.assertEqual(job['state'], 'blocked', job['result'])
+        self.assertIn('approve the new candidate before publishing', job['result'])
+        self.assertEqual(self.original(), self.before)
+        self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (self.task['id'],))['state'],
+                         'awaiting_approval')
+        record = self.record()
+        self.assertEqual(record['evaluation']['decision'], 'pass')
+        receipt = self.store.setting('delivery-approval:' + self.run['id'])
+        self.assertNotEqual(receipt['version']['candidate']['generation'], record['generation'])
+        self.assertIsNone(self.store.setting('delivery-push:' + self.run['id']))
+        self.assertEqual(self.remote.pushes, 0)
+        self.assertEqual(json.loads(self.remote.api.read_text())['creates'], 0)
 
     def original(self):
         return self.store.one('SELECT * FROM runs WHERE id=?', (self.run['id'],))
@@ -137,7 +159,9 @@ class PublicationFixture(GenerationFixture):
 
 class RuntimePublicationTest(PublicationFixture):
     def test_first_advance_real_runtime_pushes_replayed_commit_and_keeps_original(self):
-        job = self.process_approval()
+        self.assert_needs_reapproval(self.run_publication_job())
+        self.runtime.deliver(self.run['id'], automatic=False)
+        job = self.run_publication_job()
         self.assertEqual(job['state'], 'completed', job['result'])
         record = self.record()
         push = self.store.setting('delivery-push:' + self.run['id'])
@@ -339,9 +363,7 @@ class PublicationRefusalTest(PublicationFixture):
 
 class PublicationReapprovalTest(PublicationFixture):
     def test_explicit_reapproval_rebuilds_unpublished_stale_generation(self):
-        # Interrupt after registration but before a push intent can exist.
-        with patch.object(generations, 'publish_generation', side_effect=RuntimeError('stopped before intent')):
-            self.assertEqual(self.process_approval()['state'], 'blocked')
+        self.assert_needs_reapproval(self.run_publication_job())
         first = self.record()
         self.assertIsNotNone(first)
         self.assertIsNone(self.store.setting('delivery-push:' + self.run['id']))
@@ -352,9 +374,11 @@ class PublicationReapprovalTest(PublicationFixture):
         current = git(self.repo, 'rev-parse', 'HEAD')
         git(self.remote.bare, 'fetch', '--quiet', str(self.repo), 'HEAD:refs/heads/main')
         self.runtime.deliver(self.run['id'], automatic=False)
-        self.assertIsNone(self.record())
+        self.assertEqual(self.record(), first)
+        self.assert_needs_reapproval(self.run_publication_job())
         self.assertTrue(Path(first['directory']).is_dir())
-        self.assertEqual(self.process_approval()['state'], 'completed')
+        self.runtime.deliver(self.run['id'], automatic=False)
+        self.assertEqual(self.run_publication_job()['state'], 'completed')
         second = self.record()
         self.assertNotEqual(first['generation'], second['generation'])
         self.assertEqual(second['parent'], current)
@@ -389,6 +413,7 @@ class AcceptancePublicationTest(PublicationFixture):
         self.store.execute('UPDATE runs SET result=? WHERE id=?', (encode(outcome), self.run['id']))
         self.run = self.original()
         self.before = self.run
+        self.reapprove()
         self.acceptance = acceptance
 
     def test_runtime_replays_sealed_acceptance_and_test_first(self):
@@ -407,12 +432,30 @@ class AcceptancePublicationTest(PublicationFixture):
         self.assertEqual(job['state'], 'blocked', job['result'])
         self.assertEqual(self.remote.pushes, 0)
         self.assertIsNone(self.record())
-        self.assertEqual(self.original(), self.before)
+        original = self.original()
+        self.assertEqual(original['state'], 'superseded')
+        outcome = json.loads(original['result'])
+        self.assertIn('sealed acceptance evidence', outcome.pop('reason'))
+        self.assertEqual(outcome, json.loads(self.before['result']))
+        self.assertEqual({**original, 'state': self.before['state'], 'result': self.before['result']}, self.before)
 
 
 class PolicyPublicationTest(RuntimePublicationTest):
     initial_automatic = True
     base_branch = ''
+
+    def test_policy_cannot_approve_a_prepared_generation(self):
+        self.assert_needs_reapproval(self.run_publication_job())
+        record = self.record()
+        self.assertEqual(self.runtime.deliver(self.run['id'], automatic=True), self.approval)
+        pending = self.store.one('SELECT state FROM tasks WHERE id=?', (self.approval,))
+        self.assertEqual(pending['state'], 'blocked')
+        unapproved = self.run_publication_job()
+        self.assertEqual(unapproved['state'], 'blocked', unapproved['result'])
+        self.assertEqual(self.record(), record)
+        self.assertIsNone(self.store.setting('delivery-push:' + self.run['id']))
+        self.assertEqual(self.remote.pushes, 0)
+        self.assertEqual(json.loads(self.remote.api.read_text())['creates'], 0)
 
 
 class ReapprovedModePublicationTest(RuntimePublicationTest):

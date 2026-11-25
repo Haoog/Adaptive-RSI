@@ -2686,17 +2686,17 @@ class Runtime(Maintenance):
                 try:
                     url = self.publish(project, source_task, original, candidate, config)
                 except StaleCandidate as exc:
-                    # An uncertain remote write must retain the original evidence
-                    # and journal for reconciliation, never silently replan it.
-                    if self.store.one("SELECT 1 FROM settings WHERE key IN (?,?)",
-                                      ('delivery-push:' + original['id'], 'delivery-generation:' + original['id'])):
-                        raise RuntimeError('Publication retained for reconciliation: ' + str(exc)) from exc
                     outcome["reason"] = str(exc)
                     # Issue work must wait for synchronization to replace stale evidence.
                     state = "blocked" if source_task["source"] == "issue" else (
                         "queued" if (source_task["attempts"] or 0) <= config["limits"]["retries"] else "blocked")
                     with self.store.connect() as db:
                         db.execute("BEGIN IMMEDIATE")
+                        # Preserve a registered replay or uncertain remote write under the same lock as invalidation.
+                        keys = tuple(prefix + original['id'] for prefix in
+                                     ('delivery-push:', 'delivery-generation:', 'delivery-generation-pr:'))
+                        if db.execute("SELECT 1 FROM settings WHERE key IN (?,?,?)", keys).fetchone():
+                            raise RuntimeError('Publication retained for reconciliation: ' + str(exc)) from exc
                         changed = db.execute("UPDATE runs SET state='superseded',result=? WHERE id=? "
                                              "AND state='awaiting_approval'", (encode(outcome), original["id"])).rowcount
                         if changed:

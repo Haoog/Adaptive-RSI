@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .config import fingerprint
 from .delivery_approval import authority
-from .delivery_replay_checks import (_acceptance, replay_on_advanced_baseline,
+from .delivery_replay_checks import (ReplayRefused, _acceptance, replay_on_advanced_baseline,
                                      sealed_dependency_digest)
 from .gitops import git as _git
 from .store import encode
@@ -412,7 +412,7 @@ def retire_unpublished_generation(store, run_id, record):
         db.execute('DELETE FROM settings WHERE key=?', (key,))
 
 
-def publish_generation(runtime, project, task, run, config, approval_id, authorize_write, *, version_bound=False):
+def publish_generation(runtime, project, task, run, config, approval_id, authorize_write):
     """Publish a sealed replay through the existing runtime approval boundary.
 
     Version-2 intents are immutable. Every write verifies live authority, both
@@ -499,7 +499,7 @@ def publish_generation(runtime, project, task, run, config, approval_id, authori
                 raise GenerationError('Generation PR has no local push intent')
             _check_push(db, record, snap)
     else:
-        if version_bound and push is None:
+        if push is None:
             authorize_write()
             source, current, resolved = delivery.baseline(runtime, project, config)
             if resolved != target:
@@ -508,8 +508,11 @@ def publish_generation(runtime, project, task, run, config, approval_id, authori
                 if git(source, 'merge-base', record['parent'], current) != record['parent']:
                     raise GenerationError('Generation target or baseline changed; reapproval and new replay required')
                 retire_unpublished_generation(store, run['id'], record)
-                prepare_publication(runtime, project, run, approval_id,
-                                    Path(run['path']) / 'candidate', source, current, config)
+                try:
+                    prepare_publication(runtime, project, run, approval_id,
+                                        Path(run['path']) / 'candidate', source, current, config)
+                except (GenerationError, ReplayRefused) as exc:
+                    raise delivery.StaleCandidate('Remote baseline changed; replay refused: ' + str(exc)) from exc
                 raise GenerationError('Replay prepared on a new baseline; approve the new candidate before publishing')
         with runtime.dispatch_lock:
             verify()

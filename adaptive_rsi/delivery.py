@@ -940,15 +940,23 @@ def publish(runtime, project, task, run, workspace, config):
             if setting(db, APPROVAL_PREFIX + run["id"]) != grant_receipt:
                 raise RuntimeError("Candidate approval changed; approve again before publishing")
             if grant_receipt is not None:
-                current = approval_version(original, source, setting(db, "delivery-generation:" + run["id"]),
-                                           setting(db, "run-baseline:" + run["id"]), live)
-                if (current is None or current != grant_receipt.get("version") or
-                        grant_receipt.get("job") != pending["id"] or grant_receipt.get("action") != "publish_pr" or
+                approved = grant_receipt.get("version")
+                if (not isinstance(approved, dict) or grant_receipt.get("job") != pending["id"] or
+                        grant_receipt.get("action") != "publish_pr" or
                         grant_receipt.get("authorization") not in ("project_policy", "per_candidate")):
                     raise RuntimeError("Candidate version or verification changed; approve again before publishing")
-                if verification_contract(_json_object(original['config'])) != current['contract']:
+                if (approved.get("repository") != live["github"]["repository"] or
+                        approved.get("branch") != live["delivery"]["base_branch"]):
+                    raise StaleCandidate("Delivery target changed before publishing")
+                if verification_contract(_json_object(original['config'])) != verification_contract(live):
                     raise StaleCandidate('Verification settings changed; re-evaluate before approving')
+                generation = setting(db, "delivery-generation:" + run["id"])
+                current = approval_version(original, source, generation, setting(db, "run-baseline:" + run["id"]), live)
+                if current is None or current != approved:
+                    raise RuntimeError("Candidate version or verification changed; approve again before publishing")
                 authorized_by = grant_receipt["authorization"]
+                if generation and authorized_by != "per_candidate":
+                    raise RuntimeError("Replay requires explicit approval of the new candidate before publishing")
         if authorized_by == "project_policy":
             try:
                 run_config = json.loads(run["config"] or "{}")
@@ -987,8 +995,9 @@ def publish(runtime, project, task, run, workspace, config):
     generation_row = store.one("SELECT value FROM settings WHERE key=?", ("delivery-generation:" + run["id"],))
     if generation_row:
         from .delivery_generation import publish_generation
-        return publish_generation(runtime, project, task, run, config, approval['id'], authorize_write,
-                                  version_bound=grant_receipt is not None)
+        if grant_receipt is None:
+            raise RuntimeError('Replay requires explicit approval of the new candidate before publishing')
+        return publish_generation(runtime, project, task, run, config, approval['id'], authorize_write)
     source, current, base_branch = baseline(runtime, project, config)
     authorize_write()
     identity = store.setting("run-baseline:" + run["id"])
@@ -1123,12 +1132,14 @@ def publish(runtime, project, task, run, workspace, config):
             change = baseline_change(source, run["base"], current)
             store.event("baseline_changed", "Remote baseline evidence invalidated", project["id"], run["id"], change)
             if change['relation'] == 'advanced' and pushed_intent is None:
-                from .delivery_generation import prepare_publication, publish_generation
+                from .delivery_generation import GenerationError, prepare_publication
+                from .delivery_replay_checks import ReplayRefused
                 authorize_write()
-                prepare_publication(runtime, project, run, approval['id'], workspace, source, current, config)
-                if grant_receipt is not None:
-                    raise RuntimeError('Replay prepared on a new baseline; approve the new candidate before publishing')
-                return publish_generation(runtime, project, task, run, config, approval['id'], authorize_write)
+                try:
+                    prepare_publication(runtime, project, run, approval['id'], workspace, source, current, config)
+                except (GenerationError, ReplayRefused) as exc:
+                    raise StaleCandidate('Remote baseline changed; replay refused: ' + str(exc)) from exc
+                raise RuntimeError('Replay prepared on a new baseline; approve the new candidate before publishing')
             if pushed_intent is not None:
                 raise RuntimeError('Baseline changed with an unresolved push journal; reconcile before retrying')
             raise StaleCandidate("Remote baseline changed (" + change["relation"] + "); " + change["recovery"])
