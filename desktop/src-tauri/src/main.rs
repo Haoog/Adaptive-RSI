@@ -2902,7 +2902,7 @@ mod tests {
                 answer_request(stream, 200, "", &json!({"api_version":api,"version":version,"pid":pid}).to_string());
                 if owned && expected_error.is_none() {
                     let (stream, _) = receive_request(&listener, "/api/desktop-update");
-                    answer_request(stream, 200, "", "{}");
+                    answer_request(stream, 200, "", r#"{"barrier":null}"#);
                 }
             });
             let deadline = std::time::Instant::now() + Duration::from_secs(4);

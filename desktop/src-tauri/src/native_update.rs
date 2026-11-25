@@ -1405,15 +1405,17 @@ fn cancel_local_barrier(runtime: &RuntimeState, body: Value) -> bool {
 }
 
 pub(super) fn reconcile_startup_barrier(connection: &Connection, version: &Value, deadline: Instant) -> Result<(), String> {
+    let mut remaining = startup_budget(deadline)?;
     let status = loop {
-        let timeout = startup_budget(deadline)?.min(CANCEL_REQUEST_TIMEOUT);
-        match call_with_session(connection, "desktop-update", Some(json!({"action":"status"})), Some(timeout)) {
+        let timeout = remaining.min(CANCEL_REQUEST_TIMEOUT);
+        let error = match call_with_session(connection, "desktop-update", Some(json!({"action":"status"})), Some(timeout)) {
             Ok((reply, _)) if reply.status == 200 => break reply,
-            Ok((reply, _)) if !matches!(reply.status, 502 | 503 | 504) => {
-                return Err("Cannot inspect update admission".into());
-            }
-            _ => std::thread::sleep(CANCEL_RETRY_DELAY.min(deadline.saturating_duration_since(Instant::now()))),
-        }
+            Ok((reply, _)) if matches!(reply.status, 502 | 503 | 504) => "Cannot inspect update admission".into(),
+            Ok(_) => return Err("Cannot inspect update admission".into()),
+            Err(error) => error,
+        };
+        std::thread::sleep(CANCEL_RETRY_DELAY.min(deadline.saturating_duration_since(Instant::now())));
+        remaining = startup_budget(deadline).map_err(|_| error)?;
     };
     let status: Value = serde_json::from_str(&status.body).map_err(|_| "Invalid update admission")?;
     let barrier = status.get("barrier").ok_or("Invalid update admission")?;
