@@ -79,11 +79,6 @@ SCHEDULER_JOIN_TIMEOUT = 30
 # 没有终点；超时记 workers_timed_out、写事件，未收尾的 run 由下次 store.recover() 恢复。
 WORKER_DRAIN_TIMEOUT = 30
 
-# 这些状态的任务仍代表一条「在办」的发现；巡检不会为同一问题重建任务。
-LIVE_FINDING_STATES = ("queued", "planning", "executing", "evaluating", "awaiting_approval",
-                       "pr_open", "merged", "deferred", "waiting_budget")
-# 用户明确做出的决定（不采纳、取消）同样压制重复发现，只有用户重新考虑才回池。
-SUPPRESSING_STATES = LIVE_FINDING_STATES + ("rejected", "cancelled")
 # 到达这些状态的发现可以被巡检重新入队：此前尝试已结束且没有产出修复。
 # obsolete 不在其中：规划明确判定「过时/不再适用」属于结论而非失败，
 # 重新入队会在每个扫描周期重复付费规划；用户可通过手动重试重新考虑。
@@ -777,7 +772,7 @@ class Runtime(Maintenance):
         self.wake.set()
         return task
 
-    def retry(self, task, reason=None, force=False):
+    def retry(self, task, reason=None, force=False, *, candidate_review=None):
         from .task_lifecycle import intervention_reason
         intervention_reason(reason)
         if type(force) is not bool:
@@ -791,6 +786,29 @@ class Runtime(Maintenance):
             self.require_active_project(row["project"])
             if db.execute("SELECT 1 FROM runs WHERE task=? AND ended IS NULL", (task,)).fetchone():
                 raise ValueError("Wait for the active run to finish stopping before retrying or supplementing this task")
+            if candidate_review is not None:
+                from .maintenance_evidence import full_sha
+                from .storage_tools import read_patch_preview, run_artifact_path
+                latest = db.execute("SELECT id,path,state,result FROM runs WHERE task=? "
+                                    "ORDER BY started DESC,rowid DESC LIMIT 1", (task,)).fetchone()
+                outcome = decode_object(latest["result"]) if latest else {}
+                risk = outcome.get("candidate_static_review") or {}
+                if (not latest or latest["id"] != candidate_review or latest["state"] != "blocked" or
+                        row["state"] != "blocked" or not reason or not reason.strip() or
+                        not isinstance(risk, dict) or not full_sha(risk.get("approval"))):
+                    raise ValueError("Review the latest blocked candidate and enter a review reason")
+                try:
+                    path = run_artifact_path(self.store, latest, "candidate.patch")
+                    if path != self.store.root / "runs" / latest["id"] / "candidate.patch":
+                        raise ValueError("Unexpected candidate path")
+                    payload = read_patch_preview(path)
+                    patch = payload.decode("utf-8").removesuffix("\n") if payload is not None else None
+                except (ValueError, OSError, RuntimeError):
+                    raise ValueError("The candidate patch is unavailable") from None
+                if patch is None or fingerprint(patch) != risk.get("patch_hash"):
+                    raise ValueError("The reviewed patch changed or exceeds the preview limit")
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                           ("candidate-risk-approved:" + task, encode({"token": risk["approval"], "state": str(self.store.root)})))
             if force and row["source"] != "system_evolve":
                 raise ValueError("A forced retry is only available for evolution tasks")
             # 排队中的任务无论处于正常队列还是失败/额度退避期，都允许手动提前。
@@ -814,7 +832,8 @@ class Runtime(Maintenance):
                        "VALUES (?,NULL,'manual_retry','User requested fresh verification',?,?)",
                        (row["project"], encode({"task": task, "reason": reason,
                         "before": {"state": row["state"], "attempts": row["attempts"], "available": row["available"]},
-                        "after": {"state": "queued", "attempts": 0, "available": 0}, "force": force}), now))
+                        "after": {"state": "queued", "attempts": 0, "available": 0}, "force": force,
+                        **({"candidate_review": candidate_review} if candidate_review else {})}), now))
         self.wake.set()
 
     def revise_task(self, task, supplement, reason=None, request_id=None):
@@ -970,10 +989,10 @@ class Runtime(Maintenance):
         from .task_lifecycle import cancel
         return cancel(self, task, cascade, expected, reason)
 
-    def deliver(self, run_id, automatic=False, reason=None):
+    def deliver(self, run_id, automatic=False, reason=None, revision=None, console=False):
         with self.dispatch_lock:
             try:
-                return self._deliver(run_id, automatic, reason)
+                return self._deliver(run_id, automatic, reason, revision, console)
             except IssueSyncCorruptPending as exc:
                 # _deliver 的拒绝随事务一起回滚；损坏进度事件必须在回滚之后用
                 # 独立连接补写，否则阻断没有持久诊断。阻断语义不变：原异常照抛，
@@ -985,7 +1004,8 @@ class Runtime(Maintenance):
                         "Failed to record corrupt issue sync progress for %s", exc.project)
                 raise
 
-    def _deliver(self, run_id, automatic=False, reason=None):
+    def _deliver(self, run_id, automatic=False, reason=None, revision=None, console=False):
+        from .delivery_approval import APPROVAL_PREFIX, approval_version, setting
         from .task_lifecycle import intervention_reason
         intervention_reason(reason)
         now = time.time()
@@ -996,7 +1016,7 @@ class Runtime(Maintenance):
                 raise ValueError("Only a verified candidate awaiting approval can be delivered")
             if db.execute("SELECT 1 FROM settings WHERE key=?", ("project-archived:" + original["project"],)).fetchone():
                 raise ValueError("Project is archived; restore it before starting work")
-            source = db.execute("SELECT state FROM tasks WHERE id=?", (original["task"],)).fetchone()
+            source = db.execute("SELECT * FROM tasks WHERE id=?", (original["task"],)).fetchone()
             if not source or source["state"] != "awaiting_approval":
                 # 历史数据或并发取消/重试后，候选的授权已失效；不得留下成功回执或发布任务。
                 raise ValueError("Source task is no longer awaiting approval; this candidate cannot be delivered")
@@ -1018,23 +1038,23 @@ class Runtime(Maintenance):
             evidence = [{"authorization": "project_policy" if automatic else "per_candidate"}]
             prior = db.execute("SELECT * FROM tasks WHERE project=? AND fingerprint=?",
                                (original["project"], "publish:" + run_id)).fetchone()
+            generation = setting(db, 'delivery-generation:' + run_id)
+            target = setting(db, 'run-baseline:' + run_id)
+            bound = approval_version(original, source, generation, target, self.config(original['project']))
+            if bound:
+                evidence[0]["version_bound"] = True
+            if revision is not None and (not bound or revision != fingerprint(bound)):
+                raise ValueError("Candidate version changed; reopen the task before approving")
+            if prior and (prior["state"] in ("planning", "executing", "evaluating") or
+                          (automatic and (prior["state"] == "queued" or generation))):
+                return prior["id"]
             if prior:
                 task = prior["id"]
-                if prior["state"] not in ["queued", "planning", "executing", "evaluating"]:
-                    if not automatic:
-                        # Explicit reapproval may rebuild an unpublished replay.
-                        # Keep its record/files; any uncertain push forbids retirement.
-                        generation_key = 'delivery-generation:' + run_id
-                        generation = db.execute('SELECT value FROM settings WHERE key=?', (generation_key,)).fetchone()
-                        if generation and not db.execute('SELECT 1 FROM settings WHERE key IN (?,?)',
-                                ('delivery-push:' + run_id, 'delivery-generation-pr:' + run_id)).fetchone():
-                            history_id = uid()
-                            db.execute('INSERT INTO settings(key,value) VALUES (?,?)',
-                                       ('delivery-generation-history:' + run_id + ':' + history_id, generation['value']))
-                            db.execute('INSERT INTO settings(key,value) VALUES (?,?)',
-                                       ('delivery-generation-history-proof:' + run_id + ':' + history_id,
-                                        encode({'unpublished': True, 'record': fingerprint(json.loads(generation['value']))})))
-                            db.execute('DELETE FROM settings WHERE key=?', (generation_key,))
+                if generation:
+                    # Recovery must still verify the original preparation snapshot.
+                    # The new receipt below authorizes the exact prepared generation.
+                    evidence = json.loads(prior["evidence"])
+                if prior["state"] != "queued":
                     db.execute("UPDATE tasks SET state='queued',available=0,evidence=?,updated=? WHERE id=?",
                                (encode(evidence), now, task))
                 elif not automatic and prior["state"] == "queued":
@@ -1045,10 +1065,21 @@ class Runtime(Maintenance):
                            "priority,overrides,created,updated) VALUES (?,?,?,?,?,?,?,'[]','queued',100,'{}',?,?)",
                            (task, original["project"], "system_publish", "publish:" + run_id,
                             "Publish approved candidate", run_id, encode(evidence), now, now))
+            receipt = None
+            if bound:
+                receipt = {"version": bound, "action": "publish_pr", "time": now, "job": task,
+                           "authorization": "project_policy" if automatic else "per_candidate",
+                           "role": "project_policy" if automatic else "console_operator" if console else None}
+                db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)",
+                           (APPROVAL_PREFIX + run_id, encode(receipt)))
+                if automatic:
+                    db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                               (original["project"], run_id, "delivery_policy_grant", "Project policy authorized candidate",
+                                encode(receipt), now))
             if not automatic:
                 publication = db.execute("SELECT state FROM tasks WHERE id=?", (task,)).fetchone()
                 data = {"task": original["task"], "candidate": run_id, "reason": reason,
-                        "before": {"candidate_state": original["state"]},
+                        "approval": receipt, "before": {"candidate_state": original["state"]},
                         "after": {"publication_task": task, "publication_state": publication["state"]}}
                 db.execute("INSERT INTO events(project,run,kind,message,data,created) "
                            "VALUES (?,?,'delivery_approved','Candidate approved by user',?,?)",
@@ -2655,17 +2686,17 @@ class Runtime(Maintenance):
                 try:
                     url = self.publish(project, source_task, original, candidate, config)
                 except StaleCandidate as exc:
-                    # An uncertain remote write must retain the original evidence
-                    # and journal for reconciliation, never silently replan it.
-                    if self.store.one("SELECT 1 FROM settings WHERE key IN (?,?)",
-                                      ('delivery-push:' + original['id'], 'delivery-generation:' + original['id'])):
-                        raise RuntimeError('Publication retained for reconciliation: ' + str(exc)) from exc
                     outcome["reason"] = str(exc)
                     # Issue work must wait for synchronization to replace stale evidence.
                     state = "blocked" if source_task["source"] == "issue" else (
                         "queued" if (source_task["attempts"] or 0) <= config["limits"]["retries"] else "blocked")
                     with self.store.connect() as db:
                         db.execute("BEGIN IMMEDIATE")
+                        # Preserve a registered replay or uncertain remote write under the same lock as invalidation.
+                        keys = tuple(prefix + original['id'] for prefix in
+                                     ('delivery-push:', 'delivery-generation:', 'delivery-generation-pr:'))
+                        if db.execute("SELECT 1 FROM settings WHERE key IN (?,?,?)", keys).fetchone():
+                            raise RuntimeError('Publication retained for reconciliation: ' + str(exc)) from exc
                         changed = db.execute("UPDATE runs SET state='superseded',result=? WHERE id=? "
                                              "AND state='awaiting_approval'", (encode(outcome), original["id"])).rowcount
                         if changed:
@@ -2916,11 +2947,11 @@ class Runtime(Maintenance):
                              run["project"], run["id"])
 
     def inspect(self, project, workspace, kind, run, strategies):
-        from .discovery import evidence_anchors, evidence_paths
+        from .discovery import evidence_anchors, evidence_paths, finding_identity, related_task
+        from .maintenance_evidence import fixed_check_signal, record_observation
 
         head = git(workspace, "rev-parse", "HEAD")
         key = "inspection-head:" + project["id"] + ":" + kind
-        ci = self.store.setting("ci:" + project["id"], [])
         modules = detect(workspace)
         rotation = self.store.setting("rotation:" + project["id"], 0)
         if not isinstance(rotation, int) or isinstance(rotation, bool) or rotation < 0:
@@ -2930,6 +2961,8 @@ class Runtime(Maintenance):
             rotation = 0
         selected = modules["modules"][rotation % len(modules["modules"])] if modules["modules"] else None
         config = json.loads(run["config"] or "{}")
+        signal = fixed_check_signal(self.store, project["id"], config.get("github", {}).get("repository"), head)
+        ci = signal.get("checks", [])
         declared = {row["cwd"]: row["paths"] for row in config.get("inspection", {}).get("module_paths", [])}
         module_scope = (selected or {}).get("cwd", ".")
         if module_scope in declared:
@@ -3004,7 +3037,8 @@ class Runtime(Maintenance):
                                "or evidenced performance/maintenance problems. Do not turn every TODO/style preference into a task. "
                                "Use changed_paths as entry points and inspect immediate callers within the selected module or its declared dependency_paths. "
                                "On the initial scan, use that same scope. Treat related tasks and open PRs as hints and verify whether they cover the same defect and quote. "
-                               "Return every evidenced finding in scope. Each needs a literal existing-code quote and path, meaningful acceptance, priority 1..100.\n" +
+                               "Fixed check metadata is a clue for investigation; do not report a repair solely from a workflow result. "
+                               "Return each evidenced finding in scope with the specific cause in body, a literal existing-code quote and path, meaningful acceptance, and priority 1..100.\n" +
                                encode({"kind": kind, "selected_module": selected_context, "changed_paths": module_changes,
                                        "tasks": [{key: item[key] for key in ["id", "title", "state", "paths"]}
                                                  for item in backlog[:20]],
@@ -3023,7 +3057,6 @@ class Runtime(Maintenance):
         recurrences = 0
         rediscoveries = 0
         contents = {}
-        historical = {}
         skipped = 0
         for item in items:
             # 单条 finding 同样来自模型：非 dict、缺字段或字段类型不符时跳过该条，
@@ -3048,54 +3081,56 @@ class Runtime(Maintenance):
                     contents[item["path"]] = path.read_text(errors="replace")
                 if item["quote"] not in contents[item["path"]] or not item["acceptance"]:
                     continue
-                from .discovery import finding_identity, related_task
                 finding_key = finding_identity(item)
-                prior = self.store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?", (project["id"], finding_key))
-                if not prior:
-                    legacy = self.store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?",
-                                            (project["id"], fingerprint({"path": item["path"], "quote": item["quote"]})))
-                    if legacy and related_task([legacy], item):
-                        prior = legacy
-                        finding_key = legacy["fingerprint"]
-                if prior and prior["state"] == "merged":
-                    self.store.execute("UPDATE tasks SET state='queued',available=0,attempts=0,infra_retries=0,cooldown_waits=0,budget_waits=0,evidence=?,updated=? WHERE id=?",
-                                       (encode([{"path": item["path"], "quote": item["quote"], "base": head,
-                                                 "source": "reported_recurrence"}]), time.time(), prior["id"]))
-                    self.store.event("recurrence_reported", "Inspection reported a possible recurrence; planning must reproduce it", project["id"], run["id"], {"task": prior["id"]})
-                    recurrences += 1
-                    continue
-                if prior and prior["state"] in REDISCOVERABLE_STATES:
-                    last = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC,rowid DESC LIMIT 1",
-                                          (prior["id"],))
-                    if last and _environment_failure(last["result"]):
-                        # 确定性环境故障需先由用户修复；自动重新入队只会重复付费。
-                        continue
-                    # 此前的尝试已结束且没有产出修复；同一条发现不应被指纹去重永久压制。
-                    self.store.execute("UPDATE tasks SET state='queued',available=0,attempts=0,infra_retries=0,cooldown_waits=0,budget_waits=0,evidence=?,updated=? WHERE id=?",
-                                       (encode([{"path": item["path"], "quote": item["quote"], "base": head,
-                                                 "source": "rediscovered"}]), time.time(), prior["id"]))
-                    self.store.event("finding_requeued", "Earlier attempt ended without a fix; rediscovered finding queued for fresh verification", project["id"], run["id"], {"task": prior["id"]})
-                    rediscoveries += 1
-                    continue
-                if prior and prior["state"] in SUPPRESSING_STATES:
-                    continue
-                # The prompt shows a recent sample. Deduplication must also find older exact anchors.
-                cited_path = item["path"]
-                if cited_path not in historical:
-                    historical[cited_path] = self.store.query(
-                        "SELECT t.id,t.title,t.evidence FROM tasks t WHERE t.project=? AND t.source NOT LIKE 'system_%' "
-                        "AND t.state IN (" + ",".join("?" for _ in SUPPRESSING_STATES) + ") AND EXISTS ("
-                        "SELECT 1 FROM json_each(CASE WHEN json_valid(t.evidence) THEN t.evidence ELSE '[]' END) e "
-                        "WHERE json_extract(CASE WHEN e.type='object' THEN e.value ELSE '{}' END,'$.path')=?)",
-                        (project["id"], *SUPPRESSING_STATES, cited_path))
-                if related_task(historical[cited_path], item):
-                    continue
                 if finding_key in seen_keys:
                     continue
                 seen_keys.add(finding_key)
                 evidence = {"path": item["path"], "quote": item["quote"], "base": head, "source": "inspection"}
+                observation = {**evidence, "run": run["id"], "kind": kind, "module": module_scope}
+                with self.store.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    prior = db.execute("SELECT * FROM tasks WHERE project=? AND fingerprint=?",
+                                       (project["id"], finding_key)).fetchone()
+                    if prior is None:
+                        legacy_keys = (finding_identity(item, legacy=True),
+                                       fingerprint({"path": item["path"], "quote": item["quote"]}))
+                        for legacy in db.execute("SELECT * FROM tasks WHERE project=? AND source='inspection' "
+                                                 "AND fingerprint IN (?,?) ORDER BY created,id",
+                                                 (project["id"], *legacy_keys)):
+                            if (legacy["body"] == item["body"][:30000] and
+                                    legacy["acceptance"] == encode(item["acceptance"]) and
+                                    related_task([legacy], item)):
+                                prior = legacy
+                                break
+                    if prior:
+                        reason = "retained"
+                        if prior["state"] == "merged":
+                            reason = "reported_recurrence"
+                        elif prior["state"] in REDISCOVERABLE_STATES:
+                            last = db.execute("SELECT result FROM runs WHERE task=? ORDER BY started DESC,rowid DESC LIMIT 1",
+                                              (prior["id"],)).fetchone()
+                            failure = decode_object(last["result"]).get("failure") if last else None
+                            if isinstance(failure, dict) and failure.get("code") == "candidate_static_review":
+                                reason = "manual_review_wait"
+                            else:
+                                reason = "environment_wait" if last and _environment_failure(last["result"]) else "rediscovered"
+                        if (record_observation(db, prior["id"], observation, reason, state=prior["state"]) and
+                                reason in ("reported_recurrence", "rediscovered")):
+                            now = time.time()
+                            db.execute("UPDATE tasks SET state='queued',available=0,attempts=0,infra_retries=0,"
+                                       "cooldown_waits=0,budget_waits=0,evidence=?,updated=? WHERE id=?",
+                                       (encode([{**evidence, "source": reason}]), now, prior["id"]))
+                            recurrence = reason == "reported_recurrence"
+                            event = "recurrence_reported" if recurrence else "finding_requeued"
+                            message = ("Inspection reported a possible recurrence; planning must reproduce it" if recurrence else
+                                       "Earlier attempt ended without a fix; rediscovered finding queued for fresh verification")
+                            db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                                       (project["id"], run["id"], event, message, encode({"task": prior["id"]}), now))
+                            recurrences += recurrence
+                            rediscoveries += not recurrence
+                        continue
                 candidates.append({"index": len(candidates), "item": item, "key": finding_key,
-                                   "evidence": evidence})
+                                   "evidence": evidence, "observation": observation})
             except (ValueError, OSError):
                 continue
         if skipped:
@@ -3146,7 +3181,8 @@ class Runtime(Maintenance):
                 decision = "ready"
             task_id = self.store.add_task(
                 project["id"], "inspection", candidate["key"], item["title"], item["body"],
-                [candidate["evidence"]], item["acceptance"], max(1, min(70, item["priority"])))
+                [candidate["evidence"]], item["acceptance"], max(1, min(70, item["priority"])),
+                observation=candidate["observation"])
             if decision in ["deferred", "rejected"]:
                 # 决定与理由在初筛落库时即写入 task_decisions：/api/task、任务列表与
                 # 暂缓复核共用这一份记录，没有运行记录的任务也能看到理由。
@@ -3227,8 +3263,9 @@ class Runtime(Maintenance):
             self.store.event("prs_unavailable", "PR metadata unavailable: " + str(exc), project["id"])
         try:
             ci = json.loads(checked(["gh", "run", "list", "--repo", repo, "--limit", "10",
-                                     "--json", "databaseId,name,status,conclusion,headSha,url"], timeout=60))
-            self.store.put_setting("ci:" + project["id"], ci)
+                                     "--json", "databaseId,name,status,conclusion,headSha,headBranch,event,url"], timeout=60))
+            self.store.put_setting("maintenance-ci:" + project["id"],
+                                   {"repository": repo, "observed": time.time(), "checks": ci})
         except RuntimeError as exc:
             self.store.event("ci_unavailable", "CI metadata unavailable: " + str(exc), project["id"])
 

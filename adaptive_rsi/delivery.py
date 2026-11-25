@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 
 from .config import fingerprint, merge
+from .delivery_approval import (APPROVAL_PREFIX, RUN_FIELDS, TASK_FIELDS, approval_version, authority,
+                                setting, verification_contract)
 from .gitops import git, origin_repository, snapshot
 from .process import Cancelled, ProcessError, checked
 from .store import encode, uid
@@ -903,8 +905,10 @@ def publish(runtime, project, task, run, workspace, config):
     if (not isinstance(authorization, list) or len(authorization) != 1 or
             not isinstance(authorization[0], dict)):
         raise RuntimeError("Publishing authorization is malformed")
-    run_fields = ("task", "project", "base", "result", "config", "path")
-    task_fields = ("id", "project", "source", "fingerprint", "title", "body", "evidence", "acceptance", "overrides")
+    run_fields = RUN_FIELDS
+    task_fields = TASK_FIELDS
+    with store.connect() as db:
+        grant_receipt = setting(db, APPROVAL_PREFIX + run["id"])
     if task["id"] != run["task"] or task["project"] != project["id"] or run["project"] != project["id"]:
         raise RuntimeError("Publishing source identity does not match the approved run")
 
@@ -928,9 +932,32 @@ def publish(runtime, project, task, run, workspace, config):
                 not pending or pending["state"] != "planning" or (job and runtime.is_cancelled(job))):
             raise Cancelled("Publishing cancelled or project paused")
         grant = authorization[0] if authorization else None
-        if not isinstance(grant, dict) or grant.get("authorization") not in ["project_policy", "per_candidate"]:
+        authorized_by = authority(grant)
+        if not authorized_by or (grant.get('version_bound') and grant_receipt is None):
             raise RuntimeError("Publishing authorization is missing")
-        if grant.get("authorization") == "project_policy":
+        with store.connect() as db:
+            db.execute("BEGIN")
+            if setting(db, APPROVAL_PREFIX + run["id"]) != grant_receipt:
+                raise RuntimeError("Candidate approval changed; approve again before publishing")
+            if grant_receipt is not None:
+                approved = grant_receipt.get("version")
+                if (not isinstance(approved, dict) or grant_receipt.get("job") != pending["id"] or
+                        grant_receipt.get("action") != "publish_pr" or
+                        grant_receipt.get("authorization") not in ("project_policy", "per_candidate")):
+                    raise RuntimeError("Candidate version or verification changed; approve again before publishing")
+                if (approved.get("repository") != live["github"]["repository"] or
+                        approved.get("branch") != live["delivery"]["base_branch"]):
+                    raise StaleCandidate("Delivery target changed before publishing")
+                if verification_contract(_json_object(original['config'])) != verification_contract(live):
+                    raise StaleCandidate('Verification settings changed; re-evaluate before approving')
+                generation = setting(db, "delivery-generation:" + run["id"])
+                current = approval_version(original, source, generation, setting(db, "run-baseline:" + run["id"]), live)
+                if current is None or current != approved:
+                    raise RuntimeError("Candidate version or verification changed; approve again before publishing")
+                authorized_by = grant_receipt["authorization"]
+                if generation and authorized_by != "per_candidate":
+                    raise RuntimeError("Replay requires explicit approval of the new candidate before publishing")
+        if authorized_by == "project_policy":
             try:
                 run_config = json.loads(run["config"] or "{}")
             except (TypeError, ValueError):
@@ -968,6 +995,8 @@ def publish(runtime, project, task, run, workspace, config):
     generation_row = store.one("SELECT value FROM settings WHERE key=?", ("delivery-generation:" + run["id"],))
     if generation_row:
         from .delivery_generation import publish_generation
+        if grant_receipt is None:
+            raise RuntimeError('Replay requires explicit approval of the new candidate before publishing')
         return publish_generation(runtime, project, task, run, config, approval['id'], authorize_write)
     source, current, base_branch = baseline(runtime, project, config)
     authorize_write()
@@ -1103,10 +1132,14 @@ def publish(runtime, project, task, run, workspace, config):
             change = baseline_change(source, run["base"], current)
             store.event("baseline_changed", "Remote baseline evidence invalidated", project["id"], run["id"], change)
             if change['relation'] == 'advanced' and pushed_intent is None:
-                from .delivery_generation import prepare_publication, publish_generation
+                from .delivery_generation import GenerationError, prepare_publication
+                from .delivery_replay_checks import ReplayRefused
                 authorize_write()
-                prepare_publication(runtime, project, run, approval['id'], workspace, source, current, config)
-                return publish_generation(runtime, project, task, run, config, approval['id'], authorize_write)
+                try:
+                    prepare_publication(runtime, project, run, approval['id'], workspace, source, current, config)
+                except (GenerationError, ReplayRefused) as exc:
+                    raise StaleCandidate('Remote baseline changed; replay refused: ' + str(exc)) from exc
+                raise RuntimeError('Replay prepared on a new baseline; approve the new candidate before publishing')
             if pushed_intent is not None:
                 raise RuntimeError('Baseline changed with an unresolved push journal; reconcile before retrying')
             raise StaleCandidate("Remote baseline changed (" + change["relation"] + "); " + change["recovery"])
@@ -2770,7 +2803,10 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
                    else failure_attribution(merged_sha, head, result))
     outcome["feedback"] = {"state": state, "head": head, "checked_at": now,
                            "evaluation": inline_evaluation(result, report_path),
-                           "attribution": attribution}
+                           "attribution": attribution,
+                           "observation_policy": {"interval_seconds": config["delivery"]["feedback_minutes"] * 60,
+                                                  "deadline": outcome["merged_at"] + config["limits"]["retention_days"] * 86400
+                                                  if isinstance(outcome.get("merged_at"), (int, float)) else None}}
     if origin:
         outcome["feedback"]["reused_from"] = origin
         reuse_count = 1 + (shared.get(("postmerge-reused", project["id"]), 0) if isinstance(shared, dict) else 0)

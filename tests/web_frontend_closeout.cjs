@@ -24,6 +24,28 @@ test('task outcome shows head-scoped CI attention and links only web URLs',()=>{
  assert.equal(context.ciAttention({state:'pr_open',result}),null);
 });
 
+test('approval forwards the displayed revision and shows observation evidence',async()=>{
+ const app=source('app'),approval=app.indexOf('async function confirmCandidateApproval(');
+ const observation=app.indexOf('function observationPanel(');
+ const context={el:node,t:text=>text,stamp:seconds=>`time ${seconds}`,window:{},
+  uiConfirm:async(_message,content)=>{
+   assert.match(content.children[0].children[0].textContent,/批准已记录/);
+   assert.match(content.children[0].children[1].textContent,/exact-patch/);
+   content.children[1].children[0].value='verified';
+   return true;
+  }};
+ vm.runInNewContext(app.slice(approval,app.indexOf('let navigationHomeProject',approval))+
+  app.slice(observation,app.indexOf('function taskOutcome(',observation)),context);
+ const record={state:'approved',revision:'exact-revision',candidate:{patch:'exact-patch',verification:'digest'}};
+ const grant=await context.confirmCandidateApproval({delivery_record:record});
+ assert.equal(grant.revision,'exact-revision');
+ assert.equal(grant.reason,'verified');
+ const panel=context.observationPanel({state:'pending_attribution',metric:'fixed_check_verdict',pass_ratio:0,
+  minimum_pass_ratio:1,samples:1,minimum_samples:1,interval_seconds:300,attribution:'subsequent_mainline',deadline:1000});
+ assert.match(panel.children[0].textContent,/观察窗口（仅演练） · 待归因/);
+ assert.match(panel.children[2].textContent,/后续主线变更/);
+});
+
 function diagnostics(scope){
  const text=source('model-center'),start=text.indexOf('    diagnostics.onclick='),end=text.indexOf('    const authProvider=',start),calls=[];
  const provider={id:'local',catalog:{models:[{id:'model',enabled:true}]}},view={hidden:false};

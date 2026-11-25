@@ -91,6 +91,7 @@ class TaskValueFeedbackTest(unittest.TestCase):
             {"area": "security", "decision": "insufficient_evidence", "reason": "Verify the denied-write path"}]}
         self.store.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps(saved), self.record["id"]))
         runtime = SimpleNamespace(store=self.store, dispatch_lock=threading.RLock(),
+                                  config=lambda _project=None: copy.deepcopy(DEFAULTS),
                                   updates=SimpleNamespace(require_ready=lambda: None))
         server = Server(runtime)
         thread = threading.Thread(target=server.serve_forever, daemon=True)

@@ -94,6 +94,7 @@ Data and diagnostics shows recent backups and restore checks on the current mach
 
 - **Continuous discovery:** hourly checks for bugs, feature gaps, performance, usability, and maintenance work, with rotating code modules. Sync GitHub Issues incrementally or add a goal at any time.
 - **Run recovery:** task details show the latest run source, stage checkpoints, and recorded reuse and invalidation. Project advanced settings support dependency files and shared directories for module inspection.
+- **Main retrospective:** open **Main retrospective and confirmed rules** from Experience to preview manually or enable weekly summaries for review. If there is no review cursor, enter a full local main SHA or choose the currently visible main revision. When the project is active, background maintenance saves the latest due batch of up to 20 commits with existing evidence. The cursor advances on manual confirmation. If rewritten history invalidates the start, the previous summary and cursor are kept and the retry time is shown.
 - **Value gate:** assess current evidence, duplicates, expected benefit, cost, and the impact of doing nothing before implementation.
 - **Isolation and verification:** implementation and review use separate contexts. The host runs new behavior tests in isolation on the baseline and candidate, then runs frozen regression and full-candidate checks. Unsupported runners, high-risk, and performance tasks use independent acceptance; model claims do not establish success.
 - **Code review:** check correctness, security, maintainability, architecture, tests, and scope. Blocking findings or insufficient evidence stop delivery.
@@ -124,6 +125,8 @@ Models must support tool calls and structured results. Protocol support does not
 Long-term capability improvement still requires real tasks and sustained experiments. When fresh holdout cases are insufficient, proposal and trials are skipped before model calls and the stable strategy is retained.
 
 Task details collect changes, checks, usage, reused stages and the delivery commit, with optional Helpful, Unnecessary or False positive feedback. Ratings are observational and do not automatically change ranking or strategies; original-merge verification and later-mainline regressions are counted separately. Model pricing supports input, output and cache components with blended-price fallback; usage details provide historical ranges only when enough comparable samples exist. Missing usage and prices remain unknown. Failed usage or detail refreshes identify retained data and the last successful update. See the [reliable improvement loop](RELIABILITY.en.md) for execution and recovery rules.
+
+Task details show the approved candidate, its verification evidence digest, and the delivery commit receipt. A change to the candidate version or verification evidence invalidates the previous approval. Dry-run observation in delivery and strategy details shows the sampling interval, sample threshold, deadline, and attribution. Missing evidence or unresolved attribution leaves the result pending. Existing authorizations and automatic rollback gates remain in effect.
 
 Use the [offline scheduling and cost evaluation](docs/policy-evaluation.en.md) to replay a redacted queue or report stage history and automatic task cost ranges from a local snapshot.
 

@@ -79,6 +79,12 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: desktop/package-lock.json
+      - name: 安装桌面 Node 依赖
+        if: needs.changes.outputs.mode == 'full'
+        run: npm ci --prefix desktop
+      - name: 测试桌面构建配置
+        if: needs.changes.outputs.mode == 'full'
+        run: npm --prefix desktop test
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           enable-cache: true
@@ -88,33 +94,27 @@ jobs:
         with:
           workspaces: desktop/src-tauri -> target
           key: ${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
-      - name: 安装构建工具
-        env:
-          MODE: ${{ needs.changes.outputs.mode }}
-        run: |
-          rustup default 1.99.1
-          if [ "$MODE" = full ]; then
-            npm ci --prefix desktop
-          fi
+      - name: 安装 Rust 工具链
+        run: rustup default 1.99.1
       - name: 构建并启动 bundled engine
         if: needs.changes.outputs.mode == 'smoke'
         run: |
           python3 desktop/scripts/engine.py
           python3 scripts/package_desktop.py smoke-engine desktop/src-tauri/binaries/adaptive-rsi-engine-*
-      - name: 测试桌面构建配置
+      - name: 构建桌面应用
         if: needs.changes.outputs.mode == 'full'
-        run: npm --prefix desktop test
-      - name: 构建应用并运行 Rust 测试
+        run: npm run --prefix desktop build
+      # Tauri 的 Rust 测试需要构建生成的 sidecar。先编译一次，为后面的专项和通用测试复用。
+      - name: 编译 Rust 测试二进制
+        id: rust_tests
         if: needs.changes.outputs.mode == 'full'
-        run: |
-          npm run --prefix desktop build
-          cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
+        run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --no-run
       - name: 验证旧版 DMG 的 HTTPS 续传、真卷挂载和原生响应策略
-        if: needs.changes.outputs.mode == 'full'
+        if: ${{ !cancelled() && steps.rust_tests.outcome == 'success' }}
         timeout-minutes: 5
         run: bash desktop/scripts/test_legacy_dmg_https.sh
       - name: 验证更新取消在服务恢复后删除持久租约
-        if: needs.changes.outputs.mode == 'full'
+        if: ${{ !cancelled() && steps.rust_tests.outcome == 'success' }}
         timeout-minutes: 5
         shell: bash
         run: |
@@ -124,7 +124,7 @@ jobs:
           printf '%s\n' "$result"
           grep -Fx "test $name ... ok" <<< "$result"
       - name: 验证 FAT32 和 ExFAT 真卷备份
-        if: needs.changes.outputs.mode == 'full'
+        if: ${{ !cancelled() && steps.rust_tests.outcome == 'success' }}
         timeout-minutes: 5
         shell: bash
         run: |
@@ -189,10 +189,12 @@ jobs:
             detach_volume
           done
           exit "$result"
+      - name: 验证更新签名与 SBOM
+        if: ${{ !cancelled() && steps.rust_tests.outcome == 'success' }}
+        run: python3 scripts/test_updater_signing.py --measure-verification-rss
       - name: 验证应用并生成完整安装包
-        if: needs.changes.outputs.mode == 'full'
+        if: ${{ !cancelled() && steps.rust_tests.outcome == 'success' }}
         run: |
-          python3 scripts/test_updater_signing.py --measure-verification-rss
           python3 -B scripts/upgrade_harness.py --stage receipt authorization isolation --app "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app"
           codesign --verify --deep --strict "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app"
           "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app/Contents/MacOS/adaptive-rsi-engine" --version
@@ -201,6 +203,9 @@ jobs:
           DMG="dist/adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg"
           (cd dist && shasum -a 256 -c "adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg.sha256")
           python3 scripts/package_desktop.py verify-dmg --image "$DMG"
+      - name: 运行 Rust 测试
+        if: ${{ !cancelled() && steps.rust_tests.outcome == 'success' }}
+        run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: needs.changes.outputs.mode == 'full'
         with:

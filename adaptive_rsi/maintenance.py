@@ -697,9 +697,12 @@ class Maintenance:
 
     def maintenance(self):
         from .generation_retention import MAX_RECORD_BYTES
+        from .maintenance_evidence import schedule_retrospectives
         now = time.time()
         if now - self.store.setting("maintenance-last", 0) < MAINTENANCE_INTERVAL:
             return
+        with self.scheduler_scope("weekly_retrospectives"):
+            schedule_retrospectives(self, now)
         # 运行级删除失败只影响该运行：收集后整轮仍算完成，但留下降级证据，
         # 失败运行的 path 保留给下一轮自然重试。scheduler_scope 会吞掉运行级
         # 异常，只靠它会让「保留策略在个别运行上失效」看起来仍然健康。

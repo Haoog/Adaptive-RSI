@@ -1,13 +1,17 @@
 """Offline publication identity regressions with real local Git candidates."""
 import json
 import subprocess
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from unittest.mock import patch
 
 from adaptive_rsi import delivery
 from adaptive_rsi.config import fingerprint
 from adaptive_rsi.gitops import git
 from adaptive_rsi.process import Cancelled, ProcessError
+from adaptive_rsi.server import Server
 from adaptive_rsi.store import encode
 from tests import test_release_endpoints as recovery_tests
 
@@ -65,10 +69,43 @@ class DeliveryBindingTest(unittest.TestCase):
             self.addCleanup(self.runtime.close)
         # Revoke automatic policy, then approve through the public human path.
         self.runtime.configure({'delivery': {'mode': 'local'}}, self.project)
-        self.assertEqual(self.runtime.deliver(self.run['id'], automatic=False), self.approval)
+        server = Server(self.runtime)
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        headers = {'Cookie': server.cookie + '=' + server.token}
+
+        def record():
+            request = urllib.request.Request(server.origin + '/api/run?id=' + self.run['id'], headers=headers)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return json.load(response)['delivery_record']
+
+        def approve(revision):
+            request = urllib.request.Request(server.origin + '/api/deliver',
+                encode({'run': self.run['id'], 'revision': revision}).encode(),
+                {**headers, 'Origin': server.origin, 'X-RSI-CSRF': server.csrf, 'Content-Type': 'application/json'})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return json.load(response)
+
+        version = record()['revision']
+        self.assertTrue(version)
+        self.store.execute("UPDATE tasks SET body=body || ' Changed evidence' WHERE id=?", (self.run['task'],))
+        current = record()['revision']
+        self.assertNotEqual(version, current)
+        with self.assertRaises(urllib.error.HTTPError) as stale:
+            approve(version)
+        with stale.exception as response:
+            self.assertEqual(response.code, 400)
+            self.assertIn('Candidate version changed', json.load(response)['error'])
+        self.assertIsNone(self.store.setting('delivery-approval:' + self.run['id']))
+        self.assertEqual(approve(current), {'id': self.approval})
+        grant = record()['approval']
+        self.assertEqual((grant['role'], grant['action'], grant['job']), ('console_operator', 'publish_pr', self.approval))
+        self.assertEqual(grant['version']['candidate']['patch'], json.loads(self.run['result'])['patch_hash'])
         self.assertEqual(json.loads(self.store.one('SELECT evidence FROM tasks WHERE id=?',
                                                   (self.approval,))['evidence']),
-                         [{'authorization': 'per_candidate'}])
+                         [{'authorization': 'per_candidate', 'version_bound': True}])
         job = self.store.claim(self.project, self.runtime.config(self.project))
         self.assertEqual(job['task'], self.approval)
         def retry_command(argv, **kwargs):
@@ -92,6 +129,11 @@ class DeliveryBindingTest(unittest.TestCase):
         self.assertEqual(json.loads(result['result'])['pr'], self.url)
         self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (job['id'],))['state'], 'completed')
         self.assertEqual(self.store.setting('delivery:' + self.run['id'])['head'], self.head)
+        receipt = record()
+        self.assertEqual(receipt['state'], 'recorded')
+        self.assertEqual(receipt['approval'], grant)
+        self.assertEqual((receipt['receipt']['head'], receipt['receipt']['pr']), (self.head, self.url))
+        self.assertGreaterEqual(receipt['receipt']['time'], grant['time'])
         if not legacy:
             self.assertEqual(self.store.setting('delivery-candidate:' + self.run['id']), saved)
 

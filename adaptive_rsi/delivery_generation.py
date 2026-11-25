@@ -9,7 +9,8 @@ import uuid
 from pathlib import Path
 
 from .config import fingerprint
-from .delivery_replay_checks import (_acceptance, replay_on_advanced_baseline,
+from .delivery_approval import authority
+from .delivery_replay_checks import (ReplayRefused, _acceptance, replay_on_advanced_baseline,
                                      sealed_dependency_digest)
 from .gitops import git as _git
 from .store import encode
@@ -73,8 +74,8 @@ def _snapshot(db, run_id, approval_id):
         keys = {'version', 'branch', 'head', 'tree', 'base', 'repository', 'evidence', 'approval', 'authorization'}
         # The live grant must be explicit. Version-1 approval fields retain the
         # first attempt's audit snapshot, as in delivery.publish.matches_binding.
-        if (grants not in ([{'authorization': 'per_candidate'}], [{'authorization': 'project_policy'}]) or
-                (grants == [{'authorization': 'project_policy'}] and config['delivery']['mode'] != 'pr') or
+        authorized_by = authority(grants[0]) if isinstance(grants, list) and len(grants) == 1 else None
+        if (not authorized_by or (authorized_by == 'project_policy' and config['delivery']['mode'] != 'pr') or
                 not binding or set(binding) != keys or
                 type(binding['version']) is not int or binding['version'] != 1 or
                 not isinstance(binding['approval'], str) or not binding['approval'] or
@@ -395,6 +396,22 @@ def prepare_publication(runtime, project, run, approval_id, workspace, source, c
             os.close(fd)
 
 
+def retire_unpublished_generation(store, run_id, record):
+    key = 'delivery-generation:' + run_id
+    with store.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        if (_setting(db, key) != record or _raw_setting(db, 'delivery-push:' + run_id) is not None or
+                _raw_setting(db, 'delivery-generation-pr:' + run_id) is not None):
+            raise GenerationError('Generation changed or has an unresolved write; reconcile before reapproval')
+        suffix = run_id + ':' + record['generation']
+        db.execute('INSERT INTO settings(key,value) VALUES (?,?)',
+                   ('delivery-generation-history:' + suffix, encode(record)))
+        db.execute('INSERT INTO settings(key,value) VALUES (?,?)',
+                   ('delivery-generation-history-proof:' + suffix,
+                    encode({'unpublished': True, 'record': fingerprint(record)})))
+        db.execute('DELETE FROM settings WHERE key=?', (key,))
+
+
 def publish_generation(runtime, project, task, run, config, approval_id, authorize_write):
     """Publish a sealed replay through the existing runtime approval boundary.
 
@@ -422,17 +439,7 @@ def publish_generation(runtime, project, task, run, config, approval_id, authori
         identity = store.setting('run-baseline:' + run['id'])
         if identity != {'repository': config['github']['repository'], 'branch': branch, 'sha': run['base']}:
             raise GenerationError('Generation target changed')
-        with store.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            if (_setting(db, key) != record or _raw_setting(db, push_key) is not None or
-                    _raw_setting(db, 'delivery-generation-pr:' + run['id']) is not None):
-                raise GenerationError('Generation changed during reapproval')
-            db.execute('INSERT INTO settings(key,value) VALUES (?,?)',
-                       ('delivery-generation-history:' + run['id'] + ':' + record['generation'], encode(record)))
-            db.execute('INSERT INTO settings(key,value) VALUES (?,?)',
-                       ('delivery-generation-history-proof:' + run['id'] + ':' + record['generation'],
-                        encode({'unpublished': True, 'record': fingerprint(record)})))
-            db.execute('DELETE FROM settings WHERE key=?', (key,))
+        retire_unpublished_generation(store, run['id'], record)
         record = prepare_publication(runtime, project, run, approval_id,
                                      Path(run['path']) / 'candidate', source, current, config)
     generation = record.get('generation')
@@ -492,6 +499,21 @@ def publish_generation(runtime, project, task, run, config, approval_id, authori
                 raise GenerationError('Generation PR has no local push intent')
             _check_push(db, record, snap)
     else:
+        if push is None:
+            authorize_write()
+            source, current, resolved = delivery.baseline(runtime, project, config)
+            if resolved != target:
+                raise GenerationError('Generation target or baseline changed; reapproval and new replay required')
+            if current != record['parent']:
+                if git(source, 'merge-base', record['parent'], current) != record['parent']:
+                    raise GenerationError('Generation target or baseline changed; reapproval and new replay required')
+                retire_unpublished_generation(store, run['id'], record)
+                try:
+                    prepare_publication(runtime, project, run, approval_id,
+                                        Path(run['path']) / 'candidate', source, current, config)
+                except (GenerationError, ReplayRefused) as exc:
+                    raise delivery.StaleCandidate('Remote baseline changed; replay refused: ' + str(exc)) from exc
+                raise GenerationError('Replay prepared on a new baseline; approve the new candidate before publishing')
         with runtime.dispatch_lock:
             verify()
             with store.connect() as db:

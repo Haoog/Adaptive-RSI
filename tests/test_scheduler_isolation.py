@@ -832,6 +832,39 @@ class SchedulerIsolationTest(unittest.TestCase):
         self.assertIs(self.runtime.maintenance_thread, worker)
         self.assertEqual(len(attempts), 1)
 
+    def test_weekly_retrospective_uses_background_scheduler_and_respects_pause(self):
+        from adaptive_rsi.maintenance_evidence import SCHEDULE_PREFIX, configure_retrospective
+        from tests.test_runtime import fixture
+
+        repo = fixture(self.root / "paused")
+        project = self.runtime.project("paused")
+        start = git(repo, "rev-parse", "HEAD")
+        git(repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",
+            "commit", "--quiet", "--allow-empty", "-m", "weekly evidence")
+        key = SCHEDULE_PREFIX + project["id"]
+
+        def tick():
+            self.store.put_setting("maintenance-last", 0)
+            self.runtime.maintenance_async()
+            self.runtime.maintenance_thread.join(5)
+            self.assertFalse(self.runtime.maintenance_thread.is_alive())
+
+        with patch.object(self.runtime.model_center, "cleanup_credentials"), \
+                patch.object(self.runtime, "invoke", side_effect=AssertionError("unexpected model call")):
+            tick()
+            self.assertIsNone(self.store.setting(key))
+            configure_retrospective(self.store, project, True, start)
+            tick()
+            self.assertNotIn("summary", self.store.setting(key))
+            self.runtime.pause(project["id"], False)
+            tick()
+        state = self.store.setting(key)
+        self.assertEqual([commit["subject"] for commit in state["summary"]["commits"]], ["weekly evidence"])
+        self.assertGreater(state["next_at"], state["summary"]["generated_at"])
+        self.assertEqual(self.store.query("SELECT id FROM tasks"), [])
+        self.assertEqual(self.store.query("SELECT sha FROM maintenance_reviews"), [])
+        self.assertEqual(self.store.query("SELECT id FROM maintenance_rules"), [])
+
     def test_maintenance_retries_after_backoff_window(self):
         with patch.object(Runtime, "maintenance",
                           side_effect=OSError("maintenance storage unavailable")):

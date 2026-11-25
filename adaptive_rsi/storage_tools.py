@@ -691,6 +691,16 @@ def unavailable_feedback(previous):
     return report
 
 
+PATCH_PREVIEW_LIMIT = 2 * 1024 * 1024
+
+
+def read_patch_preview(path):
+    """Read a patch for the console; return None when it exceeds the preview limit."""
+    with _regular_reader(path) as stream:
+        payload = stream.read(PATCH_PREVIEW_LIMIT + 1)
+    return payload if len(payload) <= PATCH_PREVIEW_LIMIT else None
+
+
 def run_artifact_path(store, run, name=""):
     """Resolve artifacts only inside this state's own direct run directory."""
     identifier = run["id"]

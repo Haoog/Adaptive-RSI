@@ -110,3 +110,14 @@ def enforce_review(review, config):
         "Review gate: " + decision + "; blocking findings or incomplete/failed assessments override the reported pass. " + review["reason"]
     return {**review, "decision": decision, "reason": reason, "reported_decision": review["decision"],
             "blocking_threshold": block_threshold}
+
+
+_STATIC_REVIEW_PATHS = re.compile(
+    r"(?:^|/)(?:\.github/(?:workflows|actions)/|\.githooks/|scripts/|"
+    r"\.gitmodules$|\.gitattributes$|\.npmrc$|\.env(?:\.|$)|"
+    r"(?:store|config|install|bootstrap|entrypoint)(?:\.[^/]+|/|$))", re.I)
+
+
+def candidate_static_risks(paths):
+    """Flag concrete paths for human review without interpreting or running candidate code."""
+    return [path for path in sorted(paths) if SENSITIVE_PATH.search(path) or _STATIC_REVIEW_PATHS.search(path)]

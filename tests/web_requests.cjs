@@ -112,6 +112,51 @@ function descendants(node) {
   return (node.children || []).flatMap(child => child.isConnected === false ? [] : [child, ...descendants(child)]);
 }
 
+test('weekly retrospective uses the chosen local SHA and keeps manual preview available', async () => {
+  const page = browser(), posts = [], main = 'a'.repeat(40);
+  page.document.body = page.node('test-body');
+  page.context.language = 'zh-CN';
+  page.context.navigator = {};
+  let schedule = {};
+  page.context.fetch = async (url, options) => {
+    assert.match(url, /^\/api\/maintenance-review/);
+    if (options.body) {
+      const body = JSON.parse(options.body);
+      posts.push(body);
+      schedule = {enabled: body.schedule, start: body.start || schedule.start, next_at: body.schedule ? 100 : null,
+        summary: {base: main, end: main, main, cursor: null, generated_at: 50, commits: []}};
+      return response(schedule);
+    }
+    if (url.includes('&preview=1')) {
+      assert.match(url, new RegExp('&start=' + main + '$'));
+      return response({commits: []});
+    }
+    return response({cursor: null, main, schedule, paused: true, signal: {status: 'investigate'}, rules: [], reviews: []});
+  };
+  page.context.MutationObserver = class { observe() {} };
+  const ready = [], listen = page.document.addEventListener;
+  page.document.addEventListener = (event, handler) => {
+    if (event === 'DOMContentLoaded') ready.push(handler);
+    else listen(event, handler);
+  };
+  vm.runInContext(experienceSource, page.context);
+  ready.forEach(handler => handler());
+  const button = (root, label) => descendants(root).find(node => node.tagName === 'BUTTON' && node.textContent === label);
+  await button(page.node('view-usage'), '主线复盘与已确认规则').handlers.click();
+  const dialog = page.document.body.children.find(node => node.tagName === 'DIALOG');
+  await button(dialog, '以当前本地主线为起点').handlers.click();
+  await button(dialog, '开启每周摘要').handlers.click();
+  assert.deepEqual(posts[0], {project: 'a', schedule: true, start: main});
+  assert.ok(descendants(dialog).some(node => node.textContent === '项目暂停期间不生成摘要。'));
+  assert.ok(descendants(dialog).some(node => node.textContent.startsWith('下次生成')));
+  assert.ok(descendants(dialog).some(node => node.textContent.startsWith('上次生成')));
+  await button(dialog, '预览下一批主线提交').handlers.click();
+  assert.equal(descendants(dialog).filter(node => node.textContent === '这批没有新增主线提交。').length, 2);
+  await button(dialog, '关闭每周摘要').handlers.click();
+  assert.deepEqual(posts[1], {project: 'a', schedule: false});
+  assert.ok(button(dialog, '开启每周摘要'));
+});
+
 function editorForm(controls, className) {
   const editor = descendants(controls).find(node => node.className === className);
   return editor && descendants(editor).find(node => node.tagName === 'FORM');

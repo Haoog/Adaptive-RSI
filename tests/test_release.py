@@ -2160,6 +2160,31 @@ class WorkflowConfigurationTest(unittest.TestCase):
                         self.assertTrue(module in modules or module + "." + cls.name in modules,
                                         test_id + " is not covered by the Ubuntu Python matrix")
 
+    def test_delivery_matrix_runs_each_original_case_once(self):
+        from collections import Counter
+        from scripts.test_parallel import test_ids
+
+        original_modules = (
+            'tests.test_delivery_loop', 'tests.test_delivery_generation',
+            'tests.test_generation_publication', 'tests.test_generation_retention',
+            'tests.test_delivery_replay_checks', 'tests.test_superseded_delivery_recovery',
+            'tests.test_pr_feedback_context',
+        )
+        matrix = self.workflow('checks.yml')['jobs']['python']['strategy']['matrix']['include']
+        shards = [row for row in matrix if row['name'].startswith('交付循环 · ')]
+        self.assertGreater(len(shards), 1)
+        self.assertTrue(all(row['os'] == 'ubuntu-latest' and row.get('python', '3.12') == '3.12'
+                            for row in shards))
+        loader = unittest.TestLoader()
+        original = Counter(test_ids(loader.loadTestsFromNames(original_modules)))
+        sharded = Counter(test_ids(loader.loadTestsFromNames([
+            selector for row in shards for selector in row['modules'].split()
+        ])))
+        self.assertFalse(loader.errors)
+        self.assertTrue(original)
+        self.assertEqual(set(original.values()), {1})
+        self.assertEqual(sharded, original)
+
     def test_every_darwin_decorated_test_is_kept_in_a_macos_job(self):
         text = (self.ROOT / ".github/workflows/checks.yml").read_text()
         expected = set()
@@ -2190,6 +2215,21 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn("desktop/package-lock.json", text)
         self.assertIn("hashFiles('desktop/src-tauri/Cargo.lock')", text)
         self.assertIn("cache-dependency-glob: pyproject.toml", text)
+        steps = workflow['jobs']['desktop-macos']['steps']
+        commands = [step.get('run', '') for step in steps]
+        sequence = ['npm --prefix desktop test', 'npm run --prefix desktop build',
+                    '--no-run', 'test_legacy_dmg_https.sh', 'update_cancel_removes_persisted_lease',
+                    'for filesystem in FAT32 ExFAT', 'test_updater_signing.py --measure-verification-rss',
+                    'scripts/package_desktop.py verify-dmg',
+                    'cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml']
+        positions = [next(i for i, command in enumerate(commands) if marker in command)
+                     for marker in sequence[:-1]] + [commands.index(sequence[-1])]
+        self.assertEqual(positions, sorted(set(positions)))
+        for position in positions[3:]:
+            self.assertEqual(steps[position]['if'], "${{ !cancelled() && steps.rust_tests.outcome == 'success' }}")
+        upload = steps[-1]
+        self.assertTrue(upload['uses'].startswith('actions/upload-artifact@'))
+        self.assertEqual(upload['if'], "needs.changes.outputs.mode == 'full'")
 
     def test_version_metadata_cannot_supply_required_release_verify_check(self):
         checks = self.workflow('checks.yml')['jobs']['verify']

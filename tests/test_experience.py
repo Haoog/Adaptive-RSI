@@ -249,6 +249,33 @@ class ConnectionAndReleaseRoutesTest(unittest.TestCase):
                                          self.headers if headers is None else headers)
         return urllib.request.urlopen(request)
 
+    def test_maintenance_review_routes_require_auth_and_confirm_the_preview(self):
+        from adaptive_rsi.gitops import git
+
+        project = self.runtime.project(self.project)
+        start = git(project["path"], "rev-parse", "HEAD")
+        git(project["path"], "-c", "user.name=Test", "-c", "user.email=test@localhost",
+            "commit", "--quiet", "--allow-empty", "-m", "main update")
+        endpoint = "/api/maintenance-review"
+        query = endpoint + "?project=" + self.project
+        with self.assertRaises(urllib.error.HTTPError) as unauthenticated:
+            self.request(query, headers={})
+        self.assertEqual(unauthenticated.exception.code, 401)
+        unauthenticated.exception.close()
+        with self.request(query + "&preview=1&start=" + start) as response:
+            preview = json.load(response)
+        body = {"project": self.project, "start": start, "token": preview["token"], "rules": []}
+        with self.assertRaises(urllib.error.HTTPError) as missing_csrf:
+            self.request(endpoint, body, {**self.headers, "X-RSI-CSRF": ""})
+        self.assertEqual(missing_csrf.exception.code, 403)
+        missing_csrf.exception.close()
+        with self.request(query) as response:
+            self.assertIsNone(json.load(response)["cursor"])
+        with self.request(endpoint, body) as response:
+            self.assertEqual(json.load(response), {"cursor": preview["end"], "reviewed": 1})
+        with self.request(query) as response:
+            self.assertEqual(json.load(response)["reviews"][0]["sha"], preview["end"])
+
     def test_authentication_and_csrf_are_required_before_login_side_effects(self):
         for path in ["/api/auth/status", "/api/auth/session?id=login", "/api/auth/providers?backend=opencode", "/api/release-workflows?project=" + self.project]:
             with self.subTest(path=path), self.assertRaises(urllib.error.HTTPError) as denied:

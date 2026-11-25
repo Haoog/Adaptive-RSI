@@ -37,7 +37,6 @@ from .server_validation import (SAFE_ERROR_CODES, SAFE_VALIDATION_MESSAGES, Requ
                                 project_display_name, configuration_error)
 
 
-PATCH_PREVIEW_LIMIT = 2 * 1024 * 1024
 PATCH_PREVIEW_TOO_LARGE = ("Candidate patch exceeds the 2 MiB UI size limit; "
                            "download it from the run directory instead")
 
@@ -77,6 +76,8 @@ GET /api/events
 POST /api/evolution/promote
 POST /api/goal
 GET /api/health
+GET /api/maintenance-review
+POST /api/maintenance-review
 GET /api/mobile
 GET /api/model-center
 POST /api/model-center/diagnose
@@ -262,6 +263,7 @@ _POST_FIELD_TYPES = {
     "/api/release-resolve": {"project": str, "run": str, "kind": str, "target": str},
     "/api/release-abandon": {"project": str, "run": str, "kind": str, "reason": str, "target": str},
     "/api/release-authorize": {"project": str, "kind": str, "workflow": str},
+    "/api/maintenance-review": {"project": str, "start": str, "token": str, "rules": list, "schedule": bool},
     "/api/goal": {"project": str, "text": str, "request_id": str},
     "/api/task/revise": {"task": str, "supplement": str, "reason": str, "request_id": str},
     "/api/task/value-feedback": {"project": str, "task": str, "run": str, "rating": str, "note": str},
@@ -270,9 +272,9 @@ _POST_FIELD_TYPES = {
     "/api/task/schedule": {"task": str, "reason": str},
     "/api/request": {"project": str, "kind": str},
     "/api/pause": {"project": str, "paused": bool},
-    "/api/retry": {"task": str, "reason": str, "force": bool},
+    "/api/retry": {"task": str, "reason": str, "force": bool, "candidate_review": str},
     "/api/cancel": {"task": str, "cascade": bool, "reason": str},
-    "/api/deliver": {"run": str, "reason": str},
+    "/api/deliver": {"run": str, "reason": str, "revision": str},
     "/api/rollback": {"candidate": str},
     "/api/evolution/promote": {"candidate": str},
     "/api/revert-code": {"run": str},
@@ -313,13 +315,6 @@ def maintenance_status(store, running=False, now=None):
         next_due = last_success + MAINTENANCE_INTERVAL
     return {"running": bool(running), "last_success": last_success, "next_due": next_due,
             "failures": failures, "retry_at": retry_at, "degraded": None}
-
-
-def read_patch_preview(path):
-    """Read a patch for the console; return None when it exceeds the preview limit."""
-    with path.open("rb") as stream:
-        payload = stream.read(PATCH_PREVIEW_LIMIT + 1)
-    return payload if len(payload) <= PATCH_PREVIEW_LIMIT else None
 
 
 class Server(ThreadingHTTPServer):
@@ -958,12 +953,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(page(runtime, params.get("project", [""])[0] or None, before))
             elif parsed.path == "/api/candidate":
                 from .experiment_report import comparison
-                candidate = store.one("SELECT id,project,status,content,evidence FROM candidates WHERE id=? AND project=?",
+                from .observation import strategy_policy, strategy_view
+                candidate = store.one("SELECT id,project,status,content,evidence,created,promoted FROM candidates WHERE id=? AND project=?",
                                       (params.get("id", [""])[0], params.get("project", [""])[0]))
                 if not candidate:
                     raise RequestError("Candidate not found")
                 evidence = decode_evidence(candidate.pop("evidence"))
+                observation = evidence.get('observation_window')
+                if not observation and candidate['status'] == 'stable':
+                    observation = strategy_policy(candidate, runtime.config(candidate['project']))
                 candidate.update(content=decode_object(candidate["content"]), evidence=evidence,
+                                 observation=strategy_view(observation, time.time()),
                                  comparison=comparison(evidence.get("trials", [])))
                 self.respond(candidate)
             elif parsed.path == "/api/monitoring-feedback":
@@ -1025,7 +1025,16 @@ class Handler(BaseHTTPRequestHandler):
                 task["group_lineage"] = lineage(store, task["id"], task["project"])
                 from .recovery import task_recovery
                 task["recovery"] = task_recovery(store, task)
+                from .maintenance_evidence import task_observations
+                task["inspection_observations"] = task_observations(store, task["id"])
                 self.respond(task)
+            elif parsed.path == "/api/maintenance-review":
+                from .maintenance_evidence import maintenance_summary, retrospective_preview
+                project = runtime.project(params.get("project", [""])[0])
+                if params.get("preview", [""])[0] == "1":
+                    self.respond(retrospective_preview(store, project, params.get("start", [None])[0]))
+                else:
+                    self.respond(maintenance_summary(store, project, runtime.config(project["id"])["github"]["repository"]))
             elif parsed.path == "/api/workflow-metrics":
                 from .telemetry import workflow_metrics
                 self.respond(workflow_metrics(store, params.get("project", [None])[0]))
@@ -1285,8 +1294,15 @@ class Handler(BaseHTTPRequestHandler):
                 run = store.one("SELECT * FROM runs WHERE id=?", (params.get("id", [""])[0],))
                 if not run:
                     raise RequestError("Run not found")
+                from .delivery_approval import details as delivery_details
+                from .observation import delivery_window
                 from .review import risk_review_evidence_requests
+                project_exists = store.one('SELECT 1 FROM projects WHERE id=?', (run['project'],))
+                config = runtime.config(run['project'] if project_exists else None)
+                run["delivery_record"] = delivery_details(store, run, config)
                 run["result"] = decode_evidence(run["result"])
+                run["delivery_observation"] = delivery_window(run["result"], config, time.time(),
+                    store.setting("feedback-polled:" + run["id"]) if run["result"].get("merged_sha") else None)
                 run["risk_review_evidence_requests"] = risk_review_evidence_requests(run["result"].get("risk_review"))
                 run["config"] = decode_object(run["config"])
                 run["stages"] = store.query("SELECT stage,created,data FROM stages WHERE run=? ORDER BY created", (run["id"],))
@@ -1297,7 +1313,7 @@ class Handler(BaseHTTPRequestHandler):
                     stage["decision"] = decode_object(stage.pop("data")).get("decision")
                 self.respond(run)
             elif parsed.path == "/api/patch":
-                from .storage_tools import run_artifact_path
+                from .storage_tools import read_patch_preview, run_artifact_path
                 run = store.one("SELECT id,path FROM runs WHERE id=?", (params.get("id", [""])[0],))
                 if not run:
                     raise RequestError("Run has no artifacts")
@@ -1315,7 +1331,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise RequestError(PATCH_PREVIEW_TOO_LARGE, code="patch_too_large")
                 self.respond(payload, content_type="text/plain; charset=utf-8")
             elif parsed.path == "/api/diff-files":
-                from .storage_tools import run_artifact_path
+                from .storage_tools import read_patch_preview, run_artifact_path
                 run = store.one("SELECT id,path FROM runs WHERE id=?", (params.get("id", [""])[0],))
                 if not run:
                     raise RequestError("Run not found")
@@ -1402,6 +1418,20 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 100:
                     raise RequestError("request_id must contain 1..100 characters")
             response_code, response_headers, response_lock = 200, None, None
+            if path == "/api/maintenance-review":
+                from .maintenance_evidence import configure_retrospective, confirm_retrospective
+                with runtime.operations.guard("maintenance-review"):
+                    project = runtime.require_active_project(body.get("project", ""))
+                    if "schedule" in body:
+                        if set(body) - {"project", "schedule", "start"}:
+                            raise RequestError("Weekly settings must be saved separately from review confirmation")
+                        result = configure_retrospective(runtime.store, project, body["schedule"], body.get("start"))
+                        runtime.wake.set()
+                    else:
+                        result = confirm_retrospective(runtime.store, project, body.get("start"),
+                                                       body.get("token"), body.get("rules"))
+                self.respond(result)
+                return
             if path == "/api/operations":
                 options = {"reuse_active": True} if body.get("reuse_active") is True else {}
                 self.respond(runtime.operations.start(body.get("kind"), body.get("parameters", {}), **options))
@@ -1645,12 +1675,14 @@ class Handler(BaseHTTPRequestHandler):
                     runtime.pause(body["project"], body["paused"])
                     result = {"saved": True}
                 elif path == "/api/retry":
-                    runtime.retry(body["task"], body.get("reason"), force=body.get("force", False))
+                    review = {"candidate_review": body["candidate_review"]} if "candidate_review" in body else {}
+                    runtime.retry(body["task"], body.get("reason"), force=body.get("force", False), **review)
                     result = {"saved": True}
                 elif path == "/api/cancel":
                     result = runtime.cancel_task(body["task"], body.get("cascade", False), body.get("revision"), body.get("reason"))
                 elif path == "/api/deliver":
-                    result = {"id": runtime.deliver(body["run"], reason=body.get("reason"))}
+                    result = {"id": runtime.deliver(body["run"], reason=body.get("reason"),
+                                                    revision=body.get("revision"), console=True)}
                 elif path == "/api/rollback":
                     runtime.rollback_strategy(body["candidate"])
                     result = {"saved": True}
