@@ -1104,21 +1104,7 @@ fn handshake_local_runtime(
                     return Err("Existing local runtime API is incompatible".into());
                 }
                 if connection.owned {
-                    let (status, _) = call_with_session(&connection, "desktop-update",
-                        Some(json!({"action":"status"})), Some(startup_budget(health_deadline)?))?;
-                    if status.status != 200 { return Err("Cannot inspect update admission".into()); }
-                    let status: Value = serde_json::from_str(&status.body).map_err(|_| "Invalid update admission")?;
-                    if status["barrier"].is_object() {
-                        let lease = &status["barrier"]["lease"];
-                        if status["barrier"]["version"] == health["version"] {
-                            let (complete, _) = call_with_session(&connection, "desktop-update",
-                                Some(json!({"action":"complete","lease":lease})),
-                                Some(startup_budget(health_deadline)?))?;
-                            if complete.status != 200 { return Err("Cannot complete desktop update".into()); }
-                        } else {
-                            native_update::cancel_startup_barrier(&connection, lease, health_deadline)?;
-                        }
-                    }
+                    native_update::reconcile_startup_barrier(&connection, &health["version"], health_deadline)?;
                 }
                 break;
             },

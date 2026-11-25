@@ -1395,7 +1395,32 @@ fn cancel_local_barrier(runtime: &RuntimeState, body: Value) -> bool {
     connection.as_ref().is_some_and(|connection| cancel_owned_barrier(connection, body, CANCEL_REQUEST_TIMEOUT))
 }
 
-pub(super) fn cancel_startup_barrier(connection: &Connection, lease: &Value, deadline: Instant) -> Result<(), String> {
+pub(super) fn reconcile_startup_barrier(connection: &Connection, version: &Value, deadline: Instant) -> Result<(), String> {
+    let status = loop {
+        let timeout = startup_budget(deadline)?.min(CANCEL_REQUEST_TIMEOUT);
+        match call_with_session(connection, "desktop-update", Some(json!({"action":"status"})), Some(timeout)) {
+            Ok((reply, _)) if reply.status == 200 => break reply,
+            Ok((reply, _)) if !matches!(reply.status, 502 | 503 | 504) => {
+                return Err("Cannot inspect update admission".into());
+            }
+            _ => std::thread::sleep(CANCEL_RETRY_DELAY.min(deadline.saturating_duration_since(Instant::now()))),
+        }
+    };
+    let status: Value = serde_json::from_str(&status.body).map_err(|_| "Invalid update admission")?;
+    let barrier = status.get("barrier").ok_or("Invalid update admission")?;
+    if barrier.is_null() { return Ok(()); }
+    let lease = barrier.get("lease").filter(|lease| lease.as_str().is_some_and(|lease| !lease.is_empty()))
+        .ok_or("Invalid update admission")?;
+    if barrier.get("version") == Some(version) {
+        let (complete, _) = call_with_session(connection, "desktop-update",
+            Some(json!({"action":"complete","lease":lease})), Some(startup_budget(deadline)?))?;
+        if complete.status != 200 { return Err("Cannot complete desktop update".into()); }
+        return Ok(());
+    }
+    cancel_startup_barrier(connection, lease, deadline)
+}
+
+fn cancel_startup_barrier(connection: &Connection, lease: &Value, deadline: Instant) -> Result<(), String> {
     let body = json!({"action":"cancel","lease":lease});
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1405,28 +1430,45 @@ pub(super) fn cancel_startup_barrier(connection: &Connection, lease: &Value, dea
     }
 }
 
+fn retry_live_update_barrier(runtime: &RuntimeState, lease: &Value, generation: u64, deadline: Instant) -> bool {
+    let body = json!({"action":"cancel","lease":lease});
+    while Instant::now() < deadline && !QUITTING.load(Ordering::SeqCst) {
+        if let Ok(_local_start) = runtime.local_start_gate.try_lock() {
+            if QUITTING.load(Ordering::SeqCst) || runtime.recovering.load(Ordering::SeqCst)
+                || runtime.generation.load(Ordering::SeqCst) != generation
+            {
+                return false;
+            }
+            let timeout = deadline.saturating_duration_since(Instant::now()).min(CANCEL_REQUEST_TIMEOUT);
+            let connection = runtime.local.lock().unwrap().clone();
+            if !timeout.is_zero() && connection.as_ref().is_some_and(|connection| {
+                cancel_owned_barrier(connection, body.clone(), timeout)
+            }) {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2).min(deadline.saturating_duration_since(Instant::now())));
+    }
+    false
+}
+
+fn try_release_live_barrier(runtime: &RuntimeState, lease: &Value) -> Result<(), String> {
+    cancel_update_lease(lease, |body| cancel_local_barrier(runtime, body),
+        || std::thread::sleep(CANCEL_RETRY_DELAY))
+}
+
 fn release_update_barrier(app: &tauri::AppHandle, runtime: &RuntimeState, lease: &Value) -> Result<(), String> {
-    let result = cancel_update_lease(lease, |body| cancel_local_barrier(runtime, body),
-        || std::thread::sleep(CANCEL_RETRY_DELAY));
+    let result = try_release_live_barrier(runtime, lease);
     if result.is_err() {
-        // Keep the live engine available to its tasks. If it is replaced, its
-        // successor handles outstanding admission during the startup handshake.
+        // Keep the live engine available. Its successor reconciles admission at startup
+        // if the owned runtime generation changes before cancellation succeeds.
         let handle = app.clone();
         let generation = runtime.generation.load(Ordering::SeqCst);
-        let body = json!({"action":"cancel","lease":lease});
+        let lease = lease.clone();
         std::thread::spawn(move || {
             let runtime = handle.state::<RuntimeState>();
-            // Both barrier phases have a one-hour recovery window in the engine.
             let deadline = Instant::now() + Duration::from_secs(3600);
-            while Instant::now() < deadline && !QUITTING.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_secs(2));
-                if let Ok(_local_start) = runtime.local_start_gate.try_lock() {
-                    if QUITTING.load(Ordering::SeqCst) || runtime.recovering.load(Ordering::SeqCst)
-                        || runtime.generation.load(Ordering::SeqCst) != generation
-                    { return; }
-                    if cancel_local_barrier(&runtime, body.clone()) { return; }
-                }
-            }
+            retry_live_update_barrier(&runtime, &lease, generation, deadline);
         });
     }
     result
@@ -1467,6 +1509,101 @@ mod lease_tests {
             attempts == 2
         }, || pauses += 1);
         assert_eq!((result, attempts, pauses), (Ok(()), 2, 1));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires an isolated Python desktop engine on the macOS runner"]
+    fn update_cancel_removes_persisted_lease_after_service_recovery() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let output = Command::new("python3").current_dir(&repo)
+            .args(["-B", "-c", "from adaptive_rsi import __version__; print(__version__)"])
+            .output().unwrap();
+        assert!(output.status.success());
+        let version = String::from_utf8(output.stdout).unwrap();
+        let launch = |root: &Path, mode: &str| {
+            let child = Command::new("python3").current_dir(&repo)
+                .args(["-B", "-m", "desktop.scripts.update_cancel_fixture"]).arg(root).arg(mode)
+                .env("ADAPTIVE_RSI_DESKTOP_OWNER_PID", std::process::id().to_string())
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            handshake_local_runtime(PendingChild::new(child), version.trim(),
+                Instant::now() + Duration::from_secs(20)).unwrap()
+        };
+        let action = |connection: &Connection, body: Value| {
+            let (reply, _) = call_with_session(connection, "desktop-update", Some(body),
+                Some(Duration::from_secs(3))).unwrap();
+            assert_eq!(reply.status, 200, "{}", reply.body);
+            serde_json::from_str::<Value>(&reply.body).unwrap()
+        };
+        let stored_barrier = |root: &Path| {
+            let output = Command::new("python3").args(["-B", "-c", r#"
+import json, sqlite3, sys
+from pathlib import Path
+with sqlite3.connect(Path(sys.argv[1]).as_uri() + '?mode=ro', uri=True) as db:
+    row = db.execute('SELECT value FROM settings WHERE key=?', ('desktop-update-barrier',)).fetchone()
+    assert db.execute('SELECT count(*) FROM calls').fetchone() == (0,)
+    print(row[0] if row else json.dumps(None))
+"#]).arg(root.join("state.sqlite3")).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()
+        };
+
+        // The still-running engine must retain admission while every cancel fails.
+        let live = tempfile::tempdir().unwrap();
+        let (mut live_child, connection, live_pid, _lines) = launch(live.path(), "live");
+        let prepared = action(&connection, json!({"action":"prepare","version":"99.99.99"}));
+        let lease = &prepared["barrier"]["lease"];
+        assert!(lease.is_string());
+        assert_eq!(stored_barrier(live.path())["lease"], *lease);
+        let state = RuntimeState::default();
+        *state.local.lock().unwrap() = Some(connection.clone());
+        let generation = state.generation.load(Ordering::SeqCst);
+        let outage = live.path().join("fixture-unavailable");
+        fs::write(&outage, b"unavailable").unwrap();
+        assert_eq!(try_release_live_barrier(&state, lease), Err("update_barrier_release_failed".into()));
+        assert!(!retry_live_update_barrier(&state, lease, generation, Instant::now() + Duration::from_millis(500)));
+        assert_eq!(stored_barrier(live.path())["lease"], *lease);
+        assert_eq!(fs::read_to_string(live.path().join("fixture-outages")).unwrap().lines().count(), 4);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(4);
+                while fs::read_to_string(live.path().join("fixture-outages")).unwrap().lines().count() < 5 {
+                    assert!(Instant::now() < deadline, "background cancellation did not retry");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                fs::remove_file(&outage).unwrap();
+            });
+            assert!(retry_live_update_barrier(&state, lease, generation, Instant::now() + Duration::from_secs(6)));
+        });
+        assert!(stored_barrier(live.path()).is_null());
+        let (health, _) = call_with_session(&connection, "health", None, Some(Duration::from_secs(3))).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&health.body).unwrap()["pid"], live_pid);
+        stop_child(live_child.get_mut(), Duration::from_secs(5));
+
+        // A failed install after engine shutdown leaves a committed barrier for the successor.
+        let restarted = tempfile::tempdir().unwrap();
+        let (mut child, old, old_pid, _old_lines) = launch(restarted.path(), "live");
+        let prepared = action(&old, json!({"action":"prepare","version":"99.99.99"}));
+        let lease = &prepared["barrier"]["lease"];
+        assert!(lease.is_string());
+        let committed = action(&old, json!({"action":"commit","lease":lease}));
+        assert_eq!(committed["barrier"]["phase"], "installing");
+        let state = RuntimeState::default();
+        publish_local_runtime(&state, child.take(), old, true);
+        let mut exiting = shutdown_runtime(&state, Duration::from_secs(5)).unwrap();
+        assert!(wait_for_child(&mut exiting, Duration::from_secs(5)));
+        assert!(exiting.wait().unwrap().success());
+        assert!(state.recovering.load(Ordering::SeqCst));
+        assert_eq!(stored_barrier(restarted.path())["lease"], *lease);
+        let (mut successor, recovered, new_pid, _new_lines) = launch(restarted.path(), "restart");
+        assert_ne!(old_pid, new_pid);
+        publish_local_runtime(&state, successor.take(), recovered.clone(), true);
+        assert!(!state.recovering.load(Ordering::SeqCst));
+        assert_eq!(fs::read_to_string(restarted.path().join("fixture-outages")).unwrap(), "status\ncancel\n");
+        assert!(action(&recovered, json!({"action":"status"}))["barrier"].is_null());
+        assert!(stored_barrier(restarted.path()).is_null());
+        let mut successor = shutdown_runtime(&state, Duration::from_secs(5)).unwrap();
+        assert!(wait_for_child(&mut successor, Duration::from_secs(5)));
     }
 
     #[test]
