@@ -79,11 +79,6 @@ SCHEDULER_JOIN_TIMEOUT = 30
 # 没有终点；超时记 workers_timed_out、写事件，未收尾的 run 由下次 store.recover() 恢复。
 WORKER_DRAIN_TIMEOUT = 30
 
-# 这些状态的任务仍代表一条「在办」的发现；巡检不会为同一问题重建任务。
-LIVE_FINDING_STATES = ("queued", "planning", "executing", "evaluating", "awaiting_approval",
-                       "pr_open", "merged", "deferred", "waiting_budget")
-# 用户明确做出的决定（不采纳、取消）同样压制重复发现，只有用户重新考虑才回池。
-SUPPRESSING_STATES = LIVE_FINDING_STATES + ("rejected", "cancelled")
 # 到达这些状态的发现可以被巡检重新入队：此前尝试已结束且没有产出修复。
 # obsolete 不在其中：规划明确判定「过时/不再适用」属于结论而非失败，
 # 重新入队会在每个扫描周期重复付费规划；用户可通过手动重试重新考虑。
@@ -777,7 +772,7 @@ class Runtime(Maintenance):
         self.wake.set()
         return task
 
-    def retry(self, task, reason=None, force=False):
+    def retry(self, task, reason=None, force=False, *, candidate_review=None):
         from .task_lifecycle import intervention_reason
         intervention_reason(reason)
         if type(force) is not bool:
@@ -791,6 +786,22 @@ class Runtime(Maintenance):
             self.require_active_project(row["project"])
             if db.execute("SELECT 1 FROM runs WHERE task=? AND ended IS NULL", (task,)).fetchone():
                 raise ValueError("Wait for the active run to finish stopping before retrying or supplementing this task")
+            if candidate_review is not None:
+                from .maintenance_evidence import full_sha
+                from .storage_tools import run_artifact_path
+                latest = db.execute("SELECT id,path,state,result FROM runs WHERE task=? "
+                                    "ORDER BY started DESC,rowid DESC LIMIT 1", (task,)).fetchone()
+                outcome = decode_object(latest["result"]) if latest else {}
+                risk = outcome.get("candidate_static_review") or {}
+                if (not latest or latest["id"] != candidate_review or latest["state"] != "blocked" or
+                        row["state"] != "blocked" or not reason or not reason.strip() or
+                        not full_sha(risk.get("approval"))):
+                    raise ValueError("Review the latest blocked candidate and enter a review reason")
+                patch = run_artifact_path(self.store, latest, "candidate.patch").read_text(encoding="utf-8")
+                if fingerprint(patch.removesuffix("\n")) != risk.get("patch_hash"):
+                    raise ValueError("The reviewed patch changed; approval was withheld")
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                           ("candidate-risk-approved:" + task, encode(risk["approval"])))
             if force and row["source"] != "system_evolve":
                 raise ValueError("A forced retry is only available for evolution tasks")
             # 排队中的任务无论处于正常队列还是失败/额度退避期，都允许手动提前。
@@ -814,7 +825,8 @@ class Runtime(Maintenance):
                        "VALUES (?,NULL,'manual_retry','User requested fresh verification',?,?)",
                        (row["project"], encode({"task": task, "reason": reason,
                         "before": {"state": row["state"], "attempts": row["attempts"], "available": row["available"]},
-                        "after": {"state": "queued", "attempts": 0, "available": 0}, "force": force}), now))
+                        "after": {"state": "queued", "attempts": 0, "available": 0}, "force": force,
+                        **({"candidate_review": candidate_review} if candidate_review else {})}), now))
         self.wake.set()
 
     def revise_task(self, task, supplement, reason=None, request_id=None):
@@ -2916,7 +2928,8 @@ class Runtime(Maintenance):
                              run["project"], run["id"])
 
     def inspect(self, project, workspace, kind, run, strategies):
-        from .discovery import evidence_anchors, evidence_paths
+        from .discovery import evidence_anchors, evidence_paths, finding_identity, related_task
+        from .maintenance_evidence import record_observation
 
         head = git(workspace, "rev-parse", "HEAD")
         key = "inspection-head:" + project["id"] + ":" + kind
@@ -3023,7 +3036,6 @@ class Runtime(Maintenance):
         recurrences = 0
         rediscoveries = 0
         contents = {}
-        historical = {}
         skipped = 0
         for item in items:
             # 单条 finding 同样来自模型：非 dict、缺字段或字段类型不符时跳过该条，
@@ -3048,54 +3060,56 @@ class Runtime(Maintenance):
                     contents[item["path"]] = path.read_text(errors="replace")
                 if item["quote"] not in contents[item["path"]] or not item["acceptance"]:
                     continue
-                from .discovery import finding_identity, related_task
                 finding_key = finding_identity(item)
-                prior = self.store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?", (project["id"], finding_key))
-                if not prior:
-                    legacy = self.store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?",
-                                            (project["id"], fingerprint({"path": item["path"], "quote": item["quote"]})))
-                    if legacy and related_task([legacy], item):
-                        prior = legacy
-                        finding_key = legacy["fingerprint"]
-                if prior and prior["state"] == "merged":
-                    self.store.execute("UPDATE tasks SET state='queued',available=0,attempts=0,infra_retries=0,cooldown_waits=0,budget_waits=0,evidence=?,updated=? WHERE id=?",
-                                       (encode([{"path": item["path"], "quote": item["quote"], "base": head,
-                                                 "source": "reported_recurrence"}]), time.time(), prior["id"]))
-                    self.store.event("recurrence_reported", "Inspection reported a possible recurrence; planning must reproduce it", project["id"], run["id"], {"task": prior["id"]})
-                    recurrences += 1
-                    continue
-                if prior and prior["state"] in REDISCOVERABLE_STATES:
-                    last = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC,rowid DESC LIMIT 1",
-                                          (prior["id"],))
-                    if last and _environment_failure(last["result"]):
-                        # 确定性环境故障需先由用户修复；自动重新入队只会重复付费。
-                        continue
-                    # 此前的尝试已结束且没有产出修复；同一条发现不应被指纹去重永久压制。
-                    self.store.execute("UPDATE tasks SET state='queued',available=0,attempts=0,infra_retries=0,cooldown_waits=0,budget_waits=0,evidence=?,updated=? WHERE id=?",
-                                       (encode([{"path": item["path"], "quote": item["quote"], "base": head,
-                                                 "source": "rediscovered"}]), time.time(), prior["id"]))
-                    self.store.event("finding_requeued", "Earlier attempt ended without a fix; rediscovered finding queued for fresh verification", project["id"], run["id"], {"task": prior["id"]})
-                    rediscoveries += 1
-                    continue
-                if prior and prior["state"] in SUPPRESSING_STATES:
-                    continue
-                # The prompt shows a recent sample. Deduplication must also find older exact anchors.
-                cited_path = item["path"]
-                if cited_path not in historical:
-                    historical[cited_path] = self.store.query(
-                        "SELECT t.id,t.title,t.evidence FROM tasks t WHERE t.project=? AND t.source NOT LIKE 'system_%' "
-                        "AND t.state IN (" + ",".join("?" for _ in SUPPRESSING_STATES) + ") AND EXISTS ("
-                        "SELECT 1 FROM json_each(CASE WHEN json_valid(t.evidence) THEN t.evidence ELSE '[]' END) e "
-                        "WHERE json_extract(CASE WHEN e.type='object' THEN e.value ELSE '{}' END,'$.path')=?)",
-                        (project["id"], *SUPPRESSING_STATES, cited_path))
-                if related_task(historical[cited_path], item):
-                    continue
                 if finding_key in seen_keys:
                     continue
                 seen_keys.add(finding_key)
                 evidence = {"path": item["path"], "quote": item["quote"], "base": head, "source": "inspection"}
+                observation = {**evidence, "run": run["id"], "kind": kind, "module": module_scope}
+                with self.store.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    prior = db.execute("SELECT * FROM tasks WHERE project=? AND fingerprint=?",
+                                       (project["id"], finding_key)).fetchone()
+                    if prior is None:
+                        legacy_keys = (finding_identity(item, legacy=True),
+                                       fingerprint({"path": item["path"], "quote": item["quote"]}))
+                        for legacy in db.execute("SELECT * FROM tasks WHERE project=? AND source='inspection' "
+                                                 "AND fingerprint IN (?,?) ORDER BY created,id",
+                                                 (project["id"], *legacy_keys)):
+                            if (legacy["body"] == item["body"][:30000] and
+                                    legacy["acceptance"] == encode(item["acceptance"]) and
+                                    related_task([legacy], item)):
+                                prior = legacy
+                                break
+                    if prior:
+                        reason = "retained"
+                        if prior["state"] == "merged":
+                            reason = "reported_recurrence"
+                        elif prior["state"] in REDISCOVERABLE_STATES:
+                            last = db.execute("SELECT result FROM runs WHERE task=? ORDER BY started DESC,rowid DESC LIMIT 1",
+                                              (prior["id"],)).fetchone()
+                            failure = decode_object(last["result"]).get("failure") if last else None
+                            if isinstance(failure, dict) and failure.get("code") == "candidate_static_review":
+                                reason = "manual_review_wait"
+                            else:
+                                reason = "environment_wait" if last and _environment_failure(last["result"]) else "rediscovered"
+                        if (record_observation(db, prior["id"], observation, reason) and
+                                reason in ("reported_recurrence", "rediscovered")):
+                            now = time.time()
+                            db.execute("UPDATE tasks SET state='queued',available=0,attempts=0,infra_retries=0,"
+                                       "cooldown_waits=0,budget_waits=0,evidence=?,updated=? WHERE id=?",
+                                       (encode([{**evidence, "source": reason}]), now, prior["id"]))
+                            recurrence = reason == "reported_recurrence"
+                            event = "recurrence_reported" if recurrence else "finding_requeued"
+                            message = ("Inspection reported a possible recurrence; planning must reproduce it" if recurrence else
+                                       "Earlier attempt ended without a fix; rediscovered finding queued for fresh verification")
+                            db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                                       (project["id"], run["id"], event, message, encode({"task": prior["id"]}), now))
+                            recurrences += recurrence
+                            rediscoveries += not recurrence
+                        continue
                 candidates.append({"index": len(candidates), "item": item, "key": finding_key,
-                                   "evidence": evidence})
+                                   "evidence": evidence, "observation": observation})
             except (ValueError, OSError):
                 continue
         if skipped:
@@ -3146,7 +3160,8 @@ class Runtime(Maintenance):
                 decision = "ready"
             task_id = self.store.add_task(
                 project["id"], "inspection", candidate["key"], item["title"], item["body"],
-                [candidate["evidence"]], item["acceptance"], max(1, min(70, item["priority"])))
+                [candidate["evidence"]], item["acceptance"], max(1, min(70, item["priority"])),
+                observation=candidate["observation"])
             if decision in ["deferred", "rejected"]:
                 # 决定与理由在初筛落库时即写入 task_decisions：/api/task、任务列表与
                 # 暂缓复核共用这一份记录，没有运行记录的任务也能看到理由。
@@ -3227,8 +3242,10 @@ class Runtime(Maintenance):
             self.store.event("prs_unavailable", "PR metadata unavailable: " + str(exc), project["id"])
         try:
             ci = json.loads(checked(["gh", "run", "list", "--repo", repo, "--limit", "10",
-                                     "--json", "databaseId,name,status,conclusion,headSha,url"], timeout=60))
+                                     "--json", "databaseId,name,status,conclusion,headSha,headBranch,event,url"], timeout=60))
             self.store.put_setting("ci:" + project["id"], ci)
+            self.store.put_setting("maintenance-ci:" + project["id"],
+                                   {"repository": repo, "observed": time.time(), "checks": ci})
         except RuntimeError as exc:
             self.store.event("ci_unavailable", "CI metadata unavailable: " + str(exc), project["id"])
 

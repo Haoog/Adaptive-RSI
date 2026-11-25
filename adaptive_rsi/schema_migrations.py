@@ -14,7 +14,7 @@ SCRIPTS = ((3, "003_seal_bootstrap.sql"), (4, "004_revision_snapshots.sql"),
            (7, "007_call_prices.sql"), (8, "008_intervention_history_index.sql"),
            (9, "009_open_runs_index.sql"), (10, "010_failure_monitor_outbox.sql"),
            (11, "011_task_recovery.sql"), (12, "012_revision_requests.sql"),
-           (13, "013_usage_components.sql"))
+           (13, "013_usage_components.sql"), (14, "014_maintenance_evidence.sql"))
 
 # _bootstrap() 的建表 DDL：executescript 会隐式提交，与后续补列/数据迁移事务分离，
 # 进程可能在两者之间中断。提取为常量供 Store 复用，也让回归测试能直接构造
@@ -148,6 +148,9 @@ EVIDENCE = {
     12: ("table revision_requests", lambda db, tables, indexes: "revision_requests" in tables),
     13: ("calls usage_components_known column",
          lambda db, tables, indexes: "usage_components_known" in _columns(db, "calls")),
+    14: ("table inspection_observations and its ordering index",
+         lambda db, tables, indexes: {"inspection_observations", "maintenance_reviews", "maintenance_rules"} <= tables and
+         "inspection_observations_recent" in indexes),
 }
 
 

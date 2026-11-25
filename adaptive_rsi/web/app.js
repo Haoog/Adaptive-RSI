@@ -917,6 +917,22 @@ function taskOutcome(data){
  if(result.value){const reason=el('details',undefined,'outcome-value');reason.open=true;reason.append(el('summary',t('为什么值得做')),valueReport(result.value,result.plan_reason,result.scope));outcome.append(reason);}
  if(result.failure){outcome.append(el('p',failureCopy(result.failure),'form-error'));if(window.RSIProduct)outcome.append(window.RSIProduct.raw({failure:result.failure,reason:result.reason},'查看原始诊断'));}
  if(result.files?.length)outcome.append(el('p',t('修改文件')+' · '+result.files.join(', '),'muted'));
+ if(result.candidate_static_review&&data.state==='blocked'){
+  const risk=result.candidate_static_review, panel=el('section',undefined,'detail-section');
+  const reason=el('input'), label=el('label',t('人工复核说明'));reason.maxLength=1000;label.append(reason);
+  const error=el('p','','form-error');error.setAttribute('role','status');
+  const approve=action(t('确认已复核并重新验证'),async()=>{
+   if(!reason.value.trim()){error.textContent=t('请填写人工复核说明。');return;}
+   approve.disabled=true;
+   try{await api('retry',{task:data.task,candidate_review:data.id,reason:reason.value.trim()});await refresh();}
+   catch(failure){error.textContent=failure.message;}
+   finally{approve.disabled=false;}
+  },'text-button');
+  panel.append(el('h4',t('等待候选补丁人工复核')),el('p',t('敏感路径发生改动。复核这份补丁后才能执行候选检查。')),
+   el('pre',risk.paths.join('\n')),el('code',risk.patch_hash),
+   action(t('阅读代码差异'),()=>window.RSIExperience.showDiff(data.id),'text-button'),label,approve,error);
+  outcome.append(panel);
+ }
  for(const [key,title]of [['evaluation','运行检查'],['review','代码评审']]){const row=el('p');row.append(el('strong',t(title)+' · '),result[key]?badge(result[key].decision):document.createTextNode(t('尚未完成')));outcome.append(row);}
  const next=result.delivery_status?t(deliveryNames[result.delivery_status]||result.delivery_status):t(statusNames[data.state]||data.state);
  outcome.append(el('p',t('交付状态')+' · '+next));
@@ -924,7 +940,7 @@ function taskOutcome(data){
  if(attention)outcome.append(attention);
  const guidance={awaiting_approval:'修改保存在本机；确认后可推送并创建 PR。',pr_open:'可以打开 GitHub 查看合并进度。',merged:'修改已合并；合并后的运行情况会继续复查。',failed:'查看检查结果，解决问题后可以重试。',blocked:'按错误提示调整设置后重试。',insufficient_evidence:'需要补充能证明问题已解决的检查。'}[data.state];
  if(guidance)outcome.append(el('p',t(guidance),'muted'));
- if(result.failure){const target=['credentials','provider'].includes(result.failure.code)?'models':'settings';outcome.append(el('p',t(failureNext[result.failure.code]||failureNext.execution),'muted'));outcome.append(action(t(target==='models'?'修复模型连接':'检查项目设置'),()=>{closeTaskDetail();showView(target);},'text-button'));}
+ if(result.failure&&result.failure.code!=='candidate_static_review'){const target=['credentials','provider'].includes(result.failure.code)?'models':'settings';outcome.append(el('p',t(failureNext[result.failure.code]||failureNext.execution),'muted'));outcome.append(action(t(target==='models'?'修复模型连接':'检查项目设置'),()=>{closeTaskDetail();showView(target);},'text-button'));}
  if(window.RSIProduct){outcome.append(window.RSIProduct.checkList(result.evaluation?.checks));if(data.state==='awaiting_approval')outcome.append(window.RSIProduct.approval(data));}
  const evidence=data.evidence_summary;
  if(evidence){
@@ -972,12 +988,17 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
  const partial=task.body===undefined||task.evidence===undefined;
  const requirements=el('section',undefined,'task-requirements'),copy=el('p',task.body);copy.id='task-requirements';requirements.append(el('h3',t('任务要求')),copy);body.append(requirements);
  const evidence=lazyEvidence('来源与证据',()=>task.evidence||'');evidence.className='detail-section';evidence.hidden=partial;body.append(evidence);
+ const observations=lazyEvidence('巡检观测（最近 50 条）',()=>task.inspection_observations.map(row=>{
+  const reasons={discovered:'首次发现',retained:'保留当前状态',environment_wait:'等待修复运行环境',manual_review_wait:'等待候选补丁人工复核',reported_recurrence:'疑似复发，重新验证',rediscovered:'上次未修复，重新验证'};
+  return [new Date(row.observed*1000).toLocaleString(),row.source+' / '+row.kind+' / '+row.run,
+   t(reasons[row.reason]||row.reason),row.base,row.path,row.quote].join('\n');
+ }).join('\n\n'));observations.className='detail-section';observations.hidden=!task.inspection_observations?.length;body.append(observations);
  if(partial)safe(async()=>{
   let detail;
   try{detail=await api('task?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));}
   catch(error){if(stillCurrent()&&$('detail-dialog').open)throw error;return;}
   if(!stillCurrent())return;
-  task=detail;detailTask=detail;copy.textContent=detail.body||'';evidence.hidden=false;
+  task=detail;detailTask=detail;copy.textContent=detail.body||'';evidence.hidden=false;observations.hidden=!detail.inspection_observations?.length;
  });
  // 首屏请求失败时，保留当前详情；重试只重取第一页，再继续本次渲染。
  let retrying=false,rendered=false;
@@ -1353,7 +1374,7 @@ async function renderCapabilities(){
 }
 
 const readinessNames={checks:'项目检查命令',worker:'模型执行环境',sandbox:'独立运行环境',dependencies:'项目依赖',tools:'执行工具',model:'模型连接配置',budget:'模型服务用量'};
-const failureMessages={checks:'代码检查没有通过，请查看运行与效果检查。',review:'代码评审发现了需要修改的问题，请查看评审建议。',improvement:'修改后的检查通过了，但还缺少解决问题的前后对照证据。',budget:'模型服务暂未提供本次运行所需的用量，请检查连接后重试。',credentials:'模型认证失效，请检查模型连接设置。',provider:'模型服务暂不可用，请稍后重试。',environment:'运行条件不完整，请查看运行准备检查。',baseline:'项目内容已更新，请基于最新版本重新执行。',execution:'这次执行没有完成，请展开运行详情查看原因。'};
+const failureMessages={candidate_static_review:'等待候选补丁人工复核',checks:'代码检查没有通过，请查看运行与效果检查。',review:'代码评审发现了需要修改的问题，请查看评审建议。',improvement:'修改后的检查通过了，但还缺少解决问题的前后对照证据。',budget:'模型服务暂未提供本次运行所需的用量，请检查连接后重试。',credentials:'模型认证失效，请检查模型连接设置。',provider:'模型服务暂不可用，请稍后重试。',environment:'运行条件不完整，请查看运行准备检查。',baseline:'项目内容已更新，请基于最新版本重新执行。',execution:'这次执行没有完成，请展开运行详情查看原因。'};
 const failureNext={checks:'先查看失败的检查项，修正代码或补充验收条件后重试。',review:'先处理评审指出的问题，再让系统重新检查和评审。',improvement:'补充能实际运行、能证明问题已解决的验收检查。',budget:'检查模型连接和用量设置，恢复后再重试。',credentials:'检查模型连接或刷新登录凭据。',provider:'稍后重试；如果是持续故障，请切换备用模型。',environment:'检查项目依赖、执行工具和独立运行环境。',baseline:'基于最新主线重新执行，不要继续使用旧候选。',execution:'展开原始运行记录，按失败步骤修正后重试。'};
 const stopMessages={output_limit:'模型输出达到上限，请检查输出限制后重试。',safety:'模型服务的安全策略中止了响应，请查看原始诊断并核对请求。',refusal:'模型拒绝了本次请求，请查看诊断并核对模型能力与服务策略。',paused:'模型暂停了本次响应，请查看运行诊断。',stop_sequence:'响应被停止序列提前截断，请检查模型设置。',text_only:'模型只返回了文本，未返回所需工具调用，请检查模型的工具能力。'};
 function failureCopy(problem){return t(stopMessages[problem.stop_reason]||failureMessages[problem.code]||failureMessages.execution);}

@@ -262,6 +262,7 @@ _POST_FIELD_TYPES = {
     "/api/release-resolve": {"project": str, "run": str, "kind": str, "target": str},
     "/api/release-abandon": {"project": str, "run": str, "kind": str, "reason": str, "target": str},
     "/api/release-authorize": {"project": str, "kind": str, "workflow": str},
+    "/api/maintenance-review": {"project": str, "start": str, "token": str, "rules": list},
     "/api/goal": {"project": str, "text": str, "request_id": str},
     "/api/task/revise": {"task": str, "supplement": str, "reason": str, "request_id": str},
     "/api/task/value-feedback": {"project": str, "task": str, "run": str, "rating": str, "note": str},
@@ -270,7 +271,7 @@ _POST_FIELD_TYPES = {
     "/api/task/schedule": {"task": str, "reason": str},
     "/api/request": {"project": str, "kind": str},
     "/api/pause": {"project": str, "paused": bool},
-    "/api/retry": {"task": str, "reason": str, "force": bool},
+    "/api/retry": {"task": str, "reason": str, "force": bool, "candidate_review": str},
     "/api/cancel": {"task": str, "cascade": bool, "reason": str},
     "/api/deliver": {"run": str, "reason": str},
     "/api/rollback": {"candidate": str},
@@ -1025,7 +1026,16 @@ class Handler(BaseHTTPRequestHandler):
                 task["group_lineage"] = lineage(store, task["id"], task["project"])
                 from .recovery import task_recovery
                 task["recovery"] = task_recovery(store, task)
+                from .maintenance_evidence import task_observations
+                task["inspection_observations"] = task_observations(store, task["id"])
                 self.respond(task)
+            elif parsed.path == "/api/maintenance-review":
+                from .maintenance_evidence import maintenance_summary, retrospective_preview
+                project = runtime.project(params.get("project", [""])[0])
+                if params.get("preview", [""])[0] == "1":
+                    self.respond(retrospective_preview(store, project, params.get("start", [None])[0]))
+                else:
+                    self.respond(maintenance_summary(store, project, runtime.config(project["id"])["github"]["repository"]))
             elif parsed.path == "/api/workflow-metrics":
                 from .telemetry import workflow_metrics
                 self.respond(workflow_metrics(store, params.get("project", [None])[0]))
@@ -1402,6 +1412,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 100:
                     raise RequestError("request_id must contain 1..100 characters")
             response_code, response_headers, response_lock = 200, None, None
+            if path == "/api/maintenance-review":
+                from .maintenance_evidence import confirm_retrospective
+                project = runtime.require_active_project(body.get("project", ""))
+                self.respond(confirm_retrospective(runtime.store, project, body.get("start"),
+                                                   body.get("token"), body.get("rules")))
+                return
             if path == "/api/operations":
                 options = {"reuse_active": True} if body.get("reuse_active") is True else {}
                 self.respond(runtime.operations.start(body.get("kind"), body.get("parameters", {}), **options))
@@ -1645,7 +1661,8 @@ class Handler(BaseHTTPRequestHandler):
                     runtime.pause(body["project"], body["paused"])
                     result = {"saved": True}
                 elif path == "/api/retry":
-                    runtime.retry(body["task"], body.get("reason"), force=body.get("force", False))
+                    runtime.retry(body["task"], body.get("reason"), force=body.get("force", False),
+                                  candidate_review=body.get("candidate_review"))
                     result = {"saved": True}
                 elif path == "/api/cancel":
                     result = runtime.cancel_task(body["task"], body.get("cascade", False), body.get("revision"), body.get("reason"))

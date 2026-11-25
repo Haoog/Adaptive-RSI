@@ -21,7 +21,7 @@ window.RSIExperience = (() => {
     inboxAt = 0;
   const queueSaves = new Map(), supplementSaves = new Map();
   let queueEditor, backoffRetry, liveRetryButton;
-  let usageButton;
+  let usageButton, maintenanceButton;
   const queueKey = task => JSON.stringify([task.project, task.id]);
   function queueEditorCurrent(editor) {
     return queueEditor === editor && $("detail-dialog").open &&
@@ -1675,6 +1675,71 @@ window.RSIExperience = (() => {
       });
     };
   }
+  async function maintenanceReview() {
+    const project = projectId;
+    if (!project) return;
+    const endpoint = "maintenance-review?project=" + encodeURIComponent(project);
+    const box = dialog("主线复盘与已确认规则");
+    const content = el("section"), error = el("p", "", "form-error");
+    error.setAttribute("role", "status");
+    box.append(content, error);
+    const current = () => box.open && project === projectId;
+    const raw = (label, value) => lazyEvidence(label, () => JSON.stringify(value, null, 2));
+    const field = (parent, label, multiline = false) => {
+      const control = el(multiline ? "textarea" : "input"), wrapper = el("label", t(label));
+      wrapper.append(control);
+      parent.append(wrapper);
+      return control;
+    };
+    let data;
+    async function load() {
+      data = await api(endpoint);
+      if (!current()) return;
+      content.replaceChildren(el("p", t("已复盘至") + " · " + (data.cursor || t("尚无记录"))),
+        el("p", t("本地可见主线") + " · " + (data.main || t("未知"))),
+        el("p", t(data.signal.status === "version_matched" ? "固定检查已匹配主线版本" : "固定检查待调查，缺少可靠版本或完成记录。")),
+        raw("固定检查证据", data.signal), raw("已确认规则", data.rules), raw("近期复盘记录", data.reviews));
+      const start = data.cursor ? null : field(content, "起始主线完整 SHA（不含该提交）");
+      const previewPanel = el("section");
+      content.append(action(t("预览下一批主线提交"), async () => {
+        previewPanel.replaceChildren();
+        error.textContent = "";
+        const startSha = start?.value.trim();
+        const preview = await api(endpoint + "&preview=1" + (startSha ? "&start=" + encodeURIComponent(startSha) : ""));
+        if (!current()) return;
+        const {commits} = preview;
+        if (!commits.length) {
+          previewPanel.append(el("p", t("这批没有新增主线提交。")));
+          return;
+        }
+        previewPanel.append(el("p", preview.base + " → " + preview.end), raw("主线提交与证据", commits));
+        const fields = el("details");
+        fields.append(el("summary", t("添加一条已核验规则（可选）")));
+        const sha = field(fields, "证据提交完整 SHA");
+        const paths = field(fields, "关联改动路径（每行一个）", true);
+        const rule = field(fields, "规则", true);
+        const reason = field(fields, "原因", true);
+        const validation = field(fields, "测试证据或验收缺口", true);
+        const confirm = action(t("确认已复盘并保存进度"), async () => {
+          if (!current()) return;
+          confirm.disabled = true;
+          error.textContent = "";
+          try {
+            const entered = [sha, paths, rule, reason, validation].some(input => input.value.trim());
+            const rules = entered ? [{sha: sha.value.trim(), paths: paths.value.split(/\r?\n/).map(path => path.trim()).filter(Boolean),
+              rule: rule.value, reason: reason.value, validation: validation.value}] : [];
+            await api("maintenance-review", {project, start: startSha || null, token: preview.token, rules});
+            await load();
+          } catch (failure) {
+            if (current()) error.textContent = failure.message;
+          } finally { confirm.disabled = false; }
+        });
+        previewPanel.append(fields, confirm);
+      }, "text-button"), previewPanel);
+    }
+    try { await load(); }
+    catch (failure) { if (current()) error.textContent = failure.message; }
+  }
   async function metrics() {
     const data = await api("workflow-metrics?project=" + projectId),
       box = dialog("流程质量与耗时");
@@ -1797,7 +1862,8 @@ window.RSIExperience = (() => {
     $("mobile-install").onclick = () => safe(mobile);
     $("storage-tools").onclick = () => safe(storage);
     usageButton = action(t("流程质量与耗时"), metrics, "text-button");
-    $("view-usage").prepend(usageButton);
+    maintenanceButton = action(t("主线复盘与已确认规则"), maintenanceReview, "text-button");
+    $("view-usage").prepend(usageButton, maintenanceButton);
     $("detail-dialog").addEventListener("close", event => {
       if(event.rsiProgrammaticClose)return;
       if($("detail-dialog").open)return;
@@ -1815,7 +1881,7 @@ window.RSIExperience = (() => {
     if (!window.RSIDesktop && "serviceWorker" in navigator && isSecureContext)
       navigator.serviceWorker.register("/sw.js").catch(() => {});
   });
-  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { detailTaskRetryButtons.clear(); queueEditor = null; liveFailures = 0; liveNotice(); clearTimeout(liveTimer); }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时");const inbox=$("attention-inbox");if(inbox)inbox.textContent=t("所有项目待办")+(inbox.textContent.match(/ · \d+$/)?.[0]||''); } };
+  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { detailTaskRetryButtons.clear(); queueEditor = null; liveFailures = 0; liveNotice(); clearTimeout(liveTimer); }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时");if(maintenanceButton)maintenanceButton.textContent=t("主线复盘与已确认规则");const inbox=$("attention-inbox");if(inbox)inbox.textContent=t("所有项目待办")+(inbox.textContent.match(/ · \d+$/)?.[0]||''); } };
 })();
 
 'use strict';

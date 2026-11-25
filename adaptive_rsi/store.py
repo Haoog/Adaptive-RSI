@@ -1033,7 +1033,7 @@ class Store:
                      (project, run, kind, message, encode(data or {}), time.time()))
 
     def add_task(self, project, source, key, title, body="", evidence=None, acceptance=None,
-                 priority=50, overrides=None, request_id=None, request_signature=None):
+                 priority=50, overrides=None, request_id=None, request_signature=None, *, observation=None):
         task = uid()
         now = time.time()
         with self.connect() as db:
@@ -1052,6 +1052,9 @@ class Store:
                        (task, project, source, key, title[:300], body[:30000], encode(evidence or []),
                         encode(acceptance or []), "queued", priority, encode(overrides or {}), now, now))
             row = db.execute("SELECT id FROM tasks WHERE project=? AND fingerprint=?", (project, key)).fetchone()
+            if observation is not None:
+                from .maintenance_evidence import record_observation
+                record_observation(db, row["id"], observation, "discovered" if row["id"] == task else "retained")
             if request_id:
                 db.execute("INSERT INTO submissions VALUES (?,?,?,?)", (project, request_id, request_signature, row["id"]))
         return row["id"]

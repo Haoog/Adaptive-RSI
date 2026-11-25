@@ -106,7 +106,7 @@ class ServerExecutionTest(unittest.TestCase):
              "priority": priority}
             for i, priority in enumerate([20, 30, 40, 80])
         ]
-        findings.append({**findings[0], "body": "Duplicate report at the same anchor"})
+        findings.append({**findings[0], "priority": 21})
         calls = []
         def invoke(role, prompt, workspace, run):
             calls.append(role)

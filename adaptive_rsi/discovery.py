@@ -900,11 +900,14 @@ def problem_title(title):
     return " ".join(title.split()).casefold()
 
 
-def finding_identity(finding):
+def finding_identity(finding, *, legacy=False):
     from .config import fingerprint
     # 同一行可能包含多个缺陷；代码引用本身不能证明它们是同一个问题。
-    return fingerprint({"path": finding["path"], "quote": finding["quote"],
-                        "title": problem_title(finding["title"])})
+    identity = {"path": finding["path"], "quote": finding["quote"],
+                "title": problem_title(finding["title"])}
+    if not legacy and "body" in finding and "acceptance" in finding:
+        identity.update(body=finding["body"].strip(), acceptance=finding["acceptance"])
+    return fingerprint(identity)
 
 
 def evidence_anchors(value):
