@@ -109,6 +109,10 @@ jobs:
         run: |
           npm run --prefix desktop build
           cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
+      - name: 验证旧版 DMG 的 HTTPS 续传和真卷挂载
+        if: needs.changes.outputs.mode == 'full'
+        timeout-minutes: 5
+        run: bash desktop/scripts/test_legacy_dmg_https.sh
       - name: 验证 FAT32 和 ExFAT 真卷备份
         if: needs.changes.outputs.mode == 'full'
         timeout-minutes: 5

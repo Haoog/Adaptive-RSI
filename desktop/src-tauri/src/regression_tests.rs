@@ -601,3 +601,58 @@ fn update_recovery_restores_local_without_replacing_selected_remote() {
     assert_eq!(state.connection_generation.load(Ordering::SeqCst), 0);
     state.child.lock().unwrap().take().unwrap().wait().unwrap();
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires the GitHub macOS HTTPS and disk image fixture"]
+fn legacy_dmg_https_resume_and_real_mount() {
+    let fixture = PathBuf::from(std::env::var_os("RSI_DMG_FIXTURE").unwrap());
+    let volume = PathBuf::from(std::env::var_os("RSI_DMG_VOLUME").unwrap());
+    let url = std::env::var("RSI_DMG_URL").unwrap();
+    let image = fs::read(fixture.join("source.dmg")).unwrap();
+    let expected = update_receipt::sha256_hex(&image);
+    let total = image.len() as u64;
+    let cutoff = 256 * 1024;
+    let segment_end = 512 * 1024;
+    let certificate = reqwest::Certificate::from_pem(&fs::read(fixture.join("ca.pem")).unwrap()).unwrap();
+    let client = update_client_builder().add_root_certificate(certificate).build().unwrap();
+    let cache = fixture.join("cache");
+    let destination = fixture.join("published.dmg");
+
+    let mut progress = Vec::new();
+    let interrupted = stage_legacy_dmg(&destination, &expected, |file| {
+        download_legacy_dmg(&client, &url, file, Some(&cache), &expected,
+            |bytes, size| progress.push((bytes, size)))
+    }, |_| panic!("interrupted DMG reached attach"));
+    assert_eq!(interrupted, Err(("Download interrupted", "")));
+    assert_eq!(progress.last(), Some(&(cutoff, total)));
+    assert!(!destination.exists());
+    assert!(!volume.exists());
+    let checkpoint = cache.join("legacy-dmg-download/image.part");
+    assert!(checkpoint.is_file());
+
+    progress.clear();
+    stage_legacy_dmg(&destination, &expected, |file| {
+        download_legacy_dmg(&client, &url, file, Some(&cache), &expected,
+            |bytes, size| progress.push((bytes, size)))
+    }, |staged| {
+        assert!(!destination.exists());
+        assert!(attach_legacy_dmg(staged));
+        assert_eq!(fs::read(volume.join("marker.txt")).unwrap(), b"Adaptive RSI DMG fixture\n");
+        true
+    }).unwrap();
+    assert_eq!(progress.first(), Some(&(cutoff, total)));
+    assert!(progress.contains(&(segment_end, total)));
+    assert_eq!(progress.last(), Some(&(total, total)));
+    assert_eq!(fs::read(&destination).unwrap(), image);
+    assert!(!checkpoint.exists());
+
+    let wrong_checksum = "0".repeat(64);
+    assert_eq!(stage_legacy_dmg(&destination, &wrong_checksum,
+        |_| panic!("existing image should be verified in private staging"),
+        |_| panic!("checksum mismatch reached attach")),
+        Err(("Checksum verification failed", "checksum")));
+    assert!(fs::read_dir(&fixture).unwrap().all(|entry| {
+        !entry.unwrap().file_name().to_string_lossy().starts_with(".adaptive-rsi-")
+    }));
+}

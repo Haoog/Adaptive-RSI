@@ -131,13 +131,16 @@ fn update_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
-fn update_client() -> Result<Client, String> {
+fn update_client_builder() -> reqwest::blocking::ClientBuilder {
     Client::builder()
         .no_proxy()
         .https_only(true)
         .redirect(update_redirect_policy())
         .timeout(LEGACY_DOWNLOAD_TIMEOUT)
-        .build()
+}
+
+fn update_client() -> Result<Client, String> {
+    update_client_builder().build()
         .map_err(|_| "Cannot create updater connection".into())
 }
 
@@ -343,31 +346,12 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
         let path = download_dir.join(format!("adaptive-rsi-{}-macos-{}-adhoc.dmg", version, arch));
         let cache = app.path().app_cache_dir().ok();
         let download = |staged: &mut File| {
-            let started = std::time::Instant::now();
-            legacy_dmg_download::download(staged, cache.as_deref(), &expected, |range| {
-                let timeout = LEGACY_DOWNLOAD_TIMEOUT.saturating_sub(started.elapsed());
-                if timeout.is_zero() {
-                    return Err("Download interrupted");
-                }
-                let mut request = client.get(&url)
-                    .timeout(timeout)
-                    .header("User-Agent", "Adaptive-RSI-updater")
-                    .header(reqwest::header::ACCEPT_ENCODING, "identity");
-                if let Some(range) = range {
-                    request = request.header(reqwest::header::RANGE, range);
-                }
-                let response = request.send().map_err(|_| "Download failed")?;
-                Ok(legacy_dmg_download::DownloadResponse {
-                    status: response.status(),
-                    headers: response.headers().clone(),
-                    length: response.content_length(),
-                    body: response,
+            download_legacy_dmg(&client, &url, staged, cache.as_deref(), &expected,
+                |downloaded, total| {
+                    if let Some(update) = state.update.lock().unwrap().as_ref() {
+                        update.percent.store(downloaded * 10000 / total, Ordering::Relaxed);
+                    }
                 })
-            }, |downloaded, total| {
-                if let Some(update) = state.update.lock().unwrap().as_ref() {
-                    update.percent.store(downloaded * 10000 / total, Ordering::Relaxed);
-                }
-            })
         };
         let result = stage_legacy_dmg(&path, &expected, download, attach_legacy_dmg);
         complete_desktop_download(&state, result);
@@ -376,6 +360,37 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
     receiver
         .recv()
         .unwrap_or_else(|_| Err("Download did not start".into()))
+}
+
+fn download_legacy_dmg(
+    client: &Client,
+    url: &str,
+    staged: &mut File,
+    cache: Option<&Path>,
+    expected: &str,
+    progress: impl FnMut(u64, u64),
+) -> Result<(), &'static str> {
+    let started = std::time::Instant::now();
+    legacy_dmg_download::download(staged, cache, expected, |range| {
+        let timeout = LEGACY_DOWNLOAD_TIMEOUT.saturating_sub(started.elapsed());
+        if timeout.is_zero() {
+            return Err("Download interrupted");
+        }
+        let mut request = client.get(url)
+            .timeout(timeout)
+            .header("User-Agent", "Adaptive-RSI-updater")
+            .header(reqwest::header::ACCEPT_ENCODING, "identity");
+        if let Some(range) = range {
+            request = request.header(reqwest::header::RANGE, range);
+        }
+        let response = request.send().map_err(|_| "Download failed")?;
+        Ok(legacy_dmg_download::DownloadResponse {
+            status: response.status(),
+            headers: response.headers().clone(),
+            length: response.content_length(),
+            body: response,
+        })
+    }, progress)
 }
 
 fn complete_desktop_download(state: &RuntimeState, result: Result<(), (&str, &str)>) {
