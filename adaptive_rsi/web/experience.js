@@ -1699,8 +1699,61 @@ window.RSIExperience = (() => {
         el("p", t("本地可见主线") + " · " + (data.main || t("未知"))),
         el("p", t(data.signal.status === "version_matched" ? "固定检查已匹配主线版本" : "固定检查待调查，缺少可靠版本或完成记录。")),
         raw("固定检查证据", data.signal), raw("已确认规则", data.rules), raw("近期复盘记录", data.reviews));
+      const weekly = data.schedule || {};
       const start = data.cursor ? null : field(content, "起始主线完整 SHA（不含该提交）");
       const previewPanel = el("section");
+      if (start) {
+        start.value = weekly.start || "";
+        if (data.main) content.append(action(t("以当前本地主线为起点"), () => {
+          start.value = data.main;
+          previewPanel.replaceChildren();
+        }, "text-button"));
+      }
+      const settings = el("section");
+      const date = (seconds) => new Date(seconds * 1000).toLocaleString(language);
+      settings.append(el("h3", t("每周待复核摘要")));
+      if (weekly.enabled) {
+        if (data.paused) settings.append(el("p", t("项目暂停期间不生成摘要。")));
+        if (weekly.next_at != null) settings.append(el("p", t(weekly.error ? "下次重试" : "下次生成") + " · " + date(weekly.next_at)));
+        if (weekly.error) settings.append(el("p", t(apiErrors[weekly.error] || "无法读取本地复盘证据。")));
+      }
+      const summary = weekly.summary;
+      if (summary) {
+        settings.append(el("p", t("上次生成") + " · " + date(summary.generated_at)),
+          el("p", summary.base + " → " + summary.end));
+        if (summary.cursor !== data.cursor || summary.main !== data.main || (!data.cursor && summary.base !== weekly.start)) {
+          settings.append(el("p", t("此摘要对应较早的复盘范围，请使用手动预览核对。")));
+        }
+        if (summary.commits.length) {
+          const linked = summary.commits.filter(commit => commit.evidence).length;
+          settings.append(el("p", t("本批提交") + " · " + summary.commits.length + " / " +
+            t("关联运行证据") + " · " + linked), raw("主线提交与证据", summary.commits));
+          if (summary.end !== summary.main) settings.append(el("p", t("主线还有后续提交，确认本批后可继续预览。")));
+        } else settings.append(el("p", t("这批没有新增主线提交。")));
+      }
+      const scheduleButtons = [];
+      const scheduleButton = (label, enabled) => {
+        const button = action(t(label), async () => {
+          error.textContent = "";
+          scheduleButtons.forEach(control => { control.disabled = true; });
+          try {
+            const body = {project, schedule: enabled};
+            if (enabled && start?.value.trim()) body.start = start.value.trim();
+            await api("maintenance-review", body, {current});
+            await load();
+          } catch (failure) {
+            if (current()) error.textContent = failure.message;
+          } finally { scheduleButtons.forEach(control => { control.disabled = false; }); }
+        }, "text-button");
+        scheduleButtons.push(button);
+        settings.append(button);
+      };
+      if (!weekly.enabled) scheduleButton("开启每周摘要", true);
+      else {
+        if (start) scheduleButton("保存每周摘要起点", true);
+        scheduleButton("关闭每周摘要", false);
+      }
+      content.append(settings);
       const previewButton = action(t("预览下一批主线提交"), async () => {
         previewPanel.replaceChildren();
         error.textContent = "";

@@ -13,9 +13,12 @@ def diff_path(value):
     return value[2:] if value.startswith(("a/", "b/")) else value
 
 
-def git(root, *args, timeout=60):
+def git(root, *args, timeout=60, local_only=False):
     environment = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
                    "GIT_TERMINAL_PROMPT": "0"}
+    if local_only:
+        # Partial clones can fetch missing objects even for read-only commands.
+        environment.update(GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="")
     return checked(["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false",
                     "-C", str(root)] + list(args), env=environment, timeout=timeout)
 

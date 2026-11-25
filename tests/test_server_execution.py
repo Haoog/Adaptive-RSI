@@ -147,6 +147,114 @@ class ServerExecutionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             confirm_retrospective(self.store, project, start, preview["token"], [candidate])
 
+    def test_weekly_retrospective_api_and_retry_keep_the_manual_cursor(self):
+        import io
+        from email.message import Message
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from adaptive_rsi.maintenance_evidence import (
+            REVIEW_RETRY, REVIEW_WEEK, retrospective_preview, schedule_retrospectives,
+        )
+        from adaptive_rsi.server import Handler
+
+        def request(body=None, query="", csrf="fixture-csrf"):
+            handler = Handler.__new__(Handler)
+            origin = "http://localhost"
+            handler.server = SimpleNamespace(runtime=self.runtime, origin=origin, local_origin=origin,
+                                             csrf="fixture-csrf", security_failure=Mock())
+            handler.authenticated = Mock(return_value=True)
+            handler.respond = Mock()
+            handler.path = "/api/maintenance-review" + query
+            handler.headers = Message()
+            handler.headers["Origin"] = origin
+            handler.headers["X-RSI-CSRF"] = csrf
+            if body is None:
+                handler.do_GET()
+            else:
+                payload = json.dumps({"project": self.project, **body}).encode()
+                handler.headers["Content-Length"] = str(len(payload))
+                handler.headers["Content-Type"] = "application/json"
+                handler.rfile = io.BytesIO(payload)
+                handler.do_POST()
+            handler.authenticated.assert_called_once()
+            response = handler.respond.call_args.args
+            return response[0], response[1] if len(response) > 1 else 200
+
+        def commit(subject):
+            (self.repo / "calculator.py").write_text(f"# {subject}\n")
+            git(self.repo, "add", "calculator.py")
+            git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",
+                "commit", "--quiet", "-m", subject)
+            return git(self.repo, "rev-parse", "HEAD")
+
+        start = git(self.repo, "rev-parse", "HEAD")
+        reviewed = commit("first change")
+        self.runtime.pause(self.project, False)
+        task = self.runtime.goal(self.project, "record merged evidence")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertEqual(run["task"], task)
+        self.store.transition(run["id"], "merged", {"merged_sha": reviewed, "pr": 42,
+                                                   "evaluation": {"decision": "pass"}}, True)
+        query = "?project=" + self.project
+        self.assertEqual(request({"schedule": True}, csrf="wrong")[1], 403)
+        self.assertEqual(request({"schedule": True})[1], 400)
+        self.assertEqual(request({"schedule": True, "start": "f" * 40})[1], 400)
+        self.assertEqual(request({"schedule": True, "start": start, "rules": []})[1], 400)
+        enabled, status = request({"schedule": True, "start": start})
+        self.assertEqual(status, 200)
+        self.assertIsNone(request(query=query)[0]["cursor"])
+        due = enabled["next_at"]
+        schedule_retrospectives(self.runtime, due - 1)
+        self.assertEqual(request(query=query)[0]["schedule"], enabled)
+        schedule_retrospectives(self.runtime, due)
+        pending = request(query=query)[0]["schedule"]
+        preview = request(query=query + "&preview=1&start=" + start)[0]
+        self.assertEqual(pending["summary"], {**preview, "generated_at": due})
+        self.assertEqual(preview["commits"][0]["paths"], ["calculator.py"])
+        self.assertEqual(preview["commits"][0]["evidence"]["run"], run["id"])
+        self.assertEqual(preview["commits"][0]["evidence"]["pr"], 42)
+        self.assertEqual(pending["next_at"], due + REVIEW_WEEK)
+        schedule_retrospectives(self.runtime, due + REVIEW_WEEK)
+        self.assertEqual(request(query=query)[0]["schedule"]["summary"], pending["summary"])
+        self.assertEqual(request({"start": start, "token": preview["token"], "rules": []})[0]["cursor"], reviewed)
+
+        head = commit("second change")
+        schedule_retrospectives(self.runtime, due + 2 * REVIEW_WEEK)
+        current = request(query=query)[0]["schedule"]
+        self.assertEqual(current["summary"]["end"], head)
+        git(self.repo, "update-ref", "refs/heads/main", start)
+        schedule_retrospectives(self.runtime, current["next_at"])
+        failed = request(query=query)[0]
+        self.assertEqual(failed["cursor"], reviewed)
+        self.assertEqual(failed["schedule"]["summary"], current["summary"])
+        self.assertIn("first-parent", failed["schedule"]["error"])
+        retry = current["next_at"] + REVIEW_RETRY
+        self.assertEqual(failed["schedule"]["next_at"], retry)
+        git(self.repo, "update-ref", "refs/heads/main", head)
+        schedule_retrospectives(self.runtime, retry)
+        self.assertIsNone(request(query=query)[0]["schedule"]["error"])
+        def disable_during_preview(*args):
+            self.assertEqual(request({"schedule": False})[1], 200)
+            return retrospective_preview(*args)
+
+        with patch("adaptive_rsi.maintenance_evidence.retrospective_preview", side_effect=disable_during_preview) as preview_call:
+            schedule_retrospectives(self.runtime, retry + REVIEW_WEEK)
+        preview_call.assert_called_once()
+        disabled = request(query=query)[0]["schedule"]
+        self.assertFalse(disabled["enabled"])
+        self.assertIsNone(disabled["next_at"])
+        self.assertEqual(disabled["summary"], current["summary"])
+        schedule_retrospectives(self.runtime, retry + 2 * REVIEW_WEEK)
+        self.assertEqual(request(query=query)[0]["schedule"], disabled)
+        reenabled, status = request({"schedule": True})
+        self.assertEqual(status, 200)
+        self.assertIsNone(reenabled["start"])
+        self.assertEqual(request(query=query)[0]["cursor"], reviewed)
+        self.assertEqual(self.store.query("SELECT sha FROM maintenance_reviews"), [{"sha": reviewed}])
+        self.assertEqual(self.store.query("SELECT id FROM maintenance_rules"), [])
+        self.assertEqual(self.store.query("SELECT id FROM tasks"), [{"id": task}])
+
     def test_fixed_check_signal_requires_exact_main_version(self):
         from adaptive_rsi.maintenance_evidence import fixed_check_signal
 

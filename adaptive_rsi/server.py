@@ -263,7 +263,7 @@ _POST_FIELD_TYPES = {
     "/api/release-resolve": {"project": str, "run": str, "kind": str, "target": str},
     "/api/release-abandon": {"project": str, "run": str, "kind": str, "reason": str, "target": str},
     "/api/release-authorize": {"project": str, "kind": str, "workflow": str},
-    "/api/maintenance-review": {"project": str, "start": str, "token": str, "rules": list},
+    "/api/maintenance-review": {"project": str, "start": str, "token": str, "rules": list, "schedule": bool},
     "/api/goal": {"project": str, "text": str, "request_id": str},
     "/api/task/revise": {"task": str, "supplement": str, "reason": str, "request_id": str},
     "/api/task/value-feedback": {"project": str, "task": str, "run": str, "rating": str, "note": str},
@@ -1419,11 +1419,17 @@ class Handler(BaseHTTPRequestHandler):
                     raise RequestError("request_id must contain 1..100 characters")
             response_code, response_headers, response_lock = 200, None, None
             if path == "/api/maintenance-review":
-                from .maintenance_evidence import confirm_retrospective
+                from .maintenance_evidence import configure_retrospective, confirm_retrospective
                 with runtime.operations.guard("maintenance-review"):
                     project = runtime.require_active_project(body.get("project", ""))
-                    result = confirm_retrospective(runtime.store, project, body.get("start"),
-                                                   body.get("token"), body.get("rules"))
+                    if "schedule" in body:
+                        if set(body) - {"project", "schedule", "start"}:
+                            raise RequestError("Weekly settings must be saved separately from review confirmation")
+                        result = configure_retrospective(runtime.store, project, body["schedule"], body.get("start"))
+                        runtime.wake.set()
+                    else:
+                        result = confirm_retrospective(runtime.store, project, body.get("start"),
+                                                       body.get("token"), body.get("rules"))
                 self.respond(result)
                 return
             if path == "/api/operations":

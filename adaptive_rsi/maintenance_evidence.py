@@ -26,16 +26,24 @@ def task_observations(store, task):
 
 
 REVIEW_BATCH = 20
+REVIEW_WEEK = 7 * 86400
+REVIEW_RETRY = 3600
+SCHEDULE_PREFIX = "maintenance-weekly:"
+
+
+def _local_git(path, *args):
+    from .gitops import git
+
+    return git(path, "--no-replace-objects", *args, local_only=True)
 
 
 def main_head(project):
-    from .gitops import git
     path = project["path"]
-    refs = git(path, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/main", "refs/heads/main").splitlines()
+    refs = _local_git(path, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/main", "refs/heads/main").splitlines()
     ref = next((name for name in ("refs/remotes/origin/main", "refs/heads/main") if name in refs), None)
     if ref is None:
         raise ValueError("No local main or origin/main ref; refresh the repository first")
-    return git(path, "--no-replace-objects", "rev-parse", "--verify", ref + "^{commit}")
+    return _local_git(path, "rev-parse", "--verify", ref + "^{commit}")
 
 
 def fixed_check_signal(store, project, repository, head):
@@ -58,8 +66,6 @@ def _cursor(db, project):
 
 
 def retrospective_preview(store, project, start=None):
-    from .gitops import git
-
     project_id, path = project["id"], project["path"]
     with store.connect() as db:
         cursor = _cursor(db, project_id)
@@ -67,7 +73,7 @@ def retrospective_preview(store, project, start=None):
     base = cursor or start
     if not full_sha(base) or (cursor and start and start != cursor):
         raise ValueError("Provide an initial full main SHA, or use the saved review cursor")
-    history = lambda *args: git(path, "--no-replace-objects", *args)
+    history = lambda *args: _local_git(path, *args)
     try:
         distance = int(history("rev-list", "--first-parent", "--count", head, "^" + base))
         on_main = history("rev-parse", "--verify", f"{head}~{distance}") == base
@@ -161,6 +167,84 @@ def confirm_retrospective(store, project, start, token, rules):
     return {"cursor": preview["end"], "reviewed": len(commits)}
 
 
+def configure_retrospective(store, project, enabled, start=None, now=None):
+    if type(enabled) is not bool or (start is not None and (not enabled or not full_sha(start))):
+        raise ValueError("Use a boolean weekly setting and an optional full starting SHA when enabling")
+    project_id = project["id"]
+    key = SCHEDULE_PREFIX + project_id
+    now = time.time() if now is None else now
+    with store.connect() as db:
+        cursor = _cursor(db, project_id)
+        previous = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    state = decode_object(previous["value"]) if previous else {}
+    base = None if cursor else (start or state.get("start"))
+    if enabled:
+        retrospective_preview(store, project, start if cursor else base)
+    with store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        if not db.execute("SELECT 1 FROM projects WHERE id=? AND path=?", (project_id, project["path"])).fetchone():
+            raise ValueError("Project not found")
+        if db.execute("SELECT 1 FROM settings WHERE key=?", ("project-archived:" + project_id,)).fetchone():
+            raise ValueError("Project is archived; restore it before starting work")
+        if (previous != db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+                or cursor != _cursor(db, project_id)):
+            raise ValueError("Main or the review cursor changed; preview the range again")
+        if enabled and (not state.get("enabled") or (not cursor and state.get("start") != base)):
+            state.update(next_at=now, error=None)
+        if enabled:
+            state["start"] = base
+        else:
+            state["next_at"] = None
+        state["enabled"] = enabled
+        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(state)))
+    return state
+
+
+def schedule_retrospectives(runtime, now):
+    """Persist one pending batch per project and leave the review cursor to the user."""
+    store = runtime.store
+    projects = store.query(
+        "SELECT p.id,p.path,s.key,s.value FROM settings s "
+        "JOIN projects p ON p.id=substr(s.key, ?) WHERE s.key GLOB ? AND p.paused=0 "
+        "AND NOT EXISTS (SELECT 1 FROM settings WHERE key='project-archived:' || p.id) "
+        "AND CASE WHEN json_valid(s.value) THEN json_extract(s.value,'$.enabled')=1 "
+        "AND json_extract(s.value,'$.next_at')<=? ELSE 0 END ORDER BY p.created",
+        (len(SCHEDULE_PREFIX) + 1, SCHEDULE_PREFIX + "*", now))
+    for project in projects:
+        if runtime.stop.is_set():
+            return
+        with runtime.scheduler_scope("weekly_retrospective", project["id"]):
+            _scheduled_preview(store, project, now)
+
+
+def _scheduled_preview(store, project, now):
+    project_id = project["id"]
+    state = decode_object(project["value"])
+    with store.connect() as db:
+        cursor = _cursor(db, project_id)
+    try:
+        preview = retrospective_preview(store, project, None if cursor else state.get("start"))
+        if preview["main"] != main_head(project):
+            raise ValueError("Main or the review cursor changed; preview the range again")
+    except (ValueError, RuntimeError, OSError) as exc:
+        message = str(exc) if isinstance(exc, ValueError) else "Local retrospective evidence could not be read"
+        state.update(next_at=now + REVIEW_RETRY, error=message)
+    else:
+        # Ignore unchanged evidence on repeated weekly ticks. Keep the original generation time.
+        if (state.get("summary") or {}).get("token") != preview["token"]:
+            state["summary"] = {**preview, "generated_at": now}
+        state.update(next_at=now + REVIEW_WEEK, error=None)
+    with store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        if _cursor(db, project_id) != cursor:
+            return
+        db.execute("UPDATE settings SET value=? WHERE key=? AND value=? "
+                   "AND EXISTS (SELECT 1 FROM projects WHERE id=? AND path=? AND paused=0) "
+                   "AND NOT EXISTS (SELECT 1 FROM settings WHERE key=?)",
+                   (encode(state), project["key"], project["value"], project_id, project["path"],
+                    "project-archived:" + project_id))
+
+
 def maintenance_summary(store, project, repository):
     project_id = project["id"]
     with store.connect() as db:
@@ -170,6 +254,7 @@ def maintenance_summary(store, project, repository):
     except (ValueError, RuntimeError):
         head = None
     return {"cursor": cursor, "main": head, "signal": fixed_check_signal(store, project_id, repository, head),
+            "schedule": store.setting(SCHEDULE_PREFIX + project_id, {}), "paused": bool(project["paused"]),
             "rules": [decode_object(row["data"]) for row in store.query(
                 "SELECT data FROM maintenance_rules WHERE project=? ORDER BY confirmed DESC,id LIMIT 50", (project_id,))],
             "reviews": [decode_object(row["data"]) for row in store.query(
